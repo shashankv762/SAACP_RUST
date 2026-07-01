@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::errors::SAACPHardDrop;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn test_pool_evict_idle() {
         let pool = ConnectionPool::new();
-        let mut c = make_conn("a", "b");
+        let c = make_conn("a", "b");
         // Manually set idle_since to the past
         pool.release(c).unwrap();
 

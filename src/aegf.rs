@@ -28,6 +28,45 @@ pub const AEGF_META_SIZE: usize = 120;
 /// Format version — increment when binary layout changes.
 pub const AEGF_META_FORMAT_VERSION: u32 = 1;
 
+/// Field offsets in the 120-byte packed AEGFMetadata binary layout (§4.2).
+/// Each tuple is (byte_offset, field_size_in_bytes).
+pub const AEGF_META_FIELD_OFFSETS: &[(&str, usize, usize)] = &[
+    ("cid", 0, 16),
+    ("rid", 16, 16),
+    ("prid", 32, 16),
+    ("sid", 48, 16),
+    ("oaid", 64, 32),
+    ("hc", 96, 2),
+    ("ed", 98, 2),
+    ("ttl", 100, 8),
+    ("reserved", 108, 12),
+];
+
+/// Canonical test vector for AEGFMetadata binary serialization (§4.2).
+/// Input parameters:
+///   - cid  = "00000000000000000000000000000001"
+///   - rid  = "00000000000000000000000000000002"
+///   - prid = "00000000000000000000000000000000"
+///   - sid  = "00000000000000000000000000000003"
+///   - oaid = "test-agent"
+///   - hc   = 0
+///   - ed   = 0
+///   - ttl  = 0.0
+///
+/// Expected packed output (120 bytes hex):
+pub const AEGF_TEST_VECTOR_BYTES: &str = concat!(
+    "00000000000000000000000000000001",  // CID [0:16]
+    "00000000000000000000000000000002",  // RID [16:32]
+    "00000000000000000000000000000000",  // PRID [32:48]
+    "00000000000000000000000000000003",  // SID [48:64]
+    "746573742d6167656e74000000000000",  // OAID [64:96] = "test-agent" padded
+    "00000000000000000000000000000000",  // (continuation of OAID padding)
+    "0000",                              // HC [96:98]
+    "0000",                              // ED [98:100]
+    "0000000000000000",                  // TTL [100:108] (f64 = 0.0)
+    "000000000000000000000000",          // reserved [108:120]
+);
+
 /// Maximum value for HC and ED fields (uint16).
 const MAX_HC: u16 = 0xFFFF;
 const MAX_ED: u16 = 0xFFFF;
@@ -197,13 +236,13 @@ impl AEGFMetadata {
 
     /// Derive a child request from a parent (increments HC and ED).
     pub fn derive(parent: &AEGFMetadata, new_oaid: Option<&str>) -> Result<Self, SAACPHardDrop> {
-        if parent.hc >= MAX_HC {
+        if parent.hc == MAX_HC {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AegfHopLimitExceeded,
                 format!("Hop count {} already at maximum {}.", parent.hc, MAX_HC),
             ));
         }
-        if parent.ed >= MAX_ED {
+        if parent.ed == MAX_ED {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AegfDepthLimitExceeded,
                 format!("Execution depth {} already at maximum {}.", parent.ed, MAX_ED),
@@ -215,8 +254,8 @@ impl AEGFMetadata {
             prid: parent.rid.clone(),
             sid: parent.sid.clone(),
             oaid: new_oaid.unwrap_or(&parent.oaid).to_string(),
-            hc: parent.hc + 1,
-            ed: parent.ed + 1,
+            hc: parent.hc.checked_add(1).expect("hc bounded by MAX_HC check above"),
+            ed: parent.ed.checked_add(1).expect("ed bounded by MAX_ED check above"),
             ttl: parent.ttl,
         })
     }
@@ -235,8 +274,8 @@ impl AEGFMetadata {
         buf[32..48].copy_from_slice(&prid_b);
         buf[48..64].copy_from_slice(&sid_b);
         buf[64..96].copy_from_slice(&oaid_b);
-        buf[96..98].copy_from_slice(&self.hc.min(MAX_HC).to_be_bytes());
-        buf[98..100].copy_from_slice(&self.ed.min(MAX_ED).to_be_bytes());
+        buf[96..98].copy_from_slice(&self.hc.to_be_bytes());
+        buf[98..100].copy_from_slice(&self.ed.to_be_bytes());
         buf[100..108].copy_from_slice(&self.ttl.to_be_bytes());
         // bytes 108..120 remain zero (reserved)
         buf
@@ -457,6 +496,7 @@ impl Default for ExecutionStateMachine {
 
 // ─── Distributed Execution Graph (DEG) ──────────────────────────────────────────
 
+#[allow(dead_code)]
 struct DEGNode {
     rid: String,
     prid: String,
@@ -540,11 +580,7 @@ impl DistributedExecutionGraph {
         let mut ancestors = Vec::new();
         let mut current = rid.to_string();
         let mut visited = HashSet::new();
-        loop {
-            let node = match nodes.get(&current) {
-                Some(n) => n,
-                None => break,
-            };
+        while let Some(node) = nodes.get(&current) {
             if node.prid == RID_ROOT || visited.contains(&node.prid) {
                 break;
             }
@@ -906,5 +942,165 @@ impl AEGFGovernor {
         let esm_evicted = self.esm.expire_old(gc_age);
         let deg_evicted = self.deg.evict_expired();
         esm_evicted + deg_evicted
+    }
+}
+
+use std::sync::LazyLock;
+
+/// Process-wide distributed execution graph singleton.
+/// Shared between AEGF governor and CSCS loop detector.
+pub static GLOBAL_DAEG: LazyLock<std::sync::Arc<DistributedExecutionGraph>> =
+    LazyLock::new(|| std::sync::Arc::new(DistributedExecutionGraph::new()));
+
+/// Process-wide AEGFGovernor singleton.
+///
+/// Used by Gate 11.0 in `SAACPProtocolHandler::_intercept_packet_inner()` when
+/// no AEGFGovernor is explicitly injected. Shares `GLOBAL_DAEG` with the CSCS
+/// loop detector so both see the same causal graph state.
+pub static GLOBAL_AEGF_GOVERNOR: LazyLock<AEGFGovernor> =
+    LazyLock::new(|| AEGFGovernor::new(None));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// README §4.2 canonical test vector.
+    /// Input:  cid="0"*30+"01", rid="0"*30+"02", prid="0"*32,
+    ///         sid="0"*30+"03", oaid="test-agent", hc=0, ed=0, ttl=0.0
+    /// Output: 120 bytes with known hex layout.
+    #[test]
+    fn test_aegf_meta_canonical_pack() {
+        // AEGF_META_FORMAT_VERSION must be 1
+        assert_eq!(AEGF_META_FORMAT_VERSION, 1, "AEGF_META_FORMAT_VERSION must be 1");
+        assert_eq!(AEGF_META_SIZE, 120, "AEGF_META_SIZE must be 120 bytes");
+
+        let meta = AEGFMetadata {
+            cid:  "0".repeat(30) + "01",
+            rid:  "0".repeat(30) + "02",
+            prid: "0".repeat(32),
+            sid:  "0".repeat(30) + "03",
+            oaid: "test-agent".to_string(),
+            hc:   0,
+            ed:   0,
+            ttl:  0.0,
+        };
+
+        let packed = meta.pack();
+        assert_eq!(packed.len(), 120);
+
+        // CID: offset 0..16 → 0x00..0x00, 0x00, 0x01
+        assert_eq!(&packed[0..15], &[0u8; 15]);
+        assert_eq!(packed[15], 0x01, "CID last byte must be 0x01");
+
+        // RID: offset 16..32 → 0x00..0x00, 0x00, 0x02
+        assert_eq!(&packed[16..31], &[0u8; 15]);
+        assert_eq!(packed[31], 0x02, "RID last byte must be 0x02");
+
+        // PRID: offset 32..48 → all zeros (RID_ROOT)
+        assert_eq!(&packed[32..48], &[0u8; 16], "PRID must be all-zero for RID_ROOT");
+
+        // SID: offset 48..64 → 0x00..0x00, 0x00, 0x03
+        assert_eq!(&packed[48..63], &[0u8; 15]);
+        assert_eq!(packed[63], 0x03, "SID last byte must be 0x03");
+
+        // OAID: offset 64..96 → "test-agent" UTF-8, rest zeros
+        const OAID_STR: &[u8] = b"test-agent";
+        const OAID_LEN: usize = 10; // b"test-agent".len()
+        assert_eq!(&packed[64..64 + OAID_LEN], OAID_STR, "OAID prefix must match");
+        assert_eq!(&packed[64 + OAID_LEN..96], &[0u8; 32 - OAID_LEN], "OAID padding must be zero");
+
+        // HC: offset 96..98 → 0x0000
+        assert_eq!(&packed[96..98], &[0x00, 0x00], "HC must be 0x0000");
+
+        // ED: offset 98..100 → 0x0000
+        assert_eq!(&packed[98..100], &[0x00, 0x00], "ED must be 0x0000");
+
+        // TTL: offset 100..108 → IEEE 754 f64 BE of 0.0 = all zeros
+        assert_eq!(&packed[100..108], &[0u8; 8], "TTL 0.0 must be all-zero bytes");
+
+        // Reserved: offset 108..120 → all zeros
+        assert_eq!(&packed[108..120], &[0u8; 12], "Reserved bytes must be zero");
+
+        // Round-trip test
+        let unpacked = AEGFMetadata::unpack(&packed).expect("unpack must succeed");
+        assert_eq!(unpacked.oaid, "test-agent");
+        assert_eq!(unpacked.hc, 0);
+        assert_eq!(unpacked.ed, 0);
+        assert_eq!(unpacked.ttl, 0.0);
+    }
+
+    #[test]
+    fn test_aegf_meta_format_version() {
+        assert_eq!(AEGF_META_FORMAT_VERSION, 1);
+    }
+
+    #[test]
+    fn test_aegf_meta_size() {
+        assert_eq!(AEGF_META_SIZE, 120);
+    }
+
+    #[test]
+    fn test_deg_max_graph_nodes_cap() {
+        // N-7 fix: validate_and_add returns Pause when graph is full
+        let gov = AEGFGovernor::new(None);
+        gov.set_policy(AEGFPolicy { max_graph_nodes: 2, ..Default::default() });
+
+        let make_meta = |suffix: &str| -> AEGFMetadata {
+            AEGFMetadata {
+                cid: "aaa".to_string(),
+                rid: format!("rid{}", suffix),
+                prid: RID_ROOT.to_string(),
+                sid: "sid1".to_string(),
+                oaid: "agent".to_string(),
+                hc: 0,
+                ed: 0,
+                ttl: now_epoch_f64() + 3600.0,
+            }
+        };
+
+        assert_eq!(gov.submit_request(&make_meta("1")), GovernanceDecision::Allow);
+        assert_eq!(gov.submit_request(&make_meta("2")), GovernanceDecision::Allow);
+        // Graph now has 2 nodes = max_graph_nodes; next must be Pause
+        assert_eq!(gov.submit_request(&make_meta("3")), GovernanceDecision::Pause);
+    }
+
+    #[test]
+    fn test_gc_expired_proposals_factf() {
+        // Verify gc_expired_proposals() alias is accessible
+        use crate::factf::ThresholdAuthorityIssuer;
+        let tai = ThresholdAuthorityIssuer::new(
+            1,
+            vec!["auth-1".to_string()],
+            0.001, // 1ms TTL so it expires immediately
+        ).unwrap();
+        let _req_id = tai.create_request(serde_json::json!({"test": true}));
+        // Wait briefly for TTL to elapse
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let purged = tai.gc_expired_proposals();
+        assert_eq!(purged, 1, "gc_expired_proposals must have purged the expired proposal");
+    }
+
+    #[test]
+    fn test_aegf_test_vector_canonical_output() {
+        // README §4.2 test vector: validates pack() produces exact canonical bytes
+        let meta = AEGFMetadata {
+            cid: "00000000000000000000000000000001".to_string(),
+            rid: "00000000000000000000000000000002".to_string(),
+            prid: "00000000000000000000000000000000".to_string(),
+            sid: "00000000000000000000000000000003".to_string(),
+            oaid: "test-agent".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: 0.0,
+        };
+        let packed = meta.pack();
+        let packed_hex = hex::encode(packed);
+
+        // Remove whitespace from AEGF_TEST_VECTOR_BYTES for comparison
+        let expected = AEGF_TEST_VECTOR_BYTES.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(
+            packed_hex, expected,
+            "AEGF test vector mismatch — pack() output must match AEGF_TEST_VECTOR_BYTES canonical hex"
+        );
     }
 }

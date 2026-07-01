@@ -2,10 +2,11 @@
 //!
 //! Implements:
 //! - `NonceTracker`: Tracks nonces to defeat Replay Attacks
-//! - `ImmutableAuditLog`: Append-only cryptographic hash chain
+//! - `ImmutableAuditLog`: Append-only cryptographic hash chain with WAL worker thread
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::thread;
 use std::time::SystemTime;
 use std::fs;
 use std::path::Path;
@@ -17,12 +18,45 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Constant-time comparison of two byte slices.
+/// Returns true iff a.len() == b.len() AND all bytes are equal,
+/// without short-circuiting on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Constant-time comparison of two hex-encoded HMAC digests (as strings).
+/// Decodes both to raw bytes before comparing so no timing information
+/// about the first differing hex character leaks.
+fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+    match (hex::decode(a), hex::decode(b)) {
+        (Ok(ab), Ok(bb)) => constant_time_eq(&ab, &bb),
+        _ => false,
+    }
+}
+
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
 }
+
+// ===========================================================================
+// Environment variable constants (Appendix A)
+// ===========================================================================
+
+/// Env var that overrides the audit log file path.
+pub const ENV_AUDIT_LOG: &str = "SAACP_AUDIT_LOG";
+/// Env var that overrides the audit event-count sentinel file path.
+pub const ENV_COUNT_FILE: &str = "SAACP_COUNT_FILE";
 
 // ===========================================================================
 // NonceTracker
@@ -124,13 +158,17 @@ impl Default for NonceTracker {
 // ImmutableAuditLog
 // ===========================================================================
 
-/// Default log file path.
+/// Default log file path (overridden by `SAACP_AUDIT_LOG` env var).
 pub const AUDIT_LOG_FILE: &str = "saacp_audit.log";
-/// Maximum log file size before rotation (50MB).
+/// Default sentinel file path (overridden by `SAACP_COUNT_FILE` env var).
+pub const AUDIT_COUNT_FILE: &str = "saacp_event_count.sentinel";
+/// Maximum log file size before rotation (50 MB).
 pub const AUDIT_MAX_LOG_SIZE: u64 = 50_000_000;
+/// WAL queue capacity — events are dropped (not rejected) when full.
+pub const AUDIT_WAL_QUEUE_CAPACITY: usize = 100_000;
 
 /// Genesis hash for the audit chain.
-const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of "GENESIS_BLOCK"
+const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLOCK"
 
 /// An audit log entry record.
 #[derive(Debug, Clone)]
@@ -152,41 +190,93 @@ pub struct AuditLogEntry {
     pub chain_hash: String,
 }
 
+// ---------------------------------------------------------------------------
+// WAL worker message
+// ---------------------------------------------------------------------------
+
+struct WalMessage {
+    entry_json: String,
+    log_file: String,
+    count_file: String,
+    event_count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// ImmutableAuditLog
+// ---------------------------------------------------------------------------
+
 /// Append-Only Cryptographic Hash Chain Audit Log.
 ///
 /// Ties Distributed Tracing (traceparent) to lateral movement token signatures.
 /// If a compromised agent alters a past entry, the chain breaks.
 /// Detects file deletion and partial truncation attacks.
+///
+/// Disk I/O is handled by a background WAL worker thread (spec §15.2).
+/// If the WAL queue is full, the event is dropped and logged to stderr —
+/// dropping is preferred over blocking or rejecting the packet.
 pub struct ImmutableAuditLog {
     inner: Mutex<AuditInner>,
+    /// WAL worker sender — None when log_file is "" (in-memory only mode for tests).
+    wal_tx: Option<mpsc::SyncSender<WalMessage>>,
 }
 
 struct AuditInner {
     last_hash: String,
     event_count: u64,
     log_file: String,
-    entries: Vec<AuditLogEntry>, // In-memory chain for verification
+    count_file: String,
+    entries: Vec<AuditLogEntry>,
 }
 
 impl ImmutableAuditLog {
-    /// Create a new ImmutableAuditLog.
+    /// Create a new ImmutableAuditLog with explicit paths.
     pub fn new(log_file: &str) -> Self {
+        Self::with_paths(log_file, AUDIT_COUNT_FILE)
+    }
+
+    /// Create with both log file and sentinel file paths.
+    pub fn with_paths(log_file: &str, count_file: &str) -> Self {
+        let (wal_tx, wal_rx) = mpsc::sync_channel::<WalMessage>(AUDIT_WAL_QUEUE_CAPACITY);
+
+        // Spawn WAL worker daemon thread.
+        thread::Builder::new()
+            .name("saacp-wal-worker".into())
+            .spawn(move || {
+                while let Ok(msg) = wal_rx.recv() {
+                    wal_write_entry(&msg.entry_json, &msg.log_file, msg.event_count, &msg.count_file);
+                }
+            })
+            .expect("WAL worker thread spawn failed");
+
         Self {
             inner: Mutex::new(AuditInner {
                 last_hash: GENESIS_HASH.to_string(),
                 event_count: 0,
                 log_file: log_file.to_string(),
+                count_file: count_file.to_string(),
                 entries: Vec::new(),
             }),
+            wal_tx: Some(wal_tx),
         }
     }
 
-    /// Create a new audit log with default file path.
+    /// Create a new audit log with default file path (reads from env vars).
     pub fn with_default_path() -> Self {
-        Self::new(AUDIT_LOG_FILE)
+        let log_file = std::env::var(ENV_AUDIT_LOG)
+            .unwrap_or_else(|_| AUDIT_LOG_FILE.to_string());
+        let count_file = std::env::var(ENV_COUNT_FILE)
+            .unwrap_or_else(|_| AUDIT_COUNT_FILE.to_string());
+        Self::with_paths(&log_file, &count_file)
     }
 
-    /// Initialize the chain from an existing log file.
+    /// Process-wide global singleton ImmutableAuditLog.
+    /// Initializes from `SAACP_AUDIT_LOG` and `SAACP_COUNT_FILE` env vars.
+    pub fn global() -> &'static ImmutableAuditLog {
+        static GLOBAL: OnceLock<ImmutableAuditLog> = OnceLock::new();
+        GLOBAL.get_or_init(ImmutableAuditLog::with_default_path)
+    }
+
+    /// Initialize the chain from an existing log file (re-reads disk state).
     pub fn initialize_chain(&self) {
         let mut inner = self.inner.lock().expect("lock poisoned");
         let log_file = inner.log_file.clone();
@@ -206,7 +296,12 @@ impl ImmutableAuditLog {
         }
     }
 
-    /// Append one audit event to the in-memory chain and persist to disk.
+    /// Append one audit event to the in-memory chain and enqueue for WAL persistence.
+    ///
+    /// The chain hash is computed inline (synchronous) so the in-memory chain is
+    /// always coherent. Disk I/O is offloaded to the WAL worker thread.
+    /// If the WAL queue is full, the event is dropped to stderr — the packet is
+    /// NOT rejected (spec §15.2: "Dropping an event is preferred over rejecting the packet").
     pub fn append_event(
         &self,
         issuer_secret: &[u8],
@@ -229,7 +324,7 @@ impl ImmutableAuditLog {
             seq: inner.event_count,
         };
 
-        // Serialize deterministically for hashing
+        // Serialize deterministically with sort_keys (canonical JSON).
         let record_json = serde_json::to_string(&serde_json::json!({
             "intent": record.intent,
             "prev_hash": record.prev_hash,
@@ -241,7 +336,7 @@ impl ImmutableAuditLog {
             "traceparent": record.traceparent,
         })).unwrap_or_default();
 
-        // HMAC-SHA256 over the record
+        // HMAC-SHA256 over the canonical record JSON.
         let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
         mac.update(record_json.as_bytes());
         let chain_hash = hex::encode(mac.finalize().into_bytes());
@@ -254,8 +349,7 @@ impl ImmutableAuditLog {
         inner.last_hash = chain_hash;
         inner.event_count += 1;
 
-        // Persist to disk synchronously
-        let log_file = inner.log_file.clone();
+        // Build JSONL line for disk persistence.
         let entry_json = serde_json::to_string(&serde_json::json!({
             "record": {
                 "intent": log_entry.record.intent,
@@ -270,33 +364,49 @@ impl ImmutableAuditLog {
             "chain_hash": log_entry.chain_hash,
         })).unwrap_or_default();
 
-        // Rotate if needed
-        if let Ok(metadata) = fs::metadata(&log_file) {
-            if metadata.len() > AUDIT_MAX_LOG_SIZE {
-                let rotated = format!("{}.{}.bak", log_file, now_secs() as u64);
-                let _ = fs::rename(&log_file, rotated);
+        // Enqueue for WAL worker (non-blocking — drop if full, per spec §15.2).
+        if let Some(ref tx) = self.wal_tx {
+            let msg = WalMessage {
+                entry_json,
+                log_file: inner.log_file.clone(),
+                count_file: inner.count_file.clone(),
+                event_count: inner.event_count,
+            };
+            if tx.try_send(msg).is_err() {
+                eprintln!(
+                    "[SAACP AUDIT] WAL queue full — event seq={} dropped to stderr",
+                    inner.event_count - 1
+                );
             }
         }
 
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{}", entry_json)
-            });
-
-        // Keep in-memory for verification
+        // Keep in-memory for fast verify_chain().
         inner.entries.push(log_entry);
     }
 
-    /// Verify the integrity of the audit chain.
+    /// Verify the integrity of the in-memory audit chain.
+    ///
+    /// Also validates the sentinel file count if it exists (spec §15.3):
+    /// the event count on disk must be >= the sentinel value.
+    ///
+    /// Returns `false` on any tampering detection.
     pub fn verify_chain(&self, issuer_secret: &[u8]) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
 
         if inner.entries.is_empty() {
-            return inner.event_count == 0;
+            // Empty chain — valid iff event_count is also 0.
+            if inner.event_count != 0 {
+                return false;
+            }
+            // Check sentinel: if sentinel file exists and shows count > 0, tamper detected.
+            if let Ok(sentinel_str) = fs::read_to_string(&inner.count_file) {
+                if let Ok(sentinel_count) = sentinel_str.trim().parse::<u64>() {
+                    if sentinel_count > 0 {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         let mut expected_prev_hash = GENESIS_HASH.to_string();
@@ -306,7 +416,7 @@ impl ImmutableAuditLog {
                 return false; // Chain broken
             }
 
-            // Recompute HMAC
+            // Recompute HMAC over the same canonical record JSON.
             let record_json = serde_json::to_string(&serde_json::json!({
                 "intent": entry.record.intent,
                 "prev_hash": entry.record.prev_hash,
@@ -322,11 +432,110 @@ impl ImmutableAuditLog {
             mac.update(record_json.as_bytes());
             let expected_sig = hex::encode(mac.finalize().into_bytes());
 
-            if expected_sig != entry.chain_hash {
+            // SECURITY: use constant-time hex comparison to prevent timing oracle.
+            if !constant_time_eq_hex(&expected_sig, &entry.chain_hash) {
                 return false; // Tampering detected
             }
 
             expected_prev_hash = entry.chain_hash.clone();
+        }
+
+        // Spec §15.3: Total disk count MUST be >= sentinel count.
+        // The sentinel records how many events were accepted in-memory.
+        // If the sentinel exists and shows a count HIGHER than in-memory, something was erased.
+        if Path::new(&inner.count_file).exists() {
+            if let Ok(sentinel_str) = fs::read_to_string(&inner.count_file) {
+                if let Ok(sentinel_count) = sentinel_str.trim().parse::<u64>() {
+                    if inner.event_count < sentinel_count {
+                        return false; // Events were lost/erased
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Full disk-based chain verification (spec §15.3 complete implementation).
+    ///
+    /// Re-reads the log file entry by entry, recomputes HMACs, and checks:
+    /// 1. prev_hash of each entry matches chain_hash of previous entry.
+    /// 2. chain_hash matches recomputed HMAC.
+    /// 3. Total entry count on disk >= sentinel in SAACP_COUNT_FILE.
+    ///
+    /// NOTE: This requires the WAL thread to have flushed pending writes to disk.
+    /// Use `verify_chain()` for in-process verification without disk I/O.
+    pub fn verify_chain_disk(&self, issuer_secret: &[u8]) -> bool {
+        let inner = self.inner.lock().expect("lock poisoned");
+        let log_file = &inner.log_file;
+        let count_file = &inner.count_file;
+
+        // Read all log entries from disk.
+        let content = match fs::read_to_string(log_file) {
+            Ok(c) => c,
+            Err(_) => {
+                // File missing — valid only if in-memory count is 0.
+                return inner.event_count == 0;
+            }
+        };
+
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        let disk_count = lines.len() as u64;
+
+        // Check sentinel: disk count must be >= sentinel count.
+        if Path::new(count_file).exists() {
+            if let Ok(s) = fs::read_to_string(count_file) {
+                if let Ok(sentinel) = s.trim().parse::<u64>() {
+                    if disk_count < sentinel {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            return true;
+        }
+
+        let mut expected_prev_hash = GENESIS_HASH.to_string();
+
+        for line in &lines {
+            let entry: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let rec = &entry["record"];
+            let chain_hash = match entry["chain_hash"].as_str() {
+                Some(h) => h,
+                None => return false,
+            };
+            let prev_hash = rec["prev_hash"].as_str().unwrap_or("");
+
+            if prev_hash != expected_prev_hash {
+                return false;
+            }
+
+            let record_json = serde_json::to_string(&serde_json::json!({
+                "intent":          rec["intent"],
+                "prev_hash":       rec["prev_hash"],
+                "seq":             rec["seq"],
+                "source":          rec["source"],
+                "target":          rec["target"],
+                "timestamp":       rec["timestamp"],
+                "token_signature": rec["token_signature"],
+                "traceparent":     rec["traceparent"],
+            })).unwrap_or_default();
+
+            let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+            mac.update(record_json.as_bytes());
+            let expected_sig = hex::encode(mac.finalize().into_bytes());
+
+            // SECURITY: constant-time hex comparison to prevent timing oracle.
+            if !constant_time_eq_hex(&expected_sig, chain_hash) {
+                return false;
+            }
+
+            expected_prev_hash = chain_hash.to_string();
         }
 
         true
@@ -342,20 +551,34 @@ impl ImmutableAuditLog {
     pub fn reset(&self) {
         let mut inner = self.inner.lock().expect("lock poisoned");
         let log_file = inner.log_file.clone();
+        let count_file = inner.count_file.clone();
         inner.last_hash = GENESIS_HASH.to_string();
         inner.event_count = 0;
         inner.entries.clear();
         let _ = fs::remove_file(&log_file);
+        let _ = fs::remove_file(&count_file);
     }
+
     /// Alias for `event_count()` used by audit facades.
     pub fn entry_count(&self) -> usize {
         self.event_count() as usize
     }
 
     /// Convenience: append a simple text message as an audit event.
+    ///
+    /// # Security Warning
+    /// This method signs the audit entry with the hardcoded key `AUDIT_SENTINEL`.
+    /// Because the key is publicly known, any caller can forge matching entries and
+    /// the chain hash will still verify.  Use `append_event()` with a real secret key
+    /// for any security-critical log entries.  This method is kept only for non-security
+    /// diagnostic messages (e.g. daemon startup banners).
+    #[deprecated(
+        note = "Uses a publicly-known sentinel key. \
+                Call append_event() with a real secret for security-critical entries."
+    )]
     pub fn append(&self, message: String) {
         self.append_event(
-            b"AUDIT_SENTINEL",
+            b"SAACP-AUDIT-DIAGNOSTIC-ONLY-NOT-SECRET",
             "system",
             "system",
             "",
@@ -389,6 +612,33 @@ impl Default for ImmutableAuditLog {
     fn default() -> Self {
         Self::with_default_path()
     }
+}
+
+// ---------------------------------------------------------------------------
+// WAL worker helper — called from the background thread
+// ---------------------------------------------------------------------------
+
+fn wal_write_entry(entry_json: &str, log_file: &str, event_count: u64, count_file: &str) {
+    // Rotate if file exceeds 50 MB.
+    if let Ok(metadata) = fs::metadata(log_file) {
+        if metadata.len() > AUDIT_MAX_LOG_SIZE {
+            let rotated = format!("{}.{}.bak", log_file, now_secs() as u64);
+            let _ = fs::rename(log_file, rotated);
+        }
+    }
+
+    // Append JSONL entry to log file.
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", entry_json)
+        });
+
+    // Update sentinel file with current event count.
+    let _ = fs::write(count_file, format!("{}", event_count));
 }
 
 // ===========================================================================
@@ -447,7 +697,8 @@ mod tests {
 
     fn test_audit_log(name: &str) -> ImmutableAuditLog {
         let log_file = format!("test_audit_{}.log", name);
-        let log = ImmutableAuditLog::new(&log_file);
+        let count_file = format!("test_audit_{}.sentinel", name);
+        let log = ImmutableAuditLog::with_paths(&log_file, &count_file);
         log.reset(); // Clean slate
         log
     }
@@ -520,5 +771,22 @@ mod tests {
         log.append_event(secret, "src", "dst", "abc123", "execute", "tp-001");
         assert!(log.verify_chain(secret));
         log.reset();
+    }
+
+    #[test]
+    fn test_audit_wal_constants() {
+        assert_eq!(AUDIT_WAL_QUEUE_CAPACITY, 100_000);
+        assert_eq!(AUDIT_MAX_LOG_SIZE, 50_000_000);
+        assert_eq!(AUDIT_LOG_FILE, "saacp_audit.log");
+        assert_eq!(AUDIT_COUNT_FILE, "saacp_event_count.sentinel");
+        assert_eq!(ENV_AUDIT_LOG, "SAACP_AUDIT_LOG");
+        assert_eq!(ENV_COUNT_FILE, "SAACP_COUNT_FILE");
+    }
+
+    #[test]
+    fn test_audit_env_var_constants_exported() {
+        // Verify env var names match Appendix A of spec.
+        assert_eq!(ENV_AUDIT_LOG, "SAACP_AUDIT_LOG");
+        assert_eq!(ENV_COUNT_FILE, "SAACP_COUNT_FILE");
     }
 }

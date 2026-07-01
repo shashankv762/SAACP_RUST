@@ -9,12 +9,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use std::collections::BTreeMap;
+
 use sha2::{Sha256, Digest};
 use hmac::{Hmac, Mac};
 use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -233,31 +236,38 @@ impl FederatedMemory {
 
     /// Creates an immutable intent envelope, signs it with HMAC-SHA256, and stores it.
     /// Returns the 32-byte hex hash of the envelope.
+    ///
+    /// SECURITY: The HMAC covers a BTreeMap-sorted canonical JSON of ONLY the three
+    /// payload fields (root_intent, root_issuer, timestamp). This guarantees that the
+    /// byte string passed to HMAC at creation exactly matches the byte string reconstructed
+    /// at verification, regardless of serde_json's map iteration order. Separately stored
+    /// metadata (root_signature) is never part of the signed payload.
     pub fn create_intent_envelope(
         &self,
         root_intent: &str,
         root_issuer: &str,
         secret_key: &[u8],
     ) -> String {
-        let mut envelope_map = serde_json::Map::new();
-        envelope_map.insert("root_intent".into(), serde_json::Value::String(root_intent.to_string()));
-        envelope_map.insert("root_issuer".into(), serde_json::Value::String(root_issuer.to_string()));
-        envelope_map.insert("timestamp".into(), serde_json::json!(now_secs() as u64));
+        // f64→u64: epoch seconds are positive and fractional part is not needed.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ts_u64 = now_secs() as u64;
 
-        let envelope_json = serde_json::to_string(&serde_json::Value::Object(envelope_map.clone()))
-            .unwrap_or_default();
-        let envelope_bytes = envelope_json.as_bytes();
+        // Canonical signed payload: BTreeMap ensures deterministic key ordering.
+        let mut signed_fields: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        signed_fields.insert("root_intent", serde_json::Value::String(root_intent.to_string()));
+        signed_fields.insert("root_issuer", serde_json::Value::String(root_issuer.to_string()));
+        signed_fields.insert("timestamp", serde_json::json!(ts_u64));
+        let canonical_json = serde_json::to_string(&signed_fields).unwrap_or_default();
 
-        // HMAC-SHA256 signature
+        // HMAC-SHA256 over the canonical payload
         let mut mac = <HmacSha256 as Mac>::new_from_slice(secret_key).expect("HMAC accepts any key size");
-        mac.update(envelope_bytes);
+        mac.update(canonical_json.as_bytes());
         let root_signature = hex::encode(mac.finalize().into_bytes());
 
-        // Build final envelope with signature
-        let mut final_map = envelope_map;
-        final_map.insert("root_signature".into(), serde_json::Value::String(root_signature));
-        let final_json = serde_json::to_string(&serde_json::Value::Object(final_map))
-            .unwrap_or_default();
+        // Store the full envelope (canonical payload + signature) as JSON
+        let mut final_fields: BTreeMap<&str, serde_json::Value> = signed_fields.into_iter().collect();
+        final_fields.insert("root_signature", serde_json::Value::String(root_signature));
+        let final_json = serde_json::to_string(&final_fields).unwrap_or_default();
         let envelope_hash = Sha256::digest(final_json.as_bytes()).to_vec();
 
         let mut inner = self.inner.lock().expect("lock poisoned");
@@ -319,36 +329,57 @@ impl FederatedMemory {
         let obj = envelope.as_object().ok_or_else(|| {
             SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Envelope not an object.")
         })?;
-        let provided_sig = obj["root_signature"].as_str().unwrap_or_default();
-
-        // Rebuild verification payload (without root_signature)
-        let mut verify_map = serde_json::Map::new();
-        for (k, v) in obj {
-            if k != "root_signature" && k != "_sig_alg" && k != "_kid" {
-                verify_map.insert(k.clone(), v.clone());
-            }
-        }
-        let verify_json = serde_json::to_string(&serde_json::Value::Object(verify_map))
+        let provided_sig = obj.get("root_signature")
+            .and_then(|v| v.as_str())
             .unwrap_or_default();
 
+        // Reconstruct the EXACT canonical JSON that was signed at creation:
+        // BTreeMap-sorted, only the three payload fields, no root_signature.
+        // This is the only valid signed payload — no field stripping needed.
+        let root_intent_str = obj.get("root_intent").and_then(|v| v.as_str()).unwrap_or_default();
+        let root_issuer_str = obj.get("root_issuer").and_then(|v| v.as_str()).unwrap_or_default();
+        let timestamp_val = obj.get("timestamp").cloned().unwrap_or(serde_json::Value::Null);
+        let mut signed_fields: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        signed_fields.insert("root_intent", serde_json::Value::String(root_intent_str.to_string()));
+        signed_fields.insert("root_issuer", serde_json::Value::String(root_issuer_str.to_string()));
+        signed_fields.insert("timestamp", timestamp_val);
+        let canonical_json = serde_json::to_string(&signed_fields).unwrap_or_default();
+
         let mut mac = <HmacSha256 as Mac>::new_from_slice(secret_key).expect("HMAC key");
-        mac.update(verify_json.as_bytes());
+        mac.update(canonical_json.as_bytes());
         let expected_sig = hex::encode(mac.finalize().into_bytes());
 
-        if expected_sig != provided_sig {
+        // Constant-time comparison prevents timing oracle on the HMAC tag.
+        if expected_sig.as_bytes().ct_ne(provided_sig.as_bytes()).into() {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "Intent Envelope signature verification failed.",
             ));
         }
 
-        Ok(obj["root_intent"].as_str().unwrap_or_default().to_string())
+        Ok(root_intent_str.to_string())
     }
 
     /// Return number of stored entries.
     pub fn count(&self) -> usize {
         let inner = self.inner.lock().expect("lock poisoned");
         inner.store.len()
+    }
+
+    /// Process-wide singleton FederatedMemory.
+    pub fn global() -> &'static FederatedMemory {
+        static GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(FederatedMemory::new)
+    }
+
+    /// Fetch context by hex-encoded context state ID.
+    pub fn fetch_context_by_hex(&self, hex_id: &str, version: u64) -> Result<String, String> {
+        let bytes = hex::decode(hex_id)
+            .map_err(|e| format!("Invalid hex context ID: {}", e))?;
+        // context_version in the wire format is u32; reject values that don't fit.
+        let version_u32 = u32::try_from(version)
+            .map_err(|_| format!("context_version {version} exceeds u32 range"))?;
+        self.fetch_context(&bytes, version_u32)
     }
 }
 
@@ -391,6 +422,7 @@ fn build_aad(owner_id: &str, audience: &[String], expiry: f64) -> Vec<u8> {
     serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default().into_bytes()
 }
 
+#[allow(dead_code)]
 struct ScrRecord {
     ciphertext: Vec<u8>,
     salt: Vec<u8>,
@@ -576,9 +608,23 @@ impl SecureContextStore {
     }
 
     fn evict_if_needed(inner: &mut ScrInner) {
+        // High-water mark: trigger eviction before the store is completely full so
+        // there is always room for incoming entries. The old approach only evicted
+        // at exactly SCR_MAX_ENTRIES and silently dropped new entries if all existing
+        // ones were still valid — enabling a DoS by pre-filling with long-TTL SCRs.
+        const HIGH_WATER: usize = SCR_MAX_ENTRIES - SCR_MAX_ENTRIES / 5; // 40,000
+        if inner.store.len() < HIGH_WATER {
+            return;
+        }
+        let now = now_secs();
+        inner.store.retain(|_, v| v.expiry > now && !v.revoked);
+        // If expiry eviction wasn't enough (all entries still valid), forcibly remove
+        // the oldest half by key order to keep memory bounded.
         if inner.store.len() >= SCR_MAX_ENTRIES {
-            let now = now_secs();
-            inner.store.retain(|_, v| v.expiry > now && !v.revoked);
+            let target = SCR_MAX_ENTRIES / 2;
+            let excess = inner.store.len().saturating_sub(target);
+            let to_remove: Vec<_> = inner.store.keys().take(excess).cloned().collect();
+            for k in to_remove { inner.store.remove(&k); }
         }
     }
 }

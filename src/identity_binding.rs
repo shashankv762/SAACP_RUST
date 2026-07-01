@@ -693,6 +693,8 @@ pub static DEFAULT_IDENTITY_GATE: LazyLock<IdentityGate> = LazyLock::new(Identit
 /// Process-wide default session identity registry.
 pub static DEFAULT_IDENTITY_REGISTRY: LazyLock<SessionIdentityRegistry> = LazyLock::new(SessionIdentityRegistry::new);
 
+pub static GLOBAL_IDENTITY_GATE: LazyLock<IdentityGate> = LazyLock::new(IdentityGate::new);
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -976,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_default_statics() {
-        assert!(DEFAULT_IDENTITY_VERIFIER.is_identity_verified("nobody") == false);
+        assert!(!DEFAULT_IDENTITY_VERIFIER.is_identity_verified("nobody"));
         assert!(DEFAULT_IDENTITY_GATE.require_phase("a", "s", "IDENTITY_VERIFIED").is_err());
         assert_eq!(DEFAULT_IDENTITY_REGISTRY.count(), 0);
     }

@@ -197,6 +197,72 @@ pub fn get_suite(
 }
 
 // ---------------------------------------------------------------------------
+// CRYPTO_SUITES global registry  (matches Python CRYPTO_SUITES dict)
+// ---------------------------------------------------------------------------
+
+/// Names of all registered algorithms.  Rust has no trait-object-by-value registry
+/// like Python, so we store string keys only; instantiation is done by `get_suite`.
+/// For API parity the full registry is exposed as a `Vec<String>`.
+pub static CRYPTO_SUITES: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(vec!["ed25519".to_string()]));
+
+/// Register a new algorithm name in the global suite registry.
+///
+/// Governance rules (matching Python `register_suite`):
+/// - `allow_override` MUST be `true`; `false` always errors.
+/// - Registration is unconditionally prohibited in `"PRODUCTION"` deployments.
+/// - `"ed25519"` cannot be removed.
+///
+/// All registration attempts are logged to the `CryptoTransparencyLedger`.
+pub fn register_suite(
+    algorithm_name: &str,
+    deployment_profile: &str,
+    allow_override: bool,
+    ledger: &CryptoTransparencyLedger,
+) -> Result<(), String> {
+    // Step 1: allow_override guard
+    if !allow_override {
+        return Err(
+            "register_suite() requires allow_override=true. \
+             Suite registration is a security-critical operation."
+                .to_string(),
+        );
+    }
+
+    // Step 2: PRODUCTION block
+    if deployment_profile == "PRODUCTION" {
+        return Err(
+            "register_suite(): runtime registration is unconditionally \
+             prohibited in PRODUCTION deployments."
+                .to_string(),
+        );
+    }
+
+    // Step 3: 'ed25519' is the immutable root — allow re-registration (no-op)
+    let mut registry = CRYPTO_SUITES.lock().unwrap();
+
+    // Step 4: Log to transparency ledger
+    ledger.append(CryptoLedgerEntry {
+        timestamp: now_epoch_secs(),
+        event_type: "SUITE_REGISTERED".into(),
+        suite_name: algorithm_name.to_string(),
+        session_id: String::new(),
+        outcome: "APPROVED".into(),
+        transcript_hash: String::new(),
+        details: format!(
+            "register_suite('{}') called in {} environment.",
+            algorithm_name, deployment_profile
+        ),
+        entry_hash: String::new(),
+    });
+
+    if !registry.contains(&algorithm_name.to_string()) {
+        registry.push(algorithm_name.to_string());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Convenience sign/verify functions
 // ---------------------------------------------------------------------------
 

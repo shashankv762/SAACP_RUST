@@ -249,6 +249,7 @@ impl ThresholdCapabilityToken {
     }
 }
 
+#[allow(dead_code)]
 struct ProposalState {
     base_claims: serde_json::Value,
     approvals: HashMap<String, ThresholdSignatureEntry>,
@@ -329,6 +330,9 @@ impl ThresholdAuthorityIssuer {
             ));
         }
 
+        // N-6 fix: auto-clean expired proposals on every submission (matches Python behavior)
+        self.gc_expired_proposals();
+
         let mut requests = self.requests.lock().unwrap();
         let state = requests.get_mut(request_id).ok_or_else(|| {
             SAACPHardDrop::new(
@@ -362,7 +366,7 @@ impl ThresholdAuthorityIssuer {
             ThresholdSignatureEntry {
                 kid: token.kid(),
                 issuer_id: issuer_id.to_string(),
-                signature_hex: hex::encode(&token.signature),
+                signature_hex: hex::encode(token.signature),
                 claims_bytes_hex: hex::encode(token.claims_bytes()),
             },
         );
@@ -412,7 +416,7 @@ impl ThresholdAuthorityIssuer {
         })
     }
 
-    /// Remove expired proposals. Returns purge count.
+    /// Remove expired proposals. Returns purge count. (Python API: purge_expired_requests)
     pub fn purge_expired_requests(&self) -> usize {
         let now = now_f64();
         let mut requests = self.requests.lock().unwrap();
@@ -426,6 +430,13 @@ impl ThresholdAuthorityIssuer {
             requests.remove(&rid);
         }
         count
+    }
+
+    /// N-6 fix: gc_expired_proposals() — Python-API-named cleanup.
+    /// Removes all proposals where proposal_ttl has elapsed.
+    /// Call explicitly or relies on auto-call inside submit_partial_approval().
+    pub fn gc_expired_proposals(&self) -> usize {
+        self.purge_expired_requests()
     }
 
     /// Return number of in-flight (non-expired) proposals.
@@ -595,6 +606,7 @@ impl CapabilityTransparencyLog {
     }
 
     /// Append an event. Returns the chain_hash of this entry.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
         event_type: &str,
@@ -969,6 +981,195 @@ impl PostCompromiseRecovery {
             revoked_jti_list: affected_jtis,
             recovery_timestamp: now_f64(),
             recovery_complete: true,
+        }
+    }
+}
+
+// ─── ThresholdNotReached ────────────────────────────────────────────────────────
+// Python: class ThresholdNotReached(Exception): pass
+// Raised by assemble_threshold_token() when M approvals have not been collected.
+
+/// Error raised when fewer than M approvals exist in a threshold token.
+#[derive(Debug, Clone)]
+pub struct ThresholdNotReached {
+    pub message: String,
+}
+
+impl ThresholdNotReached {
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self { message: msg.into() }
+    }
+}
+
+impl std::fmt::Display for ThresholdNotReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ThresholdNotReached: {}", self.message)
+    }
+}
+
+impl std::error::Error for ThresholdNotReached {}
+
+// ─── TransparencyLogBackend ─────────────────────────────────────────────────────
+// Python: class TransparencyLogBackend(abc.ABC)  — persistence abstraction.
+
+/// Persistence abstraction for the CapabilityTransparencyLog.
+///
+/// Implementations:
+///   - [`InMemoryBackend`]  — default; development and testing.
+///   - [`FilesystemBackend`] — JSONL file-based stub for production.
+pub trait TransparencyLogBackend: Send + Sync {
+    fn append(&self, entry: &TransparencyLogEntry);
+    fn get_all(&self) -> Vec<TransparencyLogEntry>;
+    fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry>;
+    fn get_since(&self, timestamp: f64) -> Vec<TransparencyLogEntry>;
+    fn count(&self) -> usize;
+    fn clear(&self);
+}
+
+// ─── FilesystemBackend ──────────────────────────────────────────────────────────
+// Python: class FilesystemBackend(TransparencyLogBackend) — JSONL stub.
+// Full disk I/O is stubbed; uses InMemoryBackend as mirror (protocol v0.1-beta2).
+
+/// File-based transparency log backend stub.
+///
+/// Writes one JSON line per entry to a log file (JSONL format).
+/// Full implementation deferred to a future protocol version.
+/// Uses an in-memory mirror for reads.
+pub struct FilesystemBackend {
+    path: String,
+    mirror: InMemoryBackend,
+}
+
+impl FilesystemBackend {
+    /// Create a new `FilesystemBackend` writing to `path`.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            mirror: InMemoryBackend::new(),
+        }
+    }
+
+    /// Return the configured log file path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl TransparencyLogBackend for FilesystemBackend {
+    fn append(&self, entry: &TransparencyLogEntry) {
+        // Clone so InMemoryBackend's owned-value append works
+        let mut guard = self.mirror.entries.lock().unwrap();
+        guard.push(entry.clone());
+        // TODO: write to self.path as JSONL (future protocol version)
+    }
+
+    fn get_all(&self) -> Vec<TransparencyLogEntry> {
+        self.mirror.get_all()
+    }
+
+    fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
+        self.mirror.get_by_jti(jti)
+    }
+
+    fn get_since(&self, timestamp: f64) -> Vec<TransparencyLogEntry> {
+        self.mirror.get_since(timestamp)
+    }
+
+    fn count(&self) -> usize {
+        self.mirror.count()
+    }
+
+    fn clear(&self) {
+        self.mirror.clear();
+    }
+}
+
+// Implement TransparencyLogBackend for InMemoryBackend too (for dyn dispatch)
+impl TransparencyLogBackend for InMemoryBackend {
+    fn append(&self, entry: &TransparencyLogEntry) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.push(entry.clone());
+    }
+
+    fn get_all(&self) -> Vec<TransparencyLogEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.jti.as_deref() == Some(jti))
+            .cloned()
+            .collect()
+    }
+
+    fn get_since(&self, timestamp: f64) -> Vec<TransparencyLogEntry> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.timestamp >= timestamp)
+            .cloned()
+            .collect()
+    }
+
+    fn count(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+}
+
+// ─── AuthorizationPolicy ────────────────────────────────────────────────────────
+// Python: class AuthorizationPolicy(abc.ABC) — pluggable evaluation strategy.
+
+/// Pluggable authorization policy evaluated by [`RiskAwareAuthorizationEvaluator`].
+///
+/// Implement this trait to define custom risk scoring and approval logic.
+pub trait AuthorizationPolicy: Send + Sync {
+    /// Evaluate the authorization context and return a risk score (0.0–1.0).
+    /// A score >= the evaluator's threshold blocks the request.
+    fn evaluate(&self, ctx: &AuthorizationContext) -> RiskEvaluation;
+}
+
+/// The default built-in authorization policy.
+///
+/// Uses action_class + delegation_depth as heuristic risk signals.
+pub struct DefaultAuthorizationPolicy;
+
+impl AuthorizationPolicy for DefaultAuthorizationPolicy {
+    fn evaluate(&self, ctx: &AuthorizationContext) -> RiskEvaluation {
+        // Mirror DefaultPolicy logic using correct Rust struct field names
+        let mut score = 0.0_f64;
+        let mut factors: Vec<String> = Vec::new();
+        if ctx.requested_action_class > 1 {
+            score += 0.3;
+            factors.push(format!("action_class={}", ctx.requested_action_class));
+        }
+        if ctx.delegation_depth > 3 {
+            score += 0.2;
+            factors.push(format!("delegation_depth={}", ctx.delegation_depth));
+        }
+        if ctx.delegation_depth > 6 {
+            score += 0.3;
+            factors.push("deep_delegation_chain".to_string());
+        }
+        let score = score.min(1.0);
+        let decision = if score >= 0.7 {
+            "DENY".to_string()
+        } else {
+            "APPROVE".to_string()
+        };
+        RiskEvaluation {
+            risk_score: score,
+            decision,
+            factors,
+            requires_threshold: score >= 0.5,
+            requires_human_approval: score >= 0.7,
         }
     }
 }

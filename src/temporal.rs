@@ -14,6 +14,12 @@ pub const DEAD_MAN_MAX_TIMEOUT: f64 = 15.0;
 pub const DEAD_MAN_MAX_SESSIONS: usize = 10_000;
 /// Default heartbeat interval (5 seconds).
 pub const HEARTBEAT_INTERVAL_SECONDS: f64 = 5.0;
+/// Maximum pings per context per window before ping-flood is declared.
+/// A legitimate heartbeat fires at HEARTBEAT_INTERVAL_SECONDS = 5s → max 12/min.
+/// Anything above 60/min is flood territory.
+pub const DEAD_MAN_PING_FLOOD_THRESHOLD: usize = 60;
+/// Window size in seconds for ping-flood counting.
+pub const DEAD_MAN_PING_FLOOD_WINDOW_SECS: f64 = 60.0;
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -34,8 +40,17 @@ pub struct DeadMansSwitch {
     max_sessions: usize,
 }
 
+struct PingRecord {
+    /// Timestamp of the current ping-counting window start.
+    window_start: f64,
+    /// Number of pings in the current window.
+    count: usize,
+}
+
 struct DeadManInner {
     active_sessions: HashMap<Vec<u8>, f64>,
+    /// Per-context ping-flood tracking: cid → PingRecord.
+    ping_flood_records: HashMap<Vec<u8>, PingRecord>,
 }
 
 impl DeadMansSwitch {
@@ -44,6 +59,7 @@ impl DeadMansSwitch {
         Self {
             inner: Mutex::new(DeadManInner {
                 active_sessions: HashMap::new(),
+                ping_flood_records: HashMap::new(),
             }),
             max_timeout: DEAD_MAN_MAX_TIMEOUT,
             max_sessions: DEAD_MAN_MAX_SESSIONS,
@@ -55,6 +71,7 @@ impl DeadMansSwitch {
         Self {
             inner: Mutex::new(DeadManInner {
                 active_sessions: HashMap::new(),
+                ping_flood_records: HashMap::new(),
             }),
             max_timeout,
             max_sessions,
@@ -77,11 +94,37 @@ impl DeadMansSwitch {
     }
 
     /// Update the last_ping timestamp for the session.
-    pub fn ping(&self, context_state_id: &[u8]) {
+    ///
+    /// Returns `false` if a ping-flood is detected (> DEAD_MAN_PING_FLOOD_THRESHOLD
+    /// pings within DEAD_MAN_PING_FLOOD_WINDOW_SECS). Callers should log and
+    /// potentially terminate the session when this returns false.
+    pub fn ping(&self, context_state_id: &[u8]) -> bool {
+        let now = now_secs();
         let mut inner = self.inner.lock().expect("lock poisoned");
-        if let Some(ts) = inner.active_sessions.get_mut(context_state_id) {
-            *ts = now_secs();
+
+        // ── Ping-flood detection (DMS-PINGFLOOD fix) ─────────────────────────
+        // A compromised context can call ping at maximum rate to stay alive forever.
+        // Track pings per context per window and reject excess pings.
+        let flood_rec = inner.ping_flood_records
+            .entry(context_state_id.to_vec())
+            .or_insert(PingRecord { window_start: now, count: 0 });
+
+        if (now - flood_rec.window_start) > DEAD_MAN_PING_FLOOD_WINDOW_SECS {
+            // Reset window
+            flood_rec.window_start = now;
+            flood_rec.count = 0;
         }
+        flood_rec.count += 1;
+        if flood_rec.count > DEAD_MAN_PING_FLOOD_THRESHOLD {
+            // Flood detected — do NOT update the session timestamp so the DMS can
+            // time out the context naturally. Return false to signal the caller.
+            return false;
+        }
+
+        if let Some(ts) = inner.active_sessions.get_mut(context_state_id) {
+            *ts = now;
+        }
+        true
     }
 
     /// Remove the session from tracking.
@@ -116,6 +159,11 @@ impl DeadMansSwitch {
     pub fn is_active(&self, context_state_id: &[u8]) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
         inner.active_sessions.contains_key(context_state_id)
+    }
+
+    /// Process-wide singleton DeadMansSwitch.
+    pub fn global() -> &'static DeadMansSwitch {
+        &GLOBAL_DEAD_MANS_SWITCH
     }
 }
 
@@ -156,7 +204,7 @@ impl TemporalHeartbeat {
                             break;
                         }
                     }
-                    switch.ping(&session_id);
+                    let _ = switch.ping(&session_id);
                 }
             })
             .expect("failed to spawn heartbeat thread");
@@ -193,6 +241,13 @@ impl Drop for TemporalHeartbeat {
         self.stop();
     }
 }
+
+// ── Process-wide singleton ──────────────────────────────────────────────────
+
+/// Global `DeadMansSwitch` used by the gate pipeline and daemon layer.
+/// Matches Python's class-level singleton semantics of `DeadMansSwitch`.
+pub static GLOBAL_DEAD_MANS_SWITCH: std::sync::LazyLock<DeadMansSwitch> =
+    std::sync::LazyLock::new(DeadMansSwitch::new);
 
 // ===========================================================================
 // Tests

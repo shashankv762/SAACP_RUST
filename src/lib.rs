@@ -1,6 +1,7 @@
 pub mod errors;
 pub mod schemas;
 pub mod framing;
+pub mod easi;
 pub mod measc;
 pub mod acsvaf;
 pub mod aegf;
@@ -10,6 +11,7 @@ pub mod pecf;
 pub mod klms;
 pub mod handler;
 pub mod gateway;
+pub mod cscs;
 pub mod crypto_governance;
 pub mod cryptosuite;
 pub mod hth;
@@ -25,27 +27,42 @@ pub mod rgc;
 pub mod error_confidentiality;
 pub mod acsvaf_audit;
 pub mod faitf_audit;
+pub mod daemon;
+pub mod mpf;
+pub mod telemetry;
 
 pub use errors::{SAACPBytecodes, SAACPHardDrop};
 pub use schemas::PreCompiledSchemas;
-pub use framing::{MEASCFrame, MEASC_MAGIC, MEASC_HEADER_SIZE, MAX_PAYLOAD_SIZE, ParsedFrame};
+pub use framing::{MEASC_MAGIC as FRAMING_MEASC_MAGIC, MEASC_HEADER_SIZE as FRAMING_HEADER_SIZE, MAX_PAYLOAD_SIZE, ParsedFrame};
 pub use framing::{FLAG_COVER_TRAFFIC, FLAG_HAS_TOKEN, FLAG_BINARY_STREAM, FLAG_ENCRYPTED};
 pub use framing::{ACTION_CLASS_READ_ONLY, ACTION_CLASS_REVERSIBLE, ACTION_CLASS_IRREVERSIBLE};
 pub use measc::{
-    ReplayWindow, PacketSequencer, KeyEvolutionEngine,
-    SessionEpoch, SessionEpochManager, AnomalyPolicy,
+    ReplayWindow, ReplayWindowPolicy, AnomalyPolicy,
+    ReplayWindowStats, EpochSnapshot,
+    PacketSequencer, KeyEvolutionEngine,
+    SessionEpoch, SessionEpochManager,
+    ParsedMEASCFrame, MEASCFrame,
+    PSKCompromiseRecovery, PSKCompromiseReport,
     MEASC_REPLAY_WINDOW_SIZE, MEASC_MAX_PSN_ADVANCE, MEASC_PSN_MAX,
-    MEASC_DEFAULT_EPOCH_TIME_SECONDS, MEASC_EPOCH_GRACE_PERIOD_SECONDS,
+    MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD, MEASC_REPLAY_RATE_LIMIT_WINDOW_SEC,
+    MEASC_REPLAY_MAX_LARGE_ADVANCES, MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_EPOCH_GRACE_PERIOD_SECONDS, MEASC_AUTH_TAG_SIZE,
+    MEASC_HEADER_SIZE, MEASC_MAGIC,
+    MEASC_CONTEXT_REF_ID_OFFSET, MEASC_CONTEXT_REF_ID_SIZE,
 };
 pub use acsvaf::{
     CapabilitySigningKey, SignedCapabilityToken, CapabilityIssuanceAuthority,
     CapabilityVerificationAuthority, CapabilityVerificationResult, KeyManifest,
+    KeyManifestEntry,
     ACSVAF_MAX_DELEGATION_DEPTH,
 };
 pub use aegf::{
     AEGFMetadata, ExecutionState, ExecutionStateMachine, StateRecord,
     DistributedExecutionGraph, AEGFPolicy, AEGFGovernor, GovernanceDecision,
     AEGF_META_SIZE, AEGF_META_FORMAT_VERSION, RID_ROOT, CID_NONE,
+    AEGF_META_FIELD_OFFSETS, AEGF_TEST_VECTOR_BYTES,
+    GLOBAL_DAEG, GLOBAL_AEGF_GOVERNOR,
 };
 pub use faitf::{
     AgentIdentity, AgentCredential, TrustAnchor, TrustStore,
@@ -59,8 +76,11 @@ pub use faitf::{
 pub use factf::{
     DelegationChainValidator, DelegationChainResult,
     ThresholdAuthorityIssuer, ThresholdCapabilityToken, ThresholdApprovalState,
+    ThresholdNotReached,
     ThresholdSignatureEntry, CapabilityTransparencyLog, TransparencyLogEntry,
-    InMemoryBackend, AuthorizationContext, RiskEvaluation,
+    TransparencyLogBackend, InMemoryBackend, FilesystemBackend,
+    AuthorizationContext, RiskEvaluation,
+    AuthorizationPolicy, DefaultAuthorizationPolicy,
     DefaultPolicy, RiskAwareAuthorizationEvaluator,
     PostCompromiseRecovery, CompromiseRecoveryReport,
 };
@@ -68,18 +88,25 @@ pub use pecf::{
     DeploymentProfile, ExternalCode, ExternalResponse,
     PECFFilter, SREL, SecureDiagnosticLedger, SdlEntry,
     internal_to_external, internal_to_external_raw,
-    get_active_profile, set_active_profile,
+    get_active_profile, set_active_profile, init_profile_from_env,
     SDL_MAX_ENTRIES, SREL_FLOOR_SECONDS, SREL_WIRE_RESPONSE_SIZE, PECF_MARKER,
+    ENV_DEPLOYMENT_PROFILE,
 };
 pub use klms::{
     KeyStatus, KeyAlgorithm, KeyCategory, KeyDescriptor,
     KeyRotationPolicy, KeyRevocationRecord, KeyAuditEntry,
     KeyRegistry, KeyLifecycleManager, make_kid, make_descriptor,
+    default_policy as klms_default_policy,
 };
+/// Alias matching Python's KLMS_DEFAULT_REGISTRY export.
+pub use klms::DEFAULT_REGISTRY as KLMS_DEFAULT_REGISTRY;
+/// Alias matching Python's KLMS_DEFAULT_POLICY export.
+pub use klms::DEFAULT_POLICY as KLMS_DEFAULT_POLICY;
 pub use handler::{
-    GateTier, PromptInjectionScanner, JsonValue, ParsedPacket,
+    GateTier, PromptInjectionScanner, JsonValue, ParsedPacket, CachedTokenResult,
     SAACPProtocolHandler, GATE_EXECUTION_BUDGET_SECONDS,
-    EPISTEMIC_THRESHOLD, INTENT_MIN_OVERLAP,
+    EPISTEMIC_THRESHOLD, EPISTEMIC_CLAIMED_CONFIDENCE_MAX, INTENT_MIN_OVERLAP,
+    MANDATORY_GATES, serde_value_to_json_value,
 };
 pub use gateway::{
     ZeroTrustGateway, AgentRateLimiter, DelegationGuard,
@@ -87,21 +114,26 @@ pub use gateway::{
     RATE_LIMITER_THRESHOLD, RATE_LIMITER_WINDOW_SECONDS, RATE_LIMITER_LOCKOUT_SECONDS,
     COVER_TRAFFIC_THRESHOLD, COVER_TRAFFIC_WINDOW_SECONDS,
 };
+pub use cscs::{CSCSLoopDetector, OscillationFingerprinter, CSCS_MAX_OSCILLATION_COUNT};
 pub use crypto_governance::{
     SuiteStatus, CryptoLedgerEntry, CryptoTransparencyLedger,
     ApprovedSuitePolicy, NegotiationTranscript, SuiteNegotiator,
     SIGNATURE_ALGO_BASELINE, CIPHER_SUITE_BASELINE, PROTOCOL_VERSION,
     production_policy, lab_policy, get_active_policy,
+    PRODUCTION_POLICY, LAB_POLICY,
 };
 pub use cryptosuite::{
     CryptoSuite, Ed25519Suite, DEFAULT_ALGORITHM,
     get_suite, get_ed25519_suite, ed25519_sign, ed25519_verify,
+    CRYPTO_SUITES, register_suite,
 };
 pub use hth::{
     TranscriptElementType, TranscriptElement, HandshakeTranscript,
     TranscriptSession, TranscriptRegistry, DEFAULT_REGISTRY,
     bind_capability, verify_capability_binding,
 };
+/// Alias matching Python HTH_DEFAULT_REGISTRY.
+pub use hth::DEFAULT_REGISTRY as HTH_DEFAULT_REGISTRY;
 pub use identity_binding::{
     AgentIdentityCertificate, TranscriptBoundSession,
     IdentityVerifier, IdentityGate, SessionIdentityRegistry,
@@ -122,11 +154,16 @@ pub use memory::{
 pub use security::{
     NonceTracker, ImmutableAuditLog, AuditRecord, AuditLogEntry,
     NONCE_MAX_AGE_SECONDS, NONCE_MAX_ENTRIES, AUDIT_LOG_FILE, AUDIT_MAX_LOG_SIZE,
+    AUDIT_COUNT_FILE, AUDIT_WAL_QUEUE_CAPACITY,
+    ENV_AUDIT_LOG, ENV_COUNT_FILE,
 };
 pub use temporal::{
     DeadMansSwitch, TemporalHeartbeat,
+    GLOBAL_DEAD_MANS_SWITCH,
     DEAD_MAN_MAX_TIMEOUT, DEAD_MAN_MAX_SESSIONS, HEARTBEAT_INTERVAL_SECONDS,
 };
+/// Python parity alias: TemporalHeartbeatThread = TemporalHeartbeat.
+pub use temporal::TemporalHeartbeat as TemporalHeartbeatThread;
 pub use streaming::{
     StreamSession, StreamRegistry,
     STREAM_MAX_TOTAL_BYTES, STREAM_MAX_DURATION_SECONDS, STREAM_MAX_FRAME_GAP_SECONDS,
@@ -139,7 +176,14 @@ pub use pool::{
 pub use estimator::AutonomousTokenEstimator;
 pub use rgc::{
     RGCPolicy, ResourceGovernanceParser, ExecutionBudgetGuard,
-    DEFAULT_POLICY,
+    DEFAULT_POLICY, EXECUTION_BUDGET_MAX_SECONDS,
+};
+/// Alias matching Python RGC_DEFAULT_POLICY.
+pub use rgc::DEFAULT_POLICY as RGC_DEFAULT_POLICY;
+pub use mpf::{
+    AdaptivePadding, CoverTraffic, TimingObfuscator, MpfBundle,
+    MPF_PAD_BLOCK_SIZE, MPF_PAD_MAX_BUCKET, MPF_COVER_RATE_HZ,
+    MPF_TIMING_JITTER_MS, MPF_VERSION,
 };
 pub use error_confidentiality::{
     ErrorCategory, WireErrorResponse, ErrorConfidentialityFilter,
@@ -152,3 +196,15 @@ pub use acsvaf_audit::{
     EVENT_REVOKED, EVENT_KEY_ROTATED, EVENT_KEY_COMPROMISED,
 };
 pub use faitf_audit::FAITFAuditLog;
+pub use daemon::{
+    SAACPNetworkDaemon,
+    MAX_ASSEMBLY_TIME, MAX_CIRCUIT_BREAKER_IPS, HANDSHAKE_TIMEOUT_SECS,
+};
+pub use easi::EasiEncryptor;
+pub use telemetry::{TelemetryCollector, global_telemetry, GLOBAL_TELEMETRY};
+
+// ─── Protocol Version Constants ───────────────────────────────────────────────
+/// Python parity: `__version__ = "0.1-beta2"`
+pub const SAACP_VERSION: &str = "0.1-beta2";
+/// Python parity: `__protocol__ = "SAACP/0.1-beta2"`
+pub const SAACP_PROTOCOL: &str = "SAACP/0.1-beta2";

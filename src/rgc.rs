@@ -84,6 +84,10 @@ impl Default for RGCPolicy {
 pub static DEFAULT_POLICY: std::sync::LazyLock<RGCPolicy> =
     std::sync::LazyLock::new(RGCPolicy::default);
 
+/// Hard maximum for the ExecutionBudgetGuard (spec §12.3).
+/// The gate pipeline ceiling and any agent task budget MUST NOT exceed this.
+pub const EXECUTION_BUDGET_MAX_SECONDS: f64 = 30.0;
+
 // ============================================================================
 // 2. ExecutionBudgetGuard
 // ============================================================================
@@ -102,9 +106,18 @@ pub struct ExecutionBudgetGuard {
 
 impl ExecutionBudgetGuard {
     /// Create and start a new budget guard.
+    ///
+    /// Returns an error if `timeout_seconds` is non-positive or exceeds the
+    /// hard ceiling of `EXECUTION_BUDGET_MAX_SECONDS` (30 s, spec §12.3).
     pub fn new(timeout_seconds: f64) -> Result<Self, String> {
         if timeout_seconds <= 0.0 {
             return Err("timeout_seconds must be positive".into());
+        }
+        if timeout_seconds > EXECUTION_BUDGET_MAX_SECONDS {
+            return Err(format!(
+                "timeout_seconds {timeout_seconds:.1}s exceeds hard ceiling \
+                 of {EXECUTION_BUDGET_MAX_SECONDS:.1}s (spec §12.3)"
+            ));
         }
         let deadline = Instant::now()
             + std::time::Duration::from_secs_f64(timeout_seconds);
@@ -166,6 +179,7 @@ impl ExecutionBudgetGuard {
 pub struct ResourceGovernanceParser;
 
 /// Internal statistics collected during scanning.
+#[allow(dead_code)]
 struct ScanStats {
     depth: usize,
     max_depth_seen: usize,
@@ -725,5 +739,25 @@ mod tests {
         let guard = ExecutionBudgetGuard::new(5.0).unwrap();
         let remaining = guard.remaining_seconds();
         assert!(remaining > 4.0 && remaining <= 5.0);
+    }
+
+    /// Task: execution_budget_guard_timeout_fires
+    /// check() must return RgcResourceLimitExceeded after the budget expires.
+    #[test]
+    fn execution_budget_guard_timeout_fires() {
+        // Very short budget: 10ms
+        let guard = ExecutionBudgetGuard::new(0.01).unwrap();
+        // Immediately it should be OK
+        assert!(guard.check().is_ok(), "guard must be OK immediately after creation");
+        // Sleep 50ms to guarantee deadline has passed
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Now check() must raise an error
+        let result = guard.check();
+        assert!(result.is_err(), "guard.check() must fail after timeout");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.bytecode, crate::errors::SAACPBytecodes::RgcResourceLimitExceeded,
+            "timeout must produce RgcResourceLimitExceeded bytecode"
+        );
     }
 }

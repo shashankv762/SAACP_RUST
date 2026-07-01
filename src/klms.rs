@@ -141,6 +141,7 @@ pub struct KeyDescriptor {
 
 impl KeyDescriptor {
     /// Create a new KeyDescriptor with validation.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kid: String,
         version: u64,
@@ -599,6 +600,16 @@ fn now_epoch_secs() -> f64 {
 pub fn default_policy() -> KeyRotationPolicy {
     KeyRotationPolicy::default()
 }
+
+/// Process-wide default [`KeyRegistry`] singleton.
+/// Matches Python's `DEFAULT_REGISTRY as KLMS_DEFAULT_REGISTRY` export.
+pub static DEFAULT_REGISTRY: std::sync::LazyLock<KeyRegistry> =
+    std::sync::LazyLock::new(KeyRegistry::new);
+
+/// Process-wide default [`KeyRotationPolicy`] singleton.
+/// Matches Python's `DEFAULT_POLICY as KLMS_DEFAULT_POLICY` export.
+pub static DEFAULT_POLICY: std::sync::LazyLock<KeyRotationPolicy> =
+    std::sync::LazyLock::new(KeyRotationPolicy::default);
 
 // ---------------------------------------------------------------------------
 // Tests
