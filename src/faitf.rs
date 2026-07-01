@@ -66,6 +66,9 @@ fn sorted_json_bytes(value: &serde_json::Value) -> Vec<u8> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustModel {
+    /// Direct trust: agent trusts issuer directly (self-signed / bilateral).
+    /// Matches Python `TrustModel.DIRECT`.
+    Direct,
     CentralizedCa,
     DecentralizedAnchors,
     FederatedDomains,
@@ -598,6 +601,13 @@ impl SignedRevocationRecord {
             revoker_key_id,
         })
     }
+
+    /// Verify this record's signature against a trust anchor's verifying key.
+    /// Used by `TrustMeshFederation::propagate_revocation()` to filter eligible members.
+    pub fn is_valid_for_anchor(&self, anchor_key: &ed25519_dalek::VerifyingKey) -> bool {
+        let body = self.body_bytes();
+        verify_data(anchor_key, &body, &self.revoker_signature)
+    }
 }
 
 /// Thread-safe, in-memory DRI with signed revocation records.
@@ -773,6 +783,7 @@ pub struct TrustMeshFederation {
     agreements: Mutex<HashMap<String, SignedFederationAgreement>>,
 }
 
+#[allow(dead_code)]
 struct TrustAnchorMember {
     verifying_key: VerifyingKey,
     fingerprint: String,
@@ -858,11 +869,9 @@ impl TrustMeshFederation {
             }
             if ag.members.iter().any(|m| m == source_domain)
                 && ag.members.iter().any(|m| m == target_domain)
-            {
-                if ag.allowed_scopes.iter().any(|s| s == requested_scope || s == "*") {
+                && ag.allowed_scopes.iter().any(|s| s == requested_scope || s == "*") {
                     return (true, String::new());
                 }
-            }
         }
 
         (false, "no_valid_federation_agreement".to_string())
@@ -870,6 +879,27 @@ impl TrustMeshFederation {
 
     pub fn list_members(&self) -> Vec<String> {
         self.members.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Propagate a revocation record to all federation members.
+    /// Python parity: `TrustMeshFederation.propagate_revocation()`.
+    ///
+    /// In production this sends the record over the network to each member.
+    /// Here we validate the record signature and return the set of domains notified.
+    /// The caller is responsible for actual network delivery.
+    pub fn propagate_revocation(
+        &self,
+        record: &crate::faitf::SignedRevocationRecord,
+    ) -> Vec<String> {
+        let members = self.members.lock().unwrap();
+        let mut notified = Vec::new();
+        for (domain, member) in members.iter() {
+            // Only propagate to members who can verify the record issuer
+            if record.is_valid_for_anchor(&member.verifying_key) {
+                notified.push(domain.clone());
+            }
+        }
+        notified
     }
 }
 
@@ -1292,7 +1322,7 @@ impl HardwareAttestationStub {
         hasher.update(challenge);
         hasher.update(identity.agent_id.as_bytes());
         hasher.update(protocol_version.as_bytes());
-        hasher.update(&posture_hash);
+        hasher.update(posture_hash);
         let message = hasher.finalize();
         sign_data(&identity.signing_key, &message)
     }
@@ -1315,7 +1345,7 @@ impl HardwareAttestationStub {
         hasher.update(challenge);
         hasher.update(agent_id.as_bytes());
         hasher.update(protocol_version.as_bytes());
-        hasher.update(&posture_hash);
+        hasher.update(posture_hash);
         let message = hasher.finalize();
         verify_data(public_key, &message, quote)
     }
@@ -1340,4 +1370,130 @@ pub fn provision_issuer(
     anchor.valid_until = now_f64() + valid_for_days as f64 * 86400.0;
     anchor.trust_model = trust_model;
     (signing_key, anchor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create issuer (AgentIdentity + signed AgentCredential + TrustAnchor).
+    fn make_issuer(id: &str) -> (AgentIdentity, AgentCredential, TrustAnchor) {
+        let (sk, anchor) = provision_issuer(
+            id, &[id], FAITF_MAX_DELEGATION_DEPTH, 1, TrustModel::Direct,
+        );
+        let identity = AgentIdentity::generate(
+            id,           // agent_id
+            id,           // issuer_id (self-issued)
+            3600,         // ttl_seconds
+            None,         // trust_policy
+            None,         // capability_constraints
+            "",           // revocation_info
+            AttestationType::None,
+        );
+        let cred = AgentCredential::issue(&identity, &sk, &anchor.verifying_key);
+        (identity, cred, anchor)
+    }
+
+    /// Task: delegation_chain_depth_4_rejected
+    /// FAITF_MAX_DELEGATION_DEPTH = 3. Delegating to depth >= 3 must fail.
+    #[test]
+    fn delegation_chain_depth_4_rejected() {
+        let (issuer_id, issuer_cred, anchor) = make_issuer("issuer-depth");
+        let store = TrustStore::new();
+        store.register_anchor(anchor);
+        store.pin_identity(&issuer_id.agent_id, issuer_id.verifying_key);
+
+        let mut parent_identity = issuer_id;
+        let mut parent_cred = issuer_cred;
+        let constraints = serde_json::json!({"max_action_class": 0});
+
+        for depth in 1..=4usize {
+            let child_identity = AgentIdentity::generate(
+                &format!("agent-{depth}"),
+                &parent_identity.agent_id,
+                3600, None, None, "", AttestationType::None,
+            );
+            let result = DelegationChain::issue_delegated(
+                &parent_identity,
+                &parent_cred,
+                &child_identity.agent_id,
+                &child_identity.verifying_key,
+                constraints.clone(),
+                3600,
+                depth,
+            );
+            if depth >= FAITF_MAX_DELEGATION_DEPTH {
+                assert!(
+                    result.is_err(),
+                    "depth {depth} >= max ({FAITF_MAX_DELEGATION_DEPTH}) must be rejected"
+                );
+                return; // Depth limit correctly enforced
+            }
+            let delegated = result.expect("depth below max must succeed");
+            parent_cred = delegated.credential;
+            parent_identity = child_identity;
+        }
+        // verify_chain fallback: the chain itself must be rejected
+        unreachable!("loop should have returned early when depth limit was hit");
+    }
+
+    /// Task: delegation_chain_scope_amplification_rejected
+    /// A child cannot claim a higher max_action_class than its parent.
+    #[test]
+    fn delegation_chain_scope_amplification_rejected() {
+        let (parent_identity, parent_cred_base, _anchor) = make_issuer("parent-amp");
+
+        // Craft a parent cred that restricts max_action_class to 1
+        let mut patched_parent = parent_cred_base.clone();
+        if let Some(obj) = patched_parent.payload.as_object_mut() {
+            obj.insert(
+                "capability_constraints".to_string(),
+                serde_json::json!({"max_action_class": 1}),
+            );
+        }
+
+        let child_identity = AgentIdentity::generate(
+            "child-amp", &parent_identity.agent_id,
+            3600, None, None, "", AttestationType::None,
+        );
+
+        // Child claims max_action_class=2 — more than parent's 1
+        let amplified_constraints = serde_json::json!({"max_action_class": 2});
+        let result = DelegationChain::issue_delegated(
+            &parent_identity,
+            &patched_parent,
+            &child_identity.agent_id,
+            &child_identity.verifying_key,
+            amplified_constraints,
+            3600,
+            1,
+        );
+        assert!(result.is_err(), "privilege amplification must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("amplification") || err.contains("Privilege") || err.contains("max_action_class"),
+            "error must mention privilege amplification: got '{err}'"
+        );
+    }
+
+    /// Verify circular delegation detection in DelegationChain::verify_chain().
+    #[test]
+    fn delegation_chain_circular_detection() {
+        let (_issuer_identity, issuer_cred, anchor) = make_issuer("issuer-circ");
+        let store = TrustStore::new();
+        store.register_anchor(anchor);
+
+        // Craft a chain where the same credential appears twice → circular.
+        let chain = vec![issuer_cred.clone(), issuer_cred.clone()];
+        let (ok, reason) = DelegationChain::verify_chain(&chain, &store);
+        assert!(!ok, "chain with repeated credential must be rejected");
+        // The reason must indicate the circular/duplicate issue
+        assert!(
+            reason.contains("circular")
+                || reason.contains("duplicate")
+                || reason.contains("cycle")
+                || reason.contains("already"),
+            "reason must indicate circular detection: got '{reason}'"
+        );
+    }
 }

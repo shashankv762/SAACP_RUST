@@ -16,7 +16,7 @@
 //! number of concurrent stream sessions.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
@@ -49,18 +49,28 @@ fn now_epoch_secs() -> f64 {
 pub struct StreamSession {
     /// Unique stream identifier.
     pub stream_id: String,
-    /// Agent that owns this stream.
+    /// Agent that owns this stream (internal agent_id for registry accounting).
     pub agent_id: String,
+    /// Source agent identity from the capability token (for audit).
+    pub source_agent: String,
     /// Frame number of the last accepted frame.
     pub last_sequence: u64,
+    /// Alias for last_sequence for compatibility with handler.rs gate code.
+    pub last_sequence_id: Option<u64>,
     /// Cumulative byte count across all frames.
     pub total_bytes: usize,
+    /// Number of frames received.
+    pub frame_count: u64,
     /// Epoch time when the first frame was received.
     pub started_at: f64,
     /// Epoch time when the most recent frame was received.
     pub last_frame_at: f64,
     /// Whether the stream has been closed gracefully.
     pub closed: bool,
+    /// SHA-256 hash of the originating token signature (Gate 1.0 revocation check).
+    pub token_sig_hash: String,
+    /// Expiry of the originating token (Gate 1.0 expiry check, 0.0 = no expiry).
+    pub token_exp: f64,
 }
 
 impl StreamSession {
@@ -70,11 +80,16 @@ impl StreamSession {
         Self {
             stream_id,
             agent_id,
+            source_agent: String::new(),
             last_sequence: 0,
+            last_sequence_id: None,
             total_bytes: first_frame_bytes,
+            frame_count: 0,
             started_at: now,
             last_frame_at: now,
             closed: false,
+            token_sig_hash: String::new(),
+            token_exp: 0.0,
         }
     }
 
@@ -144,7 +159,9 @@ impl StreamSession {
 
         // Accept frame
         self.last_sequence = sequence;
+        self.last_sequence_id = Some(sequence);
         self.total_bytes += frame_bytes;
+        self.frame_count += 1;
         self.last_frame_at = now;
         Ok(())
     }
@@ -265,6 +282,119 @@ impl StreamRegistry {
             .get(agent_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    // ── Methods required by the stream gate pipeline in handler.rs ─────────
+
+    /// Global process-wide singleton StreamRegistry.
+    pub fn global() -> &'static StreamRegistry {
+        static GLOBAL: OnceLock<StreamRegistry> = OnceLock::new();
+        GLOBAL.get_or_init(StreamRegistry::new)
+    }
+
+    /// Register a STREAM_START and return a mutable ref snapshot.
+    ///
+    /// Called by the daemon after Gate 1.0 validates the capability token.
+    /// Sets `token_sig_hash` and `token_exp` for downstream Gate 1.0 checks.
+    pub fn start_stream(
+        &self,
+        stream_id: &str,
+        source_agent: &str,
+        agent_id: &str,
+    ) -> Result<(), SAACPHardDrop> {
+        let mut session = StreamSession::new(stream_id.to_string(), agent_id.to_string(), 0);
+        session.source_agent = source_agent.to_string();
+        self.register(session)
+    }
+
+    /// Return a clone of the stream session (for inspection; does not hold lock).
+    pub fn get_stream(&self, stream_id: &str) -> Option<StreamSession> {
+        self.streams
+            .lock()
+            .unwrap()
+            .get(stream_id)
+            .map(|s| StreamSession {
+                stream_id:        s.stream_id.clone(),
+                agent_id:         s.agent_id.clone(),
+                source_agent:     s.source_agent.clone(),
+                last_sequence:    s.last_sequence,
+                last_sequence_id: s.last_sequence_id,
+                total_bytes:      s.total_bytes,
+                frame_count:      s.frame_count,
+                started_at:       s.started_at,
+                last_frame_at:    s.last_frame_at,
+                closed:           s.closed,
+                token_sig_hash:   s.token_sig_hash.clone(),
+                token_exp:        s.token_exp,
+            })
+    }
+
+    /// Abort (forcibly remove) a stream session without error.
+    pub fn abort_stream(&self, stream_id: &str) {
+        let mut streams = self.streams.lock().unwrap();
+        let mut agent_counts = self.agent_counts.lock().unwrap();
+        if let Some(session) = streams.remove(stream_id) {
+            let cnt = agent_counts.entry(session.agent_id).or_insert(0);
+            *cnt = cnt.saturating_sub(1);
+        }
+    }
+
+    /// Advance a stream session's sequence counter and byte total.
+    ///
+    /// Returns `Err` if sequence is non-monotonic or byte cap exceeded.
+    pub fn continue_stream(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+        frame_bytes: usize,
+    ) -> Result<(), String> {
+        let mut streams = self.streams.lock().unwrap();
+        let session = streams.get_mut(stream_id).ok_or_else(|| {
+            format!("No active stream '{}'.", stream_id)
+        })?;
+        session.validate_continuation(sequence, frame_bytes)
+            .map_err(|e| e.message)
+    }
+
+    /// Get lightweight stream info without removing the stream.
+    ///
+    /// Returns `(token_exp, token_sig_hash, last_sequence_id)` for Gate 1.0 checks.
+    pub fn get_stream_info(&self, stream_id: &str) -> Option<(f64, String, Option<u64>)> {
+        let streams = self.streams.lock().unwrap();
+        streams.get(stream_id).map(|s| (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id))
+    }
+
+    /// Update token auth info on an existing stream (called after STREAM_START validation).
+    pub fn set_stream_token_info(
+        &self,
+        stream_id: &str,
+        token_sig_hash: &str,
+        token_exp: f64,
+        source_agent: &str,
+    ) {
+        let mut streams = self.streams.lock().unwrap();
+        if let Some(s) = streams.get_mut(stream_id) {
+            s.token_sig_hash = token_sig_hash.to_string();
+            s.token_exp = token_exp;
+            s.source_agent = source_agent.to_string();
+        }
+    }
+
+    /// End a stream: close it and return the final session snapshot for audit.
+    pub fn end_stream(&self, stream_id: &str) -> Option<StreamSession> {
+        let mut streams = self.streams.lock().unwrap();
+        let mut agent_counts = self.agent_counts.lock().unwrap();
+        if let Some(mut session) = streams.remove(stream_id) {
+            session.closed = true;
+            let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                agent_counts.remove(&session.agent_id);
+            }
+            Some(session)
+        } else {
+            None
+        }
     }
 }
 

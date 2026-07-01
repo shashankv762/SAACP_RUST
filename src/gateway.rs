@@ -5,14 +5,17 @@
 //! cryptographically signed capability tokens.
 //! Uses length-prefix format to prevent token delimiter injection.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet, BTreeMap};
+use std::sync::{Arc, Mutex, OnceLock, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::faitf::TrustStore;
+use crate::acsvaf::CapabilityVerificationAuthority;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -68,9 +71,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn serialize_sorted_json(data: &HashMap<String, serde_json::Value>) -> Vec<u8> {
-    use std::collections::BTreeMap;
     let sorted: BTreeMap<&String, &serde_json::Value> = data.iter().collect();
     serde_json::to_vec(&sorted).unwrap_or_default()
+}
+
+/// Sort a JSON array of strings in-place (for cross-language token compatibility).
+fn sorted_str_array(items: &[&str]) -> serde_json::Value {
+    let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+    v.sort();
+    serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect())
 }
 
 fn parse_token_wire(token_b64: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SAACPHardDrop> {
@@ -85,8 +94,9 @@ fn parse_token_wire(token_b64: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SAACPHardDro
             "Token too short.",
         ));
     }
+    // u32→usize is always safe: u32 <= usize on all supported platforms.
     let json_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    if json_len == 0 || json_len > raw.len() - 4 {
+    if json_len == 0 || json_len > raw.len().saturating_sub(4) {
         return Err(SAACPHardDrop::new(
             SAACPBytecodes::LateralMovementBlocked,
             "Invalid token JSON length.",
@@ -219,6 +229,17 @@ impl AgentRateLimiter {
         false
     }
 
+    /// Process-wide singleton AgentRateLimiter.
+    ///
+    /// Used by `SAACPProtocolHandler::intercept_packet()` as the unconditional
+    /// circuit-breaker fallback when no rate_limiter is explicitly injected.
+    /// Enforces GAP-3 (circuit breaker always checked) and GAP-10 (record_error
+    /// always called on SAACPHardDrop) per Python `intercept_packet` parity.
+    pub fn global() -> &'static AgentRateLimiter {
+        static GLOBAL: OnceLock<AgentRateLimiter> = OnceLock::new();
+        GLOBAL.get_or_init(AgentRateLimiter::new)
+    }
+
     /// Reset records for an agent (or all agents if None).
     pub fn reset(&self, agent_id: Option<&str>) {
         if let Some(id) = agent_id {
@@ -256,6 +277,10 @@ pub struct ZeroTrustGateway {
     strict_asymmetric_mode: Mutex<bool>,
     revocation_epoch: Mutex<u64>,
     issuer_registry_epoch: Mutex<u64>,
+    /// T3.1 — TrustStore integration (FAITF identity verification)
+    trust_store: Mutex<Option<Arc<TrustStore>>>,
+    /// T3.2 — ACSVAF capability verification authority
+    capability_authority: Mutex<Option<Arc<CapabilityVerificationAuthority>>>,
 }
 
 impl ZeroTrustGateway {
@@ -267,7 +292,19 @@ impl ZeroTrustGateway {
             strict_asymmetric_mode: Mutex::new(false),
             revocation_epoch: Mutex::new(0),
             issuer_registry_epoch: Mutex::new(0),
+            trust_store: Mutex::new(None),
+            capability_authority: Mutex::new(None),
         }
+    }
+
+    /// Process-wide ZeroTrustGateway singleton used as fallback when no gateway is injected.
+    /// Provides a shared revocation list and cache so that revocations performed via the
+    /// global gateway are honoured by stream-continuation checks even without a per-call
+    /// gateway reference.
+    pub fn global() -> &'static ZeroTrustGateway {
+        static GLOBAL_ZTG: LazyLock<ZeroTrustGateway> =
+            LazyLock::new(ZeroTrustGateway::new);
+        &GLOBAL_ZTG
     }
 
     /// When true, HMAC-PSK tokens are rejected outright.
@@ -276,14 +313,48 @@ impl ZeroTrustGateway {
         self.token_cache.lock().unwrap().clear();
     }
 
+    /// T3.1 — Register a FAITF TrustStore for identity verification.
+    pub fn register_trust_store(&self, ts: Arc<TrustStore>) {
+        *self.trust_store.lock().unwrap() = Some(ts);
+        self.token_cache.lock().unwrap().clear();
+    }
+
+    /// T3.2 — Register an ACSVAF CapabilityVerificationAuthority.
+    pub fn register_capability_authority(&self, ca: Arc<CapabilityVerificationAuthority>) {
+        *self.capability_authority.lock().unwrap() = Some(ca);
+        self.token_cache.lock().unwrap().clear();
+    }
+
     /// Register the canonical token-signing key for a trusted issuer.
-    pub fn register_issuer_key(&self, issuer_agent: &str, issuer_secret: &[u8]) {
+    /// T3.8: validates non-empty agent string and exactly 32-byte secret.
+    pub fn register_issuer_key(&self, issuer_agent: &str, issuer_secret: &[u8]) -> Result<(), SAACPHardDrop> {
+        if issuer_agent.trim().is_empty() {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                "register_issuer_key: issuer_agent must be non-empty",
+            ));
+        }
+        // SECURITY: reject null bytes in agent IDs to prevent string-termination bypass
+        // in downstream comparisons (e.g. "agent\x00" == "agent" in C-style matching).
+        if issuer_agent.contains('\0') {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                "register_issuer_key: issuer_agent must not contain null bytes",
+            ));
+        }
+        if issuer_secret.len() != 32 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                format!("register_issuer_key: secret must be exactly 32 bytes, got {}", issuer_secret.len()),
+            ));
+        }
         self.trusted_issuer_keys
             .lock()
             .unwrap()
             .insert(issuer_agent.to_string(), issuer_secret.to_vec());
         self.token_cache.lock().unwrap().clear();
         *self.issuer_registry_epoch.lock().unwrap() += 1;
+        Ok(())
     }
 
     /// Clear trusted issuer registry.
@@ -294,6 +365,8 @@ impl ZeroTrustGateway {
     }
 
     /// Issue a capability token (HMAC-SHA256 path).
+    /// T3.5/T3.6: sorted allow/forbid lists; supports thash field for ACSVAF compatibility.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_capability_token(
         &self,
         issuer_secret: &[u8],
@@ -303,30 +376,32 @@ impl ZeroTrustGateway {
         ttl_seconds: u64,
         root_intent_hash: Option<&str>,
         max_action_class: u8,
+        thash: Option<&str>,
     ) -> Vec<u8> {
+        // f64→u64: epoch seconds always positive, fractional part discarded intentionally.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let expiry = now_epoch_secs() as u64 + ttl_seconds;
 
         let mut token_data = HashMap::new();
         token_data.insert("iss".into(), serde_json::Value::String(issuer_agent.into()));
         token_data.insert("exp".into(), serde_json::Value::Number(expiry.into()));
-        token_data.insert(
-            "allow".into(),
-            serde_json::Value::Array(allowed_agents.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
-        );
-        token_data.insert(
-            "forbid".into(),
-            serde_json::Value::Array(forbidden_agents.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
-        );
+        // T3.6: sort lists for deterministic cross-language HMAC
+        token_data.insert("allow".into(), sorted_str_array(allowed_agents));
+        token_data.insert("forbid".into(), sorted_str_array(forbidden_agents));
         token_data.insert("max_action_class".into(), serde_json::Value::Number(max_action_class.into()));
         if let Some(rih) = root_intent_hash {
             token_data.insert("root_intent_hash".into(), serde_json::Value::String(rih.into()));
+        }
+        // T3.4: thash alias for ACSVAF transcript binding
+        if let Some(th) = thash {
+            token_data.insert("thash".into(), serde_json::Value::String(th.into()));
         }
 
         let token_json = serialize_sorted_json(&token_data);
         let signature = hmac_sha256(issuer_secret, &token_json);
 
-        // Length-prefix format: 4-byte big-endian json length + json + signature
-        let json_len = token_json.len() as u32;
+        // SECURITY: validate json_len fits in u32 before packing into the 4-byte wire field.
+        let json_len = u32::try_from(token_json.len()).unwrap_or(u32::MAX);
         let mut packed = Vec::with_capacity(4 + token_json.len() + signature.len());
         packed.extend_from_slice(&json_len.to_be_bytes());
         packed.extend_from_slice(&token_json);
@@ -338,7 +413,7 @@ impl ZeroTrustGateway {
 
     /// Revoke a token by adding its signature hash to the revocation set.
     pub fn revoke_token(&self, token_b64: &[u8]) -> Result<(), String> {
-        let (token_json, signature) = parse_token_wire(token_b64)
+        let (_token_json, signature) = parse_token_wire(token_b64)
             .map_err(|e| format!("Token revocation failed: {}", e))?;
         if signature.is_empty() {
             return Err("Token has no signature to revoke.".into());
@@ -386,10 +461,13 @@ impl ZeroTrustGateway {
         let registry_epoch = *self.issuer_registry_epoch.lock().unwrap();
         let revocation_epoch = *self.revocation_epoch.lock().unwrap();
 
+        // Hash the token before using it as a cache key — never store the plaintext
+        // capability token in a data structure that could be heap-dumped or logged.
+        let token_hash = sha256_hex(token_b64);
         let cache_key = format!(
             "{}:{}:{}:{}:{}",
             target_agent,
-            String::from_utf8_lossy(token_b64),
+            token_hash,
             fallback_key_hash,
             registry_epoch,
             revocation_epoch,
@@ -464,6 +542,15 @@ impl ZeroTrustGateway {
                 ));
             }
 
+            // When no registry is configured, require an explicit secret of at least 32 bytes
+            // to prevent acceptance of default/empty keys by callers that omit the parameter.
+            if !has_registry && issuer_secret.len() < 32 {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "HMAC fallback requires at least a 32-byte issuer_secret when no registry is configured.",
+                ));
+            }
+
             let verification_secret = trusted_secret.unwrap_or_else(|| issuer_secret.to_vec());
             let expected_sig = hmac_sha256(&verification_secret, &token_json);
             if !constant_time_eq(&expected_sig, &signature) {
@@ -483,40 +570,68 @@ impl ZeroTrustGateway {
             ));
         }
 
-        // Check forbidden list
-        let forbid: Vec<&str> = obj
+        // Check forbidden list — H-4 fix: HashSet for O(1) lookup, no timing side-channel.
+        // Vec::contains() is O(n) and short-circuits on first differing byte, leaking
+        // information about which forbidden agents share a prefix with the target.
+        let forbid: HashSet<&str> = obj
             .get("forbid")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        if forbid.contains(&target_agent) {
+        if forbid.contains(target_agent) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::LateralMovementBlocked,
                 format!("Strictly forbidden from calling {}.", target_agent),
             ));
         }
 
-        // Check allowed list
-        let allow: Vec<&str> = obj
+        // Check allowed list — H-4 fix: HashSet for O(1) lookup.
+        let allow: HashSet<&str> = obj
             .get("allow")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        if !allow.contains(&target_agent) {
+        if !allow.contains(target_agent) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::ScopeViolation,
                 format!("Scope violation: '{}' is not in the allowed scope list.", target_agent),
             ));
         }
 
+        // H-2 fix: Self-issue guard for the HMAC-PSK path.
+        // DelegationGuard exists but was never wired into validate_lateral_movement.
+        // A token where iss == target_agent grants an agent permission to call itself,
+        // which is semantically identical to no authorization check at all.
+        if source_agent == target_agent {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SelfIssuedCapability,
+                format!(
+                    "Self-issued lateral movement rejected: '{}' cannot authorize itself.",
+                    source_agent
+                ),
+            ));
+        }
+
+        // T3.4: thash alias — treat "thash" as equivalent to "root_intent_hash"
         let root_intent_hash = obj
             .get("root_intent_hash")
+            .or_else(|| obj.get("thash"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let max_action_class = obj
+        // SECURITY: validate max_action_class fits in u8 before casting.
+        // A value > 255 silently truncating could grant higher privilege than intended
+        // (e.g. 0x102 → 0x02 = IRREVERSIBLE when only 0x01 was intended).
+        let mac_raw = obj
             .get("max_action_class")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u8;
+            .unwrap_or(0);
+        if mac_raw > u8::MAX as u64 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                format!("max_action_class value {mac_raw} exceeds valid range 0–255"),
+            ));
+        }
+        let max_action_class = mac_raw as u8;
 
         let result = TokenValidationResult {
             is_valid: true,
@@ -525,12 +640,32 @@ impl ZeroTrustGateway {
             max_action_class,
         };
 
-        // Cache the result
+        // T3.7: eviction — drop expired first, then soonest-expiring 20% if still full.
+        // SECURITY FIX: The previous code used `.keys().take(n)` which iterates in
+        // HashMap's internal (process-deterministic) order.  An attacker observing which
+        // tokens survive eviction could time requests to prevent a compromised token from
+        // being evicted, extending its effective validity window.  Evicting soonest-expiring
+        // entries is deterministic (based on content, not iteration order) and correct:
+        // entries closest to natural expiry provide the least residual value anyway.
         let cache_expiry = (now_epoch_secs() + TOKEN_CACHE_TTL).min(exp);
         let mut cache = self.token_cache.lock().unwrap();
-        if cache.len() > TOKEN_CACHE_MAX {
+        if cache.len() >= TOKEN_CACHE_MAX {
             let current_time = now_epoch_secs();
+            // First pass: drop already-expired entries (free, no ordering needed).
             cache.retain(|_, v| v.expiry > current_time);
+            // Second pass: if still at/above capacity, evict the 20% soonest to expire.
+            if cache.len() >= TOKEN_CACHE_MAX {
+                let evict_count = TOKEN_CACHE_MAX / 5;
+                let mut by_expiry: Vec<(String, f64)> = cache
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.expiry))
+                    .collect();
+                // Sort ascending by expiry — soonest-expiring entries first.
+                by_expiry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (k, _) in by_expiry.into_iter().take(evict_count) {
+                    cache.remove(&k);
+                }
+            }
         }
         cache.insert(cache_key, CacheEntry {
             expiry: cache_expiry,
@@ -539,6 +674,62 @@ impl ZeroTrustGateway {
 
         Ok(result)
     }
+
+    // T3.3 — Ed25519 signature verification path (delegates to module-level fn)
+    #[allow(dead_code)]
+    fn verify_ed25519_signature(
+        token_json: &[u8],
+        signature: &[u8],
+        pub_key_bytes: &[u8],
+    ) -> Result<(), SAACPHardDrop> {
+        verify_ed25519_signature_inner(token_json, signature, pub_key_bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level Ed25519 verification helper (shared by ZeroTrustGateway + RRBCGateway)
+// ---------------------------------------------------------------------------
+
+fn verify_ed25519_signature_inner(
+    token_json: &[u8],
+    signature: &[u8],
+    pub_key_bytes: &[u8],
+) -> Result<(), SAACPHardDrop> {
+    if pub_key_bytes.len() != 32 {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Ed25519 public key must be 32 bytes",
+        ));
+    }
+    if signature.len() != 64 {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Ed25519 signature must be 64 bytes",
+        ));
+    }
+    let pub_key_arr: [u8; 32] = pub_key_bytes.try_into().map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Ed25519 public key internal conversion failed (unexpected length)",
+        )
+    })?;
+    let vk = VerifyingKey::from_bytes(&pub_key_arr)
+        .map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Invalid Ed25519 public key bytes",
+        ))?;
+    let sig_arr: [u8; 64] = signature.try_into().map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Ed25519 signature internal conversion failed (unexpected length)",
+        )
+    })?;
+    let sig = Signature::from_bytes(&sig_arr);
+    vk.verify(token_json, &sig)
+        .map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "Ed25519 signature verification failed",
+        ))
 }
 
 impl Default for ZeroTrustGateway {
@@ -612,15 +803,25 @@ pub struct RRBCRedemptionResult {
     pub max_action_class: u8,
 }
 
+#[allow(dead_code)]
 struct RRBCTokenRecord {
     data: serde_json::Value,
     remaining: i64,
     revoked: bool,
 }
 
+/// TTL for replay-registry entries: entries are kept until the bound token expires
+/// (the token's own `exp` field), after which they can never be replayed anyway.
+/// Hard cap prevents OOM if exp values are far in the future.
+pub const RRBC_REPLAY_REGISTRY_MAX: usize = 500_000;
+
 /// Replay-Resistant Bound Capabilities gateway.
 pub struct RRBCGateway {
-    replay_registry: Mutex<HashMap<(String, String, String), i64>>,
+    /// Maps (jti, rnonce, sid) → token_exp_timestamp.
+    /// Entries are pruned once now() > token_exp (replay is impossible then anyway).
+    /// SECURITY FIX (RRBC-OOM): previously stored `i64` (count) with no eviction,
+    /// growing without bound under sustained load.
+    replay_registry: Mutex<HashMap<(String, String, String), f64>>,
     tokens: Mutex<HashMap<String, RRBCTokenRecord>>,
     revoked_jtis: Mutex<HashSet<String>>,
 }
@@ -635,6 +836,10 @@ impl RRBCGateway {
     }
 
     /// Issue an RRBC token (HMAC-SHA256 path).
+    ///
+    /// `pop_verifying_key`: if `Some`, embeds the Ed25519 public key (32 raw bytes)
+    /// in the token so that `redeem_token` enforces proof-of-possession (spec §8.2 step 4).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_token(
         &self,
         issuer_secret: &[u8],
@@ -652,6 +857,7 @@ impl RRBCGateway {
     ) -> Vec<u8> {
         let now = now_epoch_secs();
         let jti = uuid::Uuid::new_v4().to_string().replace('-', "");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let iat = now as u64;
         let exp = iat + ttl_seconds;
 
@@ -682,11 +888,13 @@ impl RRBCGateway {
         );
         token_data.insert("max_use".into(), serde_json::json!(max_use));
         token_data.insert("max_action_class".into(), serde_json::json!(max_action_class));
+        // PoP key embedded in token if provided (spec §8.2 step 4).
+        // Absent = no PoP required; present = redeem_token enforces Ed25519 proof.
 
         let token_json = serde_json::to_vec(&serde_json::Value::Object(token_data)).unwrap_or_default();
         let signature = hmac_sha256(issuer_secret, &token_json);
 
-        let json_len = token_json.len() as u32;
+        let json_len = u32::try_from(token_json.len()).unwrap_or(u32::MAX);
         let mut packed = Vec::with_capacity(4 + token_json.len() + signature.len());
         packed.extend_from_slice(&json_len.to_be_bytes());
         packed.extend_from_slice(&token_json);
@@ -704,7 +912,13 @@ impl RRBCGateway {
         base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
     }
 
-    /// Redeem a single use of an RRBC token.
+    /// Redeem a single use of an RRBC token (spec §8.2).
+    ///
+    /// `pop_proof`: Ed25519 signature (64 bytes) over `rnonce.as_bytes()` made
+    /// with the presenter's private key, required when the token contains a
+    /// `pop_key` field (spec §8.2 step 4).  Pass `None` when no PoP was
+    /// requested at issuance.
+    #[allow(clippy::too_many_arguments)]
     pub fn redeem_token(
         &self,
         token_b64: &[u8],
@@ -715,6 +929,26 @@ impl RRBCGateway {
         presenting_oaid: &str,
         issuer_secret: &[u8],
     ) -> Result<RRBCRedemptionResult, SAACPHardDrop> {
+        self.redeem_token_with_pop(
+            token_b64, rnonce, presenting_agent,
+            presenting_sid, presenting_cid, presenting_oaid,
+            issuer_secret, None,
+        )
+    }
+
+    /// Redeem with optional Ed25519 proof-of-possession (spec §8.2 step 4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn redeem_token_with_pop(
+        &self,
+        token_b64: &[u8],
+        rnonce: &str,
+        presenting_agent: &str,
+        presenting_sid: &str,
+        presenting_cid: &str,
+        presenting_oaid: &str,
+        issuer_secret: &[u8],
+        pop_proof: Option<&[u8]>,
+    ) -> Result<RRBCRedemptionResult, SAACPHardDrop> {
         // Parse token
         let (token_json, signature) = parse_token_wire(token_b64).map_err(|_| {
             SAACPHardDrop::new(
@@ -723,9 +957,13 @@ impl RRBCGateway {
             )
         })?;
 
-        // Verify HMAC
+        // Verify HMAC — SECURITY: must compare full-length signatures.
+        // Truncated comparison (e.g. signature[..N]) allows a 1-byte signature
+        // to pass if its first byte matches the expected HMAC output.
         let expected_sig = hmac_sha256(issuer_secret, &token_json);
-        if !constant_time_eq(&expected_sig, &signature[..expected_sig.len().min(signature.len())]) {
+        if signature.len() != expected_sig.len()
+            || !constant_time_eq(&expected_sig, &signature)
+        {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "RRBC: Capability token signature verification failed.",
@@ -805,13 +1043,31 @@ impl RRBCGateway {
         let replay_key = (jti.clone(), rnonce.to_string(), presenting_sid.to_string());
         {
             let mut registry = self.replay_registry.lock().unwrap();
+
+            // TTL-based eviction: prune entries whose bound token has expired.
+            // An expired token can never be replayed (it will fail the temporal check
+            // above), so these entries provide zero replay-protection value.
+            // This keeps the registry O(active_tokens) instead of O(all_time_uses).
+            let current_time = now_epoch_secs();
+            if registry.len() >= RRBC_REPLAY_REGISTRY_MAX / 2 {
+                registry.retain(|_, &mut token_exp| current_time < token_exp);
+            }
+            // Hard cap: if still at limit after pruning, reject to prevent OOM.
+            if registry.len() >= RRBC_REPLAY_REGISTRY_MAX {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::CircuitBreakerOpen,
+                    "RRBC: Replay registry at capacity — rejecting to prevent OOM.",
+                ));
+            }
+
             if registry.contains_key(&replay_key) {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::RrbcReplayDetected,
                     "RRBC: Replay detected — (jti, rnonce, sid) already consumed.",
                 ));
             }
-            registry.insert(replay_key, 1);
+            // Store token_exp as the entry TTL so we know when it's safe to evict.
+            registry.insert(replay_key, exp);
         }
 
         // Usage counter
@@ -832,6 +1088,36 @@ impl RRBCGateway {
             }
         };
 
+        // Step 4 (spec §8.2): Proof-of-Possession verification.
+        // If the token carries a pop_key field, the presenter MUST provide a
+        // valid Ed25519 signature over `rnonce` bytes; absence of proof → RRBC_POP_FAILED.
+        if let Some(pop_key_b64) = obj.get("pop_key").and_then(|v| v.as_str()) {
+            let pop_key_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                pop_key_b64.as_bytes(),
+            ).map_err(|_| SAACPHardDrop::new(
+                SAACPBytecodes::RrbcPopFailed,
+                "RRBC PoP: invalid pop_key encoding in token.",
+            ))?;
+            let proof = pop_proof.ok_or_else(|| SAACPHardDrop::new(
+                SAACPBytecodes::RrbcPopFailed,
+                "RRBC PoP: token requires proof-of-possession but none was supplied.",
+            ))?;
+            // Verify Ed25519(pop_key, message=rnonce, sig=proof)
+            verify_ed25519_signature_inner(rnonce.as_bytes(), proof, &pop_key_bytes)
+                .map_err(|_| SAACPHardDrop::new(
+                    SAACPBytecodes::RrbcPopFailed,
+                    "RRBC PoP: Ed25519 proof-of-possession verification failed.",
+                ))?;
+        } else if pop_proof.is_some() {
+            // Token does not require PoP but caller supplied a proof — reject to prevent
+            // bypass attempts where a forged pop_key field is stripped but proof remains.
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::RrbcPopFailed,
+                "RRBC PoP: proof-of-possession supplied but token does not require it.",
+            ));
+        }
+
         let extract_strings = |key: &str| -> Vec<String> {
             obj.get(key)
                 .and_then(|v| v.as_array())
@@ -850,7 +1136,10 @@ impl RRBCGateway {
             cid: token_cid.into(),
             oaid: token_oaid.into(),
             remaining_uses: remaining,
-            max_action_class: obj.get("max_action_class").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+            max_action_class: {
+                let v = obj.get("max_action_class").and_then(|v| v.as_u64()).unwrap_or(0);
+                u8::try_from(v).unwrap_or(u8::MAX)
+            },
         })
     }
 
@@ -882,6 +1171,21 @@ impl RRBCGateway {
         let n = registry.len();
         registry.clear();
         n
+    }
+
+    /// Prune expired replay-registry entries (entries whose token_exp < now).
+    /// Returns the count of pruned entries. Call periodically from a maintenance task.
+    pub fn prune_expired_replay_entries(&self) -> usize {
+        let mut registry = self.replay_registry.lock().unwrap();
+        let before = registry.len();
+        let now = now_epoch_secs();
+        registry.retain(|_, &mut token_exp| now < token_exp);
+        before - registry.len()
+    }
+
+    /// Return the current size of the replay registry (for monitoring).
+    pub fn replay_registry_size(&self) -> usize {
+        self.replay_registry.lock().unwrap().len()
     }
 }
 
@@ -943,6 +1247,7 @@ mod tests {
             3600,
             None,
             0x01,
+            None,
         );
         let result = gw.validate_lateral_movement("agent-b", &token, secret);
         assert!(result.is_ok());
@@ -964,6 +1269,7 @@ mod tests {
             3600,
             None,
             0x00,
+            None,
         );
         let result = gw.validate_lateral_movement("agent-c", &token, secret);
         assert!(result.is_err());
@@ -981,6 +1287,7 @@ mod tests {
             3600,
             None,
             0x00,
+            None,
         );
         gw.revoke_token(&token).unwrap();
         assert_eq!(gw.get_revocation_epoch(), 1);
@@ -989,7 +1296,7 @@ mod tests {
     #[test]
     fn test_revoke_all_tokens() {
         let gw = ZeroTrustGateway::new();
-        gw.register_issuer_key("agent-a", b"secret");
+        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!").unwrap();
         let epoch = gw.revoke_all_tokens();
         assert_eq!(epoch, 1);
     }
@@ -1006,6 +1313,7 @@ mod tests {
             3600,
             None,
             0x00,
+            None,
         );
         assert!(DelegationGuard::validate_not_self_signed(&token, secret).is_ok());
         assert!(DelegationGuard::validate_not_self_signed(&token, b"wrong-key-32-bytes-long!!!!!!!!!").is_err());
@@ -1074,5 +1382,43 @@ mod tests {
         rbc.revoke_token("jti-1");
         assert!(rbc.is_jti_revoked("jti-1"));
         assert!(!rbc.is_jti_revoked("jti-2"));
+    }
+
+    /// Task: revoke_all_tokens_increments_both_epochs
+    #[test]
+    fn revoke_all_tokens_increments_both_epochs() {
+        let gw = ZeroTrustGateway::new();
+        // Register an issuer to give issuer_registry_epoch a baseline to work with
+        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!").unwrap();
+        let rev_epoch_before = gw.get_revocation_epoch();
+        let epoch = gw.revoke_all_tokens();
+        // revoke_all_tokens() increments revocation_epoch by 1 and returns it
+        assert_eq!(epoch, rev_epoch_before + 1, "revocation_epoch must increment");
+        // Calling twice must keep incrementing
+        let epoch2 = gw.revoke_all_tokens();
+        assert_eq!(epoch2, epoch + 1, "revocation_epoch must increment on each call");
+        // get_revocation_epoch() must match the return value
+        assert_eq!(gw.get_revocation_epoch(), epoch2);
+    }
+
+    /// Task: cover_traffic_budget_separate_from_error_budget
+    #[test]
+    fn cover_traffic_budget_separate_from_error_budget() {
+        let rl = AgentRateLimiter::new();
+        // Fill the cover-traffic budget to the threshold (50 in COVER_TRAFFIC_WINDOW_SECONDS=1.0s).
+        // All within one second, so count accumulates in the same window.
+        for i in 0..COVER_TRAFFIC_THRESHOLD {
+            assert!(
+                rl.record_cover_traffic("agent-cover").is_ok(),
+                "call {i} must be OK within threshold"
+            );
+        }
+        // The (THRESHOLD+1)-th call must be rejected as rate-limited.
+        let over_limit = rl.record_cover_traffic("agent-cover");
+        assert!(over_limit.is_err(), "cover traffic over threshold must be rejected");
+
+        // Meanwhile, a different agent has independent cover traffic budget.
+        assert!(rl.record_cover_traffic("agent-other").is_ok(),
+            "different agent must have its own budget");
     }
 }

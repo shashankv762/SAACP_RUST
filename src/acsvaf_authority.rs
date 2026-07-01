@@ -191,19 +191,19 @@ impl AuthorityRegistry {
     /// Get whether an issuer may self-issue.
     pub fn may_self_issue(&self, issuer_id: &str) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
-        inner.policies.get(issuer_id).map_or(false, |p| p.may_self_issue())
+        inner.policies.get(issuer_id).is_some_and(|p| p.may_self_issue())
     }
 
     /// Check if an issuer may issue to a given subject class.
     pub fn may_issue_to(&self, issuer_id: &str, sub_class: AuthorityClass) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
-        inner.policies.get(issuer_id).map_or(false, |p| p.may_issue_to(sub_class))
+        inner.policies.get(issuer_id).is_some_and(|p| p.may_issue_to(sub_class))
     }
 
     /// Check if an issuer is a terminal class.
     pub fn is_terminal(&self, issuer_id: &str) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
-        inner.policies.get(issuer_id).map_or(false, |p| terminal_classes().contains(&p.authority_class))
+        inner.policies.get(issuer_id).is_some_and(|p| terminal_classes().contains(&p.authority_class))
     }
 
     /// List all registered issuer IDs.
@@ -276,15 +276,14 @@ pub fn enforce_issuance_policy(
     }
 
     // 2. Self-issuance prohibition
-    if issuer_id == sub {
-        if !registry.may_self_issue(issuer_id) {
+    if issuer_id == sub
+        && !registry.may_self_issue(issuer_id) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SelfIssuedCapability,
                 format!("C-2: Self-issued capability rejected — iss == sub == '{}'. \
                     Only federation-root authorities may self-issue.", issuer_id),
             ));
         }
-    }
 
     // 3. Authority class scope (if sub class is known)
     if let Some(sub_class) = sub_authority_class {
@@ -301,15 +300,14 @@ pub fn enforce_issuance_policy(
     }
 
     // 4. Delegated token metadata completeness
-    if delegation_depth > 0 {
-        if parent_jti.is_none() || parent_iss.is_none() {
+    if delegation_depth > 0
+        && (parent_jti.is_none() || parent_iss.is_none()) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::DelegationMetadataIncomplete,
                 format!("C-2: Delegated capability (depth={}) must carry both parent_jti and parent_iss. \
                     One or both are missing.", delegation_depth),
             ));
         }
-    }
 
     Ok(())
 }
@@ -337,25 +335,23 @@ pub fn enforce_verification_policy(
     }
 
     // Self-issuance prohibition
-    if issuer_id == sub {
-        if !registry.may_self_issue(issuer_id) {
+    if issuer_id == sub
+        && !registry.may_self_issue(issuer_id) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SelfIssuedCapability,
                 format!("C-2: Self-issued token rejected at verification — iss == sub == '{}'.", issuer_id),
             ));
         }
-    }
 
     // Delegation metadata completeness
-    if delegation_depth > 0 {
-        if parent_jti.is_none() || parent_iss.is_none() {
+    if delegation_depth > 0
+        && (parent_jti.is_none() || parent_iss.is_none()) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::DelegationMetadataIncomplete,
                 format!("C-2: Delegated token (depth={}) is missing parent_jti or parent_iss delegation metadata.",
                     delegation_depth),
             ));
         }
-    }
 
     Ok(())
 }

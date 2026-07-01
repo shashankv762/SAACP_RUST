@@ -24,12 +24,14 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 /// Controls how much detail escapes to the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum DeploymentProfile {
     /// Full internal detail returned; timing equalisation disabled.
     Development,
     /// Limited debug metadata; timing equalisation enabled.
     Staging,
     /// Strict confidentiality; only ExternalCode + correlation_id.
+    #[default]
     Production,
 }
 
@@ -43,23 +45,51 @@ impl DeploymentProfile {
     }
 }
 
-impl Default for DeploymentProfile {
-    fn default() -> Self {
-        Self::Production
+
+/// Global active profile (protected by a Mutex for thread safety).
+/// Initialized from `SAACP_DEPLOYMENT_PROFILE` env var at first access.
+static ACTIVE_PROFILE: Mutex<DeploymentProfile> = Mutex::new(DeploymentProfile::Production);
+
+/// Env var name for deployment profile (Appendix A).
+pub const ENV_DEPLOYMENT_PROFILE: &str = "SAACP_DEPLOYMENT_PROFILE";
+
+/// Read deployment profile from `SAACP_DEPLOYMENT_PROFILE` env var.
+/// Unknown values default to PRODUCTION (most restrictive).
+fn profile_from_env() -> DeploymentProfile {
+    match std::env::var(ENV_DEPLOYMENT_PROFILE).as_deref() {
+        Ok("DEVELOPMENT") => DeploymentProfile::Development,
+        Ok("STAGING")     => DeploymentProfile::Staging,
+        _                 => DeploymentProfile::Production,
     }
 }
 
-/// Global active profile (protected by a Mutex for thread safety).
-static ACTIVE_PROFILE: Mutex<DeploymentProfile> = Mutex::new(DeploymentProfile::Production);
-
 /// Return the currently active DeploymentProfile.
+///
+/// On first call, initializes from `SAACP_DEPLOYMENT_PROFILE` env var
+/// if it has not already been set programmatically via `set_active_profile`.
 pub fn get_active_profile() -> DeploymentProfile {
-    *ACTIVE_PROFILE.lock().unwrap()
+    let mut profile = ACTIVE_PROFILE.lock().unwrap();
+    // If still at the static default (Production) and env var is set, apply it.
+    // Tests that call set_active_profile() directly take priority over the env var.
+    if *profile == DeploymentProfile::Production {
+        let env_profile = profile_from_env();
+        if env_profile != DeploymentProfile::Production {
+            *profile = env_profile;
+        }
+    }
+    *profile
 }
 
 /// Override the active profile (used in tests and admin tooling).
 pub fn set_active_profile(profile: DeploymentProfile) {
     *ACTIVE_PROFILE.lock().unwrap() = profile;
+}
+
+/// Initialize the global deployment profile from the environment variable.
+/// Call this once at process startup before handling any requests.
+/// Calling this after `set_active_profile()` overwrites the programmatic value.
+pub fn init_profile_from_env() {
+    *ACTIVE_PROFILE.lock().unwrap() = profile_from_env();
 }
 
 // ---------------------------------------------------------------------------
@@ -361,19 +391,33 @@ impl SREL {
 
     /// Build a fixed-size, constant-structure wire response.
     ///
-    /// Format (64 bytes):
-    ///   [1 byte ] PECF marker 0xFE
-    ///   [1 byte ] ExternalCode byte value
-    ///   [32 bytes] correlation_id (truncated/padded to 32 ASCII bytes)
-    ///   [30 bytes] zero padding
+    /// Format (64 bytes, spec §9.3):
+    ///   [0]      PECF marker 0xFE
+    ///   [1]      ExternalCode byte value
+    ///   [2..34]  correlation_id — exactly 32 ASCII hex chars (16 random bytes hex-encoded)
+    ///   [34..64] 30 bytes zero padding
+    ///
+    /// # Panics (debug only)
+    /// Asserts `correlation_id` is exactly 32 chars in debug builds to catch
+    /// silent truncation — the internal generator always produces 32 chars via
+    /// `hex::encode([u8; 16])`, so this should never fire in production.
     pub fn normalize_response(code: ExternalCode, correlation_id: &str) -> Vec<u8> {
+        // SECURITY: spec §9.3 requires EXACTLY 32 ASCII hex chars.
+        // The internal generator always produces 32 chars; this assert catches
+        // any caller passing a wrong-length string.
+        debug_assert_eq!(
+            correlation_id.len(), 32,
+            "PECF correlation_id must be exactly 32 hex chars, got {}",
+            correlation_id.len()
+        );
         let mut buf = vec![0u8; SREL_WIRE_RESPONSE_SIZE];
         buf[0] = PECF_MARKER;
         buf[1] = code as u8;
+        // Always exactly 32 hex ASCII bytes — copy_len is always 32.
         let corr_bytes = correlation_id.as_bytes();
         let copy_len = corr_bytes.len().min(32);
         buf[2..2 + copy_len].copy_from_slice(&corr_bytes[..copy_len]);
-        // remaining bytes stay zero (padding)
+        // [34..64]: 30 bytes zero padding (already zeroed)
         buf
     }
 }
@@ -584,6 +628,7 @@ impl PECFFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_external_code_values() {
@@ -619,15 +664,18 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_srel_normalize_response_format() {
         set_active_profile(DeploymentProfile::Production);
-        let resp = SREL::normalize_response(ExternalCode::AccessDenied, "abcd1234");
+        // Must be exactly 32 hex chars (spec §9.3: "16 random bytes as 32 hex ASCII chars")
+        let corr = "abcd1234ef567890abcd1234ef567890"; // 32 hex chars
+        let resp = SREL::normalize_response(ExternalCode::AccessDenied, corr);
         assert_eq!(resp.len(), 64);
         assert_eq!(resp[0], 0xFE); // PECF marker
         assert_eq!(resp[1], 0x02); // AccessDenied
-        assert_eq!(&resp[2..10], b"abcd1234");
-        // Rest is zero-padded
-        assert!(resp[10..].iter().all(|&b| b == 0));
+        assert_eq!(&resp[2..34], corr.as_bytes()); // exactly 32 ASCII hex chars
+        // [34..64]: 30 bytes zero padding
+        assert!(resp[34..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -689,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_pecf_filter_translate_production() {
         set_active_profile(DeploymentProfile::Production);
         let ledger = SecureDiagnosticLedger::new();
@@ -709,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_pecf_filter_translate_development() {
         set_active_profile(DeploymentProfile::Development);
         let ledger = SecureDiagnosticLedger::new();
@@ -723,6 +773,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_pecf_filter_translate_raw() {
         set_active_profile(DeploymentProfile::Production);
         let ledger = SecureDiagnosticLedger::new();
@@ -739,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_external_response_to_wire_production() {
         set_active_profile(DeploymentProfile::Production);
         let resp = ExternalResponse::new(
@@ -753,6 +805,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_external_response_to_wire_development() {
         set_active_profile(DeploymentProfile::Development);
         let resp = ExternalResponse::new(
@@ -779,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_deployment_profile_default() {
         assert_eq!(DeploymentProfile::default(), DeploymentProfile::Production);
     }

@@ -24,8 +24,8 @@ impl AutonomousTokenEstimator {
     pub fn estimate_cost(payload: &JsonValue, complexity_multiplier: f64) -> usize {
         let serialized = serde_json::to_string(payload).unwrap_or_default();
         let byte_len = serialized.len() as f64;
-        let cost = (byte_len / 4.0 * complexity_multiplier) as usize + 50;
-        cost
+        
+        (byte_len / 4.0 * complexity_multiplier) as usize + 50
     }
 
     /// Convenience wrapper with default multiplier of 1.0.

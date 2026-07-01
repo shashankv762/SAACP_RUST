@@ -9,7 +9,7 @@
 //! - Federation events (agreement registration, cross-domain auth)
 //! - Delegation events (chain issuance, depth, constraint summary)
 
-use std::sync::Arc;
+
 
 use crate::security::ImmutableAuditLog;
 
@@ -21,6 +21,7 @@ pub struct FAITFAuditLog;
 
 impl FAITFAuditLog {
     /// Record a credential issuance event.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_credential_issuance(
         audit_log: &ImmutableAuditLog,
         agent_id: &str,
@@ -53,6 +54,7 @@ impl FAITFAuditLog {
     }
 
     /// Record a successful FAITF authentication event.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_authentication(
         audit_log: &ImmutableAuditLog,
         agent_id: &str,
@@ -125,6 +127,7 @@ impl FAITFAuditLog {
     }
 
     /// Record a key rotation / credential renewal event.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_rotation(
         audit_log: &ImmutableAuditLog,
         agent_id: &str,
@@ -160,6 +163,7 @@ impl FAITFAuditLog {
     }
 
     /// Record a federation trust mesh event.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_federation_event(
         audit_log: &ImmutableAuditLog,
         event_type: &str,

@@ -19,7 +19,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::errors::SAACPBytecodes;
+
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -375,5 +375,47 @@ mod tests {
         let wire = ErrorConfidentialityFilter::format_wire_bytes(&resp);
         let retry_bytes = u32::from_be_bytes([wire[17], wire[18], wire[19], wire[20]]);
         assert_eq!(retry_bytes, SENTINEL_NO_RETRY);
+    }
+
+    /// Task: wire_error_response_parse_roundtrip
+    #[test]
+    fn wire_error_response_parse_roundtrip() {
+        // Sanitize → format → parse: all fields survive the roundtrip.
+        for bytecode in [0x01u8, 0x03, 0x14, 0x20, 0x2B, 0x40] {
+            let resp = ErrorConfidentialityFilter::sanitize(bytecode, "internal detail dropped");
+            let wire = ErrorConfidentialityFilter::format_wire_bytes(&resp);
+            assert_eq!(wire.len(), WIRE_SIZE, "wire must be exactly 44 bytes");
+            let parsed = ErrorConfidentialityFilter::parse_wire_bytes(&wire)
+                .unwrap_or_else(|e| panic!("parse failed for 0x{bytecode:02X}: {e}"));
+            assert_eq!(parsed.category, resp.category, "category roundtrip failed");
+            assert_eq!(parsed.correlation_id, resp.correlation_id, "correlation_id roundtrip failed");
+            assert_eq!(parsed.retry_after_seconds, resp.retry_after_seconds, "retry roundtrip failed");
+        }
+    }
+
+    /// Task: governance_violation_category_mapped
+    #[test]
+    fn governance_violation_category_mapped() {
+        // Bytecodes 0x20-0x24 must map to GovernanceViolation (AEGF bytecodes).
+        for code in 0x20u8..=0x24 {
+            assert_eq!(
+                ErrorConfidentialityFilter::bytecode_to_category(code),
+                ErrorCategory::GovernanceViolation,
+                "0x{code:02X} must be GovernanceViolation"
+            );
+        }
+        // Bytecodes 0x3A-0x3B also GovernanceViolation.
+        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x3A), ErrorCategory::GovernanceViolation);
+        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x3B), ErrorCategory::GovernanceViolation);
+        // Bytecode 0x2B must map to ResourceLimit (RGC).
+        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x2B), ErrorCategory::ResourceLimit);
+        // Bytecodes 0x3C-0x40 must map to AuthFailure (identity binding).
+        for code in 0x3Cu8..=0x40 {
+            assert_eq!(
+                ErrorConfidentialityFilter::bytecode_to_category(code),
+                ErrorCategory::AuthFailure,
+                "0x{code:02X} must be AuthFailure"
+            );
+        }
     }
 }

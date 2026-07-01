@@ -201,7 +201,7 @@ impl HandshakeTranscript {
     /// Hex-encoded HTH digest string, or `None` if not yet finalized.
     pub fn hth_hex(&self) -> Option<String> {
         let inner = self.inner.lock().ok()?;
-        inner.hth.as_ref().map(|h| hex::encode(h))
+        inner.hth.as_ref().map(hex::encode)
     }
 
     /// Return the number of elements currently in the transcript.

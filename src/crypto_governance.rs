@@ -45,7 +45,8 @@ impl SuiteStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a SuiteStatus from a string. Unknown values default to Forbidden.
+    pub fn parse(s: &str) -> Self {
         match s {
             "APPROVED" => Self::Approved,
             "EXPERIMENTAL" => Self::Experimental,
@@ -55,10 +56,23 @@ impl SuiteStatus {
     }
 }
 
-/// Signature algorithm baseline — Ed25519.
+impl std::str::FromStr for SuiteStatus {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse(s))
+    }
+}
+
+/// Signature algorithm baseline — Ed25519 governs ACSVAF/FAITF token signing.
 pub const SIGNATURE_ALGO_BASELINE: &str = "ed25519";
-/// Cipher suite baseline.
-pub const CIPHER_SUITE_BASELINE: &str = "ed25519";
+/// Cipher suite baseline — AES-256-GCM with HKDF-SHA256 key derivation.
+/// This is the AEAD session encryption baseline, NOT a signature algorithm.
+/// (C-4 fix: was incorrectly set to "ed25519" — Ed25519 is a signature algo
+///  used in ACSVAF token signing, completely separate from session encryption.)
+pub const CIPHER_SUITE_BASELINE: &str = "AES-256-GCM-HKDF-SHA256";
+/// Approved AEAD session cipher suites — only identifiers in this list may
+/// be selected as the MEASC session encryption algorithm.
+pub const APPROVED_SESSION_CIPHER_SUITES: &[&str] = &["AES-256-GCM-HKDF-SHA256"];
 
 // ---------------------------------------------------------------------------
 // CryptoLedgerEntry
@@ -250,16 +264,24 @@ impl ApprovedSuitePolicy {
     }
 }
 
-/// Production policy.
+/// Production policy (C-4 fix: ed25519 governs signature algo baseline;
+/// AES-256-GCM-HKDF-SHA256 governs AEAD session encryption — kept separate).
 pub fn production_policy() -> ApprovedSuitePolicy {
     let mut approved = HashSet::new();
     approved.insert("ed25519".into());
+    // Also mark the AEAD session cipher suite as approved for validate_suite_properties calls
+    approved.insert("AES-256-GCM-HKDF-SHA256".into());
     ApprovedSuitePolicy {
         approved_algorithms: approved,
         minimum_signature_length: 64,
         minimum_public_key_length: 32,
         allow_experimental: false,
-        suite_status_map: vec![("ed25519".into(), SuiteStatus::Approved)],
+        suite_status_map: vec![
+            ("ed25519".into(), SuiteStatus::Approved),
+            ("AES-256-GCM-HKDF-SHA256".into(), SuiteStatus::Approved),
+        ],
+        // mandatory_baseline here governs SIGNATURE algorithm (ACSVAF/FAITF signing).
+        // Session encryption baseline is governed by CIPHER_SUITE_BASELINE separately.
         mandatory_baseline: "ed25519".into(),
     }
 }
@@ -268,12 +290,16 @@ pub fn production_policy() -> ApprovedSuitePolicy {
 pub fn lab_policy() -> ApprovedSuitePolicy {
     let mut approved = HashSet::new();
     approved.insert("ed25519".into());
+    approved.insert("AES-256-GCM-HKDF-SHA256".into());
     ApprovedSuitePolicy {
         approved_algorithms: approved,
         minimum_signature_length: 32,
         minimum_public_key_length: 16,
         allow_experimental: true,
-        suite_status_map: vec![("ed25519".into(), SuiteStatus::Approved)],
+        suite_status_map: vec![
+            ("ed25519".into(), SuiteStatus::Approved),
+            ("AES-256-GCM-HKDF-SHA256".into(), SuiteStatus::Approved),
+        ],
         mandatory_baseline: "ed25519".into(),
     }
 }
@@ -510,15 +536,27 @@ impl SuiteNegotiator {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ── Module-level policy singletons (matching Python PRODUCTION_POLICY / LAB_POLICY) ──
+
+/// Process-wide production [`ApprovedSuitePolicy`] singleton.
+/// Matches Python's `PRODUCTION_POLICY` module-level variable.
+pub static PRODUCTION_POLICY: std::sync::LazyLock<ApprovedSuitePolicy> =
+    std::sync::LazyLock::new(production_policy);
+
+/// Process-wide lab [`ApprovedSuitePolicy`] singleton.
+/// Matches Python's `LAB_POLICY` module-level variable.
+pub static LAB_POLICY: std::sync::LazyLock<ApprovedSuitePolicy> =
+    std::sync::LazyLock::new(lab_policy);
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_suite_status() {
-        assert_eq!(SuiteStatus::from_str("APPROVED"), SuiteStatus::Approved);
-        assert_eq!(SuiteStatus::from_str("FORBIDDEN"), SuiteStatus::Forbidden);
-        assert_eq!(SuiteStatus::from_str("unknown"), SuiteStatus::Forbidden);
+        assert_eq!(SuiteStatus::parse("APPROVED"), SuiteStatus::Approved);
+        assert_eq!(SuiteStatus::parse("FORBIDDEN"), SuiteStatus::Forbidden);
+        assert_eq!(SuiteStatus::parse("unknown"), SuiteStatus::Forbidden);
     }
 
     #[test]
@@ -634,5 +672,73 @@ mod tests {
         let p = production_policy();
         assert!(p.validate_registration("ed25519", 64, 32, "PRODUCTION").is_err());
         assert!(p.validate_registration("ed25519", 64, 32, "DEVELOPMENT").is_ok());
+    }
+
+    /// Task: suite_negotiator_downgrade_logs_event
+    /// When the mandatory baseline is missing from one peer, DOWNGRADE_ATTEMPT must be logged.
+    #[test]
+    fn suite_negotiator_downgrade_logs_event() {
+        let ledger = CryptoTransparencyLedger::new();
+        // Local has baseline; remote does NOT → downgrade attempt
+        let result = SuiteNegotiator::negotiate(
+            &["ed25519", "AES-256-GCM-HKDF-SHA256"],
+            &["AES-256-GCM-HKDF-SHA256"], // no ed25519 baseline
+            b"session-id-test",
+            None,
+            None, // uses production_policy (baseline="ed25519")
+            &ledger,
+        );
+        assert!(result.is_err(), "missing baseline must fail negotiation");
+        // The ledger must contain a DOWNGRADE_ATTEMPT entry
+        let entries = ledger.entries();
+        let has_downgrade = entries.iter().any(|e| e.event_type == "DOWNGRADE_ATTEMPT");
+        assert!(has_downgrade, "DOWNGRADE_ATTEMPT must be logged in the ledger");
+        let blocked = entries.iter().any(|e| e.outcome == "BLOCKED");
+        assert!(blocked, "the downgrade entry must have outcome=BLOCKED");
+    }
+
+    /// Task: approved_suite_policy_forbidden_rejected
+    /// A suite with status=Forbidden must be reported as Forbidden by get_status(),
+    /// and must NOT be in the approved_algorithms set.
+    #[test]
+    fn approved_suite_policy_forbidden_rejected() {
+        let mut policy = production_policy();
+        // Add a known-bad suite to the status map as Forbidden
+        policy.suite_status_map.push(("RC4-MD5".into(), SuiteStatus::Forbidden));
+
+        // get_status() must return Forbidden for RC4-MD5
+        assert_eq!(
+            policy.get_status("RC4-MD5"),
+            SuiteStatus::Forbidden,
+            "RC4-MD5 status must be Forbidden"
+        );
+        // is_approved() must return false since RC4-MD5 is not in approved_algorithms
+        assert!(
+            !policy.is_approved("RC4-MD5"),
+            "Forbidden suite must not be in approved_algorithms"
+        );
+        // Add a Deprecated suite
+        policy.suite_status_map.push(("3DES-CBC-SHA1".into(), SuiteStatus::Deprecated));
+        assert_eq!(
+            policy.get_status("3DES-CBC-SHA1"),
+            SuiteStatus::Deprecated,
+            "3DES-CBC-SHA1 status must be Deprecated"
+        );
+        // Unknown suite defaults to Forbidden (per get_status implementation)
+        assert_eq!(
+            policy.get_status("unknown-alg"),
+            SuiteStatus::Forbidden,
+            "Unknown suite must default to Forbidden"
+        );
+        // Approved baseline ed25519 must still be approved
+        assert!(
+            policy.is_approved("ed25519"),
+            "Approved baseline must still be in approved_algorithms"
+        );
+        assert_eq!(
+            policy.get_status("ed25519"),
+            SuiteStatus::Approved,
+            "ed25519 status must be Approved"
+        );
     }
 }
