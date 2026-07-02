@@ -1,4 +1,10 @@
 /target
 fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
 *.log
 *.sentinel
+
+# Dev-only benchmark artifacts (regenerable, not source)
+benches_output.txt
+*.bak

@@ -25,6 +25,23 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 aho-corasick = "1"
 flate2 = "1"
+tokio-tungstenite = { version = "0.24", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
+redis = { version = "0.27", optional = true }
+
+[features]
+default = []
+# WebSocket tunneling transport (src/transport/ws.rs) — tunnels SAACP MEASC
+# binary frames inside WebSocket binary messages so the protocol survives
+# HTTP-only corporate proxies / API gateways / CDNs. Off by default so a
+# plain TCP-only deployment never pulls in tokio-tungstenite.
+transport-ws = ["dep:tokio-tungstenite", "dep:bytes", "dep:futures-util"]
+# Redis-backed StateBackend (src/state_backend.rs) — lets a horizontally
+# scaled fleet of SAACP gateways share rate-limiter/session/stream state
+# across nodes instead of each node holding an isolated in-memory view. Off
+# by default so a single-node deployment never pulls in the redis crate.
+redis-backend = ["dep:redis"]
 
 [dev-dependencies]
 serial_test = "3"
@@ -33,7 +50,18 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+rand = "0.8"
 
 [[bench]]
 name = "benchmarks"
 harness = false
+
+[[test]]
+name = "test_transport_ws_rs"
+path = "tests/test_transport_ws_rs.rs"
+required-features = ["transport-ws"]

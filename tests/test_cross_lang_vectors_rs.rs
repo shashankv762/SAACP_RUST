@@ -1,22 +1,22 @@
-/// Cross-language interoperability test vectors.
-///
-/// PURPOSE
-/// -------
-/// Verify that Rust and Python agree on every wire-format primitive. Fixed,
-/// deterministic inputs are used throughout. Each test prints its vector in
-/// a format that the companion `tests/cross_lang_verify.py` script can
-/// replicate with Python's `cryptography` library.
-///
-/// KNOWN DIVERGENCES (remaining)
-/// ─────────────────────────────
-/// 1. EASI context_ref_id: Python build_frame writes plaintext at header[44..76].
-///    Rust encrypts it with HKDF-XOR (GAP-9). Python must gain EASI support.
-///    Full MEASC frame bytes therefore differ at bytes 44..76.
-///
-/// HOW TO UPDATE EXPECTED VALUES
-/// ─────────────────────────────
-/// Run `python3 tests/cross_lang_verify.py` and replace the `expected` strings
-/// below with the printed Python hex values.
+//! Cross-language interoperability test vectors.
+//!
+//! PURPOSE
+//! -------
+//! Verify that Rust and Python agree on every wire-format primitive. Fixed,
+//! deterministic inputs are used throughout. Each test prints its vector in
+//! a format that the companion `tests/cross_lang_verify.py` script can
+//! replicate with Python's `cryptography` library.
+//!
+//! KNOWN DIVERGENCES (remaining)
+//! ─────────────────────────────
+//! 1. EASI context_ref_id: Python build_frame writes plaintext at header[44..76].
+//!    Rust encrypts it with HKDF-XOR (GAP-9). Python must gain EASI support.
+//!    Full MEASC frame bytes therefore differ at bytes 44..76.
+//!
+//! HOW TO UPDATE EXPECTED VALUES
+//! ─────────────────────────────
+//! Run `python3 tests/cross_lang_verify.py` and replace the `expected` strings
+//! below with the printed Python hex values.
 
 use saacp::{
     KeyEvolutionEngine, SessionEpochManager,

@@ -30,6 +30,8 @@ pub mod faitf_audit;
 pub mod daemon;
 pub mod mpf;
 pub mod telemetry;
+pub mod transport;
+pub mod state_backend;
 
 pub use errors::{SAACPBytecodes, SAACPHardDrop};
 pub use schemas::PreCompiledSchemas;

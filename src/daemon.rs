@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 use hkdf::Hkdf;
@@ -55,7 +55,7 @@ const WIRE_YIELD_ASYNC: &[u8]    = b"YIELD_ASYNC";
 // ─── CircuitBreakerEntry ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct CircuitBreakerEntry {
+pub(crate) struct CircuitBreakerEntry {
     error_count: u32,
     lockout_until: Option<Instant>,
 }
@@ -173,13 +173,22 @@ impl SAACPNetworkDaemon {
 // ─── handle_client ───────────────────────────────────────────────────────────
 
 /// Per-connection async handler (mirrors Python SAACPNetworkDaemon.handle_client).
-async fn handle_client(
-    mut stream: TcpStream,
+///
+/// Generic over any duplex byte stream (`AsyncRead + AsyncWrite`), not just
+/// `TcpStream`. This lets the same handshake/framing/gate-pipeline logic run
+/// unmodified over a tunneled transport (e.g. `transport::ws::WsByteStream`
+/// behind the `transport-ws` feature) — only the byte source/sink differs; the
+/// MEASC header parsing, MTU assembly, and gate dispatch below are identical.
+pub(crate) async fn handle_client<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
     _token_issuer_secret: Option<Vec<u8>>,
     server_ed25519_seed: Option<[u8; 32]>,
-) {
+)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let ip_key = peer_addr.ip().to_string();
 
     // ── Step 0: Circuit breaker check ────────────────────────────────────────
@@ -391,10 +400,13 @@ async fn handle_client(
 ///
 /// The client nonce is also mixed into HKDF as the salt so every session key
 /// is unique even if the X25519 shared secret is somehow repeated.
-async fn ecdh_handshake(
-    stream: &mut TcpStream,
+async fn ecdh_handshake<S>(
+    stream: &mut S,
     server_ed25519_seed: Option<[u8; 32]>,
-) -> Result<[u8; 32], SAACPHardDrop> {
+) -> Result<[u8; 32], SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use rand::rngs::OsRng;
     use ed25519_dalek::{SigningKey, Signer};
 
@@ -463,7 +475,10 @@ fn record_error(cbs: &Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>, ip: &str
     map.entry(ip.to_string()).or_insert_with(CircuitBreakerEntry::new).record_error();
 }
 
-async fn send_hard_drop(stream: &mut TcpStream, bc: SAACPBytecodes, _msg: &str) {
+async fn send_hard_drop<S>(stream: &mut S, bc: SAACPBytecodes, _msg: &str)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     let ext  = internal_to_external_raw(bc as u8);
     let wire = SREL::normalize_response(ext, "");
     let _ = stream.write_all(&wire).await;

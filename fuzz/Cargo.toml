@@ -1,0 +1,46 @@
+[package]
+name = "saacp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+saacp = { path = ".." }
+unicode-normalization = "0.1"
+
+# Each [[bin]] entry is one fuzz target.
+# Run with: cargo +nightly fuzz run <name>
+
+[[bin]]
+name = "fuzz_measc_parse_frame"
+path = "fuzz_targets/fuzz_measc_parse_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_saacpframe_parse_header"
+path = "fuzz_targets/fuzz_saacpframe_parse_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_capability_token_from_wire"
+path = "fuzz_targets/fuzz_capability_token_from_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bypass_injection_scanner"
+path = "fuzz_targets/fuzz_bypass_injection_scanner.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gate_pipeline_raw"
+path = "fuzz_targets/fuzz_gate_pipeline_raw.rs"
+test = false
+doc = false

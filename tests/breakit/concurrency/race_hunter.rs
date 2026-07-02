@@ -164,8 +164,10 @@ fn race_b_token_revocation_cache_toctou() {
 fn race_c_aegf_graph_cap_overflow() {
     use saacp::GovernanceDecision;
 
-    let mut policy = AEGFPolicy::default();
-    policy.max_graph_nodes = 10;
+    let policy = AEGFPolicy {
+        max_graph_nodes: 10,
+        ..Default::default()
+    };
     let governor = Arc::new(AEGFGovernor::new(Some(policy)));
 
     const THREADS: usize = 16;

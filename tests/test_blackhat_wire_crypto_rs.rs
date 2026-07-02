@@ -95,7 +95,7 @@ fn build_measc_frame(
     (frame, psn, mgr)
 }
 
-fn flip_byte_at(frame: &mut Vec<u8>, offset: usize) {
+fn flip_byte_at(frame: &mut [u8], offset: usize) {
     assert!(offset < frame.len(), "flip offset {} >= len {}", offset, frame.len());
     frame[offset] ^= 0xFF;
 }
@@ -200,8 +200,7 @@ fn blackhat_1d_compromised_agent_phantom_dms_ping_reveals_gap() {
     } else {
         println!("1d: Phantom DMS ping correctly returns false — safe no-op confirmed.");
     }
-    // Document the gap without failing the suite.
-    assert!(true, "1d: DMS phantom ping behaviour documented above");
+    // Document the gap without failing the suite (see println! branches above).
 }
 
 /// 1e: Token with delegation_depth > MAX_DELEGATION_DEPTH must be rejected.
@@ -231,8 +230,8 @@ fn blackhat_1f_audit_chain_wrong_key_fails_verification() {
     let key   = b"test-audit-key-1f-exactly-32byt";
     let wrong = b"wrong-audit-key-1f-exactly-32by";
 
-    log.append_event(key, "agent-a", "agent-b", "read", "sig-aa", "trace-1f-a");
-    log.append_event(key, "agent-b", "agent-c", "write", "sig-bb", "trace-1f-b");
+    log.append_event(key, "agent-a", "agent-b", "sig-aa", "read", "trace-1f-a");
+    log.append_event(key, "agent-b", "agent-c", "sig-bb", "write", "trace-1f-b");
 
     // Correct key → chain valid.
     assert!(log.verify_chain(key), "Chain must verify with the correct key");
