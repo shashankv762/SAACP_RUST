@@ -1207,10 +1207,12 @@ impl SAACPProtocolHandler {
             }
         };
 
-        parsed.source_agent = token_result.source_agent.clone();
+        // One clone for local use, then move the original into `parsed` — avoids
+        // cloning this (potentially long) agent-id string twice per packet.
         let source_agent = token_result.source_agent.clone();
         let root_intent_hash = token_result.root_intent_hash.clone();
         let max_action_class_from_token = token_result.max_action_class;
+        parsed.source_agent = token_result.source_agent;
 
         // Extract token signature hash for audit log + stream session registration.
         let token_sig_hex = extract_token_sig_hex(capability_token_b64.as_bytes());
@@ -1532,9 +1534,13 @@ impl SAACPProtocolHandler {
         // Advance stream state only after all security gates have passed.
         let _ = StreamRegistry::global().continue_stream(&stream_id, parsed.sequence_id, actual_data_len);
 
+        // Last use of stream_text in this function — move instead of clone. The
+        // earlier clone (line ~1529, inside the conditional injection-scan branch)
+        // is unavoidable since that branch may or may not run before this
+        // unconditional insert; this one is a genuine final use.
         parsed.payload_dict.insert(
             "_stream_data".to_string(),
-            JsonValue::String(stream_text.clone()),
+            JsonValue::String(stream_text),
         );
 
         // LIGHTWEIGHT: performance annotation — mandatory gates enforced above

@@ -263,8 +263,8 @@ fn blackhat_6a_nonce_tracker_fresh_flood_reveals_cap_bypass() {
     } else {
         println!("6a: Cap correctly enforced — {} tracked, {} rejected.", count, rejected);
     }
-    // Document the gap without failing the suite; the count itself is the finding.
-    assert!(true, "6a: Cap bypass gap documented above");
+    // Document the gap without failing the suite; the count itself is the finding
+    // (see println! branches above).
 }
 
 /// 6b: Open MAX_STREAMS_PER_AGENT streams, then (MAX+1)th must be rejected.

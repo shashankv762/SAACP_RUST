@@ -6,8 +6,8 @@
 //! - `SecureContextStore`: Secure Context References (SCR) with AES-256-GCM
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use std::collections::BTreeMap;
 
@@ -18,8 +18,10 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
+use serde::{Serialize, Deserialize};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::state_backend::StateBackend;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -162,11 +164,28 @@ pub const INTENT_MAX_LIFETIME: f64 = 86400.0;
 /// Decentralized, shared local memory buffer.
 /// Prevents Context Window Exhaustion by allowing agents to pass data by reference
 /// using a 32-byte Context-State-ID hash and enforcing TTLs.
+///
+/// Backed by a process-local `HashMap` by default (`::new()` / `::global()`).
+/// [`FederatedMemory::with_backend`] instead routes every record through a
+/// shared [`StateBackend`] (e.g. Redis) so multiple SAACP gateway nodes can
+/// see the same context store — see `state_backend.rs` for the rationale and
+/// which other subsystems this is (and isn't) safe to do for.
 pub struct FederatedMemory {
     inner: Mutex<FederatedInner>,
+    backend: Option<Arc<dyn StateBackend>>,
 }
 
 struct FederatedRecord {
+    data: String,
+    version: u32,
+    expires_at: f64,
+}
+
+/// Wire format for a `FederatedRecord` stored in a `StateBackend`. `store_context`,
+/// `save_context`, and the intent-envelope methods all share this one record
+/// shape and one flat key space, mirroring the single `HashMap` used locally.
+#[derive(Serialize, Deserialize)]
+struct FederatedRecordWire {
     data: String,
     version: u32,
     expires_at: f64,
@@ -177,29 +196,31 @@ struct FederatedInner {
 }
 
 impl FederatedMemory {
-    /// Create a new FederatedMemory store.
+    /// Create a new, process-local FederatedMemory store.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FederatedInner {
                 store: HashMap::new(),
             }),
+            backend: None,
+        }
+    }
+
+    /// Create a FederatedMemory store backed by a shared [`StateBackend`]
+    /// (e.g. Redis) instead of a process-local `HashMap`. Every method below
+    /// consults the backend exclusively when one is configured — the two
+    /// storage modes are never mixed within one instance.
+    pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
+        Self {
+            inner: Mutex::new(FederatedInner { store: HashMap::new() }),
+            backend: Some(backend),
         }
     }
 
     /// Stores the massive history/context and returns a 32-byte SHA-256 hash (Context-State-ID).
     pub fn store_context(&self, massive_context_string: &str, version: u32) -> Vec<u8> {
         let state_id = Sha256::digest(massive_context_string.as_bytes()).to_vec();
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.store.insert(state_id.clone(), FederatedRecord {
-            data: massive_context_string.to_string(),
-            version,
-            expires_at: now_secs() + FEDERATED_TTL_SECONDS,
-        });
-        // Evict expired entries if over capacity
-        if inner.store.len() > FEDERATED_MAX_ENTRIES {
-            let now = now_secs();
-            inner.store.retain(|_, v| v.expires_at > now);
-        }
+        self.put_record(&state_id, massive_context_string.to_string(), version, FEDERATED_TTL_SECONDS);
         state_id
     }
 
@@ -208,16 +229,16 @@ impl FederatedMemory {
         if state_id.len() != 32 {
             return Err("Context-State-ID must be exactly 32 bytes.".into());
         }
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        let record = inner.store.get(state_id).ok_or("Context-State-ID not found in Federated Memory.")?;
-        if now_secs() > record.expires_at {
-            inner.store.remove(state_id);
+        let (data, version, expires_at) = self.get_record(state_id)
+            .ok_or("Context-State-ID not found in Federated Memory.")?;
+        if now_secs() > expires_at {
+            self.remove_record(state_id);
             return Err("Context-State-ID has expired (TTL).".into());
         }
-        if record.version != expected_version {
-            return Err(format!("StaleStateError: Expected version {}, got {}", expected_version, record.version));
+        if version != expected_version {
+            return Err(format!("StaleStateError: Expected version {}, got {}", expected_version, version));
         }
-        Ok(record.data.clone())
+        Ok(data)
     }
 
     /// Directly saves a context by its 32-byte ID.
@@ -225,13 +246,69 @@ impl FederatedMemory {
         if state_id.len() != 32 {
             return Err("Context-State-ID must be exactly 32 bytes.".into());
         }
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.store.insert(state_id.to_vec(), FederatedRecord {
-            data: data.to_string(),
-            version,
-            expires_at: now_secs() + FEDERATED_TTL_SECONDS,
-        });
+        self.put_record(state_id, data.to_string(), version, FEDERATED_TTL_SECONDS);
         Ok(())
+    }
+
+    // ── Local/backend storage primitives ────────────────────────────────────
+    // Every public method above (and the intent-envelope methods below) goes
+    // through these three helpers, matching the single flat key space the
+    // original in-process HashMap always had (context records and intent
+    // envelopes are both just "a blob behind a hash, with a TTL").
+
+    fn put_record(&self, id: &[u8], data: String, version: u32, ttl_secs: f64) {
+        match &self.backend {
+            Some(backend) => {
+                let record = FederatedRecordWire { data, version, expires_at: now_secs() + ttl_secs };
+                if let Ok(bytes) = serde_json::to_vec(&record) {
+                    let _ = backend.set(
+                        &Self::backend_key(id),
+                        &bytes,
+                        Some(Duration::from_secs_f64(ttl_secs.max(0.0))),
+                    );
+                }
+            }
+            None => {
+                let mut inner = self.inner.lock().expect("lock poisoned");
+                inner.store.insert(id.to_vec(), FederatedRecord {
+                    data, version, expires_at: now_secs() + ttl_secs,
+                });
+                // Evict expired entries if over capacity (in-process mode only —
+                // the backend mode relies on the backend's own TTL expiry).
+                if inner.store.len() > FEDERATED_MAX_ENTRIES {
+                    let now = now_secs();
+                    inner.store.retain(|_, v| v.expires_at > now);
+                }
+            }
+        }
+    }
+
+    fn get_record(&self, id: &[u8]) -> Option<(String, u32, f64)> {
+        match &self.backend {
+            Some(backend) => {
+                let bytes = backend.get(&Self::backend_key(id)).ok().flatten()?;
+                let record: FederatedRecordWire = serde_json::from_slice(&bytes).ok()?;
+                Some((record.data, record.version, record.expires_at))
+            }
+            None => {
+                let inner = self.inner.lock().expect("lock poisoned");
+                inner.store.get(id).map(|r| (r.data.clone(), r.version, r.expires_at))
+            }
+        }
+    }
+
+    fn remove_record(&self, id: &[u8]) {
+        match &self.backend {
+            Some(backend) => { let _ = backend.delete(&Self::backend_key(id)); }
+            None => { self.inner.lock().expect("lock poisoned").store.remove(id); }
+        }
+    }
+
+    /// `state_backend::StateBackend` keys are namespaced under a common
+    /// prefix so a shared Redis instance can host multiple SAACP subsystems
+    /// (and future FederatedMemory-adjacent tooling) without key collisions.
+    fn backend_key(id: &[u8]) -> String {
+        format!("fedmem:{}", hex::encode(id))
     }
 
     /// Creates an immutable intent envelope, signs it with HMAC-SHA256, and stores it.
@@ -270,12 +347,7 @@ impl FederatedMemory {
         let final_json = serde_json::to_string(&final_fields).unwrap_or_default();
         let envelope_hash = Sha256::digest(final_json.as_bytes()).to_vec();
 
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.store.insert(envelope_hash.clone(), FederatedRecord {
-            data: final_json,
-            version: 1,
-            expires_at: now_secs() + INTENT_MAX_LIFETIME,
-        });
+        self.put_record(&envelope_hash, final_json, 1, INTENT_MAX_LIFETIME);
 
         hex::encode(&envelope_hash)
     }
@@ -286,17 +358,29 @@ impl FederatedMemory {
             Ok(h) => h,
             Err(_) => return false,
         };
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.store.remove(&intent_hash).is_some()
+        match &self.backend {
+            Some(backend) => backend.delete(&Self::backend_key(&intent_hash)).unwrap_or(false),
+            None => self.inner.lock().expect("lock poisoned").store.remove(&intent_hash).is_some(),
+        }
     }
 
     /// Evicts all expired entries. Returns count evicted.
+    ///
+    /// In backend mode this is a no-op that always returns 0 — the backend
+    /// (e.g. Redis `EX`) enforces TTL expiry itself; there's no generically
+    /// safe way to enumerate every key across the shared keyspace to sweep
+    /// them client-side without a full scan on every call.
     pub fn evict_expired(&self) -> usize {
-        let now = now_secs();
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        let before = inner.store.len();
-        inner.store.retain(|_, v| v.expires_at > now);
-        before - inner.store.len()
+        match &self.backend {
+            Some(_) => 0,
+            None => {
+                let now = now_secs();
+                let mut inner = self.inner.lock().expect("lock poisoned");
+                let before = inner.store.len();
+                inner.store.retain(|_, v| v.expires_at > now);
+                before - inner.store.len()
+            }
+        }
     }
 
     /// Fetches the intent envelope, validates HMAC signature, returns root_intent.
@@ -310,17 +394,16 @@ impl FederatedMemory {
         })?;
 
         let raw_data = {
-            let mut inner = self.inner.lock().expect("lock poisoned");
-            let record = inner.store.get(&intent_hash).ok_or_else(|| {
+            let (data, _version, expires_at) = self.get_record(&intent_hash).ok_or_else(|| {
                 SAACPHardDrop::new(SAACPBytecodes::StateExpiredOrStale,
                     "Intent Envelope missing from Federated Memory.")
             })?;
-            if now_secs() > record.expires_at {
-                inner.store.remove(&intent_hash);
+            if now_secs() > expires_at {
+                self.remove_record(&intent_hash);
                 return Err(SAACPHardDrop::new(SAACPBytecodes::StateExpiredOrStale,
                     "Intent Envelope has expired (TTL)."));
             }
-            record.data.clone()
+            data
         };
 
         // Parse and verify signature outside lock
@@ -361,9 +444,15 @@ impl FederatedMemory {
     }
 
     /// Return number of stored entries.
+    ///
+    /// In backend mode this performs a `scan_prefix` over the whole `fedmem:`
+    /// namespace — an O(n) diagnostic operation (matching Redis `SCAN`
+    /// semantics), not something to call on a hot path.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().expect("lock poisoned");
-        inner.store.len()
+        match &self.backend {
+            Some(backend) => backend.scan_prefix("fedmem:").map(|k| k.len()).unwrap_or(0),
+            None => self.inner.lock().expect("lock poisoned").store.len(),
+        }
     }
 
     /// Process-wide singleton FederatedMemory.
@@ -755,6 +844,90 @@ mod tests {
         assert_eq!(fm.count(), 1);
         // Nothing expired yet
         assert_eq!(fm.evict_expired(), 0);
+    }
+
+    // -- FederatedMemory::with_backend tests (state_backend.rs wiring) --
+
+    fn backend_fm() -> FederatedMemory {
+        use crate::state_backend::InMemoryBackend;
+        FederatedMemory::with_backend(Arc::new(InMemoryBackend::new()))
+    }
+
+    #[test]
+    fn test_backend_store_and_fetch_context() {
+        let fm = backend_fm();
+        let data = "Hello, backend-mode SAACP world!";
+        let state_id = fm.store_context(data, 1);
+        assert_eq!(state_id.len(), 32);
+        let fetched = fm.fetch_context(&state_id, 1).unwrap();
+        assert_eq!(fetched, data);
+    }
+
+    #[test]
+    fn test_backend_fetch_wrong_version() {
+        let fm = backend_fm();
+        let state_id = fm.store_context("data", 1);
+        assert!(fm.fetch_context(&state_id, 2).is_err());
+    }
+
+    #[test]
+    fn test_backend_fetch_not_found() {
+        let fm = backend_fm();
+        assert!(fm.fetch_context(&[0u8; 32], 1).is_err());
+    }
+
+    #[test]
+    fn test_backend_save_context_direct() {
+        let fm = backend_fm();
+        let state_id = vec![0xCCu8; 32];
+        fm.save_context(&state_id, "direct_backend_data", 5).unwrap();
+        let fetched = fm.fetch_context(&state_id, 5).unwrap();
+        assert_eq!(fetched, "direct_backend_data");
+    }
+
+    #[test]
+    fn test_backend_intent_envelope_create_and_fetch() {
+        let fm = backend_fm();
+        let secret = b"my_secret_key_for_hmac";
+        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret);
+        assert_eq!(hash_hex.len(), 64);
+        let intent = fm.fetch_intent_envelope(&hash_hex, secret).unwrap();
+        assert_eq!(intent, "do_something");
+    }
+
+    #[test]
+    fn test_backend_intent_envelope_wrong_secret() {
+        let fm = backend_fm();
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1");
+        let err = fm.fetch_intent_envelope(&hash_hex, b"secret2").unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[test]
+    fn test_backend_intent_envelope_delete() {
+        let fm = backend_fm();
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret");
+        assert!(fm.delete_intent_envelope(&hash_hex));
+        assert!(!fm.delete_intent_envelope(&hash_hex)); // already gone
+    }
+
+    #[test]
+    fn test_backend_count_reflects_scan_prefix() {
+        let fm = backend_fm();
+        assert_eq!(fm.count(), 0);
+        fm.store_context("a", 1);
+        fm.store_context("b", 1);
+        assert_eq!(fm.count(), 2);
+    }
+
+    #[test]
+    fn test_backend_and_local_instances_are_independent() {
+        let local = FederatedMemory::new();
+        let backend = backend_fm();
+        let state_id = local.store_context("only-local", 1);
+        // The backend-mode instance has an entirely separate store — it must
+        // not see data written to the local, process-only instance.
+        assert!(backend.fetch_context(&state_id, 1).is_err());
     }
 
     // -- SecureContextStore tests --

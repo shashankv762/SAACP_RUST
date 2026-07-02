@@ -216,7 +216,8 @@ struct WalMessage {
 /// dropping is preferred over blocking or rejecting the packet.
 pub struct ImmutableAuditLog {
     inner: Mutex<AuditInner>,
-    /// WAL worker sender — None when log_file is "" (in-memory only mode for tests).
+    /// WAL worker sender. Always `Some` — even a "" log_file spawns the worker,
+    /// but `wal_write_entry` silently no-ops on an empty path (see `new()`).
     wal_tx: Option<mpsc::SyncSender<WalMessage>>,
 }
 
@@ -229,9 +230,26 @@ struct AuditInner {
 }
 
 impl ImmutableAuditLog {
-    /// Create a new ImmutableAuditLog with explicit paths.
+    /// Create a new ImmutableAuditLog with an explicit log file path.
+    ///
+    /// The sentinel/count file is derived from `log_file` (`"<log_file>.sentinel"`),
+    /// NOT the global `AUDIT_COUNT_FILE` default — every `new()` instance must own
+    /// an independent sentinel, otherwise unrelated `ImmutableAuditLog` instances
+    /// (e.g. two different test files, or two subsystems in the same production
+    /// process) would clobber one shared counter and `verify_chain()` would fail
+    /// spuriously whenever another instance's event count raced ahead of this
+    /// one's. Passing `log_file = ""` (in-memory-only mode) derives an empty
+    /// count_file too, so `wal_write_entry`'s sentinel write silently no-ops and
+    /// `verify_chain()`'s sentinel check is skipped entirely (see its `Path::exists`
+    /// guard). Use `with_default_path()`/`global()` to opt into the shared,
+    /// env-var-configured default sentinel instead.
     pub fn new(log_file: &str) -> Self {
-        Self::with_paths(log_file, AUDIT_COUNT_FILE)
+        let count_file = if log_file.is_empty() {
+            String::new()
+        } else {
+            format!("{log_file}.sentinel")
+        };
+        Self::with_paths(log_file, &count_file)
     }
 
     /// Create with both log file and sentinel file paths.

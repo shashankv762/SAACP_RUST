@@ -305,7 +305,7 @@ fn duplicate_suite_entries_no_panic_no_hang() {
     let ledger = make_ledger();
     // Include sig baseline once, then 1000 copies of the AEAD suite
     let mut remote_vec: Vec<&str> = vec![SIG_BASELINE];
-    remote_vec.extend(std::iter::repeat(BASELINE).take(1000));
+    remote_vec.extend(std::iter::repeat_n(BASELINE, 1000));
     let local = vec![SIG_BASELINE, BASELINE];
     let remote = remote_vec.as_slice();
 

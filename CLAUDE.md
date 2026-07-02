@@ -6,7 +6,7 @@
 
 - Crate: `saacp` (library only — no binary)
 - Rust edition: 2021
-- Test count: **1109** (all must pass; zero failures tolerated)
+- Test count: **1277** with default features (all must pass; zero failures tolerated). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`).
 - Spec reference: `c:\Users\2025\Downloads\write_readme.py` — the authoritative SAACP v0.1-beta2 specification
 
 ## Build & Test
@@ -14,11 +14,38 @@
 ```sh
 cargo check          # fast type-check, no linking
 cargo build          # debug build — must produce ZERO warnings
-cargo test           # run all 1109 tests (must pass 100%)
+cargo test           # run the default-feature test suite (must pass 100%)
 cargo test --test <name>   # run a single integration test file
+cargo clippy --all-targets --features redis-backend,transport-ws -- -D warnings  # full lint gate, all optional code paths
 ```
 
-**Target**: `cargo test` must print only `test result: ok` lines. Any `FAILED` is a blocker. `cargo build` must emit zero warnings.
+**Target**: `cargo test` must print only `test result: ok` lines. Any `FAILED` is a blocker. `cargo build` must emit zero warnings. This must also hold with every optional feature enabled (`--features redis-backend,transport-ws`) — those are additive, not alternate, code paths.
+
+**Known flaky test (pre-existing, not a regression target):** `blackhat_7d_easi_correct_vs_wrong_key_timing_similar` (`tests/test_blackhat_wire_crypto_rs.rs`) asserts a <5µs wall-clock timing difference over 1000 iterations; under heavy parallel test-suite CPU contention it can occasionally exceed that budget. Re-running it in isolation (`cargo test --test test_blackhat_wire_crypto_rs blackhat_7d_...`) reliably passes. Don't "fix" this by touching `easi.rs` — it's a test-harness timing-noise issue, not a side-channel regression.
+
+## Optional Cargo Features
+
+Both are off by default so a single-node, TCP-only deployment pulls in zero extra dependencies.
+
+| Feature | Adds | Module |
+|---------|------|--------|
+| `transport-ws` | `tokio-tungstenite`, `bytes`, `futures-util` | `transport::ws` — tunnels SAACP MEASC frames inside WebSocket binary messages, addressing the "every LLM framework speaks HTTP/WS, not raw TCP" ecosystem-isolation gap. `SAACPWebSocketDaemon` mirrors `daemon::SAACPNetworkDaemon`'s shape. `daemon::handle_client`/`ecdh_handshake` are generic over `AsyncRead + AsyncWrite`, so the WS path reuses the exact same handshake/framing/gate-pipeline code as raw TCP — zero protocol duplication. |
+| `redis-backend` | `redis` (sync client) | `state_backend::RedisBackend` — see below. |
+
+## Distributed State (`state_backend.rs`)
+
+A single narrow `StateBackend` trait (`get`/`set`/`delete`/`incr`/`scan_prefix`, KV+TTL semantics) lets subsystems share state across a horizontally-scaled fleet of SAACP gateway nodes instead of each node holding an isolated in-memory view. `InMemoryBackend` (default, always available) is byte-for-byte equivalent to the pre-existing per-subsystem `HashMap`; `RedisBackend` (behind `redis-backend`) wraps the synchronous `redis` crate client (deliberately not the async client bridged via `block_on` — that risks deadlocking inside `tokio::task::spawn_blocking` gate-pipeline work).
+
+**Wired** (`with_backend(Arc<dyn StateBackend>)` constructor added; default `::new()`/`::global()` path untouched and still purely in-process):
+- `memory.rs::FederatedMemory`
+- `temporal.rs::DeadMansSwitch` (`with_backend_and_limits` for custom timeout/cap)
+- `streaming.rs::StreamRegistry`
+
+**Deliberately NOT wired** — see `state_backend.rs`'s module doc for full justification of each:
+- `measc.rs::ReplayWindow` — per-packet atomic bitmap check-and-mark (C-1 REPLAY-TOCTOU fix); a network round-trip here would be a throughput and correctness regression. Never distribute this.
+- `cscs.rs::CSCSLoopDetector` — Gate 12.0 runs on essentially every packet (confirmed by reading the `handler.rs` call site, not assumed); naive per-packet backend round-trips would be a real latency bug. Needs the same local-cache-authoritative / best-effort-backend-mirror design as the rate limiter below, not implemented yet.
+- `gateway.rs::AgentRateLimiter` / `RRBCGateway` — near-per-packet hot paths; a correct implementation needs the in-process map to stay the authoritative fast-path read with only best-effort write-behind for cross-node visibility. RRBC replay-safety across nodes specifically needs a synchronous atomic claim (`SET NX EX`), not read-through caching.
+- `security.rs::ImmutableAuditLog` — hash-chain with a strict prev-hash ordering dependency; use a single-authoritative-audit-node deployment pattern (ops decision), not a code change. Do not build consensus from scratch for this.
 
 ## Architecture: Source Modules
 
@@ -54,7 +81,10 @@ cargo test --test <name>   # run a single integration test file
 | `estimator.rs` | `AutonomousTokenEstimator` | `estimator.py` |
 | `rgc.rs` | Resource governance policy + `ExecutionBudgetGuard` (30s ceiling) | `rgc.py` |
 | `mpf.rs` | Metadata privacy (padding, cover traffic, jitter) | `mpf.py` |
-| `daemon.rs` | `SAACPNetworkDaemon` — async Tokio TCP server | `daemon.py` |
+| `daemon.rs` | `SAACPNetworkDaemon` — async Tokio TCP server; `handle_client`/`ecdh_handshake` generic over `AsyncRead + AsyncWrite` | `daemon.py` |
+| `telemetry.rs` | `TelemetryCollector`, Prometheus-format metrics rendering | *new in Rust* |
+| `transport.rs` / `transport/ws.rs` | `SAACPWebSocketDaemon`, `WsByteStream` — WebSocket tunnel for MEASC frames (`transport-ws` feature) | *new in Rust* |
+| `state_backend.rs` | `StateBackend` trait, `InMemoryBackend`, `RedisBackend` (`redis-backend` feature) — pluggable KV+TTL storage for horizontal scaling | *new in Rust* |
 
 ## Gate Pipeline (Authorization Invariance)
 
@@ -264,3 +294,5 @@ rrbc_gateway.redeem_token_with_pop(token_b64, rnonce, agent, sid, cid, oaid, sec
 11. **Constant-time comparisons**: HMAC verification (`constant_time_eq`), chain hash verification (`constant_time_eq_hex`), and Adler32 (`constant_time_eq_u32`) all use branch-resistant comparisons. Do not replace with `==` on secrets.
 
 12. **Cover traffic audit**: Cover traffic packets MUST write a Gate 6.0 audit entry before the silent drop. Removing this creates unlogged reconnaissance vectors.
+
+13. **`ImmutableAuditLog::new(log_file)` sentinel derivation**: The count/sentinel file is derived as `"<log_file>.sentinel"`, NOT the global `AUDIT_COUNT_FILE` default. This was a real bug (fixed in this session): every `new()` instance previously shared one process-wide default sentinel regardless of `log_file`, so unrelated `ImmutableAuditLog` instances (different test files, different production subsystems) clobbered each other's event-count sentinel and caused spurious `verify_chain()` failures. Only `with_default_path()`/`global()` use the env-var-configured shared default — that's intentional (it's the one true global log). Never make `new()` default back to the shared sentinel.

@@ -16,10 +16,13 @@
 //! number of concurrent stream sessions.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
+
+use serde::{Serialize, Deserialize};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::state_backend::StateBackend;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -46,6 +49,7 @@ fn now_epoch_secs() -> f64 {
 // ── StreamSession ──────────────────────────────────────────────────────────
 
 /// A single streaming continuation session.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StreamSession {
     /// Unique stream identifier.
     pub stream_id: String,
@@ -175,9 +179,25 @@ impl StreamSession {
 // ── StreamRegistry ─────────────────────────────────────────────────────────
 
 /// Global registry of active stream sessions.
+///
+/// Backed by a process-local `HashMap` by default. [`StreamRegistry::with_backend`]
+/// instead routes session state through a shared [`StateBackend`] (e.g.
+/// Redis) so a stream started on one SAACP gateway node can be continued
+/// against another — see `state_backend.rs` for the design. Every mutating
+/// backend-mode operation reuses `StreamSession::validate_continuation`
+/// itself (get → mutate in memory → put) rather than reimplementing its
+/// ordering/byte-cap/duration/gap checks a second time.
 pub struct StreamRegistry {
     streams: Mutex<HashMap<String, StreamSession>>,
     agent_counts: Mutex<HashMap<String, usize>>,
+    backend: Option<Arc<dyn StateBackend>>,
+}
+
+/// TTL applied to backend-stored stream sessions: comfortably beyond the
+/// max session duration plus max frame gap, as a safety net in case a stream
+/// is abandoned without an explicit `close`/`end_stream`/`abort_stream`.
+fn stream_backend_ttl() -> Duration {
+    Duration::from_secs_f64(STREAM_MAX_DURATION_SECONDS + STREAM_MAX_FRAME_GAP_SECONDS + 30.0)
 }
 
 impl StreamRegistry {
@@ -186,7 +206,40 @@ impl StreamRegistry {
         Self {
             streams: Mutex::new(HashMap::new()),
             agent_counts: Mutex::new(HashMap::new()),
+            backend: None,
         }
+    }
+
+    /// Create a StreamRegistry backed by a shared [`StateBackend`] (e.g.
+    /// Redis) instead of a process-local `HashMap`. See `state_backend.rs`.
+    pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+            agent_counts: Mutex::new(HashMap::new()),
+            backend: Some(backend),
+        }
+    }
+
+    fn stream_key(stream_id: &str) -> String {
+        format!("stream:{stream_id}")
+    }
+
+    fn get_session_backend(backend: &Arc<dyn StateBackend>, stream_id: &str) -> Option<StreamSession> {
+        let bytes = backend.get(&Self::stream_key(stream_id)).ok().flatten()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn put_session_backend(backend: &Arc<dyn StateBackend>, session: &StreamSession) {
+        if let Ok(bytes) = serde_json::to_vec(session) {
+            let _ = backend.set(&Self::stream_key(&session.stream_id), &bytes, Some(stream_backend_ttl()));
+        }
+    }
+
+    fn all_sessions_backend(backend: &Arc<dyn StateBackend>) -> Vec<StreamSession> {
+        backend.scan_prefix("stream:").unwrap_or_default().iter()
+            .filter_map(|k| backend.get(k).ok().flatten())
+            .filter_map(|b| serde_json::from_slice(&b).ok())
+            .collect()
     }
 
     /// Register a new stream session.
@@ -194,6 +247,13 @@ impl StreamRegistry {
     /// Enforces `MAX_ACTIVE_STREAMS` and `MAX_STREAMS_PER_AGENT`.
     /// If the global cap is reached the oldest session is evicted.
     pub fn register(&self, session: StreamSession) -> Result<(), SAACPHardDrop> {
+        match &self.backend {
+            Some(backend) => self.register_backend(backend, session),
+            None => self.register_local(session),
+        }
+    }
+
+    fn register_local(&self, session: StreamSession) -> Result<(), SAACPHardDrop> {
         let mut streams = self.streams.lock().unwrap();
         let mut agent_counts = self.agent_counts.lock().unwrap();
 
@@ -231,6 +291,33 @@ impl StreamRegistry {
         Ok(())
     }
 
+    fn register_backend(&self, backend: &Arc<dyn StateBackend>, session: StreamSession) -> Result<(), SAACPHardDrop> {
+        // O(n) over the active-stream set — registration is a once-per-stream
+        // connection-lifecycle event, not a per-frame hot path.
+        let mut existing = Self::all_sessions_backend(backend);
+
+        let agent_count = existing.iter().filter(|s| s.agent_id == session.agent_id).count();
+        if agent_count >= MAX_STREAMS_PER_AGENT {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::StreamAbort,
+                format!(
+                    "Agent '{}' already has {} active streams (max {}).",
+                    session.agent_id, agent_count, MAX_STREAMS_PER_AGENT
+                ),
+            ));
+        }
+
+        if existing.len() >= MAX_ACTIVE_STREAMS {
+            existing.sort_by(|a, b| a.started_at.partial_cmp(&b.started_at).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(oldest) = existing.first() {
+                let _ = backend.delete(&Self::stream_key(&oldest.stream_id));
+            }
+        }
+
+        Self::put_session_backend(backend, &session);
+        Ok(())
+    }
+
     /// Retrieve a mutable reference to a stream session by ID and
     /// validate the next frame.
     pub fn validate_frame(
@@ -239,49 +326,83 @@ impl StreamRegistry {
         sequence: u64,
         frame_bytes: usize,
     ) -> Result<(), SAACPHardDrop> {
-        let mut streams = self.streams.lock().unwrap();
-        let session = streams.get_mut(stream_id).ok_or_else(|| {
-            SAACPHardDrop::new(
-                SAACPBytecodes::StreamAbort,
-                format!("No active stream with id '{}'.", stream_id),
-            )
-        })?;
-        session.validate_continuation(sequence, frame_bytes)
+        match &self.backend {
+            Some(backend) => {
+                let mut session = Self::get_session_backend(backend, stream_id).ok_or_else(|| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::StreamAbort,
+                        format!("No active stream with id '{}'.", stream_id),
+                    )
+                })?;
+                let result = session.validate_continuation(sequence, frame_bytes);
+                Self::put_session_backend(backend, &session);
+                result
+            }
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                let session = streams.get_mut(stream_id).ok_or_else(|| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::StreamAbort,
+                        format!("No active stream with id '{}'.", stream_id),
+                    )
+                })?;
+                session.validate_continuation(sequence, frame_bytes)
+            }
+        }
     }
 
     /// Close and remove a stream session.
     pub fn close(&self, stream_id: &str) -> Result<(), SAACPHardDrop> {
-        let mut streams = self.streams.lock().unwrap();
-        let mut agent_counts = self.agent_counts.lock().unwrap();
-
-        if let Some(session) = streams.remove(stream_id) {
-            let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
-            *cnt = cnt.saturating_sub(1);
-            if *cnt == 0 {
-                agent_counts.remove(&session.agent_id);
+        match &self.backend {
+            Some(backend) => {
+                if backend.delete(&Self::stream_key(stream_id)).unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(SAACPHardDrop::new(
+                        SAACPBytecodes::StreamAbort,
+                        format!("No active stream with id '{}'.", stream_id),
+                    ))
+                }
             }
-            Ok(())
-        } else {
-            Err(SAACPHardDrop::new(
-                SAACPBytecodes::StreamAbort,
-                format!("No active stream with id '{}'.", stream_id),
-            ))
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap();
+
+                if let Some(session) = streams.remove(stream_id) {
+                    let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        agent_counts.remove(&session.agent_id);
+                    }
+                    Ok(())
+                } else {
+                    Err(SAACPHardDrop::new(
+                        SAACPBytecodes::StreamAbort,
+                        format!("No active stream with id '{}'.", stream_id),
+                    ))
+                }
+            }
         }
     }
 
     /// Number of currently active streams.
+    ///
+    /// In backend mode this is a `scan_prefix` over the `stream:` namespace —
+    /// an O(n) diagnostic operation, not a hot-path call.
     pub fn active_count(&self) -> usize {
-        self.streams.lock().unwrap().len()
+        match &self.backend {
+            Some(backend) => backend.scan_prefix("stream:").map(|k| k.len()).unwrap_or(0),
+            None => self.streams.lock().unwrap().len(),
+        }
     }
 
     /// Number of active streams for a given agent.
     pub fn agent_stream_count(&self, agent_id: &str) -> usize {
-        self.agent_counts
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .copied()
-            .unwrap_or(0)
+        match &self.backend {
+            Some(backend) => Self::all_sessions_backend(backend).iter()
+                .filter(|s| s.agent_id == agent_id).count(),
+            None => self.agent_counts.lock().unwrap().get(agent_id).copied().unwrap_or(0),
+        }
     }
 
     // ── Methods required by the stream gate pipeline in handler.rs ─────────
@@ -309,33 +430,24 @@ impl StreamRegistry {
 
     /// Return a clone of the stream session (for inspection; does not hold lock).
     pub fn get_stream(&self, stream_id: &str) -> Option<StreamSession> {
-        self.streams
-            .lock()
-            .unwrap()
-            .get(stream_id)
-            .map(|s| StreamSession {
-                stream_id:        s.stream_id.clone(),
-                agent_id:         s.agent_id.clone(),
-                source_agent:     s.source_agent.clone(),
-                last_sequence:    s.last_sequence,
-                last_sequence_id: s.last_sequence_id,
-                total_bytes:      s.total_bytes,
-                frame_count:      s.frame_count,
-                started_at:       s.started_at,
-                last_frame_at:    s.last_frame_at,
-                closed:           s.closed,
-                token_sig_hash:   s.token_sig_hash.clone(),
-                token_exp:        s.token_exp,
-            })
+        match &self.backend {
+            Some(backend) => Self::get_session_backend(backend, stream_id),
+            None => self.streams.lock().unwrap().get(stream_id).cloned(),
+        }
     }
 
     /// Abort (forcibly remove) a stream session without error.
     pub fn abort_stream(&self, stream_id: &str) {
-        let mut streams = self.streams.lock().unwrap();
-        let mut agent_counts = self.agent_counts.lock().unwrap();
-        if let Some(session) = streams.remove(stream_id) {
-            let cnt = agent_counts.entry(session.agent_id).or_insert(0);
-            *cnt = cnt.saturating_sub(1);
+        match &self.backend {
+            Some(backend) => { let _ = backend.delete(&Self::stream_key(stream_id)); }
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap();
+                if let Some(session) = streams.remove(stream_id) {
+                    let cnt = agent_counts.entry(session.agent_id).or_insert(0);
+                    *cnt = cnt.saturating_sub(1);
+                }
+            }
         }
     }
 
@@ -348,20 +460,37 @@ impl StreamRegistry {
         sequence: u64,
         frame_bytes: usize,
     ) -> Result<(), String> {
-        let mut streams = self.streams.lock().unwrap();
-        let session = streams.get_mut(stream_id).ok_or_else(|| {
-            format!("No active stream '{}'.", stream_id)
-        })?;
-        session.validate_continuation(sequence, frame_bytes)
-            .map_err(|e| e.message)
+        match &self.backend {
+            Some(backend) => {
+                let mut session = Self::get_session_backend(backend, stream_id)
+                    .ok_or_else(|| format!("No active stream '{}'.", stream_id))?;
+                let result = session.validate_continuation(sequence, frame_bytes);
+                Self::put_session_backend(backend, &session);
+                result.map_err(|e| e.message)
+            }
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                let session = streams.get_mut(stream_id).ok_or_else(|| {
+                    format!("No active stream '{}'.", stream_id)
+                })?;
+                session.validate_continuation(sequence, frame_bytes)
+                    .map_err(|e| e.message)
+            }
+        }
     }
 
     /// Get lightweight stream info without removing the stream.
     ///
     /// Returns `(token_exp, token_sig_hash, last_sequence_id)` for Gate 1.0 checks.
     pub fn get_stream_info(&self, stream_id: &str) -> Option<(f64, String, Option<u64>)> {
-        let streams = self.streams.lock().unwrap();
-        streams.get(stream_id).map(|s| (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id))
+        match &self.backend {
+            Some(backend) => Self::get_session_backend(backend, stream_id)
+                .map(|s| (s.token_exp, s.token_sig_hash, s.last_sequence_id)),
+            None => {
+                let streams = self.streams.lock().unwrap();
+                streams.get(stream_id).map(|s| (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id))
+            }
+        }
     }
 
     /// Update token auth info on an existing stream (called after STREAM_START validation).
@@ -372,28 +501,50 @@ impl StreamRegistry {
         token_exp: f64,
         source_agent: &str,
     ) {
-        let mut streams = self.streams.lock().unwrap();
-        if let Some(s) = streams.get_mut(stream_id) {
-            s.token_sig_hash = token_sig_hash.to_string();
-            s.token_exp = token_exp;
-            s.source_agent = source_agent.to_string();
+        match &self.backend {
+            Some(backend) => {
+                if let Some(mut s) = Self::get_session_backend(backend, stream_id) {
+                    s.token_sig_hash = token_sig_hash.to_string();
+                    s.token_exp = token_exp;
+                    s.source_agent = source_agent.to_string();
+                    Self::put_session_backend(backend, &s);
+                }
+            }
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                if let Some(s) = streams.get_mut(stream_id) {
+                    s.token_sig_hash = token_sig_hash.to_string();
+                    s.token_exp = token_exp;
+                    s.source_agent = source_agent.to_string();
+                }
+            }
         }
     }
 
     /// End a stream: close it and return the final session snapshot for audit.
     pub fn end_stream(&self, stream_id: &str) -> Option<StreamSession> {
-        let mut streams = self.streams.lock().unwrap();
-        let mut agent_counts = self.agent_counts.lock().unwrap();
-        if let Some(mut session) = streams.remove(stream_id) {
-            session.closed = true;
-            let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
-            *cnt = cnt.saturating_sub(1);
-            if *cnt == 0 {
-                agent_counts.remove(&session.agent_id);
+        match &self.backend {
+            Some(backend) => {
+                let mut session = Self::get_session_backend(backend, stream_id)?;
+                session.closed = true;
+                let _ = backend.delete(&Self::stream_key(stream_id));
+                Some(session)
             }
-            Some(session)
-        } else {
-            None
+            None => {
+                let mut streams = self.streams.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap();
+                if let Some(mut session) = streams.remove(stream_id) {
+                    session.closed = true;
+                    let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        agent_counts.remove(&session.agent_id);
+                    }
+                    Some(session)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -526,5 +677,111 @@ mod tests {
         s.started_at = now_epoch_secs() + MAX_ACTIVE_STREAMS as f64 + 1.0;
         assert!(reg.register(s).is_ok());
         assert_eq!(reg.active_count(), MAX_ACTIVE_STREAMS);
+    }
+
+    // -- StreamRegistry::with_backend tests (state_backend.rs wiring) --
+
+    fn backend_registry() -> StreamRegistry {
+        use crate::state_backend::InMemoryBackend;
+        StreamRegistry::with_backend(Arc::new(InMemoryBackend::new()))
+    }
+
+    #[test]
+    fn test_backend_register_and_count() {
+        let reg = backend_registry();
+        let s1 = make_session("s1", "agent-a");
+        let s2 = make_session("s2", "agent-a");
+        let s3 = make_session("s3", "agent-b");
+        assert!(reg.register(s1).is_ok());
+        assert!(reg.register(s2).is_ok());
+        assert!(reg.register(s3).is_ok());
+        assert_eq!(reg.active_count(), 3);
+        assert_eq!(reg.agent_stream_count("agent-a"), 2);
+        assert_eq!(reg.agent_stream_count("agent-b"), 1);
+    }
+
+    #[test]
+    fn test_backend_per_agent_limit() {
+        let reg = backend_registry();
+        for i in 0..MAX_STREAMS_PER_AGENT {
+            let s = make_session(&format!("s{}", i), "agent-a");
+            assert!(reg.register(s).is_ok());
+        }
+        let s = make_session("overflow", "agent-a");
+        assert!(reg.register(s).is_err());
+    }
+
+    #[test]
+    fn test_backend_close() {
+        let reg = backend_registry();
+        let s = make_session("s1", "agent-a");
+        reg.register(s).unwrap();
+        assert_eq!(reg.active_count(), 1);
+        assert!(reg.close("s1").is_ok());
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.agent_stream_count("agent-a"), 0);
+    }
+
+    #[test]
+    fn test_backend_close_nonexistent() {
+        let reg = backend_registry();
+        assert!(reg.close("no-such-stream").is_err());
+    }
+
+    #[test]
+    fn test_backend_validate_frame() {
+        let reg = backend_registry();
+        let s = make_session("s1", "agent-a");
+        reg.register(s).unwrap();
+        assert!(reg.validate_frame("s1", 1, 200).is_ok());
+        assert!(reg.validate_frame("s1", 2, 100).is_ok());
+        assert!(reg.validate_frame("s1", 1, 100).is_err()); // bad seq
+        // Confirm state actually persisted across the three calls above.
+        let session = reg.get_stream("s1").unwrap();
+        assert_eq!(session.last_sequence, 2);
+        assert_eq!(session.total_bytes, 400); // 100 initial + 200 + 100
+    }
+
+    #[test]
+    fn test_backend_continue_and_end_stream() {
+        let reg = backend_registry();
+        assert!(reg.start_stream("s1", "src-agent", "agent-a").is_ok());
+        assert!(reg.continue_stream("s1", 1, 50).is_ok());
+        let info = reg.get_stream_info("s1").unwrap();
+        assert_eq!(info.2, Some(1));
+
+        let ended = reg.end_stream("s1").unwrap();
+        assert!(ended.closed);
+        assert_eq!(reg.active_count(), 0);
+        assert!(reg.get_stream("s1").is_none());
+    }
+
+    #[test]
+    fn test_backend_set_stream_token_info() {
+        let reg = backend_registry();
+        reg.start_stream("s1", "src-agent", "agent-a").unwrap();
+        reg.set_stream_token_info("s1", "sighash123", 999.0, "src-agent-2");
+        let session = reg.get_stream("s1").unwrap();
+        assert_eq!(session.token_sig_hash, "sighash123");
+        assert_eq!(session.token_exp, 999.0);
+        assert_eq!(session.source_agent, "src-agent-2");
+    }
+
+    #[test]
+    fn test_backend_abort_stream() {
+        let reg = backend_registry();
+        reg.start_stream("s1", "src-agent", "agent-a").unwrap();
+        reg.abort_stream("s1");
+        assert!(reg.get_stream("s1").is_none());
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    #[test]
+    fn test_backend_and_local_instances_are_independent() {
+        let local = StreamRegistry::new();
+        let backend = backend_registry();
+        local.register(make_session("s1", "agent-a")).unwrap();
+        assert_eq!(local.active_count(), 1);
+        assert_eq!(backend.active_count(), 0);
     }
 }

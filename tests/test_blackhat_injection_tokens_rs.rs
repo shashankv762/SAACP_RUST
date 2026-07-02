@@ -92,8 +92,8 @@ fn blackhat_4b_combining_diacritical_marks_gap_documented() {
     } else {
         println!("4b: Combining diacritical marks correctly blocked — NFKC+ascii strips them.");
     }
-    // Document the gap; do not fail the suite — a failing test here proves the gap.
-    assert!(true, "4b: Combining-mark gap behaviour documented above");
+    // Document the gap; do not fail the suite — a failing test here proves the gap
+    // (see println! branches above).
 }
 
 /// 4c: Variation selectors (U+FE00–U+FE0F) stripped by NFKC → "system override" detected.
@@ -325,12 +325,12 @@ fn blackhat_5h_threshold_m_minus_one_approvals_not_ready() {
     let req_id = issuer.create_request(base);
 
     // Submit only M-1=2 approvals. Each authority signs with its own CIA.
-    for i in 0..(m - 1) {
-        let auth_sk  = CapabilitySigningKey::generate(&auth_ids[i], 3600);
+    for (i, auth_id) in auth_ids.iter().enumerate().take(m - 1) {
+        let auth_sk  = CapabilitySigningKey::generate(auth_id, 3600);
         let auth_cia = CapabilityIssuanceAuthority::new(auth_sk);
         let mut tok_claims = serde_json::Map::new();
         tok_claims.insert("kid".into(),              serde_json::json!(auth_cia.kid()));
-        tok_claims.insert("iss".into(),              serde_json::json!(auth_ids[i]));
+        tok_claims.insert("iss".into(),              serde_json::json!(auth_id));
         tok_claims.insert("sub".into(),              serde_json::json!("threshold-agent-5h"));
         tok_claims.insert("jti".into(),              serde_json::json!(format!("jti-5h-{}", i)));
         tok_claims.insert("nbf".into(),              serde_json::json!(0u64));
@@ -338,7 +338,7 @@ fn blackhat_5h_threshold_m_minus_one_approvals_not_ready() {
         tok_claims.insert("delegation_depth".into(), serde_json::json!(0u64));
         tok_claims.insert("actions".into(),          serde_json::json!(["read"]));
         let tok = auth_cia.issue(tok_claims).unwrap();
-        let state = issuer.submit_partial_approval(&req_id, &auth_ids[i], &tok);
+        let state = issuer.submit_partial_approval(&req_id, auth_id, &tok);
         if let Ok(s) = state {
             assert!(!s.is_ready,
                 "With only {} of {} approvals, is_ready must be false", i + 1, m);
