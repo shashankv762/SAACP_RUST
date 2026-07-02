@@ -163,10 +163,10 @@ fn bench_gate_1_5_intent(c: &mut Criterion) {
 fn bench_gate_2_5_kinetic_firewall(c: &mut Criterion) {
     let mut group = c.benchmark_group("Gate_2_5_Kinetic_Firewall");
 
-    group.bench_function("allow_equal_class",             |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(1u8), black_box(1u8)))));
-    group.bench_function("allow_lower_class",             |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(0u8), black_box(2u8)))));
-    group.bench_function("block_escalation_read_to_irrev",|b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(2u8), black_box(0u8)))));
-    group.bench_function("block_escalation_rev_to_irrev", |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(2u8), black_box(1u8)))));
+    group.bench_function("allow_equal_class",             |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(1u8), black_box(1u8), None))));
+    group.bench_function("allow_lower_class",             |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(0u8), black_box(2u8), None))));
+    group.bench_function("block_escalation_read_to_irrev",|b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(2u8), black_box(0u8), None))));
+    group.bench_function("block_escalation_rev_to_irrev", |b| b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(2u8), black_box(1u8), None))));
 
     group.finish();
 }
@@ -425,7 +425,7 @@ fn bench_pipeline_rejection_timing(c: &mut Criterion) {
         b.iter(|| black_box(SAACPProtocolHandler::intercept_packet(black_box(&bad), black_box(&secret_key), black_box("bench-agent"), black_box(false))))
     });
     group.bench_function("reject_at_gate_2_5_escalation", |b| {
-        b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(3u8), black_box(0u8))))
+        b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(3u8), black_box(0u8), None)))
     });
     group.bench_function("reject_at_gate_3_0_no_secondary", |b| {
         let empty: HashMap<String, JsonValue> = HashMap::new();
@@ -660,7 +660,7 @@ fn bench_pipeline_rejection_timing_throughput(c: &mut Criterion) {
         b.iter(|| black_box(SAACPProtocolHandler::intercept_packet(black_box(&garbage), black_box(&secret_key), black_box("bench-agent"), black_box(false))))
     });
     group.bench_function("gate_2_5_reject_escalation", |b| {
-        b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(3u8), black_box(0u8))))
+        b.iter(|| black_box(SAACPProtocolHandler::gate_2_5_kinetic_firewall(black_box(3u8), black_box(0u8), None)))
     });
     group.bench_function("gate_3_0_reject_no_secondary", |b| {
         let empty: HashMap<String, JsonValue> = HashMap::new();

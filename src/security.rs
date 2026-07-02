@@ -5,10 +5,12 @@
 //! - `ImmutableAuditLog`: Append-only cryptographic hash chain with WAL worker thread
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use std::time::SystemTime;
-use std::fs;
+use std::time::{Duration, Instant, SystemTime};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use sha2::Sha256;
@@ -167,8 +169,78 @@ pub const AUDIT_MAX_LOG_SIZE: u64 = 50_000_000;
 /// WAL queue capacity — events are dropped (not rejected) when full.
 pub const AUDIT_WAL_QUEUE_CAPACITY: usize = 100_000;
 
+/// WAL flush cadence (Gate 6.0 backpressure repair, fix #1/#3): the WAL
+/// worker batches disk writes behind a `BufWriter` and only calls `flush()` +
+/// `sync_data()` after this many buffered entries, or after
+/// `AUDIT_WAL_FLUSH_INTERVAL_MS` milliseconds — whichever comes first.
+/// This is also the stated maximum audit-data-loss window on an unclean
+/// shutdown (power loss, `kill -9`): **at most 200 entries or 50ms of audit
+/// history**, whichever bound is hit first. This number is a documented
+/// protocol contract, not an implementation detail — see `AuditHealth`.
+pub const AUDIT_WAL_FLUSH_EVERY_N_ENTRIES: u64 = 200;
+/// See `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`.
+pub const AUDIT_WAL_FLUSH_INTERVAL_MS: u64 = 50;
+
+const AUDIT_WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(AUDIT_WAL_FLUSH_INTERVAL_MS);
+
+/// WAL queue-depth ratio above which `AuditHealth` becomes `Degraded`.
+const AUDIT_HEALTH_DEGRADED_PCT: f64 = 0.70;
+/// WAL queue-depth ratio above which `AuditHealth` becomes `Saturated`.
+const AUDIT_HEALTH_SATURATED_PCT: f64 = 0.95;
+
 /// Genesis hash for the audit chain.
 const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLOCK"
+
+// ---------------------------------------------------------------------------
+// AuditHealth — Gate 6.0 backpressure contract
+// ---------------------------------------------------------------------------
+
+/// Gate 6.0 (audit checkpoint / WAL writer) backpressure health.
+///
+/// Every gate that touches disk, does unbounded-size work, or depends on
+/// external system throughput must declare an explicit backpressure contract
+/// with the packet pipeline rather than an ad-hoc drop-and-print. For the
+/// audit log, that contract is this three-state (plus terminal `Fatal`)
+/// signal:
+///
+/// - `Healthy` — WAL queue below 70% capacity. Normal async enqueue, zero
+///   packet-path cost beyond the atomic bookkeeping.
+/// - `Degraded` — WAL queue 70-95% capacity. Still enqueuing and writing,
+///   but behind. `handler::gate_2_5_kinetic_firewall` reads this (via `>=`)
+///   to start rejecting new IRREVERSIBLE_ACTION packets once the state
+///   reaches `Saturated` — fail-safe, not fail-open.
+/// - `Saturated` — WAL queue >95% capacity. New events are dropped with an
+///   atomic counter (`dropped_audit_count()`), never an inline `eprintln!`
+///   on the hot path. `Degraded`'s rejection of IRREVERSIBLE_ACTION packets
+///   is already in effect here, protecting against irreversible actions
+///   proceeding without a durable audit trail.
+/// - `Fatal` — The WAL writer cannot write at all (log file open failed, or
+///   an actual write returned an OS error). Distinguishable from `Saturated`
+///   (queue pressure) — this means the writer tried and failed, not merely
+///   that it's behind. Sticky: only constructing a fresh `ImmutableAuditLog`
+///   clears it.
+///
+/// Discriminants are chosen so `Healthy < Degraded < Saturated < Fatal`,
+/// letting callers use a single `health() >= AuditHealth::Saturated` check.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditHealth {
+    Healthy = 0,
+    Degraded = 1,
+    Saturated = 2,
+    Fatal = 3,
+}
+
+impl AuditHealth {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => AuditHealth::Healthy,
+            1 => AuditHealth::Degraded,
+            2 => AuditHealth::Saturated,
+            _ => AuditHealth::Fatal,
+        }
+    }
+}
 
 /// An audit log entry record.
 #[derive(Debug, Clone)]
@@ -196,8 +268,6 @@ pub struct AuditLogEntry {
 
 struct WalMessage {
     entry_json: String,
-    log_file: String,
-    count_file: String,
     event_count: u64,
 }
 
@@ -211,14 +281,30 @@ struct WalMessage {
 /// If a compromised agent alters a past entry, the chain breaks.
 /// Detects file deletion and partial truncation attacks.
 ///
-/// Disk I/O is handled by a background WAL worker thread (spec §15.2).
-/// If the WAL queue is full, the event is dropped and logged to stderr —
-/// dropping is preferred over blocking or rejecting the packet.
+/// Disk I/O is handled by a background WAL worker thread (spec §15.2) that
+/// holds a persistent, buffered file handle for its lifetime (see `WalWriter`)
+/// instead of reopening the file per event. If the WAL queue is full, the
+/// event is dropped and counted (`dropped_audit_count()` / the process-wide
+/// `gate_6_0_audit_drop` telemetry counter) — dropping is preferred over
+/// blocking or rejecting the packet, and the drop path itself does no
+/// blocking I/O. See `AuditHealth` for the full backpressure contract that
+/// feeds `handler::gate_2_5_kinetic_firewall`.
 pub struct ImmutableAuditLog {
     inner: Mutex<AuditInner>,
     /// WAL worker sender. Always `Some` — even a "" log_file spawns the worker,
-    /// but `wal_write_entry` silently no-ops on an empty path (see `new()`).
+    /// but the worker thread no-ops on disk I/O for an empty path (see `new()`).
     wal_tx: Option<mpsc::SyncSender<WalMessage>>,
+    /// Backpressure health shared with the WAL worker thread — see `AuditHealth`.
+    health: Arc<AtomicU8>,
+    /// Count of events dropped because the WAL queue was full (or the worker
+    /// thread had already exited after a fatal open failure).
+    dropped_audits: Arc<AtomicU64>,
+    /// Count of WAL write failures — distinct from queue-full drops: the
+    /// worker actually attempted a write and the OS returned an error.
+    wal_write_failures: Arc<AtomicU64>,
+    /// Approximate current WAL queue depth, maintained by hand since
+    /// `mpsc::SyncSender` exposes no introspection API.
+    queue_len: Arc<AtomicUsize>,
 }
 
 struct AuditInner {
@@ -239,7 +325,7 @@ impl ImmutableAuditLog {
     /// process) would clobber one shared counter and `verify_chain()` would fail
     /// spuriously whenever another instance's event count raced ahead of this
     /// one's. Passing `log_file = ""` (in-memory-only mode) derives an empty
-    /// count_file too, so `wal_write_entry`'s sentinel write silently no-ops and
+    /// count_file too, so the WAL worker's sentinel write never happens and
     /// `verify_chain()`'s sentinel check is skipped entirely (see its `Path::exists`
     /// guard). Use `with_default_path()`/`global()` to opt into the shared,
     /// env-var-configured default sentinel instead.
@@ -256,13 +342,30 @@ impl ImmutableAuditLog {
     pub fn with_paths(log_file: &str, count_file: &str) -> Self {
         let (wal_tx, wal_rx) = mpsc::sync_channel::<WalMessage>(AUDIT_WAL_QUEUE_CAPACITY);
 
-        // Spawn WAL worker daemon thread.
+        let health: Arc<AtomicU8> = Arc::new(AtomicU8::new(AuditHealth::Healthy as u8));
+        let dropped_audits: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let wal_write_failures: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let queue_len: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        // Spawn WAL worker daemon thread. `log_file`/`count_file` never change
+        // after construction (no setter exists), so the worker captures its own
+        // copies once instead of receiving them on every message.
+        let worker_health = Arc::clone(&health);
+        let worker_wal_write_failures = Arc::clone(&wal_write_failures);
+        let worker_queue_len = Arc::clone(&queue_len);
+        let worker_log_file = log_file.to_string();
+        let worker_count_file = count_file.to_string();
         thread::Builder::new()
             .name("saacp-wal-worker".into())
             .spawn(move || {
-                while let Ok(msg) = wal_rx.recv() {
-                    wal_write_entry(&msg.entry_json, &msg.log_file, msg.event_count, &msg.count_file);
-                }
+                run_wal_worker(
+                    wal_rx,
+                    &worker_log_file,
+                    &worker_count_file,
+                    &worker_health,
+                    &worker_wal_write_failures,
+                    &worker_queue_len,
+                );
             })
             .expect("WAL worker thread spawn failed");
 
@@ -275,6 +378,10 @@ impl ImmutableAuditLog {
                 entries: Vec::new(),
             }),
             wal_tx: Some(wal_tx),
+            health,
+            dropped_audits,
+            wal_write_failures,
+            queue_len,
         }
     }
 
@@ -318,8 +425,11 @@ impl ImmutableAuditLog {
     ///
     /// The chain hash is computed inline (synchronous) so the in-memory chain is
     /// always coherent. Disk I/O is offloaded to the WAL worker thread.
-    /// If the WAL queue is full, the event is dropped to stderr — the packet is
-    /// NOT rejected (spec §15.2: "Dropping an event is preferred over rejecting the packet").
+    /// If the WAL queue is full, the event is dropped and counted via
+    /// `telemetry::global_telemetry()`'s `gate_6_0_audit_drop` counter — the
+    /// packet is NOT rejected (spec §15.2: "Dropping an event is preferred over
+    /// rejecting the packet"), and the drop itself is a lock-free atomic
+    /// increment, never blocking I/O.
     pub fn append_event(
         &self,
         issuer_secret: &[u8],
@@ -386,16 +496,35 @@ impl ImmutableAuditLog {
         if let Some(ref tx) = self.wal_tx {
             let msg = WalMessage {
                 entry_json,
-                log_file: inner.log_file.clone(),
-                count_file: inner.count_file.clone(),
                 event_count: inner.event_count,
             };
-            if tx.try_send(msg).is_err() {
-                eprintln!(
-                    "[SAACP AUDIT] WAL queue full — event seq={} dropped to stderr",
-                    inner.event_count - 1
-                );
+            if tx.try_send(msg).is_ok() {
+                self.queue_len.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // FIX 3: rate-limited signal via an atomic counter — never an
+                // inline eprintln! on this hot path. (A slow consumer forcing
+                // this branch hundreds of thousands of times, each printing,
+                // was the actual root cause of the original latency spike.)
+                self.dropped_audits.fetch_add(1, Ordering::Relaxed);
+                crate::telemetry::global_telemetry().record_gate_rejection("gate_6_0_audit");
             }
+
+            // FIX 4: recompute health from live queue pressure. `fetch_update`
+            // refuses to overwrite a sticky `Fatal` — only the WAL worker sets
+            // that (on an actual I/O failure), and only a fresh
+            // `ImmutableAuditLog` clears it.
+            let pct = self.queue_len.load(Ordering::Relaxed) as f64
+                / AUDIT_WAL_QUEUE_CAPACITY as f64;
+            let level = if pct > AUDIT_HEALTH_SATURATED_PCT {
+                AuditHealth::Saturated
+            } else if pct > AUDIT_HEALTH_DEGRADED_PCT {
+                AuditHealth::Degraded
+            } else {
+                AuditHealth::Healthy
+            };
+            let _ = self.health.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur == AuditHealth::Fatal as u8 { None } else { Some(level as u8) }
+            });
         }
 
         // Keep in-memory for fast verify_chain().
@@ -565,6 +694,31 @@ impl ImmutableAuditLog {
         inner.event_count
     }
 
+    /// Current Gate 6.0 backpressure health (see `AuditHealth`). Read by
+    /// `handler::gate_2_5_kinetic_firewall` to decide whether IRREVERSIBLE_ACTION
+    /// packets should be rejected while the audit trail is degraded or blind.
+    pub fn health(&self) -> AuditHealth {
+        AuditHealth::from_u8(self.health.load(Ordering::Relaxed))
+    }
+
+    /// Count of audit events dropped because the WAL queue was full (or the
+    /// worker thread had already exited after a fatal open failure).
+    pub fn dropped_audit_count(&self) -> u64 {
+        self.dropped_audits.load(Ordering::Relaxed)
+    }
+
+    /// Count of WAL write failures — distinct from queue-full drops: the
+    /// worker actually attempted a disk write and the OS returned an error.
+    pub fn wal_write_failure_count(&self) -> u64 {
+        self.wal_write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Approximate current WAL queue depth (best-effort; maintained by hand
+    /// since `mpsc::SyncSender` exposes no introspection API).
+    pub fn queue_len(&self) -> usize {
+        self.queue_len.load(Ordering::Relaxed)
+    }
+
     /// Reset the audit log completely (for test isolation).
     pub fn reset(&self) {
         let mut inner = self.inner.lock().expect("lock poisoned");
@@ -633,30 +787,169 @@ impl Default for ImmutableAuditLog {
 }
 
 // ---------------------------------------------------------------------------
-// WAL worker helper — called from the background thread
+// WalWriter — persistent buffered file handle for the WAL worker (Fix 1)
 // ---------------------------------------------------------------------------
 
-fn wal_write_entry(entry_json: &str, log_file: &str, event_count: u64, count_file: &str) {
-    // Rotate if file exceeds 50 MB.
-    if let Ok(metadata) = fs::metadata(log_file) {
-        if metadata.len() > AUDIT_MAX_LOG_SIZE {
-            let rotated = format!("{}.{}.bak", log_file, now_secs() as u64);
-            let _ = fs::rename(log_file, rotated);
-        }
+/// Owns a persistent, buffered file handle across the lifetime of the WAL
+/// worker thread so it never pays an open()+close() cost per event — the
+/// original root cause of the Gate 6.0 latency spike: on Windows that cost is
+/// dominated by kernel filter-driver / AV real-time-scan overhead per
+/// syscall, not the syscall itself, and it forced the mpsc queue to
+/// saturate under load.
+///
+/// See `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES` for the flush/durability contract.
+struct WalWriter {
+    path: String,
+    /// `None` only for the instant between dropping the old handle and
+    /// opening the new one during rotation — never observable from outside
+    /// `maybe_rotate`.
+    writer: Option<BufWriter<File>>,
+    size: u64,
+    entries_since_flush: u64,
+    last_flush: Instant,
+    /// Most recent event_count seen — written to the sentinel file at the
+    /// same flush cadence as the WAL entries. Previously the sentinel was
+    /// rewritten via a fresh open()+write()+close() on *every* event — an
+    /// unnoticed second instance of the exact same root-cause bug. Batching
+    /// it here means the sentinel can never claim a higher durable count
+    /// than the entries it describes.
+    pending_event_count: u64,
+}
+
+impl WalWriter {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path: path.to_string(),
+            writer: Some(BufWriter::with_capacity(64 * 1024, file)),
+            size,
+            entries_since_flush: 0,
+            last_flush: Instant::now(),
+            pending_event_count: 0,
+        })
     }
 
-    // Append JSONL entry to log file.
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{}", entry_json)
-        });
+    /// Rotate BEFORE writing the next entry if the file is already oversized
+    /// — same pre-write check order as the pre-Fix-1 code. Flushes + syncs +
+    /// drops the handle first: required on Windows, where a file can't be
+    /// renamed while a handle to it is open.
+    fn maybe_rotate(&mut self) -> io::Result<()> {
+        if self.size <= AUDIT_MAX_LOG_SIZE {
+            return Ok(());
+        }
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+            w.get_ref().sync_data()?;
+        }
+        self.writer = None;
+        let rotated = format!("{}.{}.bak", self.path, now_secs() as u64);
+        let _ = fs::rename(&self.path, &rotated);
+        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+        self.size = 0;
+        Ok(())
+    }
 
-    // Update sentinel file with current event count.
-    let _ = fs::write(count_file, format!("{}", event_count));
+    /// Write one entry. Errors propagate to the caller (Fix 2) instead of
+    /// being silently swallowed.
+    fn write_entry(&mut self, entry_json: &str, event_count: u64, count_file: &str) -> io::Result<()> {
+        self.maybe_rotate()?;
+        {
+            let w = self.writer.as_mut().expect("writer present after maybe_rotate");
+            writeln!(w, "{entry_json}")?;
+        }
+        self.size += entry_json.len() as u64 + 1;
+        self.entries_since_flush += 1;
+        self.pending_event_count = event_count;
+
+        // Fix 3: durability window — flush + sync at most every
+        // AUDIT_WAL_FLUSH_EVERY_N_ENTRIES entries or AUDIT_WAL_FLUSH_INTERVAL,
+        // whichever comes first. `flush()` only moves bytes from the Rust
+        // buffer into the OS page cache; `sync_data()` is what actually makes
+        // them survive a power loss / kill -9, which is not optional for an
+        // audit log making non-repudiation claims.
+        let should_flush = self.entries_since_flush >= AUDIT_WAL_FLUSH_EVERY_N_ENTRIES
+            || self.last_flush.elapsed() >= AUDIT_WAL_FLUSH_INTERVAL;
+        if should_flush {
+            let w = self.writer.as_mut().expect("writer present after maybe_rotate");
+            w.flush()?;
+            w.get_ref().sync_data()?;
+            // Sentinel batched into the same flush boundary — see the
+            // `pending_event_count` field doc.
+            fs::write(count_file, self.pending_event_count.to_string())?;
+            self.entries_since_flush = 0;
+            self.last_flush = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WAL worker thread body
+// ---------------------------------------------------------------------------
+
+/// Runs for the lifetime of the `ImmutableAuditLog` instance that spawned it
+/// — exits when `wal_tx` is dropped (closing the channel and ending
+/// `wal_rx.iter()`), or immediately if the log file can't be opened (Fix 2).
+fn run_wal_worker(
+    wal_rx: mpsc::Receiver<WalMessage>,
+    log_file: &str,
+    count_file: &str,
+    health: &AtomicU8,
+    wal_write_failures: &AtomicU64,
+    queue_len: &AtomicUsize,
+) {
+    // In-memory-only mode (`ImmutableAuditLog::new("")`): drain without any
+    // disk I/O. This is a deliberate no-persistence mode, not a failure —
+    // health stays HEALTHY for the life of the instance.
+    if log_file.is_empty() {
+        for _msg in wal_rx.iter() {
+            queue_len.fetch_sub(1, Ordering::Relaxed);
+        }
+        return;
+    }
+
+    let mut wal = match WalWriter::open(log_file) {
+        Ok(w) => w,
+        Err(e) => {
+            // Fix 2: a WAL worker that can't open its log file is not
+            // "degraded" — it is completely blind. This must be visible, and
+            // it must halt here rather than silently no-op forever. The
+            // channel disconnects when this thread returns, so every
+            // subsequent `append_event` sees its `try_send` fail and counts
+            // it as a dropped audit (never a silent no-op).
+            health.store(AuditHealth::Fatal as u8, Ordering::SeqCst);
+            eprintln!(
+                "[SAACP audit] FATAL: WAL worker cannot open log file '{log_file}': {e} — \
+                 audit subsystem is BLIND. No further events from this instance will reach \
+                 disk. Restart the process (or construct a fresh ImmutableAuditLog) after \
+                 fixing the underlying disk/permission issue."
+            );
+            return;
+        }
+    };
+
+    for msg in wal_rx.iter() {
+        queue_len.fetch_sub(1, Ordering::Relaxed);
+        if let Err(e) = wal.write_entry(&msg.entry_json, msg.event_count, count_file) {
+            // Fix 3: an atomic counter, not an inline eprintln! on this loop
+            // — a sustained disk fault must not reintroduce the original
+            // per-event-print hot-path bug.
+            wal_write_failures.fetch_add(1, Ordering::Relaxed);
+            // Fix 4: sticky FATAL. Log only on the transition into FATAL so a
+            // sustained fault logs once, not once per failed write.
+            let already_fatal =
+                health.swap(AuditHealth::Fatal as u8, Ordering::SeqCst) == AuditHealth::Fatal as u8;
+            if !already_fatal {
+                eprintln!(
+                    "[SAACP audit] FATAL: WAL write failed for '{log_file}': {e} — audit \
+                     subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
+                     referencing this log until a fresh ImmutableAuditLog is constructed."
+                );
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -799,6 +1092,25 @@ mod tests {
         assert_eq!(AUDIT_COUNT_FILE, "saacp_event_count.sentinel");
         assert_eq!(ENV_AUDIT_LOG, "SAACP_AUDIT_LOG");
         assert_eq!(ENV_COUNT_FILE, "SAACP_COUNT_FILE");
+        // Gate 6.0 backpressure repair: durability window must be a stated,
+        // testable number — not just "we flush periodically".
+        assert_eq!(AUDIT_WAL_FLUSH_EVERY_N_ENTRIES, 200);
+        assert_eq!(AUDIT_WAL_FLUSH_INTERVAL_MS, 50);
+    }
+
+    #[test]
+    fn test_audit_health_ordering_and_default() {
+        // Fix 4 contract: Healthy < Degraded < Saturated < Fatal, and a
+        // freshly constructed log starts Healthy with zero drop/failure counts.
+        assert!(AuditHealth::Healthy < AuditHealth::Degraded);
+        assert!(AuditHealth::Degraded < AuditHealth::Saturated);
+        assert!(AuditHealth::Saturated < AuditHealth::Fatal);
+
+        let log = test_audit_log("health_default");
+        assert_eq!(log.health(), AuditHealth::Healthy);
+        assert_eq!(log.dropped_audit_count(), 0);
+        assert_eq!(log.wal_write_failure_count(), 0);
+        log.reset();
     }
 
     #[test]

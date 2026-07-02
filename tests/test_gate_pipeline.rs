@@ -108,21 +108,21 @@ fn gate_0_rejects_too_short() {
 #[test]
 fn gate_2_5_allows_equal_action_class() {
     // action_class == max_action_class → allowed
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 0).is_ok());
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1).is_ok());
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 2).is_ok());
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 0, None).is_ok());
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1, None).is_ok());
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 2, None).is_ok());
 }
 
 #[test]
 fn gate_2_5_allows_lower_action_class() {
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2).is_ok());
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 2).is_ok());
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2, None).is_ok());
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 2, None).is_ok());
 }
 
 #[test]
 fn gate_2_5_blocks_escalation() {
     // action_class > max_action_class → escalation error
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1, None);
     assert!(r.is_err(), "action_class 2 > max 1 must be blocked");
     let err = r.unwrap_err();
     assert!(
@@ -134,7 +134,7 @@ fn gate_2_5_blocks_escalation() {
 
 #[test]
 fn gate_2_5_blocks_irreversible_escalation() {
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(3, 0);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(3, 0, None);
     assert!(r.is_err());
 }
 
@@ -408,7 +408,7 @@ fn authorization_invariance_lightweight_still_enforces_kinetic_firewall() {
     // LIGHTWEIGHT tier is a performance annotation only.
     // Gate 2.5 must still fire regardless of tier.
     // action_class=2 (IRREVERSIBLE) > max_action_class=0: must fail even if tier=LIGHTWEIGHT
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0, None);
     assert!(r.is_err(), "Kinetic firewall must fire regardless of tier");
 }
 

@@ -341,13 +341,13 @@ fn redteam_lab_allows_suite_with_override() {
 
 #[test]
 fn redteam_escalation_from_read_to_irreversible() {
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0, None);
     assert!(r.is_err(), "Escalation READ→IRREVERSIBLE must be blocked");
 }
 
 #[test]
 fn redteam_escalation_from_reversible_to_irreversible() {
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1, None);
     assert!(r.is_err(), "Escalation REVERSIBLE→IRREVERSIBLE must be blocked");
 }
 

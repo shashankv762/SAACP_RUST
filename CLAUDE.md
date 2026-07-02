@@ -6,7 +6,7 @@
 
 - Crate: `saacp` (library only — no binary)
 - Rust edition: 2021
-- Test count: **1277** with default features (all must pass; zero failures tolerated). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`).
+- Test count: **1283** with default features (all must pass; zero failures tolerated). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`).
 - Spec reference: `c:\Users\2025\Downloads\write_readme.py` — the authoritative SAACP v0.1-beta2 specification
 
 ## Build & Test
@@ -47,11 +47,26 @@ A single narrow `StateBackend` trait (`get`/`set`/`delete`/`incr`/`scan_prefix`,
 - `gateway.rs::AgentRateLimiter` / `RRBCGateway` — near-per-packet hot paths; a correct implementation needs the in-process map to stay the authoritative fast-path read with only best-effort write-behind for cross-node visibility. RRBC replay-safety across nodes specifically needs a synchronous atomic claim (`SET NX EX`), not read-through caching.
 - `security.rs::ImmutableAuditLog` — hash-chain with a strict prev-hash ordering dependency; use a single-authoritative-audit-node deployment pattern (ops decision), not a code change. Do not build consensus from scratch for this.
 
+## Gate 6.0 Backpressure Contract (`security.rs`)
+
+Any gate that touches disk, does unbounded-size work, or depends on external system throughput must declare an explicit backpressure contract with the packet pipeline instead of an ad-hoc drop-and-print. For the audit log (Gate 6.0 / WAL writer), that contract is `security::AuditHealth`:
+
+| State | Trigger | Effect |
+|-------|---------|--------|
+| `Healthy` | WAL queue < 70% capacity | Normal async enqueue. |
+| `Degraded` | WAL queue 70–95% capacity | Still enqueuing/writing, but behind. |
+| `Saturated` | WAL queue > 95% capacity | New events dropped (`dropped_audit_count()`), never an inline `eprintln!` on the hot path. `handler::gate_2_5_kinetic_firewall` rejects new IRREVERSIBLE_ACTION (`action_class >= 2`) packets with `SAACPBytecodes::AuditSubsystemDegraded` once health reaches this state — fail-safe, not fail-open. READ_ONLY/REVERSIBLE packets are unaffected. |
+| `Fatal` | The WAL worker's log file failed to open, or an in-flight write returned an OS error (`wal_write_failure_count()`) | Sticky — only constructing a fresh `ImmutableAuditLog` clears it. Distinguishable from `Saturated`: this means the writer tried and failed, not merely that it's behind. Also gates IRREVERSIBLE_ACTION via Gate 2.5. |
+
+The WAL worker (`WalWriter` in `security.rs`) holds a persistent `BufWriter<File>` for its lifetime instead of reopening the file per event (the original root cause of a measured latency spike on Windows, where per-syscall kernel filter-driver/AV overhead dominates). It flushes + `sync_data()`s at most every `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES` (200) entries or `AUDIT_WAL_FLUSH_INTERVAL_MS` (50ms), whichever comes first — that pair is the **stated maximum audit-data-loss window on an unclean shutdown** (power loss, `kill -9`): at most 200 entries or 50ms of audit history. The sentinel/count file is batched into the same flush boundary (previously it was rewritten via its own open+write+close on every single event — an unnoticed second instance of the same root-cause bug).
+
+This does not reorder the gate pipeline: Gate 2.5 still runs at its existing position (step 7), well before Gate 6.0 itself (step 13) — it only reads Gate 6.0's live health signal.
+
 ## Architecture: Source Modules
 
 | Module | Purpose | Python parity |
 |--------|---------|--------------|
-| `errors.rs` | `SAACPBytecodes` enum (0x00–0x40) + `SAACPHardDrop` | `errors.py` |
+| `errors.rs` | `SAACPBytecodes` enum (0x00–0x41) + `SAACPHardDrop` | `errors.py` |
 | `framing.rs` | `SAACPFrame` (101B app-layer) + `MEASCFrame` (128B transport) | `framing.py` |
 | `measc.rs` | `MEASCFrame::build_frame/parse_frame` with AES-256-GCM + HKDF key evolution | `measc.py` |
 | `easi.rs` | EASI context-ref-ID encryption (HKDF-SHA256 XOR pad, GAP-9/M-2 fix) | *new in Rust* |
@@ -141,6 +156,8 @@ The 12-gate security pipeline in `handler.rs::_intercept_packet_inner()` **must 
 | COVER-AUDIT | HIGH | Cover traffic left no audit trace → Gate 6.0 entry written before drop | `handler.rs` |
 | GW-FALLBACK | HIGH | `gateway=None` fallback gave max_action_class=2 (IRREVERSIBLE) → 0 (READ_ONLY) | `handler.rs` |
 | STREAM-REVOKE | HIGH | Stream continuation revocation missing → falls back to `ZeroTrustGateway::global()` | `handler.rs` |
+| WAL-BLIND | HIGH | WAL open/write errors silently swallowed (`let _ = ...`), no signal when the audit subsystem stops writing → propagated errors set sticky `AuditHealth::Fatal` + one-time `eprintln!` | `security.rs` |
+| WAL-IRREV-UNAUDITED | HIGH | IRREVERSIBLE_ACTION packets could be authorized while Gate 6.0 was saturated/blind, with no durable audit trail → Gate 2.5 rejects with `SAACPBytecodes::AuditSubsystemDegraded` when `AuditHealth >= Saturated` | `handler.rs`, `security.rs` |
 
 ### Spec alignment fixes (write_readme.py audit):
 
@@ -198,6 +215,11 @@ EXECUTION_BUDGET_MAX_SECONDS = 30.0     // hard ceiling for ExecutionBudgetGuard
 AUDIT_WAL_QUEUE_CAPACITY = 100_000      // drop (not reject) if full
 AUDIT_MAX_LOG_SIZE       = 50_000_000   // rotate at 50 MB
 GENESIS_HASH = "47454e455349535f424c4f434b"  // hex of b"GENESIS_BLOCK"
+AUDIT_WAL_FLUSH_EVERY_N_ENTRIES = 200   // flush+sync_data at most every N entries...
+AUDIT_WAL_FLUSH_INTERVAL_MS     = 50    // ...or every 50ms, whichever first.
+                                         // Max audit data loss on an unclean
+                                         // shutdown: 200 entries or 50ms. See
+                                         // "Gate 6.0 Backpressure Contract" above.
 
 // Environment variables (Appendix A)
 SAACP_DEPLOYMENT_PROFILE  // DEVELOPMENT | STAGING | PRODUCTION (default)
@@ -268,6 +290,7 @@ rrbc_gateway.redeem_token_with_pop(token_b64, rnonce, agent, sid, cid, oaid, sec
 | `tests/test_exploit_vulnerabilities_rs.rs` | 39 | Exploit regression tests (all VULN-* IDs) |
 | `tests/test_advanced_redteam_rs.rs` | 59 | Advanced red-team scenarios |
 | `tests/test_production_redteam_rs.rs` | 43 | Production protocol survivor tests |
+| `tests/test_gate6_backpressure_rs.rs` | 4 | Gate 6.0 WAL backpressure: saturation stress, fatal-open-failure signaling, genuine hard-kill durability-window bound (subprocess re-exec) |
 
 ## Common Pitfalls
 
@@ -296,3 +319,7 @@ rrbc_gateway.redeem_token_with_pop(token_b64, rnonce, agent, sid, cid, oaid, sec
 12. **Cover traffic audit**: Cover traffic packets MUST write a Gate 6.0 audit entry before the silent drop. Removing this creates unlogged reconnaissance vectors.
 
 13. **`ImmutableAuditLog::new(log_file)` sentinel derivation**: The count/sentinel file is derived as `"<log_file>.sentinel"`, NOT the global `AUDIT_COUNT_FILE` default. This was a real bug (fixed in this session): every `new()` instance previously shared one process-wide default sentinel regardless of `log_file`, so unrelated `ImmutableAuditLog` instances (different test files, different production subsystems) clobbered each other's event-count sentinel and caused spurious `verify_chain()` failures. Only `with_default_path()`/`global()` use the env-var-configured shared default — that's intentional (it's the one true global log). Never make `new()` default back to the shared sentinel.
+
+14. **`AuditHealth` is per-instance, not a global static**: `health`/`dropped_audit_count()`/`wal_write_failure_count()` live on each `ImmutableAuditLog` (`Arc`-shared with its own WAL worker thread), deliberately mirroring pitfall #13's per-instance sentinel design — a single process-wide static would let one test's induced WAL failure poison another test's health assertions. `handler::gate_2_5_kinetic_firewall(action_class, max_action_class, audit_log)` reads whichever instance is passed (falling back to `ImmutableAuditLog::global()` on `None`, same pattern as the Gate 6.0 call site itself) — never assume it reads a global.
+
+15. **`AuditHealth::Fatal` is sticky**: Only set by the WAL worker itself (log file open failure, or an in-flight write error) and only cleared by constructing a fresh `ImmutableAuditLog`. The producer-side queue-pressure health update (`fetch_update` in `append_event`) is written to never downgrade a `Fatal` state back to `Healthy`/`Degraded`/`Saturated` — don't "simplify" that into a plain `store()`, it would silently un-blind a broken audit subsystem.

@@ -541,7 +541,7 @@ fn blackhat_9b_gates_accept_legitimate_data_after_attacks() {
     assert!(SAACPProtocolHandler::gate_5_0_epistemic_cb(3, &pd).is_ok(),
         "Valid confidence=0.92 must pass Gate 5.0");
 
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x00, 0x02).is_ok(),
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x00, 0x02, None).is_ok(),
         "READ_ONLY must pass Gate 2.5");
 }
 

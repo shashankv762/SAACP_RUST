@@ -365,7 +365,7 @@ fn attack_6a_all_legitimate_action_class_combinations() {
         (3, 3),
     ];
     for (req, max) in cases {
-        let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(req, max);
+        let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(req, max, None);
         assert!(r.is_ok(), "action_class {} <= max {} should pass", req, max);
     }
 }
@@ -377,7 +377,7 @@ fn attack_6b_all_escalation_action_class_combinations() {
         (1u8, 0u8), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2),
     ];
     for (req, max) in cases {
-        let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(req, max);
+        let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(req, max, None);
         assert!(r.is_err(), "action_class {} > max {} must be blocked", req, max);
         let msg = r.unwrap_err().to_string();
         assert!(
@@ -390,7 +390,7 @@ fn attack_6b_all_escalation_action_class_combinations() {
 #[test]
 fn attack_6c_irreversible_read_only_token_blocked() {
     // Attacker has READ_ONLY token (max=0) but sends IRREVERSIBLE packet (class=2)
-    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0);
+    let r = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0, None);
     assert!(r.is_err(), "IRREVERSIBLE with READ_ONLY token must be blocked");
 }
 
@@ -874,7 +874,7 @@ fn attack_bonus_2_financial_cb_missing_budget_field() {
 #[test]
 fn attack_bonus_3_escalation_with_confusable_injection_combo() {
     // First verify escalation blocks at gate 2.5
-    let escalation = SAACPProtocolHandler::gate_2_5_kinetic_firewall(3, 0);
+    let escalation = SAACPProtocolHandler::gate_2_5_kinetic_firewall(3, 0, None);
     assert!(escalation.is_err(), "Escalation must block first");
 
     // Confusable Unicode: "\u{0456}gn\u{03bf}r\u{0435}" normalizes to "ignore"

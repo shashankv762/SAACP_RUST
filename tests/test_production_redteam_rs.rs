@@ -747,7 +747,7 @@ fn redteam_scenario_15a_all_unit_gates_pass_for_legitimate_data() {
     assert!(parsed.is_ok(), "Gate 0: valid frame must parse");
 
     // Gate 2.5: READ_ONLY with READ_ONLY token
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2).is_ok(),
+    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2, None).is_ok(),
         "Gate 2.5: READ_ONLY <= max=2 must pass");
 
     // Gate 3.0: non-mutative flag

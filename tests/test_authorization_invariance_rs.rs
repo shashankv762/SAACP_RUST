@@ -157,7 +157,7 @@ fn test_clean_payload_passes_injection_scan_all_tiers() {
 fn test_lightweight_tier_still_enforces_kinetic_firewall() {
     // Even in LIGHTWEIGHT: action_class escalation is never permitted
     // Max in token = 0 (READ), request = 2 (IRREVERSIBLE) → blocked
-    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0);
+    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 0, None);
     assert!(result.is_err(),
         "Kinetic firewall must block escalation at ALL tiers (Authorization Invariance)");
 }
@@ -165,14 +165,14 @@ fn test_lightweight_tier_still_enforces_kinetic_firewall() {
 #[test]
 fn test_equal_action_class_passes_kinetic_firewall() {
     // token_max == request → always allowed (no escalation)
-    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1);
+    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1, None);
     assert!(result.is_ok(), "Equal action class must pass kinetic firewall");
 }
 
 #[test]
 fn test_lower_action_class_passes_kinetic_firewall() {
     // request < token_max → always allowed
-    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2);
+    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2, None);
     assert!(result.is_ok(), "Lower action class must pass kinetic firewall");
 }
 
