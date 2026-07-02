@@ -1087,7 +1087,7 @@ fn attack_5_6_ping_flood_deadmans_switch() -> AttackResult {
 fn attack_6_1_action_class_escalation() -> AttackResult {
     let t0 = Instant::now();
     // Token grants max_action_class=0 (READ_ONLY), agent requests action_class=2 (IRREVERSIBLE)
-    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x02, 0x00);
+    let result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x02, 0x00, None);
     let lat = t0.elapsed();
     if result.is_err() {
         AttackResult::blocked(
@@ -1337,6 +1337,7 @@ fn attack_7_4_context_poisoning_memory() -> AttackResult {
     let gate_25_result = SAACPProtocolHandler::gate_2_5_kinetic_firewall(
         0x01, // requested: WRITE
         0x00, // token allows: READ_ONLY
+        None,
     );
     let lat = t0.elapsed();
     if validate.is_ok() && gate_25_result.is_err() {
@@ -1446,7 +1447,7 @@ fn attack_compound_full_redteam() -> Vec<AttackResult> {
     });
 
     // (c) Action class escalation
-    let c_blocked = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x02, 0x01).is_err();
+    let c_blocked = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x02, 0x01, None).is_err();
     results.push(if c_blocked {
         AttackResult::blocked("Compound-C: WRITE→IRREVERSIBLE Escalation",
             "Compound Attack", "Gate 2.5 (Kinetic Firewall)",
@@ -1640,7 +1641,7 @@ fn benchmark_gate_latencies() -> Vec<(String, Duration, &'static str)> {
     // Gate 2.5 Kinetic Firewall
     let t0 = Instant::now();
     for _ in 0..n {
-        let _ = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x01, 0x01);
+        let _ = SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x01, 0x01, None);
     }
     results.push((format!("Gate 2.5 Kinetic Firewall ({}×)", n), t0.elapsed() / n as u32, "<1µs"));
 

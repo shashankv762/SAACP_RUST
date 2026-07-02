@@ -700,9 +700,17 @@ impl SAACPProtocolHandler {
     }
 
     /// Gate 2.5: Kinetic Firewall — action class escalation guard.
+    ///
+    /// Also enforces the Gate 6.0 backpressure contract (see `security::AuditHealth`):
+    /// a degraded or failing audit subsystem must not silently coexist with a
+    /// system still authorizing IRREVERSIBLE_ACTION packets — that combination
+    /// defeats the entire purpose of the audit log. This does not reorder the
+    /// gate pipeline (Gate 2.5 still runs at its existing position, well before
+    /// Gate 6.0 itself); it only has Gate 2.5 consult Gate 6.0's live health.
     pub fn gate_2_5_kinetic_firewall(
         action_class: u8,
         max_action_class: u8,
+        audit_log: Option<&ImmutableAuditLog>,
     ) -> Result<(), SAACPHardDrop> {
         if action_class > max_action_class {
             return Err(SAACPHardDrop::new(
@@ -713,6 +721,30 @@ impl SAACPProtocolHandler {
                 ),
             ));
         }
+
+        // IRREVERSIBLE_ACTION (>= 0x02) additionally requires a healthy audit
+        // trail. Reversible and read-only actions still flow through even
+        // when the audit subsystem is Saturated/Fatal — only the class of
+        // action that specifically needs a durable audit record gets gated
+        // on audit health.
+        if action_class >= 0x02 {
+            let log: &ImmutableAuditLog = match audit_log {
+                Some(l) => l,
+                None => ImmutableAuditLog::global(),
+            };
+            let health = log.health();
+            if health >= crate::security::AuditHealth::Saturated {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::AuditSubsystemDegraded,
+                    format!(
+                        "IRREVERSIBLE_ACTION rejected: Gate 6.0 audit subsystem health is \
+                         {:?}, which cannot guarantee a durable audit trail for this action.",
+                        health
+                    ),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1240,7 +1272,7 @@ impl SAACPProtocolHandler {
         // ── Gate 2.5: Kinetic Firewall ────────────────────────────────────────
         // Python parity: Gate 2.5 runs BEFORE Gate 1.5 (intent envelope).
         // Use the max_action_class from the VALIDATED token (Gate 1.0 output).
-        Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token)?;
+        Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token, audit_log)?;
 
         // ── Gate 1.5: Cognitive Firewall / Intent Envelope ────────────────────
         // Authorization Invariance: runs for ALL tiers when root_intent_hash is present.
@@ -1838,9 +1870,41 @@ mod tests {
 
     #[test]
     fn test_gate_2_5_kinetic_firewall() {
-        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 1).is_ok());
-        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1).is_ok());
-        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1).is_err());
+        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 1, None).is_ok());
+        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(1, 1, None).is_ok());
+        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 1, None).is_err());
+    }
+
+    #[test]
+    fn test_gate_2_5_rejects_irreversible_when_audit_degraded() {
+        // Point the audit log at a directory that cannot possibly exist —
+        // the WAL worker's real open() failure path sets AuditHealth::Fatal,
+        // no test-only backdoor needed.
+        let bad_dir = std::env::temp_dir().join(format!(
+            "saacp_no_such_dir_{}_{}", std::process::id(), line!()
+        ));
+        let log_file = bad_dir.join("audit.log");
+        let log = ImmutableAuditLog::with_paths(
+            log_file.to_str().unwrap(),
+            &format!("{}.sentinel", log_file.to_str().unwrap()),
+        );
+
+        // Poll (bounded) instead of a fixed sleep — avoids flaky timing.
+        let mut waited = std::time::Duration::ZERO;
+        while log.health() != crate::security::AuditHealth::Fatal
+            && waited < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += std::time::Duration::from_millis(5);
+        }
+        assert_eq!(log.health(), crate::security::AuditHealth::Fatal);
+
+        // IRREVERSIBLE_ACTION must now be rejected with AuditSubsystemDegraded.
+        let err = SAACPProtocolHandler::gate_2_5_kinetic_firewall(2, 2, Some(&log)).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::AuditSubsystemDegraded);
+
+        // READ_ONLY under the same degraded conditions still passes.
+        assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2, Some(&log)).is_ok());
     }
 
     #[test]

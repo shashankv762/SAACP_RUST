@@ -154,9 +154,10 @@ pub use memory::{
     FEDERATED_TTL_SECONDS, FEDERATED_MAX_ENTRIES, INTENT_MAX_LIFETIME,
 };
 pub use security::{
-    NonceTracker, ImmutableAuditLog, AuditRecord, AuditLogEntry,
+    NonceTracker, ImmutableAuditLog, AuditRecord, AuditLogEntry, AuditHealth,
     NONCE_MAX_AGE_SECONDS, NONCE_MAX_ENTRIES, AUDIT_LOG_FILE, AUDIT_MAX_LOG_SIZE,
     AUDIT_COUNT_FILE, AUDIT_WAL_QUEUE_CAPACITY,
+    AUDIT_WAL_FLUSH_EVERY_N_ENTRIES, AUDIT_WAL_FLUSH_INTERVAL_MS,
     ENV_AUDIT_LOG, ENV_COUNT_FILE,
 };
 pub use temporal::{

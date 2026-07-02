@@ -69,6 +69,11 @@ pub enum SAACPBytecodes {
     TranscriptHashMismatch = 0x3E,
     IdentityNotVerified = 0x3F,
     SessionSpliceDetected = 0x40,
+    /// Gate 2.5 rejection: an IRREVERSIBLE_ACTION-class packet was blocked
+    /// because Gate 6.0's audit subsystem is SATURATED or FATAL (see
+    /// `security::AuditHealth`) — the protocol will not authorize an
+    /// irreversible action it cannot durably record.
+    AuditSubsystemDegraded = 0x41,
 }
 
 impl fmt::Display for SAACPBytecodes {
