@@ -513,6 +513,16 @@ impl SessionEpoch {
     }
 }
 
+/// SECURITY FIX (FINDING-2b): `destroy()` was previously the only path that
+/// zeroized `traffic_key`; a panic unwinding through a scope holding a live
+/// `SessionEpoch` (e.g. before `rotate_epoch()`/`destroy_session()` call
+/// `destroy()`) skipped zeroization entirely. Drop guarantees it always runs.
+impl Drop for SessionEpoch {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
 // ─── SessionEpochManager ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]

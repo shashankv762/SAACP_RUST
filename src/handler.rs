@@ -419,9 +419,29 @@ impl PromptInjectionScanner {
     ///
     /// Single-pass after NFKC: avoids 5 intermediate String allocations
     /// to bring mixed-unicode scan latency within the <50µs target.
+    ///
+    /// Known heuristic limitation (documented, not a regression target): a
+    /// non-ASCII codepoint that is neither collapsed by NFKC nor present in
+    /// `replace_confusable`'s table is dropped rather than substituted. For a
+    /// codepoint outside that (currently ~300-entry) table, inserting it
+    /// adjacent to an injection keyword can still fragment the keyword enough
+    /// to dodge the Aho-Corasick match — the same is true of inserting *any*
+    /// single character (ASCII or not, table-covered or not) in the interior
+    /// of a keyword, since this scanner does literal substring matching, not
+    /// fuzzy/edit-distance matching. Closing this class fully needs either a
+    /// complete confusables.txt table (~6,000 entries) or a fuzzy-matching
+    /// redesign; this scanner is one layer of the gate pipeline's defense in
+    /// depth, not the sole boundary against prompt injection.
     pub fn normalize(text: &str) -> String {
         let truncated = if text.len() > Self::MAX_SCAN_LENGTH {
-            &text[..Self::MAX_SCAN_LENGTH]
+            // SECURITY FIX (FINDING-1): text.len() is a byte count, so slicing
+            // at MAX_SCAN_LENGTH can land mid-codepoint and panic. Walk back to
+            // the nearest char boundary (at most 3 bytes for UTF-8) first.
+            let mut boundary = Self::MAX_SCAN_LENGTH;
+            while boundary > 0 && !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            &text[..boundary]
         } else {
             text
         };

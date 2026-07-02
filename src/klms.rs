@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 // ---------------------------------------------------------------------------
@@ -115,27 +117,41 @@ impl KeyCategory {
 // ---------------------------------------------------------------------------
 
 /// Full descriptor for a single version of a managed cryptographic key.
-#[derive(Debug, Clone)]
+///
+/// SECURITY FIX (FINDING-2): derives Zeroize/ZeroizeOnDrop so `key_material`
+/// is wiped when the descriptor is dropped (rotation, revocation, scope exit),
+/// matching the pattern already used by `KeyEvolutionEngine`/`SessionMeta` in
+/// measc.rs. Non-sensitive fields are `#[zeroize(skip)]`.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct KeyDescriptor {
     /// Key identifier — a 32-character hexadecimal UUID4 string (no hyphens).
+    #[zeroize(skip)]
     pub kid: String,
     /// Monotonically increasing integer; version 1 is the first registered version.
+    #[zeroize(skip)]
     pub version: u64,
     /// The KeyAlgorithm this key material is intended for.
+    #[zeroize(skip)]
     pub algorithm: KeyAlgorithm,
     /// The KeyCategory denoting the key's role in SAACP.
+    #[zeroize(skip)]
     pub category: KeyCategory,
     /// Raw key bytes.
     pub key_material: Vec<u8>,
     /// Unix epoch timestamp (seconds) at which this descriptor was created.
+    #[zeroize(skip)]
     pub created_at: f64,
     /// Unix epoch timestamp (seconds) after which the key SHOULD be rotated.
+    #[zeroize(skip)]
     pub expires_at: f64,
     /// Unix epoch timestamp at which rotate_key was called, or None if not yet rotated.
+    #[zeroize(skip)]
     pub rotated_at: Option<f64>,
     /// Current KeyStatus of this key version.
+    #[zeroize(skip)]
     pub status: KeyStatus,
     /// Arbitrary key-value pairs for audit or application-level annotation.
+    #[zeroize(skip)]
     pub metadata: HashMap<String, String>,
 }
 

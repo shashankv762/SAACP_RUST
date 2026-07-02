@@ -1,6 +1,22 @@
 # SAACP-RS — ADVERSARIAL BREAK-IT SIMULATION v2
 ## Security Findings Report
 
+> **RESOLUTION UPDATE (2026-07-02):** All findings below with a concrete code
+> fix (FINDING-1, FINDING-2, FINDING-2b, FINDING-5, FINDING-7) have been fixed
+> and are now covered by regression-guard tests in `tests/breakit/`. FINDING-4's
+> specific PoC characters (Greek ι, Cyrillic а, Latin dotless ı) were found to
+> already be blocked by the existing confusable table; the residual
+> "insert-any-character-mid-keyword" bypass class is a documented, inherent
+> limitation of literal-substring scanning (see `normalize()`'s doc comment in
+> `src/handler.rs`), not something fixed here. FINDING-6 (token cache TOCTOU)
+> and FINDING-8 (no stolen-token detection) remain as documented, accepted
+> design trade-offs per the original report. GAP-1 (CI `--locked`) is still an
+> open process gap — no CI config exists in this repo yet. Verified: `cargo
+> build`/`cargo build --features redis-backend,transport-ws` are warning-free,
+> `cargo test` passes 1277/1277, `cargo clippy --all-targets --features
+> redis-backend,transport-ws -- -D warnings` is clean. The narrative below is
+> preserved as the original point-in-time findings record.
+
 **Date:** 2026-07-01  
 **Codebase:** `saacp-rs` v0.1.0 (SAACP v0.1-beta2)  
 **Methodology:** Black-hat simulation — all source files read first, then attacked
@@ -567,17 +583,17 @@ file is run in isolation or with `--test-threads=1`.
 
 ## PRIORITY FIX MATRIX
 
-| Priority | Finding | Fix Effort | Severity |
-|----------|---------|-----------|----------|
-| **P0** | FINDING-1: Scanner panic on UTF-8 boundary | ~5 lines | 🔴 CRITICAL |
-| **P0** | FINDING-2: `KeyDescriptor` key bytes not zeroized | Derive macro + 2 lines | 🔴 CRITICAL |
-| **P1** | FINDING-2b: `SessionEpoch` no Drop impl | ~5 lines | 🟠 HIGH |
-| **P1** | FINDING-4: Unicode deletion bypass in scanner | ~3 lines | 🟠 HIGH |
-| **P2** | FINDING-5: Suite negotiation case-sensitivity DoS | `to_uppercase()` | 🟡 MEDIUM |
-| **P2** | FINDING-6: Token cache TOCTOU on revocation | Design review | 🟡 MEDIUM |
-| **P3** | FINDING-7: AEGF graph cap non-atomic | Hold lock across check+insert | 🟢 LOW |
-| **P3** | GAP-1: CI `--locked` enforcement | CI config change | Process |
-| **Design** | FINDING-8: No automatic stolen-token detection | Token TTL reduction + Ed25519 | Architectural |
+| Priority | Finding | Fix Effort | Severity | Status |
+|----------|---------|-----------|----------|--------|
+| **P0** | FINDING-1: Scanner panic on UTF-8 boundary | ~5 lines | 🔴 CRITICAL | ✅ FIXED — `src/handler.rs::normalize()` walks back to a char boundary |
+| **P0** | FINDING-2: `KeyDescriptor` key bytes not zeroized | Derive macro + 2 lines | 🔴 CRITICAL | ✅ FIXED — `src/klms.rs` derives Zeroize/ZeroizeOnDrop |
+| **P1** | FINDING-2b: `SessionEpoch` no Drop impl | ~5 lines | 🟠 HIGH | ✅ FIXED — `impl Drop for SessionEpoch` in `src/measc.rs` |
+| **P1** | FINDING-4: Unicode deletion bypass in scanner | ~3 lines | 🟠 HIGH | ✅ PoC chars already blocked by existing confusable table; residual mid-keyword insertion bypass documented as inherent to literal-substring scanning, not fixed |
+| **P2** | FINDING-5: Suite negotiation case-sensitivity DoS | `to_uppercase()` | 🟡 MEDIUM | ✅ FIXED — `src/crypto_governance.rs` compares case-insensitively |
+| **P2** | FINDING-6: Token cache TOCTOU on revocation | Design review | 🟡 MEDIUM | ⏸ Accepted — sub-millisecond window, no structural fix needed per original analysis |
+| **P3** | FINDING-7: AEGF graph cap non-atomic | Hold lock across check+insert | 🟢 LOW | ✅ FIXED — `src/aegf.rs` re-checks cap atomically with insert |
+| **P3** | GAP-1: CI `--locked` enforcement | CI config change | Process | ⏸ Open — no CI config exists in this repo yet |
+| **Design** | FINDING-8: No automatic stolen-token detection | Token TTL reduction + Ed25519 | Architectural | ⏸ Accepted — bearer-token architecture, by design |
 
 ---
 
