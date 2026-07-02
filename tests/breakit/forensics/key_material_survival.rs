@@ -1,22 +1,24 @@
 // BREAKIT: Memory Forensics — Key Material Survival After Drop
 //
-// FINDING-2 (CRITICAL): KeyDescriptor.key_material (Vec<u8>) has no Zeroize impl.
-//   When a KeyDescriptor is dropped, the Vec's heap allocation is freed but NOT
-//   overwritten with zeros. The key bytes remain readable in process memory until
-//   the OS reclaims the page — recoverable from core dumps, swap files, or any
-//   memory-disclosure side-channel in the same binary.
+// FINDING-2 (CRITICAL, FIXED): KeyDescriptor.key_material (Vec<u8>) had no
+//   Zeroize impl. When a KeyDescriptor was dropped, the Vec's heap allocation
+//   was freed but NOT overwritten with zeros, so key bytes remained readable
+//   in process memory until the OS reclaimed the page — recoverable from core
+//   dumps, swap files, or any memory-disclosure side-channel in the same
+//   binary. FIX: KeyDescriptor now derives Zeroize/ZeroizeOnDrop (src/klms.rs)
+//   with non-sensitive fields marked #[zeroize(skip)], matching the pattern
+//   KeyEvolutionEngine and SessionMeta already used. These tests are now
+//   regression guards: they assert the marker key bytes do NOT survive drop.
 //
-// Compare: KeyEvolutionEngine and SessionMeta both derive ZeroizeOnDrop — this
-// struct is the gap.
-//
-// FINDING-2b: SessionEpoch.traffic_key relies on an EXPLICIT destroy() call for
-//   zeroization. The struct has NO Drop impl. If the epoch is dropped by the Rust
-//   unwinder during a panic (rather than via the explicit destroy() → rotate_epoch()
-//   call chain), the key bytes survive.
+// FINDING-2b (HIGH, FIXED): SessionEpoch.traffic_key relied on an EXPLICIT
+//   destroy() call for zeroization; the struct had NO Drop impl, so a panic
+//   unwinding through a scope holding a live SessionEpoch skipped
+//   zeroization entirely. FIX: `impl Drop for SessionEpoch` now calls
+//   `self.destroy()` unconditionally (src/measc.rs).
 //
 // These tests use raw-pointer reads after drop — intentional UB in a test harness
 // context, acceptable only here. Run with:
-//   cargo test --test breakit_forensics -- --nocapture
+//   cargo test --test breakit -- --nocapture
 //
 // Platform notes: The "survived" check may be flaky under some allocators or
 // in release builds with aggressive stack/register reuse. Run 50 iterations
@@ -128,29 +130,14 @@ fn finding_2_key_descriptor_key_bytes_survive_drop_no_pressure() {
         survived_count, trials, survival_rate
     );
 
-    if survived_count > 0 {
-        eprintln!(
-            "[FINDING-2 CONFIRMED] Key bytes survived drop in {}/{} trials.\n\
-             The Vec<u8> in KeyDescriptor.key_material is NOT zeroized on drop.\n\
-             These bytes are recoverable from:\n\
-             - Process core dumps\n\
-             - Swap files (if the memory page is paged out)\n\
-             - Any memory-disclosure vulnerability in the same binary\n\
-             - ptrace-based debugger or /proc/self/mem reads\n\
-             Fix: derive #[derive(Zeroize, ZeroizeOnDrop)] on KeyDescriptor\n\
-             (same as KeyEvolutionEngine and SessionMeta already do)",
-            survived_count, trials
-        );
-        // Uncomment to make this a hard failure:
-        // panic!("FINDING-2: key material survived drop in {}/{} trials", survived_count, trials);
-    } else {
-        eprintln!(
-            "[FINDING-2 NOT CONFIRMED with zero-pressure] Key bytes were overwritten in all {} trials.\n\
-             This may be because the allocator immediately reused the freed block.\n\
-             Try the high-pressure variant or run under Valgrind.",
-            trials
-        );
-    }
+    assert_eq!(
+        survived_count, 0,
+        "FINDING-2 REGRESSED: key bytes survived drop in {}/{} trials. \
+         KeyDescriptor.key_material is no longer being zeroized on drop — check the \
+         #[derive(Zeroize, ZeroizeOnDrop)] on KeyDescriptor in src/klms.rs.",
+        survived_count, trials
+    );
+    eprintln!("[FINDING-2 FIXED] Key bytes were zeroized in all {} trials.", trials);
 }
 
 /// Run 50 trials with HIGH heap pressure (1000 × 4096-byte allocs).
@@ -175,97 +162,71 @@ fn finding_2_key_descriptor_key_bytes_survive_drop_high_pressure() {
         survived_count, trials, survival_rate
     );
 
-    if survived_count > 0 {
-        eprintln!(
-            "[FINDING-2 HIGH-PRESSURE CONFIRMED] Key survived under high allocation pressure.\n\
-             This means the allocator did NOT reuse the freed block immediately — \
-             the key bytes sat in heap unzeroized for the duration of the pressure phase."
-        );
-    }
+    assert_eq!(
+        survived_count, 0,
+        "FINDING-2 REGRESSED (high pressure): key bytes survived drop in {}/{} trials.",
+        survived_count, trials
+    );
+    eprintln!("[FINDING-2 FIXED] Key bytes were zeroized in all {} trials under heap pressure.", trials);
 }
 
 // ─── FINDING-2b: SessionEpoch panic-unwind key survival ──────────────────────
 
-/// SessionEpoch.traffic_key is zeroized by an EXPLICIT destroy() call.
-/// The struct has NO Drop trait implementation.
+/// SessionEpoch now implements Drop (`impl Drop for SessionEpoch` calls
+/// `self.destroy()`), so a panic unwinding through a scope holding a live
+/// SessionEpoch — WITHOUT an explicit destroy() call — still zeroizes
+/// traffic_key via the automatic drop glue.
 ///
-/// When a panic unwinds through a scope that holds a SessionEpoch
-/// WITHOUT having called destroy(), the Rust drop glue runs the default
-/// Drop (deallocate stack frame) WITHOUT calling destroy().
+/// Real scenario this guards against: a callback registered in
+/// PSKCompromiseRecovery panics during execution; the epoch objects in other
+/// sessions are dropped by the unwinder without destroy() being called
+/// explicitly — the Drop impl must catch that path.
 ///
-/// This test proves: if we drop a SessionEpoch via panic unwind instead of
-/// via the explicit destroy() path, the traffic_key field is NOT zeroized.
-///
-/// Real scenario: a callback registered in PSKCompromiseRecovery panics
-/// during execution; the epoch objects in other sessions are dropped by
-/// the unwinder without destroy() being called.
+/// traffic_key is a private field, so this test uses the same raw-pointer
+/// memory-forensics technique as FINDING-2 above: heap-allocate the epoch
+/// via Box (stable address across drop), capture that address, force a
+/// panic-unwind drop, then scan the struct's memory footprint for the
+/// marker key bytes. Any hit means zeroization did not occur.
 #[test]
-fn finding_2b_session_epoch_panic_unwind_no_destroy() {
+fn finding_2b_session_epoch_drop_zeroizes_on_panic_unwind() {
     use saacp::SessionEpoch;
 
     let marker_key: [u8; 32] = MARKER_KEY;
     let session_id = [0u8; 16];
 
-    // Build epoch with the marker key
-    let mut epoch = SessionEpoch::new(
-        session_id,
-        0,   // epoch_id
-        marker_key,
-        1_000_000,  // packet_threshold
-        600.0,      // time_threshold_secs
-    );
-
-    // Confirm: normally destroy() zeroes it
+    // Sanity: explicit destroy() still works and is idempotent with Drop.
+    let mut epoch = SessionEpoch::new(session_id, 0, marker_key, 1_000_000, 600.0);
     epoch.destroy();
-    assert!(
-        epoch.is_destroyed(),
-        "sanity: destroy() must set is_destroyed() = true"
-    );
+    assert!(epoch.is_destroyed(), "sanity: destroy() must set is_destroyed() = true");
+    drop(epoch); // Drop::drop() must no-op safely on an already-destroyed epoch
 
-    // Now test the PANIC PATH: build a new epoch, don't call destroy(),
-    // and let the panic unwinder drop it.
-    let epoch2 = SessionEpoch::new(
-        session_id,
-        1,
-        marker_key,
-        1_000_000,
-        600.0,
-    );
-
-    // We can't read the private traffic_key field directly.
-    // What we CAN verify: epoch2 is dropped without destroy() being called
-    // (the drop glue does nothing special since there's no Drop impl).
-    // The key bytes survive on the stack/heap until overwritten.
-    //
-    // Since we cannot inspect the private field from outside the crate,
-    // we document this as a structural finding rather than a byte-level proof.
-    // The proof is in the absence of `impl Drop for SessionEpoch` in measc.rs
-    // and the call chain: destroy() → explicit call only, NOT triggered by drop().
+    // PANIC PATH: build a new epoch, don't call destroy(), let the panic
+    // unwinder drop it — this must still zeroize via the Drop impl.
+    let epoch2 = Box::new(SessionEpoch::new(session_id, 1, marker_key, 1_000_000, 600.0));
+    let raw_ptr = epoch2.as_ref() as *const SessionEpoch as *const u8;
+    let footprint = std::mem::size_of::<SessionEpoch>();
 
     let _unwind_result = std::panic::catch_unwind(move || {
-        // epoch2 is moved here; when the panic fires, it is dropped by the unwinder
-        // WITHOUT calling epoch2.destroy().
-        let _hold = epoch2; // hold a reference to prevent immediate drop before panic
+        let _hold = epoch2; // moved in; dropped by the unwinder below
         panic!("simulated mid-epoch panic (e.g., gateway_callback panicking)");
     });
 
-    // epoch2 was dropped here by unwinder. Since SessionEpoch has no Drop impl,
-    // no zeroization occurred. The traffic_key bytes (MARKER_KEY) remain wherever
-    // Rust placed them (stack or heap depending on optimizer).
+    // SAFETY: intentional forensic read of freed memory, matching FINDING-2's
+    // methodology. epoch2 was heap-allocated via Box so its footprint
+    // (including the inline traffic_key array) sits at a stable address
+    // across the drop, at least until the allocator reuses the block.
+    let post_drop = unsafe { std::slice::from_raw_parts(raw_ptr, footprint) };
+    let marker_found = post_drop.windows(marker_key.len()).any(|w| w == marker_key);
 
+    assert!(
+        !marker_found,
+        "FINDING-2b REGRESSED: traffic_key marker bytes found in SessionEpoch's memory \
+         footprint after a panic-unwind drop. `impl Drop for SessionEpoch` must call \
+         self.destroy() unconditionally — check src/measc.rs."
+    );
     eprintln!(
-        "[FINDING-2b] SessionEpoch dropped via panic unwinder without destroy(). \
-         SessionEpoch has no Drop impl, so no zeroization occurred on the unwind path. \
-         The traffic_key ([0xDE, 0xAD, ...] × 32) was NOT explicitly zeroed. \
-         \n\
-         Structural proof: \
-         \n  - src/measc.rs: `pub struct SessionEpoch` has no `impl Drop`\
-         \n  - destroy() is manually called in rotate_epoch(), expire_old_epochs(), destroy_session()\
-         \n  - PSKCompromiseRecovery::execute() wraps gateway_callback in catch_unwind()\
-         \n    but does NOT wrap destroy_session() itself\
-         \n  - If rotate_epoch() or expire_old_epochs() is called from a context\
-         \n    that panics BEFORE calling destroy(), the epoch is dropped without zeroization\
-         \nFix: implement `impl Drop for SessionEpoch {{ fn drop(&mut self) {{ self.destroy(); }} }}`"
+        "[FINDING-2b FIXED] SessionEpoch dropped via panic unwinder WITHOUT an explicit \
+         destroy() call, and traffic_key was zeroized anyway via the Drop impl."
     );
 }
 
@@ -309,18 +270,14 @@ fn forensics_summary_report() {
     eprintln!("═══════════════════════════════════════════════════════════════════");
     eprintln!("  BREAKIT PHASE 0 — MEMORY FORENSICS SUMMARY");
     eprintln!("═══════════════════════════════════════════════════════════════════");
-    eprintln!("  FINDING-2 [CRITICAL]: KeyDescriptor.key_material (Vec<u8>)");
-    eprintln!("    - No impl Drop, no #[derive(Zeroize, ZeroizeOnDrop)]");
-    eprintln!("    - Key bytes survive heap deallocation until OS reclaims page");
-    eprintln!("    - Location: src/klms.rs:128");
-    eprintln!("    - Contrast: KeyEvolutionEngine (measc.rs) correctly derives ZeroizeOnDrop");
-    eprintln!("    - Fix: add #[derive(Zeroize, ZeroizeOnDrop)] to KeyDescriptor");
-    eprintln!("           and mark key_material field with #[zeroize(drop)]");
+    eprintln!("  FINDING-2 [CRITICAL, FIXED]: KeyDescriptor.key_material (Vec<u8>)");
+    eprintln!("    - Now derives #[derive(Zeroize, ZeroizeOnDrop)] (src/klms.rs)");
+    eprintln!("    - Non-sensitive fields marked #[zeroize(skip)]");
+    eprintln!("    - Regression guard: finding_2_key_descriptor_key_bytes_survive_drop_*");
     eprintln!();
-    eprintln!("  FINDING-2b [HIGH]: SessionEpoch has no Drop impl");
-    eprintln!("    - destroy() is the ONLY zeroization path");
-    eprintln!("    - Panic unwind through scope holding epoch skips zeroization");
-    eprintln!("    - Location: src/measc.rs (SessionEpoch struct, no impl Drop)");
-    eprintln!("    - Fix: impl Drop for SessionEpoch {{ fn drop(&mut self) {{ self.destroy(); }} }}");
+    eprintln!("  FINDING-2b [HIGH, FIXED]: SessionEpoch now implements Drop");
+    eprintln!("    - impl Drop for SessionEpoch calls self.destroy() unconditionally");
+    eprintln!("    - Panic-unwind drop path now zeroizes traffic_key too (src/measc.rs)");
+    eprintln!("    - Regression guard: finding_2b_session_epoch_drop_zeroizes_on_panic_unwind");
     eprintln!("═══════════════════════════════════════════════════════════════════");
 }

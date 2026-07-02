@@ -1,9 +1,24 @@
 // BREAKIT: Protocol Downgrade and Suite Negotiation Attacks
 //
-// FINDING-5 (MEDIUM): Suite negotiation is case-sensitive.
-//   Peers advertising lowercase suite names ("aes-256-gcm-hkdf-sha256" instead of
-//   "AES-256-GCM-HKDF-SHA256") are rejected — a DoS that a MITM can trigger by
-//   modifying the suite list advertisement in transit.
+// FINDING-5 (MEDIUM, FIXED): Suite negotiation was case-sensitive.
+//   Peers advertising differently-cased suite names (e.g. "ED25519" instead of
+//   "ed25519", or "Aes-256-Gcm-Hkdf-Sha256" instead of "AES-256-GCM-HKDF-SHA256")
+//   were rejected — a DoS a MITM could trigger by mutating the suite list
+//   advertisement in transit (suite negotiation happens before the MEASC
+//   encryption layer is established, so it's unauthenticated on the wire).
+//   FIX: both the mandatory-baseline check and the candidate-selection loop
+//   in `SuiteNegotiator::negotiate` (src/crypto_governance.rs) now compare
+//   suite names case-insensitively; the canonical (locally-configured) casing
+//   is still what gets selected and recorded in the transcript.
+//
+//   The original PoC here only varied the AEAD suite's case while leaving the
+//   default policy's actual `mandatory_baseline` ("ed25519") untouched — since
+//   "ed25519" is always the first local candidate and was already an exact
+//   match, that PoC never actually exercised the vulnerable comparisons. These
+//   tests now vary the field each comparison actually depends on:
+//   `finding_5_lowercase_suite_causes_rejection` case-mangles the mandatory
+//   baseline itself, and `finding_5_mixed_case_suite_rejected` reorders local
+//   suites so the AEAD suite is evaluated by the candidate-selection loop.
 //
 // Additional attack surfaces tested:
 //   - Empty remote suite list
@@ -36,17 +51,16 @@ fn session_id() -> Vec<u8> {
 
 // ─── FINDING-5: Case sensitivity DoS ─────────────────────────────────────────
 
-/// Lowercase AEAD cipher suite name — exact match fails, negotiation rejects.
-/// A MITM that lowercases the cipher suite advertisement causes two compatible peers to fail.
-/// Note: both sides must still advertise the mandatory sig baseline "ed25519".
+/// Regression guard: a MITM (or differently-cased peer) that case-mangles the
+/// mandatory baseline suite name ("ed25519" → "ED25519") in transit must NOT
+/// cause negotiation to fail between two otherwise fully-compatible peers.
 #[test]
 fn finding_5_lowercase_suite_causes_rejection() {
     let ledger = make_ledger();
-    // Local: correct sig baseline + correct AEAD suite
     let local = vec![SIG_BASELINE, BASELINE];
-    // Remote: correct sig baseline + LOWERCASED AEAD suite (MITM modified the AEAD name)
-    let lowercase_baseline = BASELINE.to_lowercase();
-    let remote = vec![SIG_BASELINE, lowercase_baseline.as_str()];
+    // Remote advertises the mandatory baseline in different case (MITM-mangled).
+    let uppercased_sig = SIG_BASELINE.to_uppercase();
+    let remote = vec![uppercased_sig.as_str(), BASELINE];
 
     let result = SuiteNegotiator::negotiate(
         &local,
@@ -57,40 +71,35 @@ fn finding_5_lowercase_suite_causes_rejection() {
         &ledger,
     );
 
-    // The mandatory sig baseline (ed25519) IS present in both, so that check passes.
-    // The AEAD suite selection will fail because lowercase "aes-256-gcm-hkdf-sha256"
-    // is not in the approved list (case-sensitive match).
-    // Result: either succeeds with sig baseline only, or fails on no-approved-common-suite.
-    // In either case, the lowercase AEAD suite must NOT be selected.
-    match &result {
-        Ok(transcript) => {
-            assert_ne!(
-                transcript.selected_suite, lowercase_baseline,
-                "Lowercase AEAD suite must never be selected"
-            );
-            eprintln!(
-                "[FINDING-5] Lowercase AEAD suite '{}' not selected (selected: '{}').",
-                lowercase_baseline, transcript.selected_suite
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[FINDING-5 CONFIRMED] Negotiation failed when remote advertised lowercase \
-                 AEAD suite '{}': {}. A MITM lowercasing the AEAD suite name in transit \
-                 causes two otherwise-compatible peers to fail session establishment.",
-                lowercase_baseline, e
-            );
-        }
-    }
+    let transcript = result.unwrap_or_else(|e| {
+        panic!(
+            "FINDING-5 REGRESSED: negotiation failed when remote advertised the mandatory \
+             baseline as '{}' instead of '{}'. A MITM case-mangling the baseline suite name \
+             in transit must not fail two otherwise-compatible peers. Error: {}",
+            uppercased_sig, SIG_BASELINE, e
+        )
+    });
+    assert_eq!(
+        transcript.selected_suite, SIG_BASELINE,
+        "canonical (locally-configured) casing must be what gets selected/recorded"
+    );
+    eprintln!(
+        "[FINDING-5 FIXED] Remote's case-mangled baseline '{}' still negotiated successfully \
+         (selected: '{}').",
+        uppercased_sig, transcript.selected_suite
+    );
 }
 
-/// Mixed case AEAD suite ("Aes-256-Gcm-Hkdf-Sha256") — not selected.
+/// Regression guard: mixed-case AEAD suite name in the candidate-selection
+/// loop (not just the mandatory-baseline check) must still be matched
+/// case-insensitively. Local suites are ordered [AEAD, sig] so the AEAD
+/// suite is the first candidate evaluated by `negotiate`'s selection loop.
 #[test]
 fn finding_5_mixed_case_suite_rejected() {
     let ledger = make_ledger();
     let mixed = "Aes-256-Gcm-Hkdf-Sha256";
-    let local = vec![SIG_BASELINE, BASELINE];
-    let remote = vec![SIG_BASELINE, mixed];
+    let local = vec![BASELINE, SIG_BASELINE];
+    let remote = vec![mixed, SIG_BASELINE];
 
     let result = SuiteNegotiator::negotiate(
         &local,
@@ -101,15 +110,22 @@ fn finding_5_mixed_case_suite_rejected() {
         &ledger,
     );
 
-    match &result {
-        Ok(transcript) => {
-            assert_ne!(transcript.selected_suite, mixed, "Mixed-case AEAD suite must not be selected");
-            eprintln!("[FINDING-5] Mixed-case '{}' not selected (selected: '{}').", mixed, transcript.selected_suite);
-        }
-        Err(e) => {
-            eprintln!("[FINDING-5] Mixed-case '{}' caused negotiation failure: {}", mixed, e);
-        }
-    }
+    let transcript = result.unwrap_or_else(|e| {
+        panic!(
+            "FINDING-5 REGRESSED: negotiation failed when remote advertised the AEAD suite \
+             as '{}' instead of '{}'. Error: {}",
+            mixed, BASELINE, e
+        )
+    });
+    assert_eq!(
+        transcript.selected_suite, BASELINE,
+        "canonical (locally-configured) casing must be what gets selected/recorded"
+    );
+    eprintln!(
+        "[FINDING-5 FIXED] Remote's mixed-case AEAD suite '{}' still negotiated successfully \
+         (selected: '{}').",
+        mixed, transcript.selected_suite
+    );
 }
 
 // ─── Empty suite list ─────────────────────────────────────────────────────────
@@ -449,11 +465,10 @@ fn downgrade_summary_report() {
     eprintln!("═══════════════════════════════════════════════════════════════════");
     eprintln!("  BREAKIT PHASE 3 — DOWNGRADE/CONFUSION ATTACK SUMMARY");
     eprintln!("═══════════════════════════════════════════════════════════════════");
-    eprintln!("  FINDING-5 [MEDIUM]: Suite negotiation is case-sensitive.");
-    eprintln!("    Lowercase or mixed-case suite names are rejected.");
-    eprintln!("    A MITM can lowercase the suite advertisement, causing two");
-    eprintln!("    fully-compatible peers to fail session establishment.");
-    eprintln!("    Location: src/crypto_governance.rs:415, 440-442");
+    eprintln!("  FINDING-5 [MEDIUM, FIXED]: Suite negotiation case-sensitivity DoS.");
+    eprintln!("    Baseline check and candidate-selection loop now compare suite");
+    eprintln!("    names case-insensitively; canonical local casing is still selected.");
+    eprintln!("    Location: src/crypto_governance.rs (SuiteNegotiator::negotiate)");
     eprintln!();
     eprintln!("  CORRECT BEHAVIORS (no DoS risk):");
     eprintln!("    - Empty suite list → hard failure, no fallback");

@@ -666,7 +666,8 @@ impl DistributedExecutionGraph {
         meta: &AEGFMetadata,
         policy: &AEGFPolicy,
     ) -> GovernanceDecision {
-        // 0. Graph node cap
+        // 0. Graph node cap — cheap early-exit pre-check (not authoritative;
+        // see the re-check below held under the same lock as the insert).
         {
             let nodes = self.nodes.lock().unwrap();
             if nodes.len() >= policy.max_graph_nodes as usize {
@@ -696,6 +697,16 @@ impl DistributedExecutionGraph {
 
         // 5. Cycle detection — add node, check, remove if cycle
         let mut nodes = self.nodes.lock().unwrap();
+
+        // SECURITY FIX (FINDING-7): the step-0 cap check above releases the
+        // `nodes` lock before this point, so concurrent callers can all pass
+        // it and then all insert, exceeding `max_graph_nodes` by up to
+        // (thread count - 1). Re-check the cap here, atomically with the
+        // insert, under the single lock acquisition that performs it.
+        if nodes.len() >= policy.max_graph_nodes as usize {
+            return GovernanceDecision::Pause;
+        }
+
         let mut path_counts = self.path_counts.lock().unwrap();
 
         let rid = meta.rid.clone();

@@ -25,11 +25,17 @@
 //   This is a classic TOCTOU: validate starts → revoke completes → validate
 //   passes revocation check (it cached the pre-revocation state in token_cache).
 //
-// Race C: AEGF graph cap enforcement
-//   validate_and_add() checks graph size WITHOUT holding both locks simultaneously:
-//   size check (line 671) → do work → re-acquire (line 698) → insert
-//   Multiple threads can pass the size check simultaneously and all insert,
-//   exceeding max_graph_nodes.
+// Race C: AEGF graph cap enforcement (FIXED)
+//   validate_and_add() used to check graph size WITHOUT holding the insert
+//   lock continuously: size check → release lock → do work → re-acquire →
+//   insert. Multiple threads could pass the size check simultaneously and
+//   all insert, exceeding max_graph_nodes. FIX: the cap is now re-checked
+//   atomically under the same `nodes` lock acquisition that performs the
+//   insert (src/aegf.rs), so the race window is closed. The race_c test
+//   below is a regression guard on the actual post-race node_count(), not
+//   on GovernanceDecision values (Pause and Allow both count as "not
+//   Terminate", so that alone can't distinguish correct cap enforcement
+//   from an overrun).
 //
 // Race D: PSN replay window under concurrent load
 //   ReplayWindow uses Mutex internally; check-mark-accept should be atomic.
@@ -155,17 +161,22 @@ fn race_b_token_revocation_cache_toctou() {
 
 // ─── Race C: AEGF graph cap enforcement ───────────────────────────────────────
 
-/// Race C: N threads all attempt to add nodes to the AEGF graph when it's at
-/// max_graph_nodes - 1. The size check and insert are split across two lock
-/// acquisitions, so multiple threads can pass the check simultaneously.
+/// Race C regression guard: N threads all attempt to add nodes to the AEGF
+/// graph when it's at max_graph_nodes - 1. Before the fix, the size check and
+/// insert were split across two lock acquisitions, so multiple threads could
+/// pass the check simultaneously and all insert, exceeding max_graph_nodes.
 ///
-/// Expected finding: graph may briefly exceed max_graph_nodes by up to N-1 nodes.
+/// This asserts the actual post-race `node_count()` — not `GovernanceDecision`
+/// values, since both `Pause` (correctly rejected, at cap) and `Allow`
+/// (inserted) satisfy `!= Terminate`, so counting non-Terminate outcomes
+/// can't distinguish correct cap enforcement from an overrun.
 #[test]
 fn race_c_aegf_graph_cap_overflow() {
     use saacp::GovernanceDecision;
 
+    const MAX_GRAPH_NODES: u32 = 10;
     let policy = AEGFPolicy {
-        max_graph_nodes: 10,
+        max_graph_nodes: MAX_GRAPH_NODES,
         ..Default::default()
     };
     let governor = Arc::new(AEGFGovernor::new(Some(policy)));
@@ -191,6 +202,7 @@ fn race_c_aegf_graph_cap_overflow() {
         };
         let _ = governor_clone.submit_request(&meta);
     }
+    assert_eq!(governor.deg().node_count(), 9, "sanity: graph must be filled to cap-1");
 
     // Now race 16 threads to add one more node each
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -215,31 +227,34 @@ fn race_c_aegf_graph_cap_overflow() {
                 ed: 0,
                 ttl: ts + 3600.0,
             };
-            let decision = gv.submit_request(&meta);
-            decision != GovernanceDecision::Terminate
+            gv.submit_request(&meta)
         }));
     }
 
-    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let accepted = results.iter().filter(|&&r| r).count();
+    let decisions: Vec<GovernanceDecision> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let allowed = decisions.iter().filter(|&&d| d == GovernanceDecision::Allow).count();
+    let final_count = governor.deg().node_count();
 
     eprintln!(
-        "[RACE-C] AEGF graph cap race: {} threads competed, {} accepted (max_graph_nodes=10).\n\
-         If accepted > 1, the graph exceeded its configured cap.",
-        THREADS, accepted
+        "[RACE-C] AEGF graph cap race: {} threads competed, {} got Allow, final node_count={} \
+         (max_graph_nodes={}).",
+        THREADS, allowed, final_count, MAX_GRAPH_NODES
     );
 
-    if accepted > 1 {
-        eprintln!(
-            "[RACE-C FINDING] {} requests were accepted simultaneously when graph was at cap-1. \
-             The non-atomic size-check + insert pattern in validate_and_add() allows \
-             the graph to exceed max_graph_nodes by up to {} nodes under concurrent load. \
-             Fix: hold a single lock from size-check through insert.",
-            accepted, accepted - 1
-        );
-    } else {
-        eprintln!("[RACE-C] Only {} request accepted — cap enforcement appears robust under this load.", accepted);
-    }
+    assert!(
+        final_count <= MAX_GRAPH_NODES as usize,
+        "RACE-C REGRESSED: graph exceeded max_graph_nodes ({}) — final node_count={}. \
+         The cap check in validate_and_add() must be re-checked atomically under the same \
+         lock that performs the insert (src/aegf.rs).",
+        MAX_GRAPH_NODES, final_count
+    );
+    assert_eq!(
+        allowed, 1,
+        "RACE-C REGRESSED: expected exactly 1 of {} racing threads to win the single \
+         remaining cap slot, got {}.",
+        THREADS, allowed
+    );
+    eprintln!("[RACE-C FIXED] Cap enforcement held under concurrent load: exactly 1/{} accepted.", THREADS);
 }
 
 // ─── Race D: StreamRegistry concurrent register + close ───────────────────────

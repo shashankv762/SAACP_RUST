@@ -407,13 +407,22 @@ impl SuiteNegotiator {
             entry_hash: String::new(),
         });
 
-        let remote_set: HashSet<&str> = remote_suites.iter().copied().collect();
-        let local_set: HashSet<&str> = local_suites.iter().copied().collect();
+        // SECURITY FIX (FINDING-5): suite names were compared with exact byte
+        // equality, so a MITM (or a differently-cased peer implementation) that
+        // lowercases in-transit suite advertisement bytes causes two otherwise
+        // fully-compatible peers to fail negotiation (protocol-level DoS). Suite
+        // presence/matching is now case-insensitive; the canonical (as-configured)
+        // casing from `local_suites` is still what gets selected and recorded.
+        let remote_set_upper: HashSet<String> =
+            remote_suites.iter().map(|s| s.to_uppercase()).collect();
+        let local_set_upper: HashSet<String> =
+            local_suites.iter().map(|s| s.to_uppercase()).collect();
 
         // Mandatory baseline enforcement
         let baseline = &policy.mandatory_baseline;
-        let local_has = local_set.contains(baseline.as_str());
-        let remote_has = remote_set.contains(baseline.as_str());
+        let baseline_upper = baseline.to_uppercase();
+        let local_has = local_set_upper.contains(&baseline_upper);
+        let remote_has = remote_set_upper.contains(&baseline_upper);
         if !local_has || !remote_has {
             let missing = if !local_has { "local" } else { "remote" };
             ledger.append(CryptoLedgerEntry {
@@ -438,7 +447,7 @@ impl SuiteNegotiator {
         // Select first approved common suite (preference order = local order)
         let mut selected: Option<&str> = None;
         for candidate in local_suites {
-            if !remote_set.contains(candidate) {
+            if !remote_set_upper.contains(&candidate.to_uppercase()) {
                 continue;
             }
             if !policy.is_approved(candidate) {
