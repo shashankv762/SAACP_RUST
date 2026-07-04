@@ -659,6 +659,28 @@ impl MEASCFrame {
     /// Note: For full security, AES-GCM decryption is handled by the SAACPFrame layer.
     pub fn parse_header(packet: &[u8], _secret_key: &[u8]) -> Result<ParsedFrame, SAACPHardDrop> {
         let frame = Self::decode(packet)?;
+        // SECURITY FIX (BUFFER-SAFETY): `payload_length` is an attacker-controlled
+        // u32 read directly from the wire header, and this function (unlike its
+        // siblings `SAACPFrame::parse_header` and `measc::MEASCFrame::parse_frame`,
+        // which both cap it against MAX_PAYLOAD_SIZE before using it as an offset)
+        // previously used it unchecked. On a 64-bit target that's "only" an
+        // unbounded-allocation/DoS risk once `packet.len() >= payload_end`; on a
+        // 32-bit target (this crate explicitly targets OpenWrt/Raspberry-Pi-class
+        // deployments — see CLAUDE.md) `MEASC_HEADER_SIZE + payload_length` can
+        // overflow `usize`, wrap to a value smaller than `payload_start`, pass the
+        // `packet.len() < payload_end` check below, and then panic on
+        // `packet[payload_start..payload_end]` ("slice index starts at higher than
+        // ends"). Reject oversized claims up front, exactly like every other
+        // wire-parsing entry point in this crate does.
+        if frame.payload_length as usize > MAX_PAYLOAD_SIZE {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PayloadTooLarge,
+                format!(
+                    "MEASCFrame: payload_length {} exceeds {} byte MTU",
+                    frame.payload_length, MAX_PAYLOAD_SIZE
+                ),
+            ));
+        }
         let payload_start = MEASC_HEADER_SIZE;
         let payload_end   = payload_start + frame.payload_length as usize;
         if packet.len() < payload_end {
@@ -941,6 +963,30 @@ mod tests {
 
         let result = SAACPFrame::parse_header(&wire, &key, &nonce_t, &rgc);
         assert!(result.is_err(), "Tampered ciphertext must fail AES-GCM auth");
+    }
+
+    #[test]
+    fn test_measc_parse_header_rejects_oversized_payload_length_claim() {
+        // BUFFER-SAFETY regression: a header claiming a payload_length far
+        // beyond MAX_PAYLOAD_SIZE must be rejected before it's ever used to
+        // compute a slice offset, not just "happen to fail later" once a
+        // length check on the (much shorter) real buffer kicks in.
+        let mut f = MEASCFrame::new();
+        f.payload_length = u32::MAX; // would overflow usize on a 32-bit target
+        let enc = f.encode();
+        let err = MEASCFrame::parse_header(&enc, &[0u8; 32]).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::PayloadTooLarge);
+    }
+
+    #[test]
+    fn test_measc_parse_header_rejects_truncated_buffer_within_mtu() {
+        // A payload_length within MAX_PAYLOAD_SIZE but larger than what the
+        // actual buffer carries must still be rejected cleanly (not panic).
+        let mut f = MEASCFrame::new();
+        f.payload_length = 1000;
+        let enc = f.encode(); // header only, no payload bytes appended
+        let err = MEASCFrame::parse_header(&enc, &[0u8; 32]).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::MalformedHeader);
     }
 
     #[test]

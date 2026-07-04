@@ -31,6 +31,32 @@ pub fn global_telemetry() -> &'static TelemetryCollector {
     GLOBAL_TELEMETRY.get_or_init(TelemetryCollector::new)
 }
 
+/// Subscribe the global telemetry collector to `TrustDecayEngine::global()`'s
+/// signal stream, so Trust Decay Engine activity (penalties, downgrades,
+/// reauth) shows up in `render_prometheus()`'s output.
+///
+/// Opt-in, matching this module's existing philosophy — nothing in this
+/// crate calls `global_telemetry()` automatically (every counter here is
+/// only ever updated by a caller choosing to instrument its own call site).
+/// Call this once at process startup if you want Trust Decay Engine metrics
+/// scraped; skipping it costs nothing (the engine itself works identically
+/// either way, this only affects observability).
+pub fn wire_trust_decay_metrics() {
+    use crate::trust_decay::{TrustDecayEngine, TrustEvent};
+    use std::sync::Arc;
+    TrustDecayEngine::global().subscribe(Arc::new(|signal| {
+        let t = global_telemetry();
+        if let TrustEvent::Penalized(kind) = signal.event {
+            t.record_trust_penalty(kind);
+        }
+        match signal.event {
+            TrustEvent::Downgraded => t.record_trust_downgrade(),
+            TrustEvent::ReauthRequired => t.record_trust_reauth_required(),
+            TrustEvent::Penalized(_) | TrustEvent::Recovered => {}
+        }
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Counter bank (lock-free atomic u64)
 // ---------------------------------------------------------------------------
@@ -92,6 +118,22 @@ pub struct Counters {
     pub packets_accepted:              AtomicU64,
     pub packets_rejected:              AtomicU64,
     pub cover_traffic_frames:          AtomicU64,
+
+    // ── Trust Decay Engine (trust_decay.rs) ──────────────────────────────────
+    // Bounded-cardinality by design: one counter per PenaltyKind variant (6
+    // total), never a per-agent label — an unbounded number of distinct
+    // agent_ids as Prometheus label values would be a real memory/scrape-cost
+    // risk on a metrics endpoint. `trust_agents_tracked` (the live map size)
+    // is rendered directly from `TrustDecayEngine::global()` at render time,
+    // not stored here, since it's a gauge, not a monotonic counter.
+    pub trust_penalties_replay:            AtomicU64,
+    pub trust_penalties_intent_drift:      AtomicU64,
+    pub trust_penalties_scope_violation:   AtomicU64,
+    pub trust_penalties_injection:         AtomicU64,
+    pub trust_penalties_epistemic:         AtomicU64,
+    pub trust_penalties_generic:           AtomicU64,
+    pub trust_downgrades_total:            AtomicU64,
+    pub trust_reauth_required_total:       AtomicU64,
 }
 
 impl Counters {
@@ -140,6 +182,14 @@ impl Counters {
             packets_accepted:              z!(),
             packets_rejected:              z!(),
             cover_traffic_frames:          z!(),
+            trust_penalties_replay:          z!(),
+            trust_penalties_intent_drift:    z!(),
+            trust_penalties_scope_violation: z!(),
+            trust_penalties_injection:       z!(),
+            trust_penalties_epistemic:       z!(),
+            trust_penalties_generic:         z!(),
+            trust_downgrades_total:          z!(),
+            trust_reauth_required_total:     z!(),
         }
     }
 }
@@ -258,6 +308,23 @@ impl TelemetryCollector {
     pub fn record_identity_failed(&self)     { self.counters.identity_binding_failed.fetch_add(1, Ordering::Relaxed); }
     pub fn record_psk_recovery(&self)        { self.counters.psk_compromise_recoveries.fetch_add(1, Ordering::Relaxed); }
 
+    /// Record a Trust Decay Engine penalty by kind (bounded cardinality —
+    /// see the `Counters` struct doc comment on why this is per-kind, not
+    /// per-agent).
+    pub fn record_trust_penalty(&self, kind: crate::trust_decay::PenaltyKind) {
+        use crate::trust_decay::PenaltyKind;
+        match kind {
+            PenaltyKind::ReplaySuspicion    => { self.counters.trust_penalties_replay.fetch_add(1, Ordering::Relaxed); }
+            PenaltyKind::IntentDriftCeiling => { self.counters.trust_penalties_intent_drift.fetch_add(1, Ordering::Relaxed); }
+            PenaltyKind::ScopeViolation     => { self.counters.trust_penalties_scope_violation.fetch_add(1, Ordering::Relaxed); }
+            PenaltyKind::InjectionAttempt   => { self.counters.trust_penalties_injection.fetch_add(1, Ordering::Relaxed); }
+            PenaltyKind::EpistemicOverclaim => { self.counters.trust_penalties_epistemic.fetch_add(1, Ordering::Relaxed); }
+            PenaltyKind::GenericHardDrop    => { self.counters.trust_penalties_generic.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
+    pub fn record_trust_downgrade(&self)       { self.counters.trust_downgrades_total.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_trust_reauth_required(&self) { self.counters.trust_reauth_required_total.fetch_add(1, Ordering::Relaxed); }
+
     // ── Snapshot ─────────────────────────────────────────────────────────────
 
     /// Return all counters as a flat `HashMap<String, u64>`.
@@ -311,6 +378,14 @@ impl TelemetryCollector {
         snap!("packets_accepted",            c.packets_accepted);
         snap!("packets_rejected",            c.packets_rejected);
         snap!("cover_traffic_frames",        c.cover_traffic_frames);
+        snap!("trust_penalties_replay",          c.trust_penalties_replay);
+        snap!("trust_penalties_intent_drift",    c.trust_penalties_intent_drift);
+        snap!("trust_penalties_scope_violation", c.trust_penalties_scope_violation);
+        snap!("trust_penalties_injection",       c.trust_penalties_injection);
+        snap!("trust_penalties_epistemic",       c.trust_penalties_epistemic);
+        snap!("trust_penalties_generic",         c.trust_penalties_generic);
+        snap!("trust_downgrades_total",          c.trust_downgrades_total);
+        snap!("trust_reauth_required_total",     c.trust_reauth_required_total);
         m
     }
 
@@ -390,6 +465,39 @@ impl TelemetryCollector {
             ));
         }
 
+        // ── Trust Decay Engine ────────────────────────────────────────────────
+        out.push_str("# HELP saacp_trust_penalties_total Trust Decay Engine penalties applied, by kind.\n");
+        out.push_str("# TYPE saacp_trust_penalties_total counter\n");
+        for kind in &[
+            "replay", "intent_drift", "scope_violation", "injection", "epistemic", "generic",
+        ] {
+            let key = format!("trust_penalties_{kind}");
+            out.push_str(&format!(
+                "saacp_trust_penalties_total{{kind=\"{kind}\"}} {}\n",
+                snap.get(&key).copied().unwrap_or(0)
+            ));
+        }
+        out.push_str("# HELP saacp_trust_downgrades_total Agents whose effective scope was downgraded to READ_ONLY.\n");
+        out.push_str("# TYPE saacp_trust_downgrades_total counter\n");
+        out.push_str(&format!(
+            "saacp_trust_downgrades_total {}\n",
+            snap.get("trust_downgrades_total").copied().unwrap_or(0)
+        ));
+        out.push_str("# HELP saacp_trust_reauth_required_total Agents forced into the reauth soft-reset state.\n");
+        out.push_str("# TYPE saacp_trust_reauth_required_total counter\n");
+        out.push_str(&format!(
+            "saacp_trust_reauth_required_total {}\n",
+            snap.get("trust_reauth_required_total").copied().unwrap_or(0)
+        ));
+        // Live gauge, not a stored counter — bounded cardinality (a single
+        // scalar), read directly from the engine at render time.
+        out.push_str("# HELP saacp_trust_agents_tracked Agents currently tracked by the Trust Decay Engine.\n");
+        out.push_str("# TYPE saacp_trust_agents_tracked gauge\n");
+        out.push_str(&format!(
+            "saacp_trust_agents_tracked {}\n",
+            crate::trust_decay::TrustDecayEngine::global().tracked_count()
+        ));
+
         // ── Stream metrics ────────────────────────────────────────────────────
         out.push_str("# HELP saacp_streams_total Stream lifecycle counts.\n");
         out.push_str("# TYPE saacp_streams_total counter\n");
@@ -450,6 +558,10 @@ impl TelemetryCollector {
         rst!(c.delegation_depth_exceeded); rst!(c.identity_binding_failed);
         rst!(c.acsvaf_verifications); rst!(c.factf_quorum_met); rst!(c.factf_quorum_failed);
         rst!(c.packets_accepted); rst!(c.packets_rejected); rst!(c.cover_traffic_frames);
+        rst!(c.trust_penalties_replay); rst!(c.trust_penalties_intent_drift);
+        rst!(c.trust_penalties_scope_violation); rst!(c.trust_penalties_injection);
+        rst!(c.trust_penalties_epistemic); rst!(c.trust_penalties_generic);
+        rst!(c.trust_downgrades_total); rst!(c.trust_reauth_required_total);
         self.agent_errors.lock().unwrap().clear();
     }
 }
@@ -480,6 +592,46 @@ mod tests {
         assert_eq!(snap["packets_rejected"], 2); // record_packet_rejected + trip
         assert_eq!(snap["gate_4_0_injection_detected"], 1);
         assert_eq!(snap["circuit_breaker_trips"], 1);
+    }
+
+    #[test]
+    fn test_trust_penalty_counters_by_kind() {
+        use crate::trust_decay::PenaltyKind;
+        let t = TelemetryCollector::new();
+        t.record_trust_penalty(PenaltyKind::ReplaySuspicion);
+        t.record_trust_penalty(PenaltyKind::ReplaySuspicion);
+        t.record_trust_penalty(PenaltyKind::ScopeViolation);
+        t.record_trust_downgrade();
+        t.record_trust_reauth_required();
+
+        let snap = t.snapshot();
+        assert_eq!(snap["trust_penalties_replay"], 2);
+        assert_eq!(snap["trust_penalties_scope_violation"], 1);
+        assert_eq!(snap["trust_penalties_intent_drift"], 0);
+        assert_eq!(snap["trust_downgrades_total"], 1);
+        assert_eq!(snap["trust_reauth_required_total"], 1);
+    }
+
+    #[test]
+    fn test_trust_metrics_appear_in_prometheus_render() {
+        use crate::trust_decay::PenaltyKind;
+        let t = TelemetryCollector::new();
+        t.record_trust_penalty(PenaltyKind::InjectionAttempt);
+        t.record_trust_downgrade();
+        let prom = t.render_prometheus();
+        assert!(prom.contains("saacp_trust_penalties_total"));
+        assert!(prom.contains("kind=\"injection\""));
+        assert!(prom.contains("saacp_trust_downgrades_total"));
+        assert!(prom.contains("saacp_trust_agents_tracked"));
+    }
+
+    #[test]
+    fn test_wire_trust_decay_metrics_does_not_panic() {
+        // Smoke test only — this wires the GLOBAL TrustDecayEngine to the
+        // GLOBAL telemetry collector, so it can't assert on isolated counts
+        // without risking cross-test interference from other tests touching
+        // the same globals. Just confirm the wiring call itself is sound.
+        wire_trust_decay_metrics();
     }
 
     #[test]

@@ -15,6 +15,10 @@ use std::path::Path;
 
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+use rand::RngCore;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -49,6 +53,87 @@ fn now_secs() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+// ===========================================================================
+// Audit-intent confidentiality (opt-in — STRIDE Information Disclosure fix)
+// ===========================================================================
+//
+// `ImmutableAuditLog::append_event`'s `intent` field (task/action text,
+// naming source/target agents) is written to disk in cleartext JSONL,
+// integrity-protected by the chain-hash HMAC but never confidentiality-
+// protected. An attacker with filesystem read access to the log — a
+// different compromised process on the same host, a stolen backup, a
+// misconfigured permission — gets a full plaintext history of every agent's
+// tasks. `append_event_confidential` closes this gap by encrypting just the
+// `intent` string before it ever reaches `append_event`, so the audit record
+// schema, the canonical HMAC input, and `verify_chain`/`verify_chain_disk`
+// are all completely unchanged — the chain-hash covers whatever string ends
+// up in `intent`, plaintext or ciphertext, identically.
+//
+// Opt-in, mirroring this crate's established pattern for optional
+// security/privacy enhancements (`mpf.rs`'s cover traffic/padding): the
+// default `append_event` path is untouched so every existing deployment and
+// test that expects a human-readable `intent` field keeps working exactly
+// as before.
+
+/// HKDF info string for audit-intent encryption key derivation — domain-
+/// separated from the chain-hash HMAC (which uses `issuer_secret` directly
+/// as MAC key input) so adding encryption never weakens or entangles with
+/// the existing chain-integrity guarantee.
+const AUDIT_INTENT_HKDF_INFO: &[u8] = b"SAACP-audit-intent-confidentiality-v1";
+
+/// Derive a 32-byte AES-256-GCM key for audit-intent encryption from the same
+/// `issuer_secret` already used for chain-hash HMACs, via HKDF-SHA256.
+fn derive_intent_key(issuer_secret: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, issuer_secret);
+    let mut key = [0u8; 32];
+    hk.expand(AUDIT_INTENT_HKDF_INFO, &mut key)
+        .expect("HKDF-SHA256 expand: output length 32 is always valid");
+    key
+}
+
+/// Encrypt an audit intent string for confidentiality-at-rest. Returns
+/// `hex(nonce(12) || ciphertext || tag)` — pure lowercase ASCII hex, safe to
+/// embed directly as a JSON string value with no escaping, exactly like the
+/// existing `chain_hash` field. See module docs above for the security
+/// rationale and `ImmutableAuditLog::append_event_confidential` for the
+/// intended call site.
+pub fn encrypt_intent(issuer_secret: &[u8], plaintext_intent: &str) -> String {
+    let key_bytes = derive_intent_key(issuer_secret);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    // AES-256-GCM encryption of an in-memory audit string (well under the
+    // cipher's data-size limits) cannot fail.
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext_intent.as_bytes())
+        .expect("AES-256-GCM encryption of audit intent cannot fail");
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    hex::encode(out)
+}
+
+/// Decrypt an intent string previously produced by `encrypt_intent`. Returns
+/// `Err` on the wrong key, truncated/corrupt input, or authentication
+/// failure (tampering).
+pub fn decrypt_intent(issuer_secret: &[u8], encrypted_hex: &str) -> Result<String, String> {
+    let raw = hex::decode(encrypted_hex).map_err(|e| format!("hex decode error: {e}"))?;
+    if raw.len() < 12 + 16 {
+        return Err("encrypted intent too short to contain nonce + auth tag".to_string());
+    }
+    let (nonce_bytes, ciphertext) = raw.split_at(12);
+    let key_bytes = derive_intent_key(issuer_secret);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "audit intent decryption/authentication failed".to_string())?;
+    String::from_utf8(plaintext).map_err(|e| format!("decrypted intent not valid UTF-8: {e}"))
 }
 
 // ===========================================================================
@@ -262,6 +347,34 @@ pub struct AuditLogEntry {
     pub chain_hash: String,
 }
 
+/// Borrowed, alphabetically-field-ordered mirror of [`AuditRecord`], used
+/// only to serialize the canonical HMAC input in `append_event`.
+///
+/// Throughput fix: `serde_json::to_string` on a `#[derive(Serialize)]`
+/// struct serializes directly, without building an intermediate
+/// `serde_json::Value` tree the way the `json!` macro does (one boxed
+/// `Value`/`String` per field, plus a `Map`) — measured to meaningfully cut
+/// per-event allocation (see `benches/benchmarks.rs`'s
+/// `T14_WAL_Sustained_Throughput`). Field order here is alphabetical and
+/// MUST stay that way — it's the canonical form the chain hash is computed
+/// over, and changing it would silently break `verify_chain()` against any
+/// audit log written before the change. Deliberately a separate borrowed
+/// struct rather than adding `#[derive(Serialize)]` directly to
+/// `AuditRecord` (whose field *declaration* order is not alphabetical) —
+/// that would require reordering `AuditRecord`'s public fields to get the
+/// same output, a much larger and riskier diff for the same result.
+#[derive(serde::Serialize)]
+struct CanonicalAuditRecord<'a> {
+    intent: &'a str,
+    prev_hash: &'a str,
+    seq: u64,
+    source: &'a str,
+    target: &'a str,
+    timestamp: f64,
+    token_signature: &'a str,
+    traceparent: &'a str,
+}
+
 // ---------------------------------------------------------------------------
 // WAL worker message
 // ---------------------------------------------------------------------------
@@ -452,17 +565,20 @@ impl ImmutableAuditLog {
             seq: inner.event_count,
         };
 
-        // Serialize deterministically with sort_keys (canonical JSON).
-        let record_json = serde_json::to_string(&serde_json::json!({
-            "intent": record.intent,
-            "prev_hash": record.prev_hash,
-            "seq": record.seq,
-            "source": record.source,
-            "target": record.target,
-            "timestamp": record.timestamp,
-            "token_signature": record.token_signature,
-            "traceparent": record.traceparent,
-        })).unwrap_or_default();
+        // Serialize deterministically (canonical JSON, alphabetical field
+        // order) via a derived struct rather than the `json!` macro — see
+        // `CanonicalAuditRecord`'s doc comment for why this is both faster
+        // and still exactly reproduces the prior byte-for-byte output.
+        let record_json = serde_json::to_string(&CanonicalAuditRecord {
+            intent: &record.intent,
+            prev_hash: &record.prev_hash,
+            seq: record.seq,
+            source: &record.source,
+            target: &record.target,
+            timestamp: record.timestamp,
+            token_signature: &record.token_signature,
+            traceparent: &record.traceparent,
+        }).unwrap_or_default();
 
         // HMAC-SHA256 over the canonical record JSON.
         let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
@@ -477,20 +593,20 @@ impl ImmutableAuditLog {
         inner.last_hash = chain_hash;
         inner.event_count += 1;
 
-        // Build JSONL line for disk persistence.
-        let entry_json = serde_json::to_string(&serde_json::json!({
-            "record": {
-                "intent": log_entry.record.intent,
-                "prev_hash": log_entry.record.prev_hash,
-                "seq": log_entry.record.seq,
-                "source": log_entry.record.source,
-                "target": log_entry.record.target,
-                "timestamp": log_entry.record.timestamp,
-                "token_signature": log_entry.record.token_signature,
-                "traceparent": log_entry.record.traceparent,
-            },
-            "chain_hash": log_entry.chain_hash,
-        })).unwrap_or_default();
+        // Build JSONL line for disk persistence. Throughput fix: reuses
+        // `record_json` (already serialized above, once, for the HMAC input)
+        // as the nested "record" value instead of re-serializing an
+        // identical Value tree a second time via another `json!` macro call
+        // — this was measured (see `benches/benchmarks.rs`'s
+        // `T14_WAL_Sustained_Throughput`) to roughly halve the per-event
+        // JSON-serialization cost, since building a `serde_json::Value` via
+        // the `json!` macro allocates a full tree (one `String`/`Value` per
+        // field) before `to_string()` even runs. Safe because `record_json`
+        // is already valid, compact, properly-escaped JSON text, and
+        // `chain_hash` is a hex string (`hex::encode` output — pure
+        // lowercase ASCII hex digits, never containing `"` or a control
+        // character), so no escaping is needed to embed it directly.
+        let entry_json = format!(r#"{{"record":{record_json},"chain_hash":"{}"}}"#, log_entry.chain_hash);
 
         // Enqueue for WAL worker (non-blocking — drop if full, per spec §15.2).
         if let Some(ref tx) = self.wal_tx {
@@ -756,6 +872,29 @@ impl ImmutableAuditLog {
             "",
             &message,
             &"0".repeat(48),
+        );
+    }
+
+    /// Append an audit event with the `intent` field encrypted at rest
+    /// (AES-256-GCM; see the "Audit-intent confidentiality" module docs and
+    /// `encrypt_intent`). Opt-in — choose this instead of `append_event` when
+    /// the deployment's threat model includes an attacker with filesystem
+    /// read access to the log but not `issuer_secret`. Chain integrity is
+    /// identical either way: `verify_chain`/`verify_chain_disk` need no
+    /// changes, since the HMAC covers whatever string is in `intent`.
+    /// Decrypt with `decrypt_intent`.
+    pub fn append_event_confidential(
+        &self,
+        issuer_secret: &[u8],
+        source_agent: &str,
+        target_agent: &str,
+        token_signature: &str,
+        evaluated_intent: &str,
+        traceparent: &str,
+    ) {
+        let encrypted = encrypt_intent(issuer_secret, evaluated_intent);
+        self.append_event(
+            issuer_secret, source_agent, target_agent, token_signature, &encrypted, traceparent,
         );
     }
 
@@ -1118,5 +1257,76 @@ mod tests {
         // Verify env var names match Appendix A of spec.
         assert_eq!(ENV_AUDIT_LOG, "SAACP_AUDIT_LOG");
         assert_eq!(ENV_COUNT_FILE, "SAACP_COUNT_FILE");
+    }
+
+    // -- Audit-intent confidentiality (STRIDE Information Disclosure fix) --
+
+    #[test]
+    fn test_encrypt_intent_roundtrip() {
+        let secret = b"audit-intent-secret-32-bytes!!!";
+        let plaintext = "transfer $5000 from acct-A to acct-B";
+        let encrypted = encrypt_intent(secret, plaintext);
+        // Ciphertext must not leak the plaintext as a substring.
+        assert!(!encrypted.contains("transfer"));
+        assert!(!encrypted.contains("acct-A"));
+        let decrypted = decrypt_intent(secret, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_intent_wrong_key_fails() {
+        let secret = b"audit-intent-secret-32-bytes!!!";
+        let wrong = b"a-completely-different-secret!!";
+        let encrypted = encrypt_intent(secret, "sensitive task detail");
+        assert!(decrypt_intent(wrong, &encrypted).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_intent_nonce_uniqueness() {
+        // Same plaintext, same key — different nonces must produce different
+        // ciphertexts (no keystream/nonce reuse).
+        let secret = b"audit-intent-secret-32-bytes!!!";
+        let a = encrypt_intent(secret, "same task text");
+        let b = encrypt_intent(secret, "same task text");
+        assert_ne!(a, b);
+        assert_eq!(decrypt_intent(secret, &a).unwrap(), "same task text");
+        assert_eq!(decrypt_intent(secret, &b).unwrap(), "same task text");
+    }
+
+    #[test]
+    fn test_decrypt_intent_rejects_corrupt_input() {
+        let secret = b"audit-intent-secret-32-bytes!!!";
+        assert!(decrypt_intent(secret, "not-valid-hex").is_err());
+        assert!(decrypt_intent(secret, "aabb").is_err()); // too short
+    }
+
+    #[test]
+    fn test_append_event_confidential_preserves_chain_integrity() {
+        let log = test_audit_log("confidential");
+        let secret = b"confidential_audit_secret_key!!!";
+        let plaintext_intent = "delete all records matching filter X";
+
+        log.append_event_confidential(secret, "agent-a", "agent-b", "sig-001", plaintext_intent, "trace-001");
+        log.append_event(secret, "agent-b", "agent-c", "sig-002", "ordinary plaintext intent", "trace-002");
+
+        // Chain integrity (HMAC over whatever string is in `intent`) is
+        // completely unaffected by whether that string is ciphertext or
+        // plaintext.
+        assert_eq!(log.event_count(), 2);
+        assert!(log.verify_chain(secret));
+
+        // The stored intent for the first entry is ciphertext, not plaintext,
+        // and decrypts back to the original.
+        // Scoped so the MutexGuard drops before `log.reset()` below re-locks
+        // `inner` — holding a reference derived from it across that call
+        // would deadlock (the lock is not reentrant).
+        let stored_intent = {
+            let inner = log.inner.lock().unwrap();
+            inner.entries[0].record.intent.clone()
+        };
+        assert_ne!(stored_intent, plaintext_intent);
+        assert_eq!(decrypt_intent(secret, &stored_intent).unwrap(), plaintext_intent);
+
+        log.reset();
     }
 }

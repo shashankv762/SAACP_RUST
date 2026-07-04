@@ -74,6 +74,20 @@ pub enum SAACPBytecodes {
     /// `security::AuditHealth`) — the protocol will not authorize an
     /// irreversible action it cannot durably record.
     AuditSubsystemDegraded = 0x41,
+    /// Trust Decay Engine sidecar rejection (`trust_decay.rs`): this agent's
+    /// behavioral trust score has dropped below `TRUST_REAUTH_THRESHOLD` — a
+    /// soft reset, not a full token revocation. The capability token remains
+    /// cryptographically valid; the agent is time-boxed out until its score
+    /// recovers *and* the minimum cooldown floor elapses. *New in Rust* — no
+    /// Python parity (the Trust Decay Engine has no Python-reference analog).
+    TrustReauthRequired = 0x42,
+    /// Gate 1.5 reinforcement (`handler.rs`): cumulative intent divergence
+    /// across a delegation chain (tracked per `session_uuid` by
+    /// `trust_decay::IntentDriftTracker`) exceeded `CHAIN_DRIFT_CEILING`,
+    /// independent of any single hop passing its own per-hop check. Answers
+    /// the "small, individually-plausible scope creep at every hop" failure
+    /// mode. *New in Rust* — no Python parity.
+    IntentChainDriftExceeded = 0x43,
 }
 
 impl fmt::Display for SAACPBytecodes {

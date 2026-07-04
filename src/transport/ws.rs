@@ -263,6 +263,9 @@ async fn serve_ws_connection(
         circuit_breakers,
         token_issuer_secret,
         server_ed25519_seed,
+        None, // gateway — WS transport does not yet opt into real Gate 1.0 verification
+        None, // epoch_manager — WS transport does not yet opt into real AEAD decryption
+        None, // on_delivered
     )
     .await;
 }

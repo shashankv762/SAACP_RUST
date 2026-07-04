@@ -28,10 +28,21 @@ pub mod error_confidentiality;
 pub mod acsvaf_audit;
 pub mod faitf_audit;
 pub mod daemon;
+// Metadata Privacy (cover traffic / adaptive padding / timing jitter): traffic-
+// analysis resistance. Never wired into the default gate pipeline (verified —
+// it was already dead code before this feature gate existed), and matters far
+// more for anonymity-network threat models than for AI agent pipelines running
+// inside a controlled infrastructure boundary. Off by default so IoT/low-
+// resource builds don't compile it at all; enable explicitly if your
+// deployment's threat model includes passive traffic analysis.
+#[cfg(feature = "mpf")]
 pub mod mpf;
 pub mod telemetry;
 pub mod transport;
 pub mod state_backend;
+pub mod trust_decay;
+#[cfg(feature = "sidecar")]
+pub mod sidecar;
 
 pub use errors::{SAACPBytecodes, SAACPHardDrop};
 pub use schemas::PreCompiledSchemas;
@@ -183,6 +194,7 @@ pub use rgc::{
 };
 /// Alias matching Python RGC_DEFAULT_POLICY.
 pub use rgc::DEFAULT_POLICY as RGC_DEFAULT_POLICY;
+#[cfg(feature = "mpf")]
 pub use mpf::{
     AdaptivePadding, CoverTraffic, TimingObfuscator, MpfBundle,
     MPF_PAD_BLOCK_SIZE, MPF_PAD_MAX_BUCKET, MPF_COVER_RATE_HZ,
