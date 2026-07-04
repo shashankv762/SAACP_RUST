@@ -26,9 +26,9 @@ use saacp::{
     CapabilityIssuanceAuthority, CapabilitySigningKey,
     register_suite, CryptoTransparencyLedger,
     SessionEpochManager, PSKCompromiseRecovery,
-    AdaptivePadding, CoverTraffic, TimingObfuscator,
-    MPF_COVER_RATE_HZ,
 };
+#[cfg(feature = "mpf")]
+use saacp::{AdaptivePadding, CoverTraffic, TimingObfuscator, MPF_COVER_RATE_HZ};
 
 // ─── Injection via Unicode Confusables ────────────────────────────────────────
 
@@ -353,6 +353,7 @@ fn redteam_escalation_from_reversible_to_irreversible() {
 
 // ─── Cover Traffic DoS Flood ──────────────────────────────────────────────────
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_cover_traffic_rate_limiting() {
     // At 1 pps, calling 100 times rapidly should suppress most
@@ -543,8 +544,9 @@ fn redteam_psk_recovery_steps_6_7_8_all_fire() {
     assert_eq!(counter.load(Ordering::SeqCst), 3, "All 3 extended callbacks must fire");
 }
 
-// ─── MPF Security Properties ──────────────────────────────────────────────────
+// ─── MPF Security Properties (opt-in feature — see Cargo.toml `mpf`) ─────────
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_mpf_padding_hides_size_difference() {
     let ap = AdaptivePadding::new();
@@ -556,6 +558,7 @@ fn redteam_mpf_padding_hides_size_difference() {
     assert_eq!(t1, t2, "Both sizes must map to the same bucket (padding oracle prevented)");
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_mpf_padding_no_size_leakage_across_buckets() {
     let ap = AdaptivePadding::new();
@@ -566,6 +569,7 @@ fn redteam_mpf_padding_no_size_leakage_across_buckets() {
     }
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_timing_obfuscator_never_zero_delay() {
     let mut to = TimingObfuscator::with_jitter(1, 50);
@@ -576,6 +580,7 @@ fn redteam_timing_obfuscator_never_zero_delay() {
     }
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_mpf_adaptive_padding_vec_grows_to_bucket() {
     let mut ap = AdaptivePadding::new();
@@ -585,6 +590,7 @@ fn redteam_mpf_adaptive_padding_vec_grows_to_bucket() {
     assert_eq!(added, 212);
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn redteam_cover_traffic_budget_independent() {
     let mut ct1 = CoverTraffic::with_rate(10.0);

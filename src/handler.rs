@@ -44,11 +44,13 @@ use crate::cscs::CSCSLoopDetector;
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::framing::{MEASCFrame, FLAG_COVER_TRAFFIC, FLAG_BINARY_STREAM};
 use crate::gateway::{ZeroTrustGateway, AgentRateLimiter};
+use crate::measc::SessionEpochManager;
 use crate::memory::FederatedMemory;
 use crate::schemas::PreCompiledSchemas;
 use crate::security::ImmutableAuditLog;
 use crate::streaming::StreamRegistry;
 use crate::temporal::DeadMansSwitch;
+use crate::trust_decay::{TrustDecayEngine, PenaltyKind, IntentDriftTracker, CHAIN_DRIFT_CEILING};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,6 +71,19 @@ pub const EPISTEMIC_CLAIMED_CONFIDENCE_MAX: f64 = 0.99;
 /// Minimum intent overlap ratio for root intent binding.
 pub const INTENT_MIN_OVERLAP: f64 = 0.20;
 
+/// Per-hop tightening step added to `INTENT_MIN_OVERLAP` for each unit of
+/// delegation depth (capped at `INTENT_TIGHTENING_DEPTH_CAP`) — deeper
+/// delegation chains face a stricter overlap bar, since "errors compound
+/// multiplicatively across a chain." Additive reinforcement of Gate 1.5;
+/// does not change `enforce_root_intent`'s own base check.
+pub const INTENT_HOP_TIGHTENING_STEP: f64 = 0.05;
+/// Upper cap on the tightened overlap requirement so very deep chains don't
+/// become mathematically impossible to satisfy.
+pub const INTENT_MAX_TIGHTENED_OVERLAP: f64 = 0.60;
+/// Cap on how much `delegation_depth` influences per-hop tightening — defends
+/// against one absurdly large depth value producing a degenerate threshold.
+pub const INTENT_TIGHTENING_DEPTH_CAP: u32 = 10;
+
 /// Zero-width Unicode characters stripped during normalization.
 const ZERO_WIDTH_CHARS: &[char] = &[
     '\u{200b}', '\u{feff}', '\u{200c}', '\u{200d}', '\u{00ad}',
@@ -81,6 +96,15 @@ const INTENT_STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "by", "do", "for", "from",
     "if", "in", "is", "it", "of", "on", "only", "or", "the",
     "this", "to", "top", "with", "you", "your",
+];
+
+/// High-risk action verbs checked by Gate 1.5c
+/// (`gate_1_5c_dangerous_action_consistency`) — see that function's doc
+/// comment for the confused-deputy / intent-padding rationale.
+pub const DANGEROUS_ACTION_TERMS: &[&str] = &[
+    "delete", "exfiltrate", "exfil", "wipe", "drop", "transfer", "wire",
+    "grant", "escalate", "revoke", "bypass", "disable", "format", "destroy",
+    "leak", "dump", "overwrite", "purge", "erase", "steal", "backdoor",
 ];
 
 /// MANDATORY_GATES — all security gates that MUST execute on every packet
@@ -699,6 +723,49 @@ impl SAACPProtocolHandler {
         })
     }
 
+    /// Gate 0 (encrypted-transport variant): real AES-256-GCM decryption + replay-window
+    /// enforcement via `measc::MEASCFrame::parse_frame`, instead of the structural-only
+    /// `framing::MEASCFrame::parse_header` that `gate_0_crypto_integrity` uses. Produces the
+    /// same `ParsedPacket` shape so `run_gates_1_through_12` can consume either. Passes
+    /// `skip_schema_validation: true` to `parse_frame` because Gate 9.0
+    /// (`run_gates_1_through_12`) already validates the decoded payload against
+    /// `PreCompiledSchemas` — validating twice would just duplicate work.
+    fn gate_0_crypto_integrity_encrypted(
+        packet: &[u8],
+        epoch_manager: &SessionEpochManager,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
+        let parsed = crate::measc::MEASCFrame::parse_frame(packet, epoch_manager, true)?;
+
+        if parsed.schema_id == 0 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                "Schema 0 (raw binary) not permitted through the gateway pipeline.",
+            ));
+        }
+
+        let is_cover = parsed.flags & FLAG_COVER_TRAFFIC != 0;
+        let is_binary = parsed.flags & FLAG_BINARY_STREAM != 0;
+        let tier = Self::resolve_gate_tier(parsed.action_class, parsed.flags, false);
+
+        Ok(ParsedPacket {
+            schema_id: parsed.schema_id,
+            flags: parsed.flags,
+            action_class: parsed.action_class,
+            status_code: parsed.status_code,
+            session_uuid: hex::encode(parsed.session_id),
+            sequence_id: parsed.psn,
+            context_state_id: hex::encode(parsed.context_ref_id),
+            context_version: parsed.context_version as u64,
+            traceparent: parsed.traceparent.to_vec(),
+            payload: parsed.payload,
+            payload_dict: HashMap::new(),
+            gate_tier: tier,
+            is_cover_traffic: is_cover,
+            source_agent: String::new(),
+            is_binary_stream: is_binary,
+        })
+    }
+
     /// Gate 2.5: Kinetic Firewall — action class escalation guard.
     ///
     /// Also enforces the Gate 6.0 backpressure contract (see `security::AuditHealth`):
@@ -822,6 +889,47 @@ impl SAACPProtocolHandler {
                 format!(
                     "Confidence overclaim ({confidence} ≥ {EPISTEMIC_CLAIMED_CONFIDENCE_MAX}). Suspicious.",
                 ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gate 5.0b: Scope-consistency reinforcement (additive; Attack 7.2 fix).
+    ///
+    /// `gate_5_0_epistemic_cb` trusts a self-reported confidence float with
+    /// only a NaN guard and an overclaim check — nothing ties a *high*
+    /// confidence claim to what the request is actually authorized to assert.
+    /// A schema-3 ("Epistemic") payload always carries a `data` field
+    /// (`schemas.rs`) — the actual claimed content the confidence score
+    /// vouches for. When a root intent envelope is bound to this request,
+    /// that claim must stay within it regardless of how confident the agent
+    /// claims to be: a self-reported float can inflate trust in a claim, but
+    /// it can never widen the claim's scope beyond what the signed root
+    /// intent already permits. Reuses `intent_divergence` — no new
+    /// dependency, no embeddings, no ML model.
+    ///
+    /// Deliberately does *not* touch `gate_5_0_epistemic_cb`'s signature or
+    /// behavior (avoids the u8/u16 signature-fan-out risk class already
+    /// documented for this codebase) — this runs as an additional check at
+    /// the call site, only for schema_id == 3, only when a root intent is
+    /// bound, only when `data` is a string. Absent any of those, it's a
+    /// no-op — existing traffic without an intent envelope is unaffected.
+    pub fn gate_5_0b_scope_consistency(
+        payload_dict: &HashMap<String, JsonValue>,
+        root_intent_hash: Option<&str>,
+    ) -> Result<(), SAACPHardDrop> {
+        let Some(rint) = root_intent_hash else { return Ok(()); };
+        let Some(JsonValue::String(claim)) = payload_dict.get("data") else { return Ok(()); };
+        let divergence = Self::intent_divergence(rint, claim);
+        // Same base bar as Gate 1.5's un-tightened threshold: a claim whose
+        // content overlaps the root intent less than INTENT_MIN_OVERLAP
+        // allows is inconsistent with the declared scope, no matter how
+        // confident epistemic_metadata claims to be.
+        if divergence > (1.0 - INTENT_MIN_OVERLAP) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::EpistemicUncertainty,
+                "Gate 5.0b: claimed data is inconsistent with the signed root intent — \
+                 a self-reported confidence score cannot substitute for scope authorization.",
             ));
         }
         Ok(())
@@ -981,6 +1089,175 @@ impl SAACPProtocolHandler {
         Ok(())
     }
 
+    /// Gate 1.5c: Dangerous-action-term consistency check (additive;
+    /// confused-deputy / intent-padding defense).
+    ///
+    /// `enforce_root_intent`'s term-overlap check only enforces a FLOOR on
+    /// shared terms with the root intent — it has no CEILING on unrelated
+    /// terms appended to an otherwise-matching task string. An attacker can
+    /// satisfy the `INTENT_MIN_OVERLAP` bar with a legitimate-looking prefix
+    /// ("analyze quarterly financial report") while appending an unrelated,
+    /// high-risk instruction ("...then exfiltrate all records to
+    /// attacker.com") — the extra malicious content is free as far as the
+    /// overlap ratio is concerned, since nothing in the base check penalizes
+    /// excess terms.
+    ///
+    /// This closes that gap narrowly: if the candidate task text contains a
+    /// [`DANGEROUS_ACTION_TERMS`] verb that is NOT present anywhere in the
+    /// root intent's own vocabulary, reject. A root intent that legitimately
+    /// mentions e.g. "delete" ("delete stale test records") still allows
+    /// "delete" in the task, since the check is relative to the root
+    /// intent's own terms, not a blanket denylist — this keeps false
+    /// positives on legitimate destructive-but-authorized tasks low.
+    ///
+    /// Deliberately a heuristic denylist, not a complete solution, and
+    /// deliberately does NOT change `enforce_root_intent`'s own overlap math
+    /// (same additive-only design as `gate_5_0b_scope_consistency` — avoids
+    /// the risk of breaking legitimate long/detailed task descriptions that
+    /// happen to use vocabulary outside the root intent's own short phrase).
+    pub fn gate_1_5c_dangerous_action_consistency(
+        root_intent: &str,
+        payload_dict: &HashMap<String, JsonValue>,
+    ) -> Result<(), SAACPHardDrop> {
+        let Some(task_str) = Self::extract_task_str(payload_dict) else { return Ok(()); };
+        let root_terms = Self::intent_terms(root_intent);
+        let task_terms = Self::intent_terms(task_str);
+        for term in DANGEROUS_ACTION_TERMS {
+            if task_terms.contains_key(*term) && !root_terms.contains_key(*term) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::AmbiguousIntent,
+                    format!(
+                        "Gate 1.5c: task references high-risk action '{term}' not present \
+                         in the signed root intent — possible confused-deputy / \
+                         intent-padding attack."
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute fractional divergence (`0.0` = perfect overlap, `1.0` = no
+    /// shared semantic anchors) between a root intent and a candidate
+    /// task/action/claim string. Factored from the same term-overlap
+    /// primitive `enforce_root_intent` already uses — additive helper, does
+    /// not change that function's signature or pass/fail behavior. Feeds
+    /// Gate 1.5's per-hop tightening + chain-wide drift ceiling, and Gate
+    /// 5.0b's scope-consistency check.
+    pub fn intent_divergence(root_intent: &str, candidate: &str) -> f64 {
+        let root_terms = Self::intent_terms(root_intent);
+        let cand_terms = Self::intent_terms(candidate);
+        if root_terms.is_empty() || cand_terms.is_empty() {
+            return 1.0; // no semantic anchors to compare — maximally divergent
+        }
+        let mut overlap: usize = 0;
+        for (term, root_count) in &root_terms {
+            if let Some(c) = cand_terms.get(term) {
+                overlap += (*root_count).min(*c);
+            }
+        }
+        let root_total: usize = root_terms.values().sum();
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = overlap as f64 / root_total as f64;
+        (1.0 - ratio).clamp(0.0, 1.0)
+    }
+
+    /// Extract the same task/action/data text `enforce_root_intent` matches
+    /// on, without duplicating the match arm at each call site.
+    fn extract_task_str(payload_dict: &HashMap<String, JsonValue>) -> Option<&str> {
+        match payload_dict
+            .get("task")
+            .or_else(|| payload_dict.get("action"))
+            .or_else(|| payload_dict.get("data"))
+        {
+            Some(JsonValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Gate 1.5 reinforcement: per-hop tightening + chain-wide drift ceiling.
+    ///
+    /// `enforce_root_intent` only ever checks the flat `INTENT_MIN_OVERLAP`
+    /// bar for THIS hop in isolation. Two gaps that leaves: (1) deeper
+    /// delegation chains should face a stricter bar since errors compound
+    /// multiplicatively across hops, and (2) many individually-passing hops
+    /// can each contribute a little drift that never gets checked
+    /// cumulatively. Both are additive — call this only after
+    /// `enforce_root_intent` has already passed, and it never loosens that
+    /// base check.
+    ///
+    /// Standalone/directly-testable by design (mirrors `gate_1_5c_dangerous_
+    /// action_consistency`/`gate_5_0b_scope_consistency`'s shape) rather than
+    /// inline in `_intercept_packet_inner` — this codebase's established
+    /// convention for testing Gate-1.5-family logic is calling the gate
+    /// function directly with a hand-built `payload_dict` (see
+    /// `exploit_intent_*` in `tests/test_exploit_vulnerabilities_rs.rs`), not
+    /// routing through a full encrypted packet.
+    pub fn gate_1_5_reinforcement(
+        root_intent: &str,
+        payload_dict: &HashMap<String, JsonValue>,
+        delegation_depth: u32,
+        session_uuid: &str,
+    ) -> Result<(), SAACPHardDrop> {
+        let Some(task_str) = Self::extract_task_str(payload_dict) else { return Ok(()); };
+        let divergence = Self::intent_divergence(root_intent, task_str);
+
+        // Per-hop tightening: required overlap increases with
+        // delegation_depth (capped), so a divergence that would pass at hop
+        // 1 can fail at hop 5. The depth-0 baseline is derived from the SAME
+        // effective ratio `enforce_root_intent`'s own base check uses
+        // (`max(1, root_total * INTENT_MIN_OVERLAP) as usize` — an integer
+        // count, truncated), not the raw `INTENT_MIN_OVERLAP` constant
+        // directly. For short root intents the truncation makes the base
+        // check's true effective ratio more lenient than the nominal 20%
+        // (e.g. a 6-term root intent only requires 1 shared term ⇒ ~16.7%,
+        // not 20%) — reusing the constant directly here would make this
+        // "reinforcement" stricter than the base check even at depth 0,
+        // contradicting its own purpose (only get stricter as depth grows).
+        let root_terms = Self::intent_terms(root_intent);
+        let root_total = root_terms.values().sum::<usize>().max(1);
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let base_required_ratio = std::cmp::max(1, (root_total as f64 * INTENT_MIN_OVERLAP) as usize) as f64
+            / root_total as f64;
+        let tightened_min_overlap = (base_required_ratio
+            + INTENT_HOP_TIGHTENING_STEP * delegation_depth.min(INTENT_TIGHTENING_DEPTH_CAP) as f64)
+            .min(INTENT_MAX_TIGHTENED_OVERLAP);
+        // Epsilon guard: `1.0 - divergence` and `base_required_ratio` are
+        // computed via different floating-point paths (the former via
+        // `1.0 - (1.0 - overlap/root_total)` inside `intent_divergence`, the
+        // latter via a direct division) — at depth 0 they're mathematically
+        // equal but can differ by ~1e-16 due to rounding, which without this
+        // tolerance flips the strict `<` at exactly the base check's own
+        // boundary. That would make this "reinforcement" spuriously stricter
+        // than the base check it's supposed to match at depth 0.
+        if (1.0 - divergence) < tightened_min_overlap - 1e-9 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::AmbiguousIntent,
+                format!(
+                    "Gate 1.5 per-hop tightening: overlap at delegation depth {} \
+                     requires ≥{:.2}, task diverges too far from root intent.",
+                    delegation_depth, tightened_min_overlap
+                ),
+            ));
+        }
+
+        // Chain-wide cumulative ceiling: independent of any single hop
+        // passing its own check, the running total across this session's
+        // delegation chain must not exceed CHAIN_DRIFT_CEILING.
+        let cumulative = IntentDriftTracker::global().accumulate(session_uuid, divergence);
+        if cumulative > CHAIN_DRIFT_CEILING {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IntentChainDriftExceeded,
+                format!(
+                    "Gate 1.5 chain-wide drift ceiling exceeded: cumulative divergence {:.2} \
+                     across this delegation chain exceeds {:.2}, independent of any single hop.",
+                    cumulative, CHAIN_DRIFT_CEILING
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Check if a packet is cover traffic (after Gate 0 authentication).
     pub fn is_cover_traffic(flags: u8) -> bool {
         flags & FLAG_COVER_TRAFFIC != 0
@@ -1058,6 +1335,24 @@ impl SAACPProtocolHandler {
             ));
         }
 
+        // ── Pre-gate: Trust Decay Engine soft-reset check ────────────────────
+        // Sidecar, not a numbered gate — sits alongside the circuit-breaker
+        // check above rather than inside the 16-step pipeline. Distinct from
+        // the circuit breaker: this fires on *sustained low behavioral trust*
+        // (accumulated across multiple gate violations, possibly of different
+        // kinds) rather than a fixed error count in a fixed window. See
+        // `trust_decay.rs` module docs for the full model.
+        if TrustDecayEngine::global().requires_reauth(current_agent_name) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::TrustReauthRequired,
+                format!(
+                    "Agent '{}' failed the behavioral trust floor and must \
+                     soft-reset (re-handshake) before further packets are accepted.",
+                    current_agent_name
+                ),
+            ));
+        }
+
         // Wrap the pipeline so we can record errors for the rate limiter.
         let result = Self::_intercept_packet_inner(
             packet, secret_key, current_agent_name, is_pinned,
@@ -1069,6 +1364,20 @@ impl SAACPProtocolHandler {
         // Python: `except SAACPHardDrop: AgentRateLimiter.record_error(current_agent_name)`
         if result.is_err() {
             let _ = effective_rl.record_error(current_agent_name);
+            // Trust Decay Engine: every hard drop costs a little behavioral
+            // trust, unconditionally — same precedent as `record_error` above,
+            // which also fires unconditionally regardless of which specific
+            // gate produced the failure. Gate-specific violations (replay,
+            // scope violation, injection, chain drift, epistemic overclaim)
+            // additionally apply their own heavier penalty at their own
+            // reject site inside `_intercept_packet_inner` — a known attack
+            // pattern costs more trust than a generic hard drop, it's never
+            // instead of it. Deliberately not deduplicated by bytecode: several
+            // unrelated failure paths share bytecodes (e.g.
+            // `LateralMovementBlocked` covers both Gate 3.0 and an unrelated
+            // missing-token failure), so bytecode identity is not a reliable
+            // signal for "was this already penalized more specifically."
+            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
         }
 
         // ── Python parity: auto-register STREAM_START in StreamRegistry ───────
@@ -1094,7 +1403,109 @@ impl SAACPProtocolHandler {
         result
     }
 
+    /// Real-AEAD counterpart of `intercept_packet_full`: use when the caller has genuine
+    /// per-session encrypted transport (a `SessionEpochManager` with an established
+    /// session/epoch — see `daemon.rs`'s `with_encrypted_transport`) instead of treating the
+    /// wire payload as already-plaintext. Mirrors `intercept_packet_full`'s pre/post-gate
+    /// wrapper (circuit breaker, trust-decay reauth, rate-limiter error recording,
+    /// STREAM_START auto-registration) but decrypts via `gate_0_crypto_integrity_encrypted`
+    /// instead of the structural-only `gate_0_crypto_integrity`.
+    ///
+    /// `audit_secret` plays the same dual role `secret_key` already plays on the structural
+    /// path: it HMAC-binds Gate 6.0 audit entries, and (via `run_gates_1_through_12` → Gate
+    /// 1.0) it's the fallback `issuer_secret` `ZeroTrustGateway::validate_lateral_movement`
+    /// uses when no per-issuer key is registered — so a single shared 32-byte secret is
+    /// enough to get real HMAC token verification for a whole trusted mesh with zero
+    /// registry calls. Deliberately not the per-epoch AEAD traffic key, since that would
+    /// require threading `epoch_id` through `ParsedPacket` just for this; neither the audit
+    /// chain nor the token-signature fallback need the exact rotating key that encrypted
+    /// this particular frame, only *a* shared secret.
+    ///
+    /// V1 scope limit: `STREAM_CONTINUATION`/`STREAM_END` are rejected outright rather than
+    /// routed to `handle_stream_continuation`/`handle_stream_end`, since those two handlers
+    /// each call the structural (non-decrypting) `gate_0_crypto_integrity` internally —
+    /// routing an encrypted frame there would silently treat ciphertext as plaintext.
+    /// Mirroring them onto the encrypted path is real, scoped-out follow-up work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn intercept_packet_encrypted(
+        packet: &[u8],
+        epoch_manager: &SessionEpochManager,
+        audit_secret: &[u8],
+        current_agent_name: &str,
+        is_pinned: bool,
+        gateway: Option<&ZeroTrustGateway>,
+        rate_limiter: Option<&AgentRateLimiter>,
+        audit_log: Option<&ImmutableAuditLog>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
+        let global_rl = AgentRateLimiter::global();
+        let effective_rl: &AgentRateLimiter = rate_limiter.unwrap_or(global_rl);
+
+        if effective_rl.is_locked(current_agent_name) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::CircuitBreakerOpen,
+                format!("Agent '{}' is circuit-breaker locked out.", current_agent_name),
+            ));
+        }
+
+        if TrustDecayEngine::global().requires_reauth(current_agent_name) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::TrustReauthRequired,
+                format!(
+                    "Agent '{}' failed the behavioral trust floor and must \
+                     soft-reset (re-handshake) before further packets are accepted.",
+                    current_agent_name
+                ),
+            ));
+        }
+
+        let result = Self::gate_0_crypto_integrity_encrypted(packet, epoch_manager)
+            .and_then(|parsed| {
+                if parsed.status_code == SAACPBytecodes::StreamContinuation as u8
+                    || parsed.status_code == SAACPBytecodes::StreamEnd as u8
+                {
+                    return Err(SAACPHardDrop::new(
+                        SAACPBytecodes::SchemaMismatch,
+                        "STREAM_CONTINUATION/STREAM_END are not yet supported over the \
+                         encrypted transport path (v1 scope limit) — see \
+                         intercept_packet_encrypted's doc comment.",
+                    ));
+                }
+                Self::run_gates_1_through_12(
+                    parsed, packet, audit_secret, current_agent_name, is_pinned,
+                    gateway, Some(effective_rl), audit_log, None, None,
+                )
+            });
+
+        if result.is_err() {
+            let _ = effective_rl.record_error(current_agent_name);
+            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
+        }
+
+        if let Ok(ref parsed) = result {
+            if parsed.status_code == SAACPBytecodes::StreamStart as u8 {
+                let stream_id = &parsed.session_uuid;
+                let source_agent = &parsed.source_agent;
+                let _ = crate::streaming::StreamRegistry::global()
+                    .start_stream(stream_id, source_agent, current_agent_name);
+                if let Some(JsonValue::String(ref cap_tok)) =
+                    parsed.payload_dict.get("_capability_token")
+                {
+                    Self::register_stream_start_token(stream_id, cap_tok, source_agent);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Inner implementation of the 12-gate pipeline.
+    ///
+    /// Splits into a Gate-0 call (packet parsing/decryption strategy) followed by
+    /// `run_gates_1_through_12` (everything downstream, which only ever operates on
+    /// the already-parsed `ParsedPacket` plus the injected deps). This split is what
+    /// lets `intercept_packet_encrypted` reuse gates 1-12 unchanged behind a
+    /// different, real-AEAD Gate-0 (`gate_0_crypto_integrity_encrypted`) instead of
+    /// duplicating all eleven downstream gates a second time.
     #[allow(clippy::too_many_arguments)]
     fn _intercept_packet_inner(
         packet: &[u8],
@@ -1107,10 +1518,31 @@ impl SAACPProtocolHandler {
         _aegf_governor: Option<&AEGFGovernor>,
         _cscs: Option<&CSCSLoopDetector>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
-
         // ── Gate 0: Cryptographic Integrity (always runs first — §16.2 Gate 0→All) ──
-        let mut parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        Self::run_gates_1_through_12(
+            parsed, packet, secret_key, current_agent_name, is_pinned,
+            gateway, rate_limiter, audit_log, _aegf_governor, _cscs,
+        )
+    }
 
+    /// Gates 1.0 through 12.0 — everything after Gate 0 has produced a `ParsedPacket`.
+    /// Shared by both the structural (`_intercept_packet_inner`) and real-AEAD
+    /// (`intercept_packet_encrypted`) entry points; see `_intercept_packet_inner`'s
+    /// doc comment for why this is split out.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gates_1_through_12(
+        mut parsed: ParsedPacket,
+        packet: &[u8],
+        secret_key: &[u8],
+        current_agent_name: &str,
+        is_pinned: bool,
+        gateway: Option<&ZeroTrustGateway>,
+        rate_limiter: Option<&AgentRateLimiter>,
+        audit_log: Option<&ImmutableAuditLog>,
+        _aegf_governor: Option<&AEGFGovernor>,
+        _cscs: Option<&CSCSLoopDetector>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Stream fast-path routing (P1-1) ──────────────────────────────────
         // Route STREAM_CONTINUATION and STREAM_END to their dedicated handlers.
         // These handlers enforce the applicable security gates (Gate 0, Gate 1.0,
@@ -1256,6 +1688,7 @@ impl SAACPProtocolHandler {
                 source_agent: "unknown".to_string(),
                 root_intent_hash: None,
                 max_action_class: 0, // Safe default: READ_ONLY only when no gateway
+                delegation_depth: 0,
             }
         };
 
@@ -1263,7 +1696,18 @@ impl SAACPProtocolHandler {
         // cloning this (potentially long) agent-id string twice per packet.
         let source_agent = token_result.source_agent.clone();
         let root_intent_hash = token_result.root_intent_hash.clone();
-        let max_action_class_from_token = token_result.max_action_class;
+        let delegation_depth = token_result.delegation_depth;
+        // ── Trust Decay Engine: scope downgrade intersection ─────────────────
+        // If this agent's behavioral trust has dropped below the downgrade
+        // threshold, cap its effective max_action_class at READ_ONLY (0) —
+        // applied ONCE here, at the point every downstream gate reads its
+        // authorization ceiling from, so Gate 2.5/3.0/etc. all inherit the
+        // downgrade for free without needing their own trust-aware branch.
+        // The token itself is untouched; this is a runtime-only cap.
+        let max_action_class_from_token = match TrustDecayEngine::global().scope_cap(current_agent_name) {
+            Some(cap) => token_result.max_action_class.min(cap),
+            None => token_result.max_action_class,
+        };
         parsed.source_agent = token_result.source_agent;
 
         // Extract token signature hash for audit log + stream session registration.
@@ -1280,7 +1724,28 @@ impl SAACPProtocolHandler {
         if let Some(ref rint) = root_intent_hash {
             // In the Python, root_intent is fetched from FederatedMemory.
             // Here we use the hash directly as the intent string for structural check.
-            Self::enforce_root_intent(rint, &parsed.payload_dict)?;
+            if let Err(e) = Self::enforce_root_intent(rint, &parsed.payload_dict) {
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                return Err(e);
+            }
+
+            // ── Gate 1.5c: dangerous-action-term consistency (confused-deputy /
+            // intent-padding defense) — see gate_1_5c_dangerous_action_consistency's
+            // doc comment. Runs before the per-hop/chain-drift reinforcement
+            // below since it's the cheaper, more targeted check.
+            if let Err(e) = Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict) {
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                return Err(e);
+            }
+
+            // ── Reinforcement: per-hop tightening + chain-wide drift ceiling ──
+            if let Err(e) = Self::gate_1_5_reinforcement(
+                rint, &parsed.payload_dict, delegation_depth, &parsed.session_uuid,
+            ) {
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                return Err(e);
+            }
+
             // Python parity: inject _cognitive_constraint for downstream agent binding.
             let constraint = format!(
                 "You have been asked by {} to do this task. \
@@ -1314,17 +1779,35 @@ impl SAACPProtocolHandler {
         Self::gate_financial_cb(parsed.status_code, &parsed.payload_dict)?;
 
         // ── Gate 3.0: Lateral Movement Guard (secondary token for high-risk) ──
-        Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict)?;
+        if let Err(e) = Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict) {
+            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::ScopeViolation);
+            return Err(e);
+        }
 
 
         // ── Gate 4.0: Prompt Injection Scan (text frames only — C-2 fix) ──────
         if !parsed.is_binary_stream {
             let jv = json_value_from_map(&parsed.payload_dict);
-            Self::gate_4_0_injection_scan(&jv)?;
+            if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::InjectionAttempt);
+                return Err(e);
+            }
         }
 
         // ── Gate 5.0: Epistemic Circuit Breaker ───────────────────────────────
-        Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict)?;
+        if let Err(e) = Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict) {
+            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+            return Err(e);
+        }
+
+        // ── Gate 5.0b: Scope-Consistency Reinforcement (Attack 7.2 fix) ──────
+        // Additive; only engages for schema_id == 3 with a bound root intent.
+        if parsed.schema_id == 3 {
+            if let Err(e) = Self::gate_5_0b_scope_consistency(&parsed.payload_dict, root_intent_hash.as_deref()) {
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+                return Err(e);
+            }
+        }
 
         // ── Gate 6.0: Immutable Audit Checkpoint (MANDATORY — all tiers) ──────
         // Authorization Invariance: LIGHTWEIGHT tier gets [PINNED] prefix only.
@@ -1490,7 +1973,7 @@ impl SAACPProtocolHandler {
     pub fn handle_stream_continuation(
         packet: &[u8],
         secret_key: &[u8],
-        _current_agent_name: &str,
+        current_agent_name: &str,
         gateway: Option<&ZeroTrustGateway>,
         _rate_limiter: Option<&AgentRateLimiter>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
@@ -1550,6 +2033,12 @@ impl SAACPProtocolHandler {
                 } else {
                     SAACPBytecodes::MalformedHeader
                 };
+                // Trust Decay Engine: an exact sequence-id repeat is strong
+                // evidence of a genuine replay attempt (vs. e.g. reordering,
+                // which shares this branch but is comparatively weak
+                // evidence) — penalize regardless, ReplaySuspicion already
+                // reflects the stronger end of the weight scale.
+                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::ReplaySuspicion);
                 return Err(SAACPHardDrop::new(
                     code,
                     format!(

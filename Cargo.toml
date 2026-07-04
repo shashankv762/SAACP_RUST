@@ -15,7 +15,15 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["full"] }
+# IoT / low-resource fix: "full" pulled in signal/process/fs/io-std/sync — none
+# of which src/ actually uses (only daemon.rs and transport/ws.rs touch tokio,
+# and only via spawn/spawn_blocking, TcpListener, AsyncRead/WriteExt, and
+# timeout — verified by grep across src/). Trimming to just what's used cuts
+# compile time and binary size for embedded-Linux-class deployments (Raspberry
+# Pi / OpenWrt-class routers) without losing any functionality. Left at "full"
+# in [dev-dependencies] below since dev-deps never ship to downstream consumers
+# of this library crate.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros"] }
 base64 = "0.22"
 adler2 = "2"
 unicode-normalization = "0.1"
@@ -29,6 +37,7 @@ tokio-tungstenite = { version = "0.24", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 redis = { version = "0.27", optional = true }
+axum = { version = "0.7", optional = true }
 
 [features]
 default = []
@@ -42,6 +51,21 @@ transport-ws = ["dep:tokio-tungstenite", "dep:bytes", "dep:futures-util"]
 # across nodes instead of each node holding an isolated in-memory view. Off
 # by default so a single-node deployment never pulls in the redis crate.
 redis-backend = ["dep:redis"]
+# Metadata Privacy Filter (src/mpf.rs) — cover traffic, adaptive padding, and
+# timing-jitter recommendations for traffic-analysis resistance. This is not,
+# and never has been, wired into the mandatory gate pipeline (it's opt-in
+# caller-invoked utility code) — matters far more for anonymity-network threat
+# models than for AI agent pipelines running inside a controlled
+# infrastructure boundary. Off by default so IoT/low-resource builds don't
+# even compile it; enable explicitly if your deployment's threat model
+# includes passive traffic analysis.
+mpf = []
+# Python/HTTP sidecar proxy (src/sidecar.rs + the `saacp-sidecar` binary) — lets a
+# Python (or any HTTP-capable) agent get SAACP's crypto/gate-pipeline guarantees over
+# plain localhost HTTP/JSON, with zero SAACP protocol knowledge on the Python side. Off
+# by default so a library-only deployment never pulls in axum; also the first feature
+# to add a `[[bin]]` target to this otherwise library-only crate.
+sidecar = ["dep:axum"]
 
 [dev-dependencies]
 serial_test = "3"
@@ -56,6 +80,7 @@ futures-util = "0.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [[bench]]
 name = "benchmarks"
@@ -65,3 +90,28 @@ harness = false
 name = "test_transport_ws_rs"
 path = "tests/test_transport_ws_rs.rs"
 required-features = ["transport-ws"]
+
+[[test]]
+name = "test_sidecar_rs"
+path = "tests/test_sidecar_rs.rs"
+required-features = ["sidecar"]
+
+# The crate's first binary target — a standalone local HTTP sidecar proxy so
+# non-Rust (e.g. Python) agents can get SAACP's security guarantees over plain
+# HTTP/JSON without any SAACP protocol knowledge. See src/sidecar.rs.
+[[bin]]
+name = "saacp-sidecar"
+path = "src/bin/saacp_sidecar.rs"
+required-features = ["sidecar"]
+
+# High-performance / low-resource fix: no release profile existed at all, so
+# "high performance" was asserted without any tuning to back it. Deliberately
+# NOT setting `panic = "abort"` — this crate has ~70+ internal
+# `.lock().unwrap()` calls and runs as a long-lived network daemon;
+# abort-on-panic would turn one attacker-triggered panic in one connection
+# into a full-process crash for every other connection too, which is worse
+# for availability, not better.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

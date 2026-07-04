@@ -17,7 +17,8 @@ use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
-use crate::handler::SAACPProtocolHandler;
+use crate::handler::{ParsedPacket, SAACPProtocolHandler};
+use crate::measc::SessionEpochManager;
 use crate::pecf::{internal_to_external_raw, SREL};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -105,6 +106,24 @@ pub struct SAACPNetworkDaemon {
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
     /// DAEMON-MTLS: optional Ed25519 signing key seed (32 bytes) for server auth.
     server_ed25519_seed: Option<[u8; 32]>,
+    /// Opt-in real Gate 1.0 token verification (DAEMON-NO-TOKEN-VERIFY fix). `None`
+    /// preserves today's existing behavior byte-for-byte: `handle_client` calls the 4-arg
+    /// `intercept_packet` wrapper, which always passes `gateway: None` into Gate 1.0 and
+    /// grants every token a hardcoded `max_action_class = 0` / `source_agent = "unknown"`
+    /// without ever checking its HMAC signature. `Some` routes through
+    /// `intercept_packet_full`/`intercept_packet_encrypted` with a real gateway instead.
+    gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
+    /// Opt-in real AES-256-GCM decryption (DAEMON-NO-AEAD fix). `None` preserves today's
+    /// existing behavior: Gate 0 uses the structural-only `framing::MEASCFrame::parse_header`,
+    /// which never decrypts. `Some` routes incoming packets through the real encrypting
+    /// `measc::MEASCFrame::parse_frame`/`SessionEpochManager` machinery instead — see
+    /// `with_encrypted_transport`.
+    epoch_manager: Option<Arc<SessionEpochManager>>,
+    /// Opt-in hook invoked with every successfully-verified `ParsedPacket` right before the
+    /// ack is written back — lets a caller (e.g. `sidecar.rs`) observe decrypted, gate-passed
+    /// payloads without forking `handle_client`'s dispatch logic. Called from inside
+    /// `spawn_blocking`, so implementations must not `.await` (use `try_send`/`blocking_send`).
+    on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
 }
 
 impl SAACPNetworkDaemon {
@@ -115,6 +134,9 @@ impl SAACPNetworkDaemon {
             token_issuer_secret,
             circuit_breakers: Arc::new(Mutex::new(HashMap::new())),
             server_ed25519_seed: None,
+            gateway: None,
+            epoch_manager: None,
+            on_delivered: None,
         }
     }
 
@@ -134,6 +156,32 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// Opt in to real Gate 1.0 capability-token signature verification
+    /// (`ZeroTrustGateway::validate_lateral_movement`) instead of the structural-only
+    /// presence check every connection gets by default. See the `gateway` field doc comment.
+    pub fn with_gateway(mut self, gateway: Arc<crate::gateway::ZeroTrustGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
+    }
+
+    /// Opt in to real AES-256-GCM decryption + replay-window enforcement of incoming
+    /// packets via `measc::MEASCFrame::parse_frame`, instead of the structural-only Gate 0.
+    /// See the `epoch_manager` field doc comment.
+    pub fn with_encrypted_transport(mut self, epoch_manager: Arc<SessionEpochManager>) -> Self {
+        self.epoch_manager = Some(epoch_manager);
+        self
+    }
+
+    /// Observe every successfully-verified `ParsedPacket` (see the `on_delivered` field doc
+    /// comment).
+    pub fn with_on_delivered(
+        mut self,
+        callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>,
+    ) -> Self {
+        self.on_delivered = Some(callback);
+        self
+    }
+
     /// Start listening for connections. Runs forever.
     pub async fn start(&self) {
         let addr = format!("{}:{}", self.host, self.port);
@@ -149,8 +197,14 @@ impl SAACPNetworkDaemon {
                     let cbs    = Arc::clone(&self.circuit_breakers);
                     let secret = self.token_issuer_secret.clone();
                     let seed   = self.server_ed25519_seed;
+                    let gateway       = self.gateway.clone();
+                    let epoch_manager = self.epoch_manager.clone();
+                    let on_delivered  = self.on_delivered.clone();
                     tokio::spawn(async move {
-                        handle_client(stream, peer_addr, cbs, secret, seed).await;
+                        handle_client(
+                            stream, peer_addr, cbs, secret, seed,
+                            gateway, epoch_manager, on_delivered,
+                        ).await;
                     });
                 }
                 Err(e) => {
@@ -179,17 +233,28 @@ impl SAACPNetworkDaemon {
 /// unmodified over a tunneled transport (e.g. `transport::ws::WsByteStream`
 /// behind the `transport-ws` feature) — only the byte source/sink differs; the
 /// MEASC header parsing, MTU assembly, and gate dispatch below are identical.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_client<S>(
     mut stream: S,
     peer_addr: SocketAddr,
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
-    _token_issuer_secret: Option<Vec<u8>>,
+    // DAEMON-NO-TOKEN-VERIFY fix: previously received but never read (hence the leading
+    // underscore) — the structural default path still ignores it (matching today's exact
+    // behavior), but the `gateway`-opted-in branches below now use it as the stable,
+    // out-of-band Gate 1.0 issuer-secret fallback instead of the ephemeral per-connection
+    // ECDH `session_key`, since coupling token validity to a key that changes every
+    // reconnect would be a fragile, unintended design.
+    token_issuer_secret: Option<Vec<u8>>,
     server_ed25519_seed: Option<[u8; 32]>,
+    gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
+    epoch_manager: Option<Arc<SessionEpochManager>>,
+    on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
 )
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let ip_key = peer_addr.ip().to_string();
+    let ip_trust_key = ip_trust_key(&ip_key);
 
     // ── Step 0: Circuit breaker check ────────────────────────────────────────
     {
@@ -200,6 +265,34 @@ where
                 return;
             }
         }
+    }
+
+    // ── Step 0b: IP-level behavioral trust check (identity-rotation defense) ──
+    // `TrustDecayEngine` (trust_decay.rs) is keyed by the packet's claimed
+    // agent identity (`current_agent_name` / capability-token `iss`), by
+    // design — it tracks *behavior*, not identity, and assumes identity
+    // itself is already stable. But a connection's `pinned_agent` resets to
+    // `None` on every hard drop (see below), so a caller that holds (or has
+    // compromised) signing credentials for more than one agent identity —
+    // or is simply relying on a single shared issuer secret with no
+    // per-issuer registry configured, in which case `iss` is a free-form
+    // self-chosen claim — can "launder" its accumulated trust penalty by
+    // claiming a fresh identity on its next packet, resetting straight back
+    // to `TRUST_SCORE_INITIAL`. That defeats the entire point of a
+    // *continuous* behavioral signal. The one thing that can't be rotated
+    // away for free is the underlying network endpoint, so this tracks a
+    // second, independent trust bucket keyed by IP (namespaced via
+    // `ip_trust_key` so it can never collide with a real agent_id in the same
+    // map) and rejects new connection attempts from an IP whose accumulated
+    // distrust has crossed the reauth floor — regardless of what identity it
+    // claims next. Checked once per connection (mirroring the IP circuit
+    // breaker's own check above, which is likewise only evaluated at connect
+    // time, not per-packet) and penalized on every hard drop below.
+    if crate::trust_decay::TrustDecayEngine::global().requires_reauth(&ip_trust_key) {
+        // Silent drop — no response, no logging (same DDoS-defence rationale
+        // as the circuit breaker check above: don't give a probing attacker
+        // a distinguishable signal for which defense tripped).
+        return;
     }
 
     // ── Step 1: X25519 ECDH handshake with 100ms timeout ─────────────────────
@@ -223,9 +316,18 @@ where
     let mut pinned_revocation_epoch: u64 =
         crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
     
-    // ── C-3 Identity Gate: Connection Init ────────────────────────────────────
-    let connection_sid = uuid::Uuid::new_v4().to_string();
-    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance("unknown", &connection_sid, "connection_init");
+    // ── C-3 Identity Gate ──────────────────────────────────────────────────────
+    // NOTE: no phase is advanced here at connection-init time. A previous
+    // version of this code called `GLOBAL_IDENTITY_GATE.advance("unknown", ...,
+    // "connection_init")`, but `"connection_init"` is not one of the six
+    // canonical `IDENTITY_GATE_PHASES` (`identity_binding.rs`) — `advance()`
+    // rejects unknown phase names and returns `Err`, which the `let _ = ...`
+    // silently discarded. That call had done nothing, ever, since it was
+    // written: recording "unknown" as having completed a phase before any
+    // authentication has even happened would itself be a false security
+    // signal, not a fix, so it is removed outright rather than patched to a
+    // real phase name. The first real phase is advanced below, once Gate 1.0
+    // has actually validated a capability token for this connection.
 
     // ── Step 2: Persistent connection loop ────────────────────────────────────
     loop {
@@ -301,14 +403,69 @@ where
         let start = Instant::now();
         let agent_name = pinned_agent.as_deref().unwrap_or("unknown").to_string();
         let is_pinned  = pinned_agent.is_some();
-        let intercept_result = tokio::task::spawn_blocking(move || {
-            SAACPProtocolHandler::intercept_packet(
-                &full_packet,
-                &session_key,
-                &agent_name,
-                is_pinned,
-            )
-        }).await;
+
+        // DAEMON-NO-AEAD / DAEMON-NO-TOKEN-VERIFY fix: when the daemon was built with
+        // `.with_encrypted_transport(...)`/`.with_gateway(...)`, lazily create the epoch-0
+        // session for this packet's session_id (bytes [16..32] of the header) on first
+        // sight, then route through the real-AEAD `intercept_packet_encrypted` /
+        // `intercept_packet_full` instead of the structural-only `intercept_packet`.
+        // `epoch_manager`/`gateway` both `None` (the default) preserves today's exact
+        // existing behavior byte-for-byte.
+        //
+        // `gate_secret` is the stable, out-of-band `token_issuer_secret` this daemon was
+        // constructed with, used as Gate 1.0's issuer-secret fallback and to HMAC-bind audit
+        // entries — deliberately NOT the ephemeral per-connection ECDH `session_key`, which
+        // changes every reconnect and would make token validity fragile if coupled to it.
+        // Falls back to `session_key` only if the daemon has no configured issuer secret
+        // (keeps `with_gateway`-without-a-configured-secret at least self-consistent rather
+        // than panicking on an empty slice).
+        let gate_secret: Vec<u8> = token_issuer_secret
+            .clone()
+            .unwrap_or_else(|| session_key.to_vec());
+
+        let intercept_result = if let Some(epoch_mgr) = epoch_manager.clone() {
+            let session_id: [u8; 16] = full_packet.get(16..32)
+                .and_then(|s| <[u8; 16]>::try_from(s).ok())
+                .unwrap_or([0u8; 16]);
+            if epoch_mgr.get_current_epoch_id(&session_id).is_none() {
+                // Idempotent: ignore "already exists" races from concurrent packets on
+                // the same not-yet-registered session_id — the loser just reuses the
+                // winner's session.
+                let _ = epoch_mgr.create_session(
+                    session_id,
+                    session_key,
+                    crate::measc::MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                    crate::measc::MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                    None,
+                );
+            }
+            let gw_for_task = gateway.clone();
+            tokio::task::spawn_blocking(move || {
+                SAACPProtocolHandler::intercept_packet_encrypted(
+                    &full_packet,
+                    &epoch_mgr,
+                    &gate_secret,
+                    &agent_name,
+                    is_pinned,
+                    gw_for_task.as_deref(),
+                    None,
+                    None,
+                )
+            }).await
+        } else {
+            let gw_for_task = gateway.clone();
+            tokio::task::spawn_blocking(move || {
+                match gw_for_task.as_deref() {
+                    Some(gw) => SAACPProtocolHandler::intercept_packet_full(
+                        &full_packet, &gate_secret, &agent_name, is_pinned,
+                        Some(gw), None, None, None, None,
+                    ),
+                    None => SAACPProtocolHandler::intercept_packet(
+                        &full_packet, &session_key, &agent_name, is_pinned,
+                    ),
+                }
+            }).await
+        };
         // Flatten JoinError (panic in gate pipeline) into SAACPHardDrop
         let intercept_result = match intercept_result {
             Ok(inner) => inner,
@@ -319,6 +476,12 @@ where
         };
         match intercept_result {
             Ok(parsed) => {
+                // Opt-in observer hook (sidecar.rs's Inbox) — invoked synchronously, same
+                // as any other post-gate bookkeeping here; implementations must not block
+                // (see the `on_delivered` field doc comment on `SAACPNetworkDaemon`).
+                if let Some(cb) = on_delivered.as_ref() {
+                    cb(parsed.clone());
+                }
                 // Update pinning state
                 if pinned_agent.is_none() && !parsed.source_agent.is_empty() {
                     pinned_agent    = Some(parsed.source_agent.clone());
@@ -327,7 +490,19 @@ where
                     // trigger disconnect (C1 fix).
                     pinned_revocation_epoch =
                         crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
-                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(&parsed.source_agent, &parsed.session_uuid, "authenticated");
+                    // C-3 Identity Gate bookkeeping: by the time `intercept_packet`
+                    // returns `Ok`, Gate 1.0 (capability token validation) through
+                    // Gate 12.0 have all already passed for this packet, so both
+                    // "identity verified" and "authorized" are true facts about
+                    // this (agent, session) pair. Use the real phase names from
+                    // `IDENTITY_GATE_PHASES` — a prior version of this call used
+                    // `"authenticated"`, which is not one of the six canonical
+                    // phases and silently failed every single time (see the
+                    // removed connection-init call above for the same bug).
+                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
+                        .advance(&parsed.source_agent, &parsed.session_uuid, "IDENTITY_VERIFIED");
+                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
+                        .advance(&parsed.source_agent, &parsed.session_uuid, "AUTHORIZED");
                 }
 
                 // Route response by status code
@@ -361,6 +536,12 @@ where
                 pinned_agent       = None;
                 last_validated_at  = None;
                 record_error(&circuit_breakers, &ip_key);
+                // IP-level trust penalty (identity-rotation defense — see the
+                // Step 0b comment above): applied unconditionally on every
+                // hard drop, independent of whatever identity this packet
+                // claimed, so switching identities cannot reset it.
+                let _ = crate::trust_decay::TrustDecayEngine::global()
+                    .penalize(&ip_trust_key, crate::trust_decay::PenaltyKind::GenericHardDrop);
                 // Most hard drops are non-fatal; loop continues.
                 // Fatal drops (epoch expired, etc.) close the connection.
                 match drop.bytecode {
@@ -462,7 +643,63 @@ where
     Ok(session_key)
 }
 
+/// Client-side (initiator) counterpart of `ecdh_handshake`, unauthenticated mode only —
+/// promotes the hand-rolled logic already proven correct in
+/// `tests/test_transport_ws_rs.rs`'s `ws_client_handshake` (and this crate's own
+/// `tests/test_daemon_encrypted_rs.rs::tcp_client_handshake`) into real library code, so
+/// callers that need to dial *out* to a SAACP daemon (e.g. `sidecar.rs`) don't have to
+/// hand-roll the wire protocol themselves. `daemon.rs` itself only ever plays the responder
+/// role (`ecdh_handshake`); this is the first initiator-side implementation in the crate.
+///
+/// Ed25519 server-authentication mode (mirroring `ecdh_handshake`'s `server_ed25519_seed`
+/// path) is intentionally not implemented here — a v1 scope limit, not a correctness gap:
+/// a client that needs to verify a server's signature would need the corresponding
+/// verifying key distributed out-of-band first, which is deployment-specific and not yet
+/// wired into any caller.
+///
+/// Wire protocol (must match `ecdh_handshake`'s unauthenticated mode exactly):
+///   Client → Server: [client_nonce(32)] || [client_x25519_pub(32)] = 64B
+///   Server → Client: [server_x25519_pub(32)] = 32B
+pub async fn client_handshake<S>(stream: &mut S) -> Result<[u8; 32], SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use rand::rngs::OsRng;
+
+    let client_nonce: [u8; 32] = rand::random();
+    let client_secret = EphemeralSecret::random_from_rng(OsRng);
+    let client_pub = PublicKey::from(&client_secret);
+
+    let mut client_msg = Vec::with_capacity(64);
+    client_msg.extend_from_slice(&client_nonce);
+    client_msg.extend_from_slice(client_pub.as_bytes());
+    stream.write_all(&client_msg).await.map_err(|_| SAACPHardDrop::new(
+        SAACPBytecodes::MalformedHeader, "client_handshake: write failed",
+    ))?;
+
+    let mut server_pub_bytes = [0u8; 32];
+    stream.read_exact(&mut server_pub_bytes).await.map_err(|_| SAACPHardDrop::new(
+        SAACPBytecodes::MalformedHeader, "client_handshake: read server pubkey failed",
+    ))?;
+    let server_pub = PublicKey::from(server_pub_bytes);
+
+    let shared = client_secret.diffie_hellman(&server_pub);
+    let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
+    let mut session_key = [0u8; 32];
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "HKDF expand failed"))?;
+
+    Ok(session_key)
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Namespaced `TrustDecayEngine` key for an IP address — distinct prefix so
+/// it can never collide with a real agent_id sharing the same process-wide
+/// map (see the Step 0b comment in `handle_client` for the full rationale).
+fn ip_trust_key(ip: &str) -> String {
+    format!("ip:{ip}")
+}
 
 fn record_error(cbs: &Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>, ip: &str) {
     let mut map = cbs.lock().unwrap();
@@ -516,6 +753,41 @@ mod tests {
         record_error(&cbs, "192.168.1.1");
         assert!(cbs.lock().unwrap().len() < MAX_CIRCUIT_BREAKER_IPS + 1,
             "OOM guard must prevent unbounded growth");
+    }
+
+    #[test]
+    fn test_ip_trust_key_namespaced() {
+        // Namespaced distinctly from a bare agent_id of the same string, so
+        // the shared TrustDecayEngine map can never confuse an IP bucket
+        // with a real agent identity bucket.
+        assert_eq!(ip_trust_key("127.0.0.1"), "ip:127.0.0.1");
+        assert_ne!(ip_trust_key("agent-a"), "agent-a");
+    }
+
+    #[test]
+    fn test_ip_trust_key_evasion_resistance() {
+        // Simulates the exact scenario Step 0b defends against: an attacker
+        // rotates its claimed agent identity on every request (resetting its
+        // own per-agent TrustDecayEngine bucket each time), but the shared
+        // IP-level bucket still accumulates penalties across every identity
+        // it ever claimed and eventually requires reauth regardless.
+        use crate::trust_decay::{TrustDecayEngine, PenaltyKind};
+        let engine = TrustDecayEngine::new();
+        let ip_key = ip_trust_key("203.0.113.7");
+
+        for i in 0..5 {
+            let rotating_identity = format!("agent-rotating-{i}");
+            // Per-agent bucket resets fresh every time (fully trusted) —
+            // rotating identity alone is a successful evasion of it.
+            assert_eq!(engine.score(&rotating_identity), 1.0);
+            engine.penalize(&rotating_identity, PenaltyKind::ReplaySuspicion);
+            // But the IP-level bucket accumulates regardless of identity.
+            engine.penalize(&ip_key, PenaltyKind::ReplaySuspicion);
+        }
+        // Five ReplaySuspicion penalties (0.40 each) on the same IP bucket
+        // drive it below TRUST_REAUTH_THRESHOLD (0.25), forcing reauth even
+        // though no single rotating identity ever crossed it.
+        assert!(engine.requires_reauth(&ip_key));
     }
 
     #[test]

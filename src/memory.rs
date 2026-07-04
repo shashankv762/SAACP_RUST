@@ -250,6 +250,60 @@ impl FederatedMemory {
         Ok(())
     }
 
+    /// Provenance-tracking sibling of [`Self::save_context`]. `save_context`
+    /// itself is left unchanged (no signature/behavior change, no blast
+    /// radius on its existing callers/tests) — this is a purely additive,
+    /// opt-in API for callers that want to record *who* wrote a context
+    /// entry, so a reader can later check provenance before trusting shared
+    /// content instead of treating the store as write-by-anyone,
+    /// trust-unconditionally. Defense-in-depth against cross-agent context
+    /// poisoning — `save_context`/`fetch_context` currently have no caller
+    /// anywhere in this crate outside their own unit tests, so this hardens
+    /// the primitive ahead of any future live wiring rather than closing an
+    /// actively-exploited gap.
+    pub fn save_context_with_provenance(
+        &self,
+        state_id: &[u8],
+        data: &str,
+        version: u32,
+        writer_agent: &str,
+    ) -> Result<(), String> {
+        if state_id.len() != 32 {
+            return Err("Context-State-ID must be exactly 32 bytes.".into());
+        }
+        let tagged = serde_json::json!({
+            "_saacp_provenance_v1": true,
+            "writer_agent": writer_agent,
+            "data": data,
+        }).to_string();
+        self.put_record(state_id, tagged, version, FEDERATED_TTL_SECONDS);
+        Ok(())
+    }
+
+    /// Fetches context by 32-byte state ID, returning the recorded
+    /// `writer_agent` if the entry was written via
+    /// [`Self::save_context_with_provenance`]. Entries written via the plain
+    /// `save_context`/`store_context` (or any pre-existing data with no
+    /// provenance tag) return `writer_agent: None` — provenance is strictly
+    /// opt-in and never retroactive, so this never breaks reads of
+    /// non-provenance-tagged entries. Internally delegates to the unchanged
+    /// `fetch_context` for the actual lookup/expiry/version checks.
+    pub fn fetch_context_with_provenance(
+        &self,
+        state_id: &[u8],
+        expected_version: u32,
+    ) -> Result<(String, Option<String>), String> {
+        let raw = self.fetch_context(state_id, expected_version)?;
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) if v.get("_saacp_provenance_v1") == Some(&serde_json::Value::Bool(true)) => {
+                let writer = v.get("writer_agent").and_then(|w| w.as_str()).map(String::from);
+                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                Ok((data, writer))
+            }
+            _ => Ok((raw, None)),
+        }
+    }
+
     // ── Local/backend storage primitives ────────────────────────────────────
     // Every public method above (and the intent-envelope methods below) goes
     // through these three helpers, matching the single flat key space the

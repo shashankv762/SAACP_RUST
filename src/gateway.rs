@@ -15,7 +15,7 @@ use sha2::{Sha256, Digest};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::faitf::TrustStore;
-use crate::acsvaf::CapabilityVerificationAuthority;
+use crate::acsvaf::{CapabilityVerificationAuthority, ACSVAF_MAX_DELEGATION_DEPTH};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,6 +35,13 @@ pub const COVER_TRAFFIC_WINDOW_SECONDS: f64 = 1.0;
 pub const TOKEN_CACHE_MAX: usize = 10_000;
 /// Token cache TTL cap (seconds).
 pub const TOKEN_CACHE_TTL: f64 = 30.0;
+/// Maximum tracked agent_ids in each `AgentRateLimiter` map before a stale-entry
+/// sweep runs. IoT / low-resource fix: these maps previously grew unbounded for
+/// the process lifetime — one permanent entry per distinct agent_id ever seen,
+/// with no TTL or cap. Mirrors `memory::FEDERATED_MAX_ENTRIES`'s sweep-on-overflow
+/// idiom: only swept when the cap is exceeded, so well-behaved fleets (fewer than
+/// this many concurrently-active agents) never pay the sweep cost at all.
+pub const RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -124,6 +131,13 @@ pub struct TokenValidationResult {
     pub source_agent: String,
     pub root_intent_hash: Option<String>,
     pub max_action_class: u8,
+    /// Optional `delegation_depth` claim, read the same way ACSVAF tokens
+    /// already do (`acsvaf.rs`), but treated as informational here rather
+    /// than a mandatory authorization gate — legacy/plain tokens without the
+    /// claim default to `0` ("no known delegation chain") and validate
+    /// exactly as before. Feeds Gate 1.5's per-hop intent-drift tightening
+    /// (`handler.rs`) — deeper delegation chains get a stricter overlap bar.
+    pub delegation_depth: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +175,18 @@ impl AgentRateLimiter {
     pub fn record_error(&self, agent_id: &str) -> Result<(), SAACPHardDrop> {
         let mut records = self.records.lock().unwrap();
         let now = now_epoch_secs();
+
+        // IoT / low-resource fix: this map previously grew unbounded — one permanent
+        // entry per distinct agent_id ever seen. Sweep stale entries (not currently
+        // locked out AND window already elapsed — i.e. functionally identical to
+        // never having existed) only once the cap is exceeded, mirroring
+        // `memory::FederatedMemory`'s sweep-on-overflow idiom.
+        if records.len() >= RATE_LIMITER_MAX_ENTRIES {
+            records.retain(|_, r| {
+                now < r.locked_until || (now - r.window_start) <= RATE_LIMITER_WINDOW_SECONDS
+            });
+        }
+
         let rec = records.entry(agent_id.to_string()).or_insert(RateRecord {
             errors: 0,
             window_start: now,
@@ -197,6 +223,12 @@ impl AgentRateLimiter {
     pub fn record_cover_traffic(&self, agent_id: &str) -> Result<(), SAACPHardDrop> {
         let mut records = self.cover_records.lock().unwrap();
         let now = now_epoch_secs();
+
+        // IoT / low-resource fix: same unbounded-growth issue as `record_error`'s map.
+        if records.len() >= RATE_LIMITER_MAX_ENTRIES {
+            records.retain(|_, r| (now - r.window_start) <= COVER_TRAFFIC_WINDOW_SECONDS);
+        }
+
         let rec = records.entry(agent_id.to_string()).or_insert(CoverRecord {
             count: 0,
             window_start: now,
@@ -633,11 +665,48 @@ impl ZeroTrustGateway {
         }
         let max_action_class = mac_raw as u8;
 
+        // delegation_depth claim (feeds Trust Decay Engine / Gate 1.5 per-hop
+        // tightening, and is itself now an authorization gate): the live
+        // packet-processing path previously treated this claim as
+        // informational-only, defaulting to 0 on anything absent or invalid,
+        // while the separate (not-live-wired) ACSVAF token system enforced
+        // ACSVAF_MAX_DELEGATION_DEPTH on its own, different token type. A
+        // compromised agent holding the shared HMAC issuer secret could mint
+        // a token claiming an arbitrarily deep delegation chain and it would
+        // pass Gate 1.0 unchecked. Now rejects when the claim is present but
+        // non-numeric, out of u32 range, or exceeds the max. An absent claim
+        // still defaults to 0 — no regression for legacy tokens that never
+        // set this field.
+        let delegation_depth = match obj.get("delegation_depth") {
+            None => 0,
+            Some(v) => {
+                let raw = v.as_u64().ok_or_else(|| SAACPHardDrop::new(
+                    SAACPBytecodes::DelegationRejected,
+                    "delegation_depth claim present but not a non-negative integer.",
+                ))?;
+                let depth = u32::try_from(raw).map_err(|_| SAACPHardDrop::new(
+                    SAACPBytecodes::DelegationRejected,
+                    format!("delegation_depth value {raw} exceeds valid u32 range."),
+                ))?;
+                if depth > ACSVAF_MAX_DELEGATION_DEPTH {
+                    return Err(SAACPHardDrop::new(
+                        SAACPBytecodes::DelegationRejected,
+                        format!(
+                            "delegation_depth {depth} exceeds max {ACSVAF_MAX_DELEGATION_DEPTH} \
+                             on the live capability-token path.",
+                        ),
+                    ));
+                }
+                depth
+            }
+        };
+
         let result = TokenValidationResult {
             is_valid: true,
             source_agent,
             root_intent_hash,
             max_action_class,
+            delegation_depth,
         };
 
         // T3.7: eviction — drop expired first, then soonest-expiring 20% if still full.
@@ -767,6 +836,21 @@ impl DelegationGuard {
                 ));
             }
             let json_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+            // SECURITY FIX (BUFFER-SAFETY): `json_len` is an attacker-controlled
+            // 4-byte length prefix. `parse_token_wire` (this file) already
+            // bounds-checks it (`json_len == 0 || json_len > raw.len().saturating_sub(4)`)
+            // before slicing — this sibling function used to skip that check
+            // entirely, so a token claiming a JSON length larger than the bytes
+            // actually present (e.g. a 4-byte token declaring a 65535-byte body)
+            // panicked on `raw[4..4 + json_len]` ("range end index out of range
+            // for slice") instead of returning a clean `SAACPHardDrop`. Apply the
+            // exact same bound here.
+            if json_len == 0 || json_len > raw.len().saturating_sub(4) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::DelegationRejected,
+                    "Delegation attempt with malformed token structure.",
+                ));
+            }
             let tj = raw[4..4 + json_len].to_vec();
             let sig = raw[4 + json_len..].to_vec();
             (tj, sig)
@@ -1317,6 +1401,35 @@ mod tests {
         );
         assert!(DelegationGuard::validate_not_self_signed(&token, secret).is_ok());
         assert!(DelegationGuard::validate_not_self_signed(&token, b"wrong-key-32-bytes-long!!!!!!!!!").is_err());
+    }
+
+    /// BUFFER-SAFETY regression: a 4-byte length prefix claiming far more JSON
+    /// bytes than are actually present must be rejected cleanly, not panic on
+    /// `raw[4..4+json_len]` ("range end index out of range for slice").
+    #[test]
+    fn test_delegation_guard_rejects_oversized_length_prefix() {
+        use base64::Engine;
+        // json_len = 0x0000FFFF (65535), but zero bytes follow — same attack
+        // shape as parse_token_wire's own bounds check already guards against.
+        let malicious_raw = vec![0x00, 0x00, 0xFF, 0xFF];
+        let malicious_token = base64::engine::general_purpose::STANDARD.encode(&malicious_raw);
+        let err = DelegationGuard::validate_not_self_signed(
+            malicious_token.as_bytes(),
+            b"root-orchestrator-key-32-bytes!!",
+        ).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::DelegationRejected);
+    }
+
+    #[test]
+    fn test_delegation_guard_rejects_zero_length_json() {
+        use base64::Engine;
+        let malicious_raw = vec![0x00, 0x00, 0x00, 0x00, 0xAB]; // json_len=0, trailing sig byte
+        let malicious_token = base64::engine::general_purpose::STANDARD.encode(&malicious_raw);
+        let err = DelegationGuard::validate_not_self_signed(
+            malicious_token.as_bytes(),
+            b"root-orchestrator-key-32-bytes!!",
+        ).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::DelegationRejected);
     }
 
     #[test]

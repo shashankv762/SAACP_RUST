@@ -290,7 +290,12 @@ fn compromise_summary_report() {
     eprintln!("  What the attacker does NOT gain:");
     eprintln!("    - Cannot forge new tokens (needs PSK to sign HMAC)");
     eprintln!("    - Cannot replay expired tokens (exp field enforced)");
-    eprintln!("    - Cannot bypass ACSVAF depth check (delegation depth enforced)");
+    eprintln!("    - Cannot claim an excessive delegation_depth on a self-forged token —");
+    eprintln!("      ZeroTrustGateway::validate_lateral_movement (the LIVE token-validation");
+    eprintln!("      path, not just the separate ACSVAF token system) now enforces");
+    eprintln!("      ACSVAF_MAX_DELEGATION_DEPTH on this claim directly (see");
+    eprintln!("      tests/test_blackhat_agent_hijack_rs.rs Act I for the regression proof —");
+    eprintln!("      this was NOT true prior to that fix, when the claim was informational-only)");
     eprintln!();
     eprintln!("  Automatic compromise detection: NONE");
     eprintln!("    - CSCS: no (only catches repeated loop patterns)");

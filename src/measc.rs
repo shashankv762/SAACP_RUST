@@ -934,9 +934,20 @@ impl MEASCFrame {
         // in a single Mutex hold. The old split (check → decrypt → accept) created
         // a TOCTOU window where two concurrent threads could both pass check()
         // for the same PSN before either called accept().
+        // TOCTOU fix: the step-4 existence check above and this use are not
+        // covered by a single lock hold, so a concurrently-destroyed/rotated
+        // epoch between them previously panicked the whole process via
+        // `.unwrap()` on the `None` this returns. Reject gracefully instead.
         let (rw_ok, rw_reason) = epoch_manager
             .with_epoch_mut(&session_id, epoch_id, |e| e.replay_window.check_and_accept(psn))
-            .unwrap();
+            .ok_or_else(|| SAACPHardDrop::new(
+                SAACPBytecodes::EpochExpired,
+                format!(
+                    "Epoch (session={}, epoch_id={}) was destroyed between existence \
+                     check and replay-window update.",
+                    hex::encode(&session_id[..4]), epoch_id
+                ),
+            ))?;
 
         if !rw_ok {
             let (bc, msg) = match rw_reason {
@@ -958,9 +969,17 @@ impl MEASCFrame {
         let auth_tag   = &buffer[MEASC_HEADER_SIZE..MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE];
         let ciphertext = &buffer[MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE..expected_total];
 
+        // TOCTOU fix: same rationale as the replay-window access above.
         let traffic_key = epoch_manager
             .with_epoch(&session_id, epoch_id, |e| e.traffic_key().copied())
-            .unwrap()?;
+            .ok_or_else(|| SAACPHardDrop::new(
+                SAACPBytecodes::EpochExpired,
+                format!(
+                    "Epoch (session={}, epoch_id={}) was destroyed between existence \
+                     check and traffic-key use.",
+                    hex::encode(&session_id[..4]), epoch_id
+                ),
+            ))??;
 
         let iv    = derive_iv(&traffic_key, epoch_id, psn);
         let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + MEASC_AUTH_TAG_SIZE);

@@ -249,6 +249,14 @@ impl ThresholdCapabilityToken {
     }
 }
 
+/// Maximum tracked proposals before a stale-entry sweep runs. IoT /
+/// low-resource fix: `create_request()` previously grew `requests` unbounded
+/// if a caller never called `submit_partial_approval()`/
+/// `purge_expired_requests()` — one permanent entry per request ever created.
+/// Mirrors the sweep-on-overflow idiom already used in `cscs.rs`/`gateway.rs`/
+/// `trust_decay.rs`: only sweeps once the cap is exceeded.
+pub const FACTF_MAX_TRACKED_REQUESTS: usize = 10_000;
+
 #[allow(dead_code)]
 struct ProposalState {
     base_claims: serde_json::Value,
@@ -300,10 +308,26 @@ impl ThresholdAuthorityIssuer {
             created_at: now,
             expires_at: now + self.proposal_ttl,
         };
-        self.requests
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), state);
+
+        let mut requests = self.requests.lock().unwrap();
+        // IoT / low-resource fix: sweep once the cap is exceeded — expired
+        // proposals first, then oldest-created as a fallback if the map is
+        // still full (mirrors the two-pass idiom in trust_decay.rs).
+        if requests.len() >= FACTF_MAX_TRACKED_REQUESTS {
+            requests.retain(|_, s| now <= s.expires_at);
+            if requests.len() >= FACTF_MAX_TRACKED_REQUESTS {
+                let evict_count = requests.len() + 1 - FACTF_MAX_TRACKED_REQUESTS;
+                let mut by_age: Vec<(String, f64)> = requests.iter()
+                    .map(|(k, s)| (k.clone(), s.created_at))
+                    .collect();
+                by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (k, _) in by_age.into_iter().take(evict_count) {
+                    requests.remove(&k);
+                }
+            }
+        }
+
+        requests.insert(request_id.clone(), state);
         request_id
     }
 

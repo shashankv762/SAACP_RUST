@@ -11,10 +11,10 @@ use saacp::{
     MEASC_REPLAY_WINDOW_SIZE, MEASC_MAX_PSN_ADVANCE,
     ZeroTrustGateway, AgentRateLimiter,
     RATE_LIMITER_THRESHOLD, RATE_LIMITER_WINDOW_SECONDS, RATE_LIMITER_LOCKOUT_SECONDS,
-    CoverTraffic, AdaptivePadding,
-    MPF_COVER_RATE_HZ, MPF_PAD_BLOCK_SIZE,
     NonceTracker, NONCE_MAX_AGE_SECONDS,
 };
+#[cfg(feature = "mpf")]
+use saacp::{CoverTraffic, AdaptivePadding, MPF_COVER_RATE_HZ, MPF_PAD_BLOCK_SIZE};
 
 // ─── ReplayWindow ─────────────────────────────────────────────────────────────
 
@@ -203,8 +203,9 @@ fn test_nonce_max_age_constant() {
     assert!(NONCE_MAX_AGE_SECONDS > 0.0);
 }
 
-// ─── MPF Anti-traffic-analysis ───────────────────────────────────────────────
+// ─── MPF Anti-traffic-analysis (opt-in feature — see Cargo.toml `mpf`) ───────
 
+#[cfg(feature = "mpf")]
 #[test]
 fn test_adaptive_padding_pads_to_block_boundary() {
     let mut pad = AdaptivePadding::new();
@@ -213,6 +214,7 @@ fn test_adaptive_padding_pads_to_block_boundary() {
     assert_eq!(data.len() % MPF_PAD_BLOCK_SIZE, 0, "Padded data must be multiple of block size");
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn test_adaptive_padding_does_not_shrink() {
     let mut pad = AdaptivePadding::new();
@@ -222,11 +224,13 @@ fn test_adaptive_padding_does_not_shrink() {
     assert!(data.len() >= original_len);
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn test_cover_traffic_rate() {
     assert!(MPF_COVER_RATE_HZ > 0.0);
 }
 
+#[cfg(feature = "mpf")]
 #[test]
 fn test_cover_traffic_generate_not_empty() {
     let ct = CoverTraffic::new();

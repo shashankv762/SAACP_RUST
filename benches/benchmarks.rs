@@ -730,6 +730,47 @@ fn bench_audit_log_growth(c: &mut Criterion) {
     group.finish();
 }
 
+/// Dedicated sustained-throughput measurement for the Gate 6.0 WAL writer
+/// (`security::ImmutableAuditLog`), reported in events/sec via
+/// `Throughput::Elements` — distinct from `bench_audit_log_growth` above
+/// (which measures per-call latency as the hash chain grows). The WAL
+/// worker already holds a persistent `BufWriter<File>` for its lifetime and
+/// batches flush/sync every `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES` (200) entries
+/// or `AUDIT_WAL_FLUSH_INTERVAL_MS` (50ms) — this benchmark exists to put an
+/// actual, current-hardware number behind the "500k events/sec" throughput
+/// target rather than asserting it, and to catch a regression if a future
+/// change reintroduces a per-event allocation/syscall.
+fn bench_wal_sustained_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T14_WAL_Sustained_Throughput");
+    group.sample_size(20);
+
+    let secret_key = [0xBBu8; 32];
+    const N: usize = 100_000;
+    // Log created ONCE, outside the timed closure — this measures steady-
+    // state append throughput, not one-time file-open/WAL-thread-spawn cost
+    // (matching bench_audit_log_growth's own convention above).
+    let log = ImmutableAuditLog::new("wal_sustained_bench_audit.log");
+    let mut ctr = 0u64;
+    group.throughput(Throughput::Elements(N as u64));
+    group.bench_function("append_event_100k_sustained", |b| {
+        b.iter(|| {
+            for _ in 0..N {
+                ctr += 1;
+                log.append_event(
+                    black_box(&secret_key),
+                    black_box("source-agent"),
+                    black_box("target-agent"),
+                    black_box(&format!("sig_{ctr}")),
+                    black_box("analyze quarterly report"),
+                    black_box("00-wal-sustained-bench-00"),
+                );
+            }
+        });
+    });
+
+    group.finish();
+}
+
 // ─── Criterion Groups & Entry Point ──────────────────────────────────────────
 
 criterion_group!(
@@ -764,6 +805,7 @@ criterion_group!(
     bench_pipeline_rejection_timing_throughput,
     bench_cscs_scaling,
     bench_audit_log_growth,
+    bench_wal_sustained_throughput,
 );
 
 criterion_main!(gate_groups, throughput_groups, worst_case_groups);
