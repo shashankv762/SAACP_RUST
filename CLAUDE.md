@@ -6,7 +6,7 @@
 
 - Crate: `saacp` (library, plus one optional binary — `saacp-sidecar`, behind the `sidecar` feature; see "Sidecar Proxy / Python Translation Layer" below)
 - Rust edition: 2021
-- Test count: **1294** with default features (all must pass; zero failures tolerated) — grown to 1310 by prior-session work already present before this feature (`trust_decay.rs`, `test_blackhat_agent_hijack_rs.rs`, `test_gate5_scope_consistency_rs.rs`) plus this session's `tests/test_daemon_encrypted_rs.rs` (+5). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`). +4 with `--features sidecar` (`tests/test_sidecar_rs.rs`, gated via `required-features`). MPF's own unit/integration tests only compile under `--features mpf` (see "Optional Cargo Features" below) — not counted in the default-feature baseline.
+- Test count: **1310** with default features (all must pass; zero failures tolerated) — unchanged by this session's sidecar-hardening work (all new Rust tests are `sidecar`-feature-gated). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`). +8 with `--features sidecar` (`tests/test_sidecar_rs.rs`, gated via `required-features` — grew from 4 to 8 this session: per-peer-secret accept/reject, `/healthz` field, `503`-on-saturation). MPF's own unit/integration tests only compile under `--features mpf` (see "Optional Cargo Features" below) — not counted in the default-feature baseline. Python: `python/tests/test_wrap.py` (stdlib `unittest`, 2 tests) exercises real subprocess sidecars — not part of the Rust `cargo test` count, run separately (`python -m unittest tests.test_wrap -v` from `python/`).
 - Spec reference: `c:\Users\2025\Downloads\write_readme.py` — the authoritative SAACP v0.1-beta2 specification
 
 ## Build & Test
@@ -146,10 +146,9 @@ behavior byte-for-byte unchanged) before `sidecar.rs` uses them for real.
   `daemon::client_handshake` promotes the hand-rolled initiator-side ECDH logic already
   proven correct in `tests/test_transport_ws_rs.rs`'s `ws_client_handshake` into real
   library code — `daemon.rs` itself had only ever implemented the responder side before.
-- **`sidecar.rs`**: `SidecarConfig` (agent_id, one shared 32-byte `token_issuer_secret`
-  across the whole trusted mesh — an out-of-band pre-shared key, not a per-peer registry;
-  same "honest v1, real v2 later" pattern as `trust_decay.rs`), a bounded `Inbox`
-  (`tokio::sync::mpsc`, capacity `SIDECAR_INBOX_CAPACITY` — matches the existing
+- **`sidecar.rs`**: `SidecarConfig` (agent_id, a shared 32-byte `token_issuer_secret`
+  across the whole trusted mesh by default — an out-of-band pre-shared key), a bounded
+  `Inbox` (`tokio::sync::mpsc`, capacity `SIDECAR_INBOX_CAPACITY` — matches the existing
   bounded-queue idiom, e.g. `AUDIT_WAL_QUEUE_CAPACITY`), `send_message()` (dials out,
   `client_handshake`s, issues a token, builds a real encrypted frame, classifies the ack),
   and `run()` (starts a `SAACPNetworkDaemon` with all three builders above plus an `axum`
@@ -161,9 +160,85 @@ behavior byte-for-byte unchanged) before `sidecar.rs` uses them for real.
   peer name, or Gate 1.0's scope check would reject every message. Handled inside
   `send_message` so the HTTP API surface never has to expose this quirk.
 - **`python/`**: a pure-Python `saacp_client` package (`requests`-only, no PyO3, no build
-  step) — `SaacpClient.send()`/`.receive()`/`.healthz()`, plus a generic
-  `SaacpAgentWrapper` pattern (documented as adaptable to LangChain/AutoGen, not a tested
-  deep integration with either) and a runnable `examples/demo_two_agents.py`.
+  step) — `SaacpClient.send()`/`.receive()`/`.healthz()`, `wrap()` (see "Production
+  hardening + `saacp.wrap()`" below), and runnable `examples/demo_two_agents.py` /
+  `examples/demo_wrap.py`.
+
+### Production hardening + `saacp.wrap()` (this session)
+
+Two gaps remained after the sidecar first shipped: there was no literal one-line API
+(`SaacpAgentWrapper` still required a running sidecar and known addresses up front — its
+own docstring called it "a pattern, not a tested integration"), and the security/
+operational model was v1-simple (one bearer secret for the whole mesh, unbounded
+outbound fan-out, no retry, a static `/healthz`).
+
+**`sidecar.rs` hardening** (all additive/opt-in — `SidecarConfig::new(...)` gives every
+new field a backward-compatible default):
+- **Per-peer issuer secrets** (`SidecarConfig::peer_secrets: HashMap<String, [u8; 32]>`):
+  confirmed via `gateway.rs::validate_lateral_movement` that once
+  `ZeroTrustGateway::register_issuer_key` has been called for *any* peer, the registry
+  becomes authoritative — an unregistered issuer is hard-rejected with **no** fallback to
+  a shared secret. `run()` registers every `peer_secrets` entry at startup; empty map
+  (default) preserves today's single-shared-secret behavior exactly. `secret_for()`
+  (`SidecarState`) picks a peer's pairwise secret over the mesh-wide shared one for both
+  signing (outbound) and verification (inbound, via the registry). Configured via
+  `SAACP_PEER_SECRETS_FILE` (JSON) in `saacp_sidecar.rs`.
+- **Bounded outbound concurrency** (`SidecarConfig::max_concurrent_sends`, default 64):
+  a `tokio::sync::Semaphore` around `/send`; a bounded acquire-with-timeout
+  (`SEND_PERMIT_ACQUIRE_WAIT_MS`) returns `503`/`status: "saturated"` on saturation
+  instead of queuing without bound — same explicit-backpressure philosophy as Gate 6.0's
+  `AuditHealth`.
+- **Bounded retry** (`SidecarConfig::send_retry_attempts`, default 2): a new
+  `connect_with_retry()` retries *only* the initial TCP-connect step (a distinct
+  `SidecarError::ConnectTimeout` variant, separate from the generic post-connect
+  `Timeout`, is what makes this precise) — handshake/session/IO errors are never
+  retried, since those indicate a real protocol problem, not network flakiness.
+- **Real `/healthz`**: reports live `inbox_depth`/`inbox_capacity` (`Inbox::len()`, via
+  `mpsc::Receiver::len()`) and `peers_configured`, instead of a static `"ok"`.
+- **Secret hygiene**: `SAACP_TOKEN_SECRET_FILE` (bin only) keeps the secret out of the
+  process environment as an alternative to `SAACP_TOKEN_SECRET`.
+- **Deliberately not attempted**: real TCP connection reuse/pooling for `send_message`.
+  `daemon.rs::handle_client` pins every packet *after* the first on a connection to
+  `target_agent = pinned_agent` (the first packet's token issuer), not `"unknown"` —
+  reusing a socket across sends would need the sender to track that per-connection pin
+  state and change the token's `allow` list accordingly, a real protocol-level change
+  with identity-pinning/trust-decay implications, not something to bolt on here.
+  `pool.rs`'s `ConnectionPool` is bookkeeping-only (no actual socket), so it doesn't help.
+
+**`saacp.wrap(agent)` — the literal one-liner** (`python/saacp_client/wrap.py` +
+`sidecar_manager.py`):
+- `sidecar_manager.get_or_start()`: locates the `saacp-sidecar` binary
+  (`SAACP_SIDECAR_BIN` env var → dev-relative search for `target/{release,debug}/
+  saacp-sidecar[.exe]` walking up from the installed package → `PATH`), probes
+  `GET /healthz` and reuses an already-healthy sidecar, or spawns one and polls
+  `/healthz` until ready (bounded ~5s deadline). Only a sidecar it spawned itself gets an
+  `atexit` termination hook — one it merely reused is left running for whoever else needs
+  it.
+- `wrap(agent, *, agent_id=None, peers=None, secret=None, default_peer=None, ...,
+  auto_start=True)`: all keyword args optional, falling back to `SAACP_AGENT_ID`/
+  `SAACP_TOKEN_SECRET`/`SAACP_LISTEN_ADDR`/`SAACP_HTTP_ADDR` env vars exactly like the
+  binary — so with those set, `agent = saacp.wrap(agent)` alone is real. Missing secret +
+  no env var → generates an ephemeral one with a printed warning (honest zero-config
+  behavior, not a silent gap).
+- Duck-types `agent`: **`.send`/`.receive`-shaped** (AutoGen's `ConversableAgent` shape) →
+  monkey-patches `.send(message, recipient)` to route through the sidecar only when
+  `recipient` is a name in `peers` (falls through to the original `.send` otherwise), and
+  starts one background daemon thread long-polling `/receive` that calls the *original*
+  `.receive(task, sender=from_agent)` for anything delivered — returns the same (mutated)
+  `agent` object. **Callable / `.run`/`.invoke`-shaped** (LangChain tool/chain shape) →
+  returns a `SecuredCallable`; calling it delivers the input as a fire-and-forget task
+  and returns a `SendResult` — deliberately **not** a synchronous RPC bridge with a
+  return value, since that's what SAACP's schema-1 Task message actually is (same
+  honesty convention `SaacpAgentWrapper`'s own docstring already used). Anything else
+  raises `TypeError` naming the two supported shapes.
+- `wrapper.py`'s `SaacpAgentWrapper` is superseded by this and now just re-exports `wrap`
+  for anyone still importing from that module.
+- `tests/test_wrap.py` (Python, stdlib `unittest`, no new hard dependency): two real
+  `saacp-sidecar` subprocesses spawned via `get_or_start`, a fake `ConversableAgent`-
+  shaped object on each side proving a real cross-process message round trip, and a
+  plain function wrapped into a `SecuredCallable` proving real delivery +
+  `SendResult.ok`. Skips gracefully (not a hard failure) if the binary hasn't been built
+  locally.
 
 ## Gate 6.0 Backpressure Contract (`security.rs`)
 
@@ -223,7 +298,7 @@ This does not reorder the gate pipeline: Gate 2.5 still runs at its existing pos
 | `transport.rs` / `transport/ws.rs` | `SAACPWebSocketDaemon`, `WsByteStream` — WebSocket tunnel for MEASC frames (`transport-ws` feature) | *new in Rust* |
 | `state_backend.rs` | `StateBackend` trait, `InMemoryBackend`, `RedisBackend` (`redis-backend` feature) — pluggable KV+TTL storage for horizontal scaling | *new in Rust* |
 | `trust_decay.rs` | `TrustDecayEngine` (continuous behavioral trust scoring sidecar), `IntentDriftTracker` (chain-wide drift ceiling) — see "Trust Decay Engine" section above | *new in Rust* |
-| `sidecar.rs` | `SidecarConfig`, `Inbox`, `send_message`, `run` — local HTTP proxy for non-Rust agents (`sidecar` feature); `src/bin/saacp_sidecar.rs` binary; see "Sidecar Proxy / Python Translation Layer" section above | *new in Rust* |
+| `sidecar.rs` | `SidecarConfig` (per-peer secrets, concurrency/retry limits), `Inbox`, `send_message`, `run` — local HTTP proxy for non-Rust agents (`sidecar` feature); `src/bin/saacp_sidecar.rs` binary; see "Sidecar Proxy / Python Translation Layer" + "Production hardening + `saacp.wrap()`" sections above | *new in Rust* |
 
 ## Gate Pipeline (Authorization Invariance)
 
@@ -429,7 +504,7 @@ rrbc_gateway.redeem_token_with_pop(token_b64, rnonce, agent, sid, cid, oaid, sec
 | `tests/test_gate5_scope_consistency_rs.rs` | 7 | Gate 5.0b regression proof: Attack 7.2 (fake high confidence on off-scope `data` claim), on-scope controls, no-op conditions (no root intent / missing / non-string `data`) |
 | `tests/test_blackhat_agent_hijack_rs.rs` | 15 | The 20-year black-hat multi-step chain attack: delegation-depth escalation (Act I, live `validate_lateral_movement` path) → confused-deputy intent-padding incl. Unicode-confusable evasion (Act II, `gate_1_5c_dangerous_action_consistency`) → chain-wide cumulative drift (Act III, `gate_1_5_reinforcement`) → context-provenance capability check (Act IV, `FederatedMemory::save_context_with_provenance`) → Finale chaining all three live techniques + a "legitimate traffic still works" check. Calls gate functions directly with hand-built `payload_dict`s, matching this repo's established Gate-1.5-family test convention (see the module doc comment for why, and `trust_decay.rs`'s "Gate 1.5 reinforcement" section above) |
 | `tests/test_daemon_encrypted_rs.rs` | 5 | DAEMON-NO-AEAD / DAEMON-NO-TOKEN-VERIFY regression proof: real `SAACPNetworkDaemon` over real loopback TCP with `.with_gateway()`/`.with_encrypted_transport()` — validly-signed encrypted frame accepted and decoded via `on_delivered`, tampered ciphertext AEAD-rejected, wrong-issuer-secret token rejected, two independent sessions don't cross-contaminate, and a plain `SAACPNetworkDaemon::new()` (no builders) is unchanged |
-| `tests/test_sidecar_rs.rs` | 4 | `sidecar` feature only. Two in-process `sidecar::run()` instances driven purely via HTTP/JSON (`reqwest`, mirroring a Python caller) — real send/receive round trip, `/receive` 204-on-timeout, wrong-shared-secret rejection (proving the HTTP surface rides on the real crypto/token fixes, not just that the routes exist), `/healthz` |
+| `tests/test_sidecar_rs.rs` | 8 | `sidecar` feature only. In-process `sidecar::run()` instances driven purely via HTTP/JSON (`reqwest`, mirroring a Python caller) — real send/receive round trip, `/receive` 204-on-timeout, wrong-shared-secret rejection, `/healthz`; plus this session's production-hardening regression proofs: a registered peer's pairwise secret accepted, an unregistered issuer rejected once any `peer_secrets` entry exists (real allowlist behavior, not just "wrong secret"), `/healthz`'s new `inbox_depth`/`inbox_capacity`/`peers_configured` fields, and `503`/`"saturated"` when `max_concurrent_sends` is exhausted |
 
 ## Common Pitfalls
 

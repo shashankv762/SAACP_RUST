@@ -12,3 +12,4 @@ benches_output.txt
 # Python bytecode cache (python/saacp_client package)
 __pycache__/
 *.pyc
+*.egg-info/

@@ -10,10 +10,10 @@
 //! (see `SAACPNetworkDaemon::with_gateway`/`with_encrypted_transport`/`with_on_delivered`).
 //!
 //! ## V1 scope
-//! - One shared 32-byte `token_issuer_secret` across the whole trusted mesh (an out-of-band
-//!   pre-shared key, not a per-peer registry) — same "honest v1, real v2 later" pattern as
-//!   `trust_decay.rs`. A v2 could add per-peer issuer keys via
-//!   `ZeroTrustGateway::register_issuer_key`.
+//! - One shared 32-byte `token_issuer_secret` across the whole trusted mesh by default (an
+//!   out-of-band pre-shared key) — same "honest v1, real v2 later" pattern as
+//!   `trust_decay.rs`. `SidecarConfig::peer_secrets` (see "Production hardening" below) is
+//!   the opt-in v2 upgrade to per-peer issuer keys via `ZeroTrustGateway::register_issuer_key`.
 //! - `send_message` opens a fresh TCP connection, ECDH handshake, and one-shot session per
 //!   call — no connection pooling/reuse. Simple and correct; a real perf cost for
 //!   high-throughput use, flagged as a known follow-up rather than solved here.
@@ -26,7 +26,40 @@
 //!   so the sidecar's HTTP API surface doesn't need to expose it.
 //! - Messages are schema-1 ("Task": `{task, priority}`) only; other schemas are a natural
 //!   extension of this same pattern, not built here.
+//!
+//! ## Production hardening (this pass)
+//! - **Per-peer issuer secrets** (`SidecarConfig::peer_secrets`): an opt-in upgrade from
+//!   "one shared secret for the whole mesh" to a real allowlist of known peers, each with
+//!   their own pairwise HMAC secret. Confirmed via `gateway.rs::validate_lateral_movement`:
+//!   once `ZeroTrustGateway::register_issuer_key` has been called for *any* peer, the
+//!   registry becomes authoritative — an unregistered issuer is hard-rejected with no
+//!   fallback to a shared secret. So `peer_secrets` empty (default) = today's exact
+//!   behavior; non-empty = every peer this sidecar talks to must have an entry (on both
+//!   ends, since HMAC is symmetric), or that peer's traffic is rejected outright.
+//! - **Bounded outbound concurrency** (`SidecarConfig::max_concurrent_sends`): a
+//!   `tokio::sync::Semaphore` around `/send` dispatch, so an unbounded burst of outbound
+//!   sends can't exhaust local sockets/file descriptors. A saturated sidecar returns
+//!   `503` with `status: "saturated"` rather than queuing without bound — the same
+//!   explicit-backpressure philosophy as `security.rs`'s `AuditHealth`.
+//! - **Bounded retry** (`SidecarConfig::send_retry_attempts`): only the initial TCP
+//!   connect step is retried on transient failure/timeout. Handshake, session setup, and
+//!   post-connect I/O errors are never retried — those indicate a real protocol problem,
+//!   not network flakiness, and retrying would just mask it.
+//! - **Real `/healthz`**: reports live inbox depth/capacity and how many peers are
+//!   registered, instead of a static `"ok"`.
+//!
+//! Deliberately *not* attempted here: real TCP connection reuse/pooling for
+//! `send_message`. `daemon.rs::handle_client`'s identity-pinning model checks every
+//! packet *after* the first one on a connection against `target_agent = pinned_agent`
+//! (set from the first packet's token issuer), not `"unknown"` — reusing a socket across
+//! multiple sends would require tracking that per-connection pin state on the sending
+//! side and changing the token's `allow` list accordingly, a real protocol-level change
+//! with identity-pinning/trust-decay implications, not a safe thing to bolt on here.
+//! `pool.rs`'s `ConnectionPool` is bookkeeping-only (no actual socket), so it doesn't
+//! help either. Flagged as follow-up, matching this codebase's "honest v1 scope"
+//! convention elsewhere (`trust_decay.rs`, this module's own scope notes above).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +96,18 @@ pub const SIDECAR_SEND_TIMEOUT_SECS: u64 = 10;
 /// see this module's doc comment for why.
 const BOOTSTRAP_AGENT: &str = "unknown";
 
+/// Default bound on concurrent outbound `/send` dispatches (see module doc).
+pub const SIDECAR_DEFAULT_MAX_CONCURRENT_SENDS: usize = 64;
+
+/// Default number of retries for a transient failure at the initial TCP-connect step only.
+pub const SIDECAR_DEFAULT_SEND_RETRY_ATTEMPTS: u32 = 2;
+
+/// Fixed backoff between connect retries.
+const SEND_RETRY_BACKOFF_MS: u64 = 100;
+
+/// How long `/send` will wait for a free concurrency permit before reporting saturation.
+const SEND_PERMIT_ACQUIRE_WAIT_MS: u64 = 50;
+
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -70,11 +115,44 @@ pub struct SidecarConfig {
     /// This sidecar's own agent identity — used as the `iss` claim on tokens it issues.
     pub agent_id: String,
     /// Shared out-of-band HMAC secret trusted by every peer in this mesh (see module doc).
+    /// Used as the signing/verification fallback for any peer without its own entry in
+    /// `peer_secrets`.
     pub token_issuer_secret: [u8; 32],
     /// Address the real SAACP protocol listener binds (peer sidecars dial this).
     pub saacp_listen_addr: SocketAddr,
     /// Address the local plain-HTTP/JSON API binds (the co-located agent talks to this).
     pub http_listen_addr: SocketAddr,
+    /// Pairwise secrets shared with specific peers, keyed by peer `agent_id` (see module
+    /// doc's "per-peer issuer secrets" section). Empty (default) preserves today's exact
+    /// single-shared-secret behavior. Non-empty makes the peer registry authoritative —
+    /// only these named peers can be accepted as senders.
+    pub peer_secrets: HashMap<String, [u8; 32]>,
+    /// Bound on concurrent outbound `/send` dispatches.
+    pub max_concurrent_sends: usize,
+    /// Retries for a transient failure at the initial TCP-connect step only.
+    pub send_retry_attempts: u32,
+}
+
+impl SidecarConfig {
+    /// Convenience constructor for the common case: single shared mesh secret, default
+    /// concurrency/retry limits, no per-peer overrides. Use struct-update syntax
+    /// (`SidecarConfig { peer_secrets, ..SidecarConfig::new(...) }`) to customize.
+    pub fn new(
+        agent_id: impl Into<String>,
+        token_issuer_secret: [u8; 32],
+        saacp_listen_addr: SocketAddr,
+        http_listen_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            token_issuer_secret,
+            saacp_listen_addr,
+            http_listen_addr,
+            peer_secrets: HashMap::new(),
+            max_concurrent_sends: SIDECAR_DEFAULT_MAX_CONCURRENT_SENDS,
+            send_retry_attempts: SIDECAR_DEFAULT_SEND_RETRY_ATTEMPTS,
+        }
+    }
 }
 
 // ─── Inbox ────────────────────────────────────────────────────────────────────
@@ -123,6 +201,11 @@ impl Inbox {
         let mut rx = self.rx.lock().await;
         tokio::time::timeout(wait, rx.recv()).await.ok().flatten()
     }
+
+    /// Current number of undelivered messages waiting for `/receive` to pick them up.
+    async fn len(&self) -> usize {
+        self.rx.lock().await.len()
+    }
 }
 
 // ─── Outbound send ───────────────────────────────────────────────────────────
@@ -137,10 +220,16 @@ pub enum SendOutcome {
 
 #[derive(Debug)]
 pub enum SidecarError {
+    /// TCP connect failed outright — retried up to `send_retry_attempts` times.
     Connect(std::io::Error),
+    /// TCP connect didn't complete within the timeout — retried the same as `Connect`.
+    ConnectTimeout,
     Handshake(crate::errors::SAACPHardDrop),
     Session(crate::errors::SAACPHardDrop),
     Io(std::io::Error),
+    /// Timed out at any post-connect step (handshake, write, or ack read) — never
+    /// retried, since it indicates a live but misbehaving/slow peer, not a transient
+    /// connect failure.
     Timeout,
 }
 
@@ -148,6 +237,7 @@ impl std::fmt::Display for SidecarError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(e) => write!(f, "connect failed: {e}"),
+            Self::ConnectTimeout => write!(f, "timed out connecting to peer"),
             Self::Handshake(e) => write!(f, "handshake failed: {}", e.message),
             Self::Session(e) => write!(f, "session setup failed: {}", e.message),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -158,27 +248,56 @@ impl std::fmt::Display for SidecarError {
 
 impl std::error::Error for SidecarError {}
 
+/// Connect to `target_addr`, retrying only a transient failure/timeout at this exact step
+/// up to `retry_attempts` times with a fixed short backoff. See this module's doc comment
+/// for why only the connect step is retried.
+async fn connect_with_retry(
+    target_addr: &str,
+    retry_attempts: u32,
+    timeout: Duration,
+) -> Result<TcpStream, SidecarError> {
+    let mut attempt = 0u32;
+    loop {
+        match tokio::time::timeout(timeout, TcpStream::connect(target_addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                if attempt >= retry_attempts {
+                    return Err(SidecarError::Connect(e));
+                }
+            }
+            Err(_) => {
+                if attempt >= retry_attempts {
+                    return Err(SidecarError::ConnectTimeout);
+                }
+            }
+        }
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(SEND_RETRY_BACKOFF_MS)).await;
+    }
+}
+
 /// Send one schema-1 ("Task") message to a peer's SAACP listener. Opens a fresh TCP
-/// connection, performs a real X25519 ECDH handshake (`daemon::client_handshake`), issues a
-/// capability token signed with `token_issuer_secret`, builds a real AES-256-GCM frame
+/// connection (retrying transient connect failures up to `retry_attempts` times), performs
+/// a real X25519 ECDH handshake (`daemon::client_handshake`), issues a capability token
+/// signed with `secret` (the mesh-wide shared secret, or a peer-specific one — see this
+/// module's "per-peer issuer secrets" doc section), builds a real AES-256-GCM frame
 /// (`measc::MEASCFrame::build_frame`), and classifies the peer's ack. See this module's doc
 /// comment for why the token's `allow` list is always `["unknown"]` rather than
 /// `target_agent`.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     target_addr: &str,
     target_agent: &str,
     from_agent: &str,
-    token_issuer_secret: &[u8; 32],
+    secret: &[u8; 32],
     task: &str,
     priority: i64,
     action_class: u8,
+    retry_attempts: u32,
 ) -> Result<SendOutcome, SidecarError> {
     let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
 
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(target_addr))
-        .await
-        .map_err(|_| SidecarError::Timeout)?
-        .map_err(SidecarError::Connect)?;
+    let mut stream = connect_with_retry(target_addr, retry_attempts, timeout).await?;
 
     let session_key = tokio::time::timeout(timeout, client_handshake(&mut stream))
         .await
@@ -205,7 +324,7 @@ pub async fn send_message(
     let _ = target_agent;
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        token_issuer_secret, from_agent, &[BOOTSTRAP_AGENT], &[], 60, None, action_class, None,
+        secret, from_agent, &[BOOTSTRAP_AGENT], &[], 60, None, action_class, None,
     );
     let token_str = String::from_utf8(token).map_err(|_| SidecarError::Session(
         crate::errors::SAACPHardDrop::new(
@@ -264,7 +383,23 @@ pub async fn send_message(
 struct SidecarState {
     agent_id: String,
     token_issuer_secret: [u8; 32],
+    peer_secrets: HashMap<String, [u8; 32]>,
+    send_retry_attempts: u32,
+    send_semaphore: tokio::sync::Semaphore,
     inbox: Inbox,
+    inbox_capacity: usize,
+}
+
+impl SidecarState {
+    /// The secret to sign/verify traffic with `target_agent` under: their own pairwise
+    /// entry if one is registered, else the mesh-wide shared secret (see module doc's
+    /// "per-peer issuer secrets" section).
+    fn secret_for(&self, target_agent: &str) -> [u8; 32] {
+        self.peer_secrets
+            .get(target_agent)
+            .copied()
+            .unwrap_or(self.token_issuer_secret)
+    }
 }
 
 #[derive(Deserialize)]
@@ -289,9 +424,28 @@ async fn handle_send(
     State(state): State<Arc<SidecarState>>,
     Json(req): Json<SendRequest>,
 ) -> (StatusCode, Json<SendResponse>) {
+    // Bounded outbound concurrency: a short bounded wait for a free permit, then an
+    // explicit saturation response rather than queuing without bound (see module doc).
+    let _permit = match tokio::time::timeout(
+        Duration::from_millis(SEND_PERMIT_ACQUIRE_WAIT_MS),
+        state.send_semaphore.acquire(),
+    ).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SendResponse {
+                    status: "saturated",
+                    detail: Some("too many concurrent outbound sends in flight; retry shortly".into()),
+                }),
+            );
+        }
+    };
+
+    let secret = state.secret_for(&req.to_agent);
     match send_message(
-        &req.target_addr, &req.to_agent, &state.agent_id, &state.token_issuer_secret,
-        &req.task, req.priority, req.action_class,
+        &req.target_addr, &req.to_agent, &state.agent_id, &secret,
+        &req.task, req.priority, req.action_class, state.send_retry_attempts,
     ).await {
         Ok(SendOutcome::Success) => (
             StatusCode::OK,
@@ -327,7 +481,13 @@ async fn handle_receive(
 }
 
 async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok", "agent_id": state.agent_id}))
+    Json(serde_json::json!({
+        "status": "ok",
+        "agent_id": state.agent_id,
+        "inbox_depth": state.inbox.len().await,
+        "inbox_capacity": state.inbox_capacity,
+        "peers_configured": state.peer_secrets.len(),
+    }))
 }
 
 /// Start the sidecar: the real SAACP protocol listener (peer sidecars dial in) plus the
@@ -337,6 +497,18 @@ pub async fn run(config: SidecarConfig) {
 
     let gateway = Arc::new(ZeroTrustGateway::new());
     let epoch_manager = Arc::new(SessionEpochManager::new());
+
+    // Per-peer issuer secrets (see module doc): once any entry is registered, the
+    // registry becomes authoritative for every subsequent token — no more falling back
+    // to a shared secret for anyone. Empty `peer_secrets` (default) never calls this, so
+    // today's single-shared-secret behavior is unchanged.
+    for (peer_id, secret) in &config.peer_secrets {
+        gateway
+            .register_issuer_key(peer_id.as_str(), secret)
+            .unwrap_or_else(|e| {
+                panic!("saacp-sidecar: failed to register peer secret for '{peer_id}': {}", e.message)
+            });
+    }
 
     let daemon = SAACPNetworkDaemon::new(
         &config.saacp_listen_addr.ip().to_string(),
@@ -359,7 +531,11 @@ pub async fn run(config: SidecarConfig) {
     let state = Arc::new(SidecarState {
         agent_id: config.agent_id,
         token_issuer_secret: config.token_issuer_secret,
+        peer_secrets: config.peer_secrets,
+        send_retry_attempts: config.send_retry_attempts,
+        send_semaphore: tokio::sync::Semaphore::new(config.max_concurrent_sends.max(1)),
         inbox: Inbox { rx: Mutex::new(rx) },
+        inbox_capacity: SIDECAR_INBOX_CAPACITY,
     });
 
     let app = Router::new()

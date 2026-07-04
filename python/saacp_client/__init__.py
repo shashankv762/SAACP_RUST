@@ -13,15 +13,18 @@ from typing import Any, Optional
 
 import requests
 
+from ._errors import SaacpError
+
 DEFAULT_SIDECAR_URL = "http://127.0.0.1:8787"
 
-__all__ = ["SaacpClient", "SendResult", "SaacpError", "DEFAULT_SIDECAR_URL"]
-
-
-class SaacpError(RuntimeError):
-    """A transport-level failure talking to the *local* sidecar (connection refused, sidecar
-    itself errored out). Not raised for a peer-side rejection — see ``SendResult.status``.
-    """
+__all__ = [
+    "SaacpClient",
+    "SendResult",
+    "SaacpError",
+    "DEFAULT_SIDECAR_URL",
+    "wrap",
+    "SecuredCallable",
+]
 
 
 class SendResult:
@@ -58,25 +61,33 @@ class SaacpClient:
 
         ``target_addr`` is the *peer's* SAACP protocol address (``host:port`` — the
         ``SAACP_LISTEN_ADDR`` that peer's sidecar was started with), not that peer's HTTP
-        API address. Raises ``SaacpError`` only for a transport-level failure talking to
-        *this* sidecar; a peer-side rejection (bad token, tampered frame, scope violation,
-        ...) is reported via ``SendResult.status``, never as an exception — the caller
-        decides how to handle "the network worked but the message wasn't accepted."
+        API address. Raises ``SaacpError`` only when this sidecar couldn't be reached at
+        all, or responded with something that isn't the expected JSON body. A peer-side
+        rejection (bad token, tampered frame, scope violation, ...) *or* this sidecar
+        reporting its own outbound concurrency limit is saturated (``status="saturated"``)
+        are both reported via ``SendResult.status``, never as an exception — the caller
+        decides how to handle "the request completed but wasn't a plain success."
         """
-        resp = requests.post(
-            f"{self.sidecar_url}/send",
-            json={
-                "to_agent": to_agent,
-                "target_addr": target_addr,
-                "task": task,
-                "priority": priority,
-                "action_class": action_class,
-            },
-            timeout=self.timeout,
-        )
-        if resp.status_code >= 500:
-            raise SaacpError(f"sidecar reported a transport error: {resp.text}")
-        body = resp.json()
+        try:
+            resp = requests.post(
+                f"{self.sidecar_url}/send",
+                json={
+                    "to_agent": to_agent,
+                    "target_addr": target_addr,
+                    "task": task,
+                    "priority": priority,
+                    "action_class": action_class,
+                },
+                timeout=self.timeout,
+            )
+        except requests.RequestException as e:
+            raise SaacpError(f"could not reach the local sidecar at {self.sidecar_url}: {e}") from e
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise SaacpError(
+                f"sidecar returned a non-JSON response (status {resp.status_code}): {resp.text}"
+            ) from e
         return SendResult(status=body.get("status", "error"), detail=body.get("detail"))
 
     def receive(self, wait_secs: float = 5.0) -> Optional[dict[str, Any]]:
@@ -100,3 +111,10 @@ class SaacpClient:
         resp = requests.get(f"{self.sidecar_url}/healthz", timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
+
+
+# Imported at the bottom, after `SaacpClient`/`SendResult`/`SaacpError` are already
+# defined on this module — `wrap.py` and `sidecar_manager.py` both do
+# `from ._errors import SaacpError` directly (not `from . import SaacpError`) precisely
+# so this ordering isn't load-bearing, but keeping the import here regardless.
+from .wrap import wrap, SecuredCallable  # noqa: E402
