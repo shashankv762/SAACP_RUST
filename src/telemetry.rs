@@ -14,10 +14,19 @@
 //! let report = global_telemetry().render_prometheus();
 //! ```
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+fn now_epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 // ---------------------------------------------------------------------------
 // Global singleton
@@ -134,6 +143,15 @@ pub struct Counters {
     pub trust_penalties_generic:           AtomicU64,
     pub trust_downgrades_total:            AtomicU64,
     pub trust_reauth_required_total:       AtomicU64,
+
+    // ── Financial Circuit Breaker (Gate 0.5, handler.rs::gate_financial_cb) ──
+    // Sum of `estimated_cost` across every rejected (BudgetExceeded) packet.
+    // This is "tokens the caller claimed it would spend and was prevented
+    // from spending" — NOT a claim about actual downstream cost avoidance,
+    // which this system has no way to observe. A single global counter, not
+    // per-agent, to keep this bounded-cardinality like the trust-penalty
+    // counters above.
+    pub financial_tokens_rejected:         AtomicU64,
 }
 
 impl Counters {
@@ -190,6 +208,7 @@ impl Counters {
             trust_penalties_generic:         z!(),
             trust_downgrades_total:          z!(),
             trust_reauth_required_total:     z!(),
+            financial_tokens_rejected:       z!(),
         }
     }
 }
@@ -325,6 +344,19 @@ impl TelemetryCollector {
     pub fn record_trust_downgrade(&self)       { self.counters.trust_downgrades_total.fetch_add(1, Ordering::Relaxed); }
     pub fn record_trust_reauth_required(&self) { self.counters.trust_reauth_required_total.fetch_add(1, Ordering::Relaxed); }
 
+    /// Record one Gate 0.5 (Financial Circuit Breaker) rejection's claimed
+    /// cost. `estimated_cost` is the caller-supplied value already validated
+    /// finite/non-negative by `gate_financial_cb` before this is called;
+    /// non-finite/negative values are defensively treated as zero here too.
+    pub fn record_financial_rejection(&self, estimated_cost: f64) {
+        let tokens = if estimated_cost.is_finite() && estimated_cost > 0.0 {
+            estimated_cost.round() as u64
+        } else {
+            0
+        };
+        self.counters.financial_tokens_rejected.fetch_add(tokens, Ordering::Relaxed);
+    }
+
     // ── Snapshot ─────────────────────────────────────────────────────────────
 
     /// Return all counters as a flat `HashMap<String, u64>`.
@@ -386,6 +418,7 @@ impl TelemetryCollector {
         snap!("trust_penalties_generic",         c.trust_penalties_generic);
         snap!("trust_downgrades_total",          c.trust_downgrades_total);
         snap!("trust_reauth_required_total",     c.trust_reauth_required_total);
+        snap!("financial_tokens_rejected",       c.financial_tokens_rejected);
         m
     }
 
@@ -515,6 +548,14 @@ impl TelemetryCollector {
             snap.get("stream_bytes_processed").copied().unwrap_or(0)
         ));
 
+        // ── Financial Circuit Breaker ────────────────────────────────────────
+        out.push_str("# HELP saacp_financial_tokens_rejected_total Sum of estimated_cost across every Gate 0.5 BudgetExceeded rejection (claimed cost prevented, not observed actual spend).\n");
+        out.push_str("# TYPE saacp_financial_tokens_rejected_total counter\n");
+        out.push_str(&format!(
+            "saacp_financial_tokens_rejected_total {}\n",
+            snap.get("financial_tokens_rejected").copied().unwrap_or(0)
+        ));
+
         // ── Per-agent error table (top-N) ─────────────────────────────────────
         out.push_str("# HELP saacp_agent_errors_total Error count per agent (top-50).\n");
         out.push_str("# TYPE saacp_agent_errors_total counter\n");
@@ -562,6 +603,7 @@ impl TelemetryCollector {
         rst!(c.trust_penalties_scope_violation); rst!(c.trust_penalties_injection);
         rst!(c.trust_penalties_epistemic); rst!(c.trust_penalties_generic);
         rst!(c.trust_downgrades_total); rst!(c.trust_reauth_required_total);
+        rst!(c.financial_tokens_rejected);
         self.agent_errors.lock().unwrap().clear();
     }
 }
@@ -571,12 +613,117 @@ impl Default for TelemetryCollector {
 }
 
 // ---------------------------------------------------------------------------
+// SecurityAlertFeed — bounded, network-safe live feed of gate rejections
+// ---------------------------------------------------------------------------
+//
+// Deliberately a separate, always-network-safe structure from `pecf.rs`'s
+// `SecureDiagnosticLedger` (whose own doc comment forbids network exposure)
+// — this holds only the same level of detail already returned to legitimate
+// callers via `SAACPHardDrop` (bytecode + message), nothing more sensitive.
+// Built for the SAACP Command Center dashboard's live alert feed.
+
+/// One gate rejection, recorded for the live alert feed.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityAlert {
+    pub timestamp: f64,
+    pub agent_id: String,
+    pub gate: &'static str,
+    pub bytecode: String,
+    pub message: String,
+}
+
+/// Bounded capacity of `SecurityAlertFeed`'s ring buffer — oldest entries
+/// evicted first, mirroring `pecf.rs::SecureDiagnosticLedger`'s eviction
+/// idiom (but this is a distinct, purpose-built, network-safe structure).
+pub const ALERT_FEED_MAX_ENTRIES: usize = 2000;
+
+pub struct SecurityAlertFeed {
+    ring: Mutex<VecDeque<SecurityAlert>>,
+    #[allow(clippy::type_complexity)]
+    subscribers: Mutex<Vec<Arc<dyn Fn(&SecurityAlert) + Send + Sync>>>,
+}
+
+impl SecurityAlertFeed {
+    fn new() -> Self {
+        Self {
+            ring: Mutex::new(VecDeque::new()),
+            subscribers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Process-wide singleton.
+    pub fn global() -> &'static SecurityAlertFeed {
+        static GLOBAL: OnceLock<SecurityAlertFeed> = OnceLock::new();
+        GLOBAL.get_or_init(SecurityAlertFeed::new)
+    }
+
+    /// Record one alert: push to the bounded ring, then notify subscribers.
+    /// The subscriber-list mutex is held across the callback loop (same
+    /// precedent as `trust_decay.rs`'s signal dispatch) — never the ring
+    /// mutex, which is dropped first.
+    pub fn record(&self, alert: SecurityAlert) {
+        {
+            let mut ring = self.ring.lock().unwrap();
+            if ring.len() >= ALERT_FEED_MAX_ENTRIES {
+                ring.pop_front();
+            }
+            ring.push_back(alert.clone());
+        }
+        let subs = self.subscribers.lock().unwrap();
+        for cb in subs.iter() {
+            cb(&alert);
+        }
+    }
+
+    /// Most recent `limit` alerts, newest first.
+    pub fn recent(&self, limit: usize) -> Vec<SecurityAlert> {
+        let ring = self.ring.lock().unwrap();
+        ring.iter().rev().take(limit).cloned().collect()
+    }
+
+    pub fn subscribe(&self, cb: Arc<dyn Fn(&SecurityAlert) + Send + Sync>) {
+        self.subscribers.lock().unwrap().push(cb);
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Process-wide `SecurityAlertFeed` singleton — convenience alias for
+/// `SecurityAlertFeed::global()`, matching this module's `global_telemetry()`
+/// naming convention.
+pub fn global_alert_feed() -> &'static SecurityAlertFeed {
+    SecurityAlertFeed::global()
+}
+
+/// Record a gate rejection to both the counter bank and the live alert feed
+/// in one call — the standard instrumentation point for every gate's reject
+/// site in `handler.rs`. `gate` should be one of the strings recognized by
+/// `TelemetryCollector::record_gate_rejection` (e.g. `"gate_4_0_inject"`).
+pub fn report_gate_rejection(gate: &'static str, agent_id: &str, err: &crate::errors::SAACPHardDrop) {
+    global_telemetry().record_gate_rejection(gate);
+    global_alert_feed().record(SecurityAlert {
+        timestamp: now_epoch_secs(),
+        agent_id: agent_id.to_string(),
+        gate,
+        bytecode: format!("{:?}", err.bytecode),
+        message: err.message.clone(),
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_counters_increment() {
@@ -675,5 +822,87 @@ mod tests {
         let prom = t.render_prometheus();
         assert!(prom.contains("saacp_token_cache_hit_ratio 0.6667")
              || prom.contains("saacp_token_cache_hit_ratio 0.666"));
+    }
+
+    #[test]
+    fn test_financial_rejection_accumulates_and_renders() {
+        let t = TelemetryCollector::new();
+        t.record_financial_rejection(150.0);
+        t.record_financial_rejection(50.4);
+        let snap = t.snapshot();
+        assert_eq!(snap["financial_tokens_rejected"], 200); // 150 + round(50.4)
+        let prom = t.render_prometheus();
+        assert!(prom.contains("saacp_financial_tokens_rejected_total 200"));
+    }
+
+    #[test]
+    fn test_financial_rejection_ignores_non_finite_and_negative() {
+        let t = TelemetryCollector::new();
+        t.record_financial_rejection(f64::NAN);
+        t.record_financial_rejection(f64::INFINITY);
+        t.record_financial_rejection(-5.0);
+        let snap = t.snapshot();
+        assert_eq!(snap["financial_tokens_rejected"], 0);
+    }
+
+    #[test]
+    fn test_security_alert_feed_records_and_notifies_subscribers() {
+        use std::sync::atomic::AtomicUsize;
+        use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+
+        let feed = SecurityAlertFeed::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_clone = Arc::clone(&seen);
+        feed.subscribe(Arc::new(move |_alert: &SecurityAlert| {
+            seen_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let err = SAACPHardDrop::new(SAACPBytecodes::PromptInjectionDetected, "test message");
+        feed.record(SecurityAlert {
+            timestamp: 123.0,
+            agent_id: "agent-x".to_string(),
+            gate: "gate_4_0_inject",
+            bytecode: format!("{:?}", err.bytecode),
+            message: err.message.clone(),
+        });
+
+        assert_eq!(feed.len(), 1);
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        let recent = feed.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].agent_id, "agent-x");
+        assert_eq!(recent[0].gate, "gate_4_0_inject");
+    }
+
+    #[test]
+    fn test_security_alert_feed_bounded_eviction() {
+        let feed = SecurityAlertFeed::new();
+        for i in 0..(ALERT_FEED_MAX_ENTRIES + 10) {
+            feed.record(SecurityAlert {
+                timestamp: i as f64,
+                agent_id: format!("agent-{i}"),
+                gate: "gate_4_0_inject",
+                bytecode: "PromptInjectionDetected".to_string(),
+                message: "x".to_string(),
+            });
+        }
+        assert_eq!(feed.len(), ALERT_FEED_MAX_ENTRIES);
+        // Newest-first: the very last recorded entry should be first.
+        let recent = feed.recent(1);
+        assert_eq!(recent[0].agent_id, format!("agent-{}", ALERT_FEED_MAX_ENTRIES + 9));
+    }
+
+    #[test]
+    #[serial]
+    fn test_report_gate_rejection_updates_counter_and_feed() {
+        use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+
+        let before = global_telemetry().snapshot()["gate_4_0_injection_detected"];
+        let before_alerts = global_alert_feed().len();
+        let err = SAACPHardDrop::new(SAACPBytecodes::PromptInjectionDetected, "unit test injection");
+        report_gate_rejection("gate_4_0_inject", "agent-report-test", &err);
+        let after = global_telemetry().snapshot()["gate_4_0_injection_detected"];
+        assert_eq!(after, before + 1);
+        assert!(global_alert_feed().len() > before_alerts || global_alert_feed().len() == ALERT_FEED_MAX_ENTRIES);
     }
 }

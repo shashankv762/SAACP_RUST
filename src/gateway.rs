@@ -6,8 +6,9 @@
 //! Uses length-prefix format to prevent token delimiter injection.
 
 use std::collections::{HashMap, HashSet, BTreeMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use hmac::{Hmac, Mac};
@@ -16,6 +17,7 @@ use sha2::{Sha256, Digest};
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::faitf::TrustStore;
 use crate::acsvaf::{CapabilityVerificationAuthority, ACSVAF_MAX_DELEGATION_DEPTH};
+use crate::state_backend::StateBackend;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,6 +44,11 @@ pub const TOKEN_CACHE_TTL: f64 = 30.0;
 /// idiom: only swept when the cap is exceeded, so well-behaved fleets (fewer than
 /// this many concurrently-active agents) never pay the sweep cost at all.
 pub const RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
+/// Default interval at which `AgentRateLimiter::with_backend`'s background
+/// poller mirrors fleet-wide lockouts (tripped on another node) into this
+/// node's local map. Bounds the "already-known-here" staleness window —
+/// see `state_backend.rs`'s module doc for the full design rationale.
+pub const RATE_LIMITER_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -158,23 +165,176 @@ struct CoverRecord {
 }
 
 /// Per-agent-identity circuit breaker with separate cover traffic budget.
+///
+/// Optionally backed by a [`StateBackend`] (see `state_backend.rs`'s module
+/// doc for the full cross-node design) via [`Self::with_backend`]. Without a
+/// backend (`::new()`/`::global()`), behavior is byte-for-byte identical to
+/// before this was added — purely in-process, no thread spawned.
 pub struct AgentRateLimiter {
-    records: Mutex<HashMap<String, RateRecord>>,
-    cover_records: Mutex<HashMap<String, CoverRecord>>,
+    records: Arc<Mutex<HashMap<String, RateRecord>>>,
+    cover_records: Arc<Mutex<HashMap<String, CoverRecord>>>,
+    backend: Option<Arc<dyn StateBackend>>,
+    poller_stop: Option<Arc<AtomicBool>>,
+}
+
+fn ratelimit_err_key(agent_id: &str) -> String {
+    format!("ratelimit:err:{agent_id}")
+}
+
+fn ratelimit_lock_key(agent_id: &str) -> String {
+    format!("ratelimit:lock:{agent_id}")
 }
 
 impl AgentRateLimiter {
     pub fn new() -> Self {
         Self {
-            records: Mutex::new(HashMap::new()),
-            cover_records: Mutex::new(HashMap::new()),
+            records: Arc::new(Mutex::new(HashMap::new())),
+            cover_records: Arc::new(Mutex::new(HashMap::new())),
+            backend: None,
+            poller_stop: None,
+        }
+    }
+
+    /// Construct with a shared [`StateBackend`] for cross-node visibility and
+    /// atomic fleet-wide circuit-breaker enforcement on the (rare) error
+    /// path. Spawns a background poller at the default interval — see
+    /// [`Self::with_backend_and_poll_interval`] to customize it.
+    pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
+        Self::with_backend_and_poll_interval(backend, RATE_LIMITER_DEFAULT_POLL_INTERVAL)
+    }
+
+    /// Same as [`Self::with_backend`], with a configurable poll interval for
+    /// the background lockout-mirroring thread.
+    pub fn with_backend_and_poll_interval(backend: Arc<dyn StateBackend>, poll_interval: Duration) -> Self {
+        let records = Arc::new(Mutex::new(HashMap::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let poll_records = Arc::clone(&records);
+        let poll_backend = Arc::clone(&backend);
+        let poll_stop = Arc::clone(&stop);
+        let _ = std::thread::Builder::new()
+            .name("saacp-ratelimit-poller".to_string())
+            .spawn(move || {
+                while !poll_stop.load(Ordering::Relaxed) {
+                    Self::poll_once(&poll_records, poll_backend.as_ref());
+                    std::thread::sleep(poll_interval);
+                }
+            });
+
+        Self {
+            records,
+            cover_records: Arc::new(Mutex::new(HashMap::new())),
+            backend: Some(backend),
+            poller_stop: Some(stop),
+        }
+    }
+
+    /// Merge any fleet-wide lockouts visible on the backend into the local
+    /// map. Called periodically by the background poller when constructed
+    /// via `with_backend`; also callable directly for deterministic tests
+    /// (avoids sleeping past the poll interval).
+    pub fn refresh_from_backend(&self) {
+        if let Some(backend) = &self.backend {
+            Self::poll_once(&self.records, backend.as_ref());
+        }
+    }
+
+    fn poll_once(records: &Mutex<HashMap<String, RateRecord>>, backend: &dyn StateBackend) {
+        // The `ratelimit:lock:` keyspace is small and self-cleaning (only
+        // currently-locked-out agents, TTL-bounded at
+        // RATE_LIMITER_LOCKOUT_SECONDS), so a SCAN here is cheap — this is
+        // not a scan of the full production keyspace.
+        let Ok(keys) = backend.scan_prefix("ratelimit:lock:") else { return };
+        for key in keys {
+            let agent_id = key.strip_prefix("ratelimit:lock:").unwrap_or(&key);
+            let Ok(Some(bytes)) = backend.get(&key) else { continue };
+            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+            let Ok(locked_until) = text.parse::<f64>() else { continue };
+
+            let mut r = records.lock().unwrap();
+            let rec = r.entry(agent_id.to_string()).or_insert(RateRecord {
+                errors: 0,
+                window_start: now_epoch_secs(),
+                locked_until: 0.0,
+            });
+            rec.locked_until = rec.locked_until.max(locked_until);
         }
     }
 
     /// Record one error. Raises CIRCUIT_BREAKER_OPEN if threshold exceeded.
+    ///
+    /// When a backend is configured, the shared fleet-wide error counter is
+    /// bumped atomically (`StateBackend::incr_with_ttl`) so an agent can't
+    /// evade the breaker by round-robining across nodes; on a backend error
+    /// this fails *safe* (falls back to the local-only algorithm below) not
+    /// open.
     pub fn record_error(&self, agent_id: &str) -> Result<(), SAACPHardDrop> {
-        let mut records = self.records.lock().unwrap();
         let now = now_epoch_secs();
+
+        if let Some(backend) = &self.backend {
+            // Already locked out locally — no backend call needed; avoids
+            // hammering the backend with every subsequent bad packet during
+            // an active lockout.
+            {
+                let records = self.records.lock().unwrap();
+                if let Some(rec) = records.get(agent_id) {
+                    if now < rec.locked_until {
+                        return Err(SAACPHardDrop::new(
+                            SAACPBytecodes::CircuitBreakerOpen,
+                            format!("Agent '{}' is locked out for malformed packet flooding.", agent_id),
+                        ));
+                    }
+                }
+            } // guard dropped before any backend I/O
+
+            match backend.incr_with_ttl(
+                &ratelimit_err_key(agent_id),
+                1,
+                Duration::from_secs_f64(RATE_LIMITER_WINDOW_SECONDS),
+            ) {
+                Ok(shared_count) => {
+                    if shared_count >= RATE_LIMITER_THRESHOLD as i64 {
+                        let locked_until = now + RATE_LIMITER_LOCKOUT_SECONDS;
+                        {
+                            let mut records = self.records.lock().unwrap();
+                            let rec = records.entry(agent_id.to_string()).or_insert(RateRecord {
+                                errors: 0,
+                                window_start: now,
+                                locked_until: 0.0,
+                            });
+                            rec.errors = shared_count.max(0) as usize;
+                            rec.locked_until = locked_until;
+                        }
+                        let _ = backend.set(
+                            &ratelimit_lock_key(agent_id),
+                            locked_until.to_string().as_bytes(),
+                            Some(Duration::from_secs_f64(RATE_LIMITER_LOCKOUT_SECONDS)),
+                        );
+                        return Err(SAACPHardDrop::new(
+                            SAACPBytecodes::CircuitBreakerOpen,
+                            format!(
+                                "Circuit breaker OPEN for '{}': {} errors in {}s (fleet-wide).",
+                                agent_id, shared_count, RATE_LIMITER_WINDOW_SECONDS
+                            ),
+                        ));
+                    }
+                    let mut records = self.records.lock().unwrap();
+                    let rec = records.entry(agent_id.to_string()).or_insert(RateRecord {
+                        errors: 0,
+                        window_start: now,
+                        locked_until: 0.0,
+                    });
+                    rec.errors = shared_count.max(0) as usize;
+                    return Ok(());
+                }
+                Err(_backend_error) => {
+                    // Fail-safe, not fail-open: fall through to the
+                    // local-only algorithm for this one call.
+                }
+            }
+        }
+
+        let mut records = self.records.lock().unwrap();
 
         // IoT / low-resource fix: this map previously grew unbounded — one permanent
         // entry per distinct agent_id ever seen. Sweep stale entries (not currently
@@ -220,6 +380,13 @@ impl AgentRateLimiter {
     }
 
     /// Record one cover traffic packet (M-8 fix).
+    ///
+    /// Deliberately node-local even when a backend is configured: this
+    /// window is an order of magnitude higher-frequency than
+    /// `record_error`'s (50 packets/1s vs 5 errors/10s), and its trip
+    /// consequence is lower-severity (traffic-shaping, not a compromise
+    /// signal) — a per-packet backend round trip here would reintroduce
+    /// exactly the regression the hybrid design avoids for `record_error`.
     pub fn record_cover_traffic(&self, agent_id: &str) -> Result<(), SAACPHardDrop> {
         let mut records = self.cover_records.lock().unwrap();
         let now = now_epoch_secs();
@@ -253,6 +420,12 @@ impl AgentRateLimiter {
     }
 
     /// Returns true if the agent is currently under circuit-breaker lockout.
+    ///
+    /// Always a pure local read — zero network calls in any configuration.
+    /// This runs on every packet (before Gate 0 decryption), so it must
+    /// never depend on backend latency; cross-node lockouts reach this map
+    /// via `record_error`'s immediate local write (same node) or the
+    /// background poller (other nodes, bounded by the poll interval).
     pub fn is_locked(&self, agent_id: &str) -> bool {
         let records = self.records.lock().unwrap();
         if let Some(rec) = records.get(agent_id) {
@@ -277,9 +450,20 @@ impl AgentRateLimiter {
         if let Some(id) = agent_id {
             self.records.lock().unwrap().remove(id);
             self.cover_records.lock().unwrap().remove(id);
+            if let Some(backend) = &self.backend {
+                let _ = backend.delete(&ratelimit_err_key(id));
+                let _ = backend.delete(&ratelimit_lock_key(id));
+            }
         } else {
             self.records.lock().unwrap().clear();
             self.cover_records.lock().unwrap().clear();
+            if let Some(backend) = &self.backend {
+                if let Ok(keys) = backend.scan_prefix("ratelimit:") {
+                    for key in keys {
+                        let _ = backend.delete(&key);
+                    }
+                }
+            }
         }
     }
 }
@@ -287,6 +471,14 @@ impl AgentRateLimiter {
 impl Default for AgentRateLimiter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for AgentRateLimiter {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.poller_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1317,6 +1509,88 @@ mod tests {
         }
         // 51st should exceed threshold
         assert!(rl.record_cover_traffic("agent1").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // AgentRateLimiter::with_backend — distributed state (Workstream A)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn rate_limiter_new_behavior_unchanged_without_backend() {
+        // No backend configured: existing threshold/lockout behavior must be
+        // bit-for-bit identical to before this feature existed.
+        let rl = AgentRateLimiter::new();
+        assert!(rl.poller_stop.is_none());
+        for _ in 0..4 {
+            assert!(rl.record_error("agentX").is_ok());
+        }
+        assert!(rl.record_error("agentX").is_err());
+        assert!(rl.is_locked("agentX"));
+    }
+
+    #[test]
+    fn rate_limiter_with_inmemory_backend_cross_instance_lockout() {
+        use crate::state_backend::InMemoryBackend;
+
+        // Simulate two gateway nodes sharing one backend.
+        let shared: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let node_a = AgentRateLimiter::with_backend(Arc::clone(&shared));
+        let node_b = AgentRateLimiter::with_backend(Arc::clone(&shared));
+
+        assert!(!node_b.is_locked("agentY"));
+
+        // Drive enough errors into node A to trip the fleet-wide threshold.
+        let mut tripped = false;
+        for _ in 0..RATE_LIMITER_THRESHOLD {
+            if node_a.record_error("agentY").is_err() {
+                tripped = true;
+            }
+        }
+        assert!(tripped, "node A should have tripped the circuit breaker");
+        assert!(node_a.is_locked("agentY"));
+
+        // Node B hasn't seen any traffic for this agent yet — deterministically
+        // pull the fleet-wide lockout marker instead of sleeping.
+        assert!(!node_b.is_locked("agentY"), "node B shouldn't know yet without a refresh");
+        node_b.refresh_from_backend();
+        assert!(node_b.is_locked("agentY"), "node B should observe the cross-node lockout after refresh");
+    }
+
+    #[test]
+    fn rate_limiter_backend_error_fails_safe_not_open() {
+        struct AlwaysErrBackend;
+        impl StateBackend for AlwaysErrBackend {
+            fn get(&self, _key: &str) -> crate::state_backend::BackendResult<Option<Vec<u8>>> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+            fn set(&self, _key: &str, _value: &[u8], _ttl: Option<Duration>) -> crate::state_backend::BackendResult<()> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+            fn delete(&self, _key: &str) -> crate::state_backend::BackendResult<bool> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+            fn incr(&self, _key: &str, _by: i64) -> crate::state_backend::BackendResult<i64> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+            fn scan_prefix(&self, _prefix: &str) -> crate::state_backend::BackendResult<Vec<String>> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+            fn incr_with_ttl(&self, _key: &str, _by: i64, _ttl: Duration) -> crate::state_backend::BackendResult<i64> {
+                Err(crate::state_backend::BackendError("boom".into()))
+            }
+        }
+
+        let rl = AgentRateLimiter::with_backend(Arc::new(AlwaysErrBackend));
+        // Even though every backend call fails, the breaker must still
+        // enforce locally (fail-safe, not fail-open).
+        let mut tripped = false;
+        for _ in 0..RATE_LIMITER_THRESHOLD {
+            if rl.record_error("agentZ").is_err() {
+                tripped = true;
+            }
+        }
+        assert!(tripped, "circuit breaker must still trip when the backend is unreachable");
+        assert!(rl.is_locked("agentZ"));
     }
 
     #[test]

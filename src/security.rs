@@ -328,7 +328,7 @@ impl AuditHealth {
 }
 
 /// An audit log entry record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRecord {
     pub timestamp: f64,
     pub source: String,
@@ -418,6 +418,14 @@ pub struct ImmutableAuditLog {
     /// Approximate current WAL queue depth, maintained by hand since
     /// `mpsc::SyncSender` exposes no introspection API.
     queue_len: Arc<AtomicUsize>,
+    /// Subscribers notified synchronously on every successful `append_event`
+    /// — after the hash-chain mutex (`inner`) has been released, never
+    /// while held, matching `trust_decay.rs::emit`'s precedent. Built for
+    /// the Command Center dashboard's live-traffic and delegation-edge
+    /// feeds; does not participate in the chain-hash/verification logic at
+    /// all (that's driven entirely by `CanonicalAuditRecord`, untouched).
+    #[allow(clippy::type_complexity)]
+    subscribers: Mutex<Vec<Arc<dyn Fn(&AuditRecord) + Send + Sync>>>,
 }
 
 struct AuditInner {
@@ -495,7 +503,18 @@ impl ImmutableAuditLog {
             dropped_audits,
             wal_write_failures,
             queue_len,
+            subscribers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a callback invoked synchronously on every successfully
+    /// appended event (i.e. every call to `append_event`/`append_signed`),
+    /// with the plaintext `AuditRecord` (before WAL persistence, after the
+    /// hash-chain lock is released). Keep callbacks fast and non-blocking —
+    /// they run inline on the packet-processing path that triggered the
+    /// append. Mirrors `TrustDecayEngine::subscribe`'s established pattern.
+    pub fn subscribe(&self, cb: Arc<dyn Fn(&AuditRecord) + Send + Sync>) {
+        self.subscribers.lock().expect("lock poisoned").push(cb);
     }
 
     /// Create a new audit log with default file path (reads from env vars).
@@ -644,7 +663,16 @@ impl ImmutableAuditLog {
         }
 
         // Keep in-memory for fast verify_chain().
+        let record_for_subscribers = log_entry.record.clone();
         inner.entries.push(log_entry);
+
+        // Release the hash-chain lock BEFORE invoking subscriber callbacks —
+        // never hold `inner` across a callback (same rule `trust_decay.rs`'s
+        // `emit` follows for its own, separate subscriber-list mutex).
+        drop(inner);
+        for cb in self.subscribers.lock().expect("lock poisoned").iter() {
+            cb(&record_for_subscribers);
+        }
     }
 
     /// Verify the integrity of the in-memory audit chain.
@@ -1163,6 +1191,62 @@ mod tests {
 
         assert_eq!(log.event_count(), 2);
         assert!(log.verify_chain(secret));
+        log.reset();
+    }
+
+    #[test]
+    fn test_subscribe_notified_on_append_with_correct_record() {
+        let log = test_audit_log("subscribe_basic");
+        let secret = b"audit_secret_key";
+
+        let received: Arc<Mutex<Vec<AuditRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let received2 = Arc::clone(&received);
+        log.subscribe(Arc::new(move |record: &AuditRecord| {
+            received2.lock().unwrap().push(record.clone());
+        }));
+
+        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+
+        let recs = received.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].source, "agent-a");
+        assert_eq!(recs[0].target, "agent-b");
+        assert_eq!(recs[0].intent, "read:data");
+        log.reset();
+    }
+
+    #[test]
+    fn test_subscribe_does_not_affect_chain_verification() {
+        // Adding a subscriber must not change AuditRecord's HMAC input
+        // (that's driven entirely by the separate CanonicalAuditRecord) —
+        // confirm the chain still verifies correctly with a subscriber attached.
+        let log = test_audit_log("subscribe_chain_integrity");
+        let secret = b"audit_secret_key";
+        log.subscribe(Arc::new(|_record: &AuditRecord| {}));
+
+        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+        log.append_event(secret, "agent-b", "agent-c", "sig-002", "write:data", "trace-002");
+
+        assert!(log.verify_chain(secret));
+        log.reset();
+    }
+
+    #[test]
+    fn test_multiple_subscribers_all_notified() {
+        let log = test_audit_log("subscribe_multi");
+        let secret = b"audit_secret_key";
+
+        let count_a = Arc::new(Mutex::new(0u32));
+        let count_b = Arc::new(Mutex::new(0u32));
+        let ca = Arc::clone(&count_a);
+        let cb = Arc::clone(&count_b);
+        log.subscribe(Arc::new(move |_record: &AuditRecord| { *ca.lock().unwrap() += 1; }));
+        log.subscribe(Arc::new(move |_record: &AuditRecord| { *cb.lock().unwrap() += 1; }));
+
+        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+
+        assert_eq!(*count_a.lock().unwrap(), 1);
+        assert_eq!(*count_b.lock().unwrap(), 1);
         log.reset();
     }
 

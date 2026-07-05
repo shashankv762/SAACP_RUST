@@ -96,6 +96,11 @@ name = "test_sidecar_rs"
 path = "tests/test_sidecar_rs.rs"
 required-features = ["sidecar"]
 
+[[test]]
+name = "test_redis_backend_rs"
+path = "tests/test_redis_backend_rs.rs"
+required-features = ["redis-backend"]
+
 # The crate's first binary target — a standalone local HTTP sidecar proxy so
 # non-Rust (e.g. Python) agents can get SAACP's security guarantees over plain
 # HTTP/JSON without any SAACP protocol knowledge. See src/sidecar.rs.

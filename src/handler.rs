@@ -49,6 +49,7 @@ use crate::memory::FederatedMemory;
 use crate::schemas::PreCompiledSchemas;
 use crate::security::ImmutableAuditLog;
 use crate::streaming::StreamRegistry;
+use crate::telemetry::report_gate_rejection;
 use crate::temporal::DeadMansSwitch;
 use crate::trust_decay::{TrustDecayEngine, PenaltyKind, IntentDriftTracker, CHAIN_DRIFT_CEILING};
 
@@ -997,6 +998,11 @@ impl SAACPProtocolHandler {
             _ => 0.0,
         };
         if estimated_cost > max_budget {
+            // "Tokens Blocked" accumulator for the Command Center's financial
+            // dashboard — sum of claimed `estimated_cost` across every
+            // BudgetExceeded rejection. `estimated_cost` is already validated
+            // finite/non-negative above, right here at the point of rejection.
+            crate::telemetry::global_telemetry().record_financial_rejection(estimated_cost);
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::BudgetExceeded,
                 format!(
@@ -1378,6 +1384,9 @@ impl SAACPProtocolHandler {
             // missing-token failure), so bytecode identity is not a reliable
             // signal for "was this already penalized more specifically."
             let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
+            crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
+        } else {
+            crate::telemetry::global_telemetry().record_packet_accepted();
         }
 
         // ── Python parity: auto-register STREAM_START in StreamRegistry ───────
@@ -1459,6 +1468,9 @@ impl SAACPProtocolHandler {
         }
 
         let result = Self::gate_0_crypto_integrity_encrypted(packet, epoch_manager)
+            .inspect_err(|e| {
+                report_gate_rejection("gate_0_crypto", current_agent_name, e);
+            })
             .and_then(|parsed| {
                 if parsed.status_code == SAACPBytecodes::StreamContinuation as u8
                     || parsed.status_code == SAACPBytecodes::StreamEnd as u8
@@ -1479,6 +1491,9 @@ impl SAACPProtocolHandler {
         if result.is_err() {
             let _ = effective_rl.record_error(current_agent_name);
             let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
+            crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
+        } else {
+            crate::telemetry::global_telemetry().record_packet_accepted();
         }
 
         if let Ok(ref parsed) = result {
@@ -1519,7 +1534,9 @@ impl SAACPProtocolHandler {
         _cscs: Option<&CSCSLoopDetector>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic Integrity (always runs first — §16.2 Gate 0→All) ──
-        let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        let parsed = Self::gate_0_crypto_integrity(packet, secret_key).inspect_err(|e| {
+            report_gate_rejection("gate_0_crypto", current_agent_name, e);
+        })?;
         Self::run_gates_1_through_12(
             parsed, packet, secret_key, current_agent_name, is_pinned,
             gateway, rate_limiter, audit_log, _aegf_governor, _cscs,
@@ -1676,7 +1693,9 @@ impl SAACPProtocolHandler {
                 current_agent_name,
                 capability_token_b64.as_bytes(),
                 secret_key,
-            )?
+            ).inspect_err(|e| {
+                report_gate_rejection("gate_1_0_token", current_agent_name, e);
+            })?
         } else {
             // No gateway injected — structural token check only (test/daemon-less mode).
             // SECURITY FIX: max_action_class was incorrectly set to 2 (IRREVERSIBLE),
@@ -1716,7 +1735,10 @@ impl SAACPProtocolHandler {
         // ── Gate 2.5: Kinetic Firewall ────────────────────────────────────────
         // Python parity: Gate 2.5 runs BEFORE Gate 1.5 (intent envelope).
         // Use the max_action_class from the VALIDATED token (Gate 1.0 output).
-        Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token, audit_log)?;
+        Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token, audit_log)
+            .inspect_err(|e| {
+                report_gate_rejection("gate_2_5_kinetic", current_agent_name, e);
+            })?;
 
         // ── Gate 1.5: Cognitive Firewall / Intent Envelope ────────────────────
         // Authorization Invariance: runs for ALL tiers when root_intent_hash is present.
@@ -1726,6 +1748,7 @@ impl SAACPProtocolHandler {
             // Here we use the hash directly as the intent string for structural check.
             if let Err(e) = Self::enforce_root_intent(rint, &parsed.payload_dict) {
                 let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
 
@@ -1735,6 +1758,7 @@ impl SAACPProtocolHandler {
             // below since it's the cheaper, more targeted check.
             if let Err(e) = Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict) {
                 let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
 
@@ -1743,6 +1767,7 @@ impl SAACPProtocolHandler {
                 rint, &parsed.payload_dict, delegation_depth, &parsed.session_uuid,
             ) {
                 let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
 
@@ -1781,6 +1806,7 @@ impl SAACPProtocolHandler {
         // ── Gate 3.0: Lateral Movement Guard (secondary token for high-risk) ──
         if let Err(e) = Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict) {
             let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::ScopeViolation);
+            report_gate_rejection("gate_3_0_lateral", current_agent_name, &e);
             return Err(e);
         }
 
@@ -1790,6 +1816,7 @@ impl SAACPProtocolHandler {
             let jv = json_value_from_map(&parsed.payload_dict);
             if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
                 let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::InjectionAttempt);
+                report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
         }
@@ -1797,6 +1824,7 @@ impl SAACPProtocolHandler {
         // ── Gate 5.0: Epistemic Circuit Breaker ───────────────────────────────
         if let Err(e) = Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict) {
             let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+            report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
             return Err(e);
         }
 
@@ -1805,6 +1833,7 @@ impl SAACPProtocolHandler {
         if parsed.schema_id == 3 {
             if let Err(e) = Self::gate_5_0b_scope_consistency(&parsed.payload_dict, root_intent_hash.as_deref()) {
                 let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+                report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
                 return Err(e);
             }
         }
@@ -1850,7 +1879,9 @@ impl SAACPProtocolHandler {
         if !parsed.is_binary_stream && !is_schema_exempt(parsed.status_code) {
             if let Ok(s) = std::str::from_utf8(&parsed.payload) {
                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(s) {
-                    PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val)?;
+                    PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val).inspect_err(|e| {
+                        report_gate_rejection("gate_9_0_schema", current_agent_name, e);
+                    })?;
                 }
             }
         }
@@ -1896,22 +1927,28 @@ impl SAACPProtocolHandler {
             match decision {
                 GovernanceDecision::Allow => {} // proceed normally
                 GovernanceDecision::Pause => {
-                    return Err(SAACPHardDrop::new(
+                    let e = SAACPHardDrop::new(
                         SAACPBytecodes::AegfHopLimitExceeded,
                         "AEGF Gate 11.0: DEG node cap exceeded — request paused.",
-                    ));
+                    );
+                    report_gate_rejection("gate_11_0_aegf", current_agent_name, &e);
+                    return Err(e);
                 }
                 GovernanceDecision::Review => {
-                    return Err(SAACPHardDrop::new(
+                    let e = SAACPHardDrop::new(
                         SAACPBytecodes::AegfLoopDetected,
                         "AEGF Gate 11.0: Cycle or repeated agent path detected.",
-                    ));
+                    );
+                    report_gate_rejection("gate_11_0_aegf", current_agent_name, &e);
+                    return Err(e);
                 }
                 GovernanceDecision::Terminate => {
-                    return Err(SAACPHardDrop::new(
+                    let e = SAACPHardDrop::new(
                         SAACPBytecodes::AegfTtlExpired,
                         "AEGF Gate 11.0: Request metadata TTL expired.",
-                    ));
+                    );
+                    report_gate_rejection("gate_11_0_aegf", current_agent_name, &e);
+                    return Err(e);
                 }
             }
         }
@@ -1955,7 +1992,9 @@ impl SAACPProtocolHandler {
                 ttl: now_secs + 3600.0,
             };
 
-            cscs_det.cs_detect_loop(&parsed.session_uuid, &cscs_meta, parsed.action_class)?;
+            cscs_det.cs_detect_loop(&parsed.session_uuid, &cscs_meta, parsed.action_class).inspect_err(|e| {
+                report_gate_rejection("gate_12_0_cscs", current_agent_name, e);
+            })?;
         }
 
         Ok(parsed)

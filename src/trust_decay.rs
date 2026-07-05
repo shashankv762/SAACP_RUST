@@ -77,6 +77,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -127,7 +129,7 @@ fn now_secs() -> f64 {
 /// The category of gate violation that triggered a trust penalty. Maps 1:1
 /// onto the existing gate-pipeline reject points (`handler.rs`) — see the
 /// module docs for the exact wiring and weight rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum PenaltyKind {
     /// PSN/sequence replay detected on a stream frame.
     ReplaySuspicion,
@@ -144,7 +146,7 @@ pub enum PenaltyKind {
 }
 
 /// A trust-score state transition worth telling an operator about.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum TrustEvent {
     /// A penalty was applied (score may or may not have crossed a threshold).
     Penalized(PenaltyKind),
@@ -158,11 +160,20 @@ pub enum TrustEvent {
 }
 
 /// Payload delivered to subscribers on every trust state transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TrustSignal {
     pub agent_id: String,
     pub score: f64,
     pub event: TrustEvent,
+}
+
+/// One agent's current trust state, for the Command Center dashboard's live
+/// agent list. Returned by [`TrustDecayEngine::snapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentTrustSnapshot {
+    pub agent_id: String,
+    pub score: f64,
+    pub requires_reauth: bool,
 }
 
 struct TrustEntry {
@@ -352,6 +363,41 @@ impl TrustDecayEngine {
     /// `saacp_trust_agents_tracked` telemetry gauge).
     pub fn tracked_count(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    /// Snapshot of up to `limit` tracked agents, sorted ascending by score
+    /// (most-concerning-first) — for the Command Center dashboard's live
+    /// agent list. Bounded by construction: `entries` is already capped at
+    /// `TRUST_MAX_ENTRIES`, so a full snapshot is always bounded-size even
+    /// without the `limit` truncation.
+    ///
+    /// `requires_reauth` here mirrors [`Self::requires_reauth`]'s logic
+    /// read-only — it does NOT clear an expired lock or emit a `Recovered`
+    /// signal the way the real method does, since a dashboard poll must
+    /// never have a side effect on live gate decisions. It may therefore
+    /// show `true` for a brief window after the real cooldown+recovery
+    /// conditions are met, until the next actual packet from that agent
+    /// clears it for real.
+    pub fn snapshot(&self, limit: usize) -> Vec<AgentTrustSnapshot> {
+        let mut entries = self.entries.lock().unwrap();
+        let now = now_secs();
+
+        let mut out: Vec<AgentTrustSnapshot> = entries.iter_mut().map(|(id, e)| {
+            e.recover_to(now);
+            let requires_reauth = match e.locked_at {
+                Some(locked_at) => {
+                    let cooldown_elapsed = (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
+                    let score_recovered = e.score >= TRUST_REAUTH_THRESHOLD;
+                    !(cooldown_elapsed && score_recovered)
+                }
+                None => false,
+            };
+            AgentTrustSnapshot { agent_id: id.clone(), score: e.score, requires_reauth }
+        }).collect();
+
+        out.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(limit);
+        out
     }
 }
 
@@ -557,6 +603,53 @@ mod tests {
         let e = TrustDecayEngine::new();
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         assert_eq!(e.score("agent-b"), TRUST_SCORE_INITIAL);
+    }
+
+    #[test]
+    fn snapshot_returns_agents_sorted_ascending_by_score() {
+        let e = TrustDecayEngine::new();
+        e.penalize("agent-low", PenaltyKind::ReplaySuspicion); // 1.0 -> 0.60
+        e.penalize("agent-low", PenaltyKind::ReplaySuspicion); // 0.60 -> 0.20
+        e.penalize("agent-mid", PenaltyKind::ScopeViolation);  // 1.0 -> 0.75
+        e.penalize("agent-high", PenaltyKind::GenericHardDrop); // 1.0 -> 0.95
+
+        let snap = e.snapshot(10);
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].agent_id, "agent-low");
+        assert_eq!(snap[1].agent_id, "agent-mid");
+        assert_eq!(snap[2].agent_id, "agent-high");
+        assert!(snap[0].score < snap[1].score);
+        assert!(snap[1].score < snap[2].score);
+    }
+
+    #[test]
+    fn snapshot_respects_limit() {
+        let e = TrustDecayEngine::new();
+        for i in 0..20 {
+            e.penalize(&format!("agent-{i}"), PenaltyKind::GenericHardDrop);
+        }
+        let snap = e.snapshot(5);
+        assert_eq!(snap.len(), 5);
+    }
+
+    #[test]
+    fn snapshot_reports_requires_reauth_for_locked_agent() {
+        let e = TrustDecayEngine::new();
+        e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
+        e.penalize("agent-a", PenaltyKind::ReplaySuspicion); // drops below TRUST_REAUTH_THRESHOLD
+        let snap = e.snapshot(10);
+        let entry = snap.iter().find(|s| s.agent_id == "agent-a").unwrap();
+        assert!(entry.requires_reauth, "just-locked agent should show requires_reauth=true");
+    }
+
+    #[test]
+    fn snapshot_is_bounded_by_construction() {
+        let e = TrustDecayEngine::new();
+        for i in 0..(TRUST_MAX_ENTRIES + 500) {
+            e.penalize(&format!("bounded-agent-{i}"), PenaltyKind::GenericHardDrop);
+        }
+        let snap = e.snapshot(usize::MAX);
+        assert!(snap.len() <= TRUST_MAX_ENTRIES);
     }
 
     #[test]

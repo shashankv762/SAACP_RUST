@@ -74,9 +74,11 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::daemon::{client_handshake, SAACPNetworkDaemon};
+use crate::faitf_audit::FAITFAuditLog;
 use crate::gateway::ZeroTrustGateway;
 use crate::handler::{JsonValue, ParsedPacket};
 use crate::measc::{MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS};
+use crate::security::ImmutableAuditLog;
 use crate::MAX_PAYLOAD_SIZE;
 
 /// Bounded inbox capacity — matches this codebase's existing bounded-queue idiom (e.g.
@@ -294,6 +296,7 @@ pub async fn send_message(
     priority: i64,
     action_class: u8,
     retry_attempts: u32,
+    audit_log: Option<&ImmutableAuditLog>,
 ) -> Result<SendOutcome, SidecarError> {
     let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
 
@@ -319,13 +322,25 @@ pub async fn send_message(
 
     // See module doc: every send is the first packet on a fresh connection, so the peer's
     // bootstrap identity is always "unknown" — the allow-list must match that, not
-    // `target_agent` (which is retained as a parameter for future connection-reuse/pinning
-    // scenarios and for the caller's own bookkeeping).
-    let _ = target_agent;
+    // `target_agent`. `target_agent` is still the real semantic recipient though, and is
+    // used below (not discarded) for the Command Center's delegation-edge audit logging —
+    // see this module's "SAACP Command Center" wiring note.
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
         secret, from_agent, &[BOOTSTRAP_AGENT], &[], 60, None, action_class, None,
     );
+
+    // Command Center trust-mesh wiring: log a real (from_agent -> target_agent) capability
+    // grant edge once per dispatch. Deliberately hooked here (token issuance), not inside
+    // `ZeroTrustGateway::validate_lateral_movement` (Gate 1.0, which re-verifies the SAME
+    // already-issued token on every packet and only ever sees the bootstrap "unknown"
+    // identity from this call site) — see CLAUDE.md's "SAACP Command Center" section for
+    // why this is the correct, low-frequency, semantically-real place for this edge.
+    if let Some(log) = audit_log {
+        FAITFAuditLog::log_delegation(
+            log, from_agent, target_agent, 0, "sidecar message capability", None, "",
+        );
+    }
     let token_str = String::from_utf8(token).map_err(|_| SidecarError::Session(
         crate::errors::SAACPHardDrop::new(
             crate::errors::SAACPBytecodes::SchemaMismatch, "issued token was not valid UTF-8",
@@ -446,6 +461,7 @@ async fn handle_send(
     match send_message(
         &req.target_addr, &req.to_agent, &state.agent_id, &secret,
         &req.task, req.priority, req.action_class, state.send_retry_attempts,
+        Some(ImmutableAuditLog::global()),
     ).await {
         Ok(SendOutcome::Success) => (
             StatusCode::OK,
