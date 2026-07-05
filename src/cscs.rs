@@ -1,8 +1,11 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex, LazyLock};
+use std::time::Duration;
 use sha2::{Sha256, Digest};
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::aegf::{AEGFMetadata, DistributedExecutionGraph};
+use crate::state_backend::StateBackend;
 
 pub const CSCS_MAX_OSCILLATION_COUNT: usize = 3;
 pub const CSCS_WINDOW_SIZE: usize = 128;
@@ -13,6 +16,13 @@ pub const CSCS_WINDOW_SIZE: usize = 128;
 /// many short-lived sessions accumulated one permanent entry per session_id
 /// ever seen. Mirrors `streaming::StreamRegistry`'s oldest-first eviction.
 pub const CSCS_MAX_TRACKED_SESSIONS: usize = 50_000;
+/// Bounded capacity of the best-effort trip-event mirror channel used by
+/// `CSCSLoopDetector::with_backend`. A full channel silently drops the event
+/// (forensic visibility only — never consulted by `cs_detect_loop`'s own
+/// decision), rather than blocking the hot path.
+pub const CSCS_MIRROR_QUEUE_CAPACITY: usize = 256;
+/// TTL for a mirrored trip event in the backend, in seconds.
+const CSCS_MIRROR_TTL_SECONDS: u64 = 3600;
 
 #[derive(Clone, Debug)]
 pub struct OscillationRecord {
@@ -114,9 +124,20 @@ impl OscillationFingerprinter {
     }
 }
 
+/// One rare trip event, sent (best-effort, non-blocking) to the mirror
+/// thread for forensic/dashboard visibility. Never read back by
+/// `cs_detect_loop` itself.
+struct CscsTripEvent {
+    session_id: String,
+    fingerprint: String,
+    count: usize,
+    ts: f64,
+}
+
 pub struct CSCSLoopDetector {
     fingerprinter: OscillationFingerprinter,
     daeg: Arc<DistributedExecutionGraph>,
+    mirror_tx: Option<SyncSender<CscsTripEvent>>,
 }
 
 impl CSCSLoopDetector {
@@ -124,6 +145,42 @@ impl CSCSLoopDetector {
         Self {
             fingerprinter: OscillationFingerprinter::new(),
             daeg,
+            mirror_tx: None,
+        }
+    }
+
+    /// Construct with a shared [`StateBackend`] for best-effort, forensic-only
+    /// cross-node visibility of oscillation trips. Unlike
+    /// `AgentRateLimiter::with_backend`, this is deliberately **not** atomic
+    /// or hot-path-synchronous — see `state_backend.rs`'s module doc for the
+    /// full rationale (CSCS is a heuristic anomaly detector, not a hard
+    /// security boundary, and `cs_detect_loop` runs on essentially every
+    /// packet). Only the rare trip event is mirrored, via a non-blocking
+    /// bounded channel — zero cost on the common non-tripping path.
+    pub fn with_backend(daeg: Arc<DistributedExecutionGraph>, backend: Arc<dyn StateBackend>) -> Self {
+        let (tx, rx) = sync_channel::<CscsTripEvent>(CSCS_MIRROR_QUEUE_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("saacp-cscs-mirror".to_string())
+            .spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    let key = format!("cscs:trip:{}", event.session_id);
+                    let payload = serde_json::json!({
+                        "fingerprint": event.fingerprint,
+                        "count": event.count,
+                        "ts": event.ts,
+                    })
+                    .to_string();
+                    let _ = backend.set(
+                        &key,
+                        payload.as_bytes(),
+                        Some(Duration::from_secs(CSCS_MIRROR_TTL_SECONDS)),
+                    );
+                }
+            });
+        Self {
+            fingerprinter: OscillationFingerprinter::new(),
+            daeg,
+            mirror_tx: Some(tx),
         }
     }
 
@@ -139,6 +196,16 @@ impl CSCSLoopDetector {
         let count = self.fingerprinter.record_and_count(session_id, &fp);
 
         if count >= CSCS_MAX_OSCILLATION_COUNT {
+            if let Some(tx) = &self.mirror_tx {
+                // Non-blocking, best-effort — silently dropped if the mirror
+                // thread is behind. Never affects this decision.
+                let _ = tx.try_send(CscsTripEvent {
+                    session_id: session_id.to_string(),
+                    fingerprint: fp.clone(),
+                    count,
+                    ts: now_secs(),
+                });
+            }
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::CircuitBreakerOpen,
                 format!(
@@ -168,3 +235,60 @@ impl Default for CSCSLoopDetector {
 
 pub static GLOBAL_CSCS: LazyLock<CSCSLoopDetector> = LazyLock::new(|| CSCSLoopDetector::new(crate::aegf::GLOBAL_DAEG.clone()));
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_backend::InMemoryBackend;
+
+    fn test_meta(session_id: &str) -> AEGFMetadata {
+        AEGFMetadata::new("agent-osc", session_id, None, None, 300.0, 0, 0)
+    }
+
+    #[test]
+    fn cscs_new_behavior_unchanged_without_backend() {
+        let det = CSCSLoopDetector::new(Arc::new(DistributedExecutionGraph::new()));
+        let meta = test_meta("sess-1");
+        let mut tripped = false;
+        for _ in 0..CSCS_MAX_OSCILLATION_COUNT {
+            if det.cs_detect_loop("sess-1", &meta, 1).is_err() {
+                tripped = true;
+            }
+        }
+        assert!(tripped);
+    }
+
+    #[test]
+    fn cscs_with_backend_mirrors_trip_event_without_blocking_hot_path() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let det = CSCSLoopDetector::with_backend(
+            Arc::new(DistributedExecutionGraph::new()),
+            backend.clone() as Arc<dyn StateBackend>,
+        );
+        let meta = test_meta("sess-2");
+
+        // Non-tripping calls must not write anything to the backend.
+        let _ = det.cs_detect_loop("sess-2", &meta, 1);
+        assert!(backend.scan_prefix("cscs:trip:").unwrap().is_empty());
+
+        // Drive enough repeats of the same fingerprint to force a trip.
+        let mut tripped = false;
+        for _ in 0..CSCS_MAX_OSCILLATION_COUNT + 1 {
+            if det.cs_detect_loop("sess-2", &meta, 1).is_err() {
+                tripped = true;
+            }
+        }
+        assert!(tripped);
+
+        // The mirror thread is async — poll with a bounded retry loop for the
+        // trip key to appear rather than sleeping a fixed guess.
+        let mut found = false;
+        for _ in 0..200 {
+            if !backend.scan_prefix("cscs:trip:").unwrap().is_empty() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(found, "expected a mirrored trip event to appear in the backend");
+    }
+}
