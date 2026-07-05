@@ -66,6 +66,15 @@ mpf = []
 # by default so a library-only deployment never pulls in axum; also the first feature
 # to add a `[[bin]]` target to this otherwise library-only crate.
 sidecar = ["dep:axum"]
+# SAACP Command Center dashboard backend (src/command_center.rs + the
+# `saacp-command-center` binary) — a REST + Server-Sent-Events API surfacing
+# live agent trust scores, the trust-mesh delegation graph, security alerts,
+# and Financial Circuit Breaker activity for a web dashboard. Off by default,
+# same rationale as `sidecar`. Adds ZERO new dependencies — reuses the
+# already-optional `axum` (also pulled in by `sidecar`) and `futures-util`
+# (for `futures_util::stream::unfold`, used to turn a `tokio::sync::broadcast`
+# receiver into an SSE `Stream` without pulling in `tokio-stream`).
+command-center = ["dep:axum", "dep:futures-util"]
 
 [dev-dependencies]
 serial_test = "3"
@@ -80,7 +89,7 @@ futures-util = "0.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 [[bench]]
 name = "benchmarks"
@@ -101,6 +110,11 @@ name = "test_redis_backend_rs"
 path = "tests/test_redis_backend_rs.rs"
 required-features = ["redis-backend"]
 
+[[test]]
+name = "test_command_center_rs"
+path = "tests/test_command_center_rs.rs"
+required-features = ["command-center"]
+
 # The crate's first binary target — a standalone local HTTP sidecar proxy so
 # non-Rust (e.g. Python) agents can get SAACP's security guarantees over plain
 # HTTP/JSON without any SAACP protocol knowledge. See src/sidecar.rs.
@@ -108,6 +122,14 @@ required-features = ["redis-backend"]
 name = "saacp-sidecar"
 path = "src/bin/saacp_sidecar.rs"
 required-features = ["sidecar"]
+
+# SAACP Command Center dashboard backend binary — a standalone REST+SSE HTTP
+# server exposing live gateway security telemetry to the dashboard-ui
+# frontend. See src/command_center.rs.
+[[bin]]
+name = "saacp-command-center"
+path = "src/bin/saacp_command_center.rs"
+required-features = ["command-center"]
 
 # High-performance / low-resource fix: no release profile existed at all, so
 # "high performance" was asserted without any tuning to back it. Deliberately

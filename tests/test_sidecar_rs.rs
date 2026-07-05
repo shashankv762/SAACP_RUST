@@ -7,8 +7,10 @@
 //! exist.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use saacp::security::{AuditRecord, ImmutableAuditLog};
 use saacp::sidecar::{run, SidecarConfig, SIDECAR_INBOX_CAPACITY};
 
 async fn free_addr() -> SocketAddr {
@@ -286,4 +288,48 @@ async fn sidecar_send_saturation_returns_503() {
     assert_eq!(second.status(), 503);
     let second_body: serde_json::Value = second.json().await.expect("second body json");
     assert_eq!(second_body["status"], "saturated", "body: {second_body}");
+}
+
+/// Command Center wiring regression proof: `/send` now logs a real
+/// `[FAITF:DELEGATION]` audit entry via `ImmutableAuditLog::global()`
+/// carrying the actual semantic recipient (`to_agent`), not the token's
+/// internal bootstrap `"unknown"` placeholder — see `sidecar.rs::send_message`'s
+/// wiring note and CLAUDE.md's "SAACP Command Center" section.
+#[tokio::test]
+async fn sidecar_send_logs_delegation_edge_with_real_target_agent() {
+    let received: Arc<Mutex<Vec<AuditRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received2 = Arc::clone(&received);
+    ImmutableAuditLog::global().subscribe(Arc::new(move |record: &AuditRecord| {
+        received2.lock().unwrap().push(record.clone());
+    }));
+
+    let mesh_secret = [0x99u8; 32];
+    let (_agent_a_saacp, agent_a_http) = spawn_sidecar("agent-delegator", mesh_secret).await;
+    let (agent_b_saacp, _agent_b_http) = spawn_sidecar("agent-delegate-target", mesh_secret).await;
+
+    let client = reqwest::Client::new();
+    let send_resp = client
+        .post(format!("http://{}/send", agent_a_http))
+        .json(&serde_json::json!({
+            "to_agent": "agent-delegate-target",
+            "target_addr": agent_b_saacp.to_string(),
+            "task": "delegated work",
+        }))
+        .send()
+        .await
+        .expect("send request failed");
+    assert_eq!(send_resp.status(), 200);
+
+    let recs = received.lock().unwrap();
+    // Filter on OUR specific agent pair, not just the `[FAITF:DELEGATION]` prefix —
+    // `ImmutableAuditLog::global()` is a process-wide singleton shared with every other
+    // test in this binary, several of which run concurrently and log their own
+    // delegation entries for their own agent pairs.
+    let delegation = recs.iter()
+        .find(|r| r.intent.starts_with("[FAITF:DELEGATION]") && r.source == "agent-delegator")
+        .expect("expected a [FAITF:DELEGATION] audit entry for agent-delegator to have been logged");
+    assert_eq!(delegation.source, "agent-delegator");
+    assert_eq!(delegation.target, "agent-delegate-target");
+    assert!(delegation.intent.contains("parent=agent-delegator"));
+    assert!(delegation.intent.contains("child=agent-delegate-target"));
 }
