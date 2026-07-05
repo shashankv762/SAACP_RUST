@@ -43,6 +43,8 @@ pub mod state_backend;
 pub mod trust_decay;
 #[cfg(feature = "sidecar")]
 pub mod sidecar;
+#[cfg(feature = "command-center")]
+pub mod command_center;
 
 pub use errors::{SAACPBytecodes, SAACPHardDrop};
 pub use schemas::PreCompiledSchemas;

@@ -6,7 +6,7 @@
 
 - Crate: `saacp` (library, plus one optional binary — `saacp-sidecar`, behind the `sidecar` feature; see "Sidecar Proxy / Python Translation Layer" below)
 - Rust edition: 2021
-- Test count: **1318** with default features (all must pass; zero failures tolerated) — grew from 1310 this session with 8 new unit tests proving `AgentRateLimiter`/`CSCSLoopDetector`'s distributed-state wiring is behavior-neutral without a backend and correct with one (`InMemoryBackend`-based, no Redis required — see "Distributed State" below). +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`). +8 with `--features sidecar` (`tests/test_sidecar_rs.rs`, gated via `required-features` — grew from 4 to 8 this session: per-peer-secret accept/reject, `/healthz` field, `503`-on-saturation). +4 with `--features redis-backend` (`tests/test_redis_backend_rs.rs`, gated via `required-features` — requires a real local Redis at `redis://127.0.0.1:6379/`; each test probes connectivity first and skips gracefully, printing a notice, rather than hard-failing when Redis isn't reachable). MPF's own unit/integration tests only compile under `--features mpf` (see "Optional Cargo Features" below) — not counted in the default-feature baseline. Python: `python/tests/test_wrap.py` (stdlib `unittest`, 2 tests) exercises real subprocess sidecars — not part of the Rust `cargo test` count, run separately (`python -m unittest tests.test_wrap -v` from `python/`).
+- Test count: **1333** with default features (all must pass; zero failures tolerated) — grew from 1318 this session with a new `tests/test_telemetry_wiring_rs.rs` (3 tests, default feature, no gate) proving `telemetry::report_gate_rejection`/the financial-rejection accumulator/the accept-reject counters are wired to real gate-pipeline outcomes, not just unit-tested in isolation — the prerequisite plumbing the Command Center dashboard reads from. +2 with `--features transport-ws` (`tests/test_transport_ws_rs.rs`, gated via `required-features`). +9 with `--features sidecar` (`tests/test_sidecar_rs.rs`, gated via `required-features` — grew from 8 to 9 this session: `sidecar_send_logs_delegation_edge_with_real_target_agent` proves `send_message` logs a real `[FAITF:DELEGATION]` audit entry carrying the actual semantic recipient, not the token's internal bootstrap `"unknown"` placeholder — see "SAACP Command Center" below). +4 with `--features redis-backend` (`tests/test_redis_backend_rs.rs`, gated via `required-features` — requires a real local Redis at `redis://127.0.0.1:6379/`; each test probes connectivity first and skips gracefully, printing a notice, rather than hard-failing when Redis isn't reachable). +7 with `--features command-center` (`tests/test_command_center_rs.rs`, gated via `required-features` — real REST+SSE round trips against real gate-pipeline events, see "SAACP Command Center" below). MPF's own unit/integration tests only compile under `--features mpf` (see "Optional Cargo Features" below) — not counted in the default-feature baseline. Python: `python/tests/test_wrap.py` (stdlib `unittest`, 2 tests) exercises real subprocess sidecars — not part of the Rust `cargo test` count, run separately (`python -m unittest tests.test_wrap -v` from `python/`).
 - Spec reference: `c:\Users\2025\Downloads\write_readme.py` — the authoritative SAACP v0.1-beta2 specification
 
 ## Build & Test
@@ -16,16 +16,16 @@ cargo check          # fast type-check, no linking
 cargo build          # debug build — must produce ZERO warnings
 cargo test           # run the default-feature test suite (must pass 100%)
 cargo test --test <name>   # run a single integration test file
-cargo clippy --all-targets --features redis-backend,transport-ws,mpf -- -D warnings  # full lint gate, all optional code paths
+cargo clippy --all-targets --features redis-backend,transport-ws,mpf,sidecar,command-center -- -D warnings  # full lint gate, all optional code paths
 ```
 
-**Target**: `cargo test` must print only `test result: ok` lines. Any `FAILED` is a blocker. `cargo build` must emit zero warnings. This must also hold with every optional feature enabled (`--features redis-backend,transport-ws,mpf`) — those are additive, not alternate, code paths. A `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `opt-level = 3`) is set in `Cargo.toml` — deliberately *not* `panic = "abort"` (this crate runs as a long-lived network daemon with ~70+ internal `.lock().unwrap()` calls; abort-on-panic would turn one attacker-triggered panic in one connection into a full-process crash for every other connection too).
+**Target**: `cargo test` must print only `test result: ok` lines. Any `FAILED` is a blocker. `cargo build` must emit zero warnings. This must also hold with every optional feature enabled (`--features redis-backend,transport-ws,mpf,sidecar,command-center`) — those are additive, not alternate, code paths. A `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `opt-level = 3`) is set in `Cargo.toml` — deliberately *not* `panic = "abort"` (this crate runs as a long-lived network daemon with ~70+ internal `.lock().unwrap()` calls; abort-on-panic would turn one attacker-triggered panic in one connection into a full-process crash for every other connection too).
 
 **Known flaky test (pre-existing, not a regression target):** `blackhat_7d_easi_correct_vs_wrong_key_timing_similar` (`tests/test_blackhat_wire_crypto_rs.rs`) asserts a <5µs wall-clock timing difference over 1000 iterations; under heavy parallel test-suite CPU contention it can occasionally exceed that budget. Re-running it in isolation (`cargo test --test test_blackhat_wire_crypto_rs blackhat_7d_...`) reliably passes. Don't "fix" this by touching `easi.rs` — it's a test-harness timing-noise issue, not a side-channel regression.
 
 ## Optional Cargo Features
 
-All four are off by default so a single-node, TCP-only deployment pulls in zero extra dependencies — this matters concretely for embedded-Linux-class deployments (Raspberry Pi / OpenWrt-class routers), not just as a nicety.
+All are off by default so a single-node, TCP-only deployment pulls in zero extra dependencies — this matters concretely for embedded-Linux-class deployments (Raspberry Pi / OpenWrt-class routers), not just as a nicety.
 
 | Feature | Adds | Module |
 |---------|------|--------|
@@ -33,6 +33,7 @@ All four are off by default so a single-node, TCP-only deployment pulls in zero 
 | `redis-backend` | `redis` (sync client) | `state_backend::RedisBackend` — see below. |
 | `mpf` | nothing (pure Rust, no new deps) | `mpf.rs` — cover traffic / adaptive padding / timing jitter for traffic-analysis resistance. **Never wired into the mandatory gate pipeline** (confirmed by grep — this was true before the feature gate existed too; it's opt-in caller-invoked utility code, not a bypassable security control). Demoted to a feature flag because it matters far more for anonymity-network threat models than for AI agent pipelines running inside a controlled infrastructure boundary — the realistic threat here is a compromised agent or insider, not passive traffic analysis on the wire. Off by default so IoT/low-resource builds don't even compile it. |
 | `sidecar` | `axum` (HTTP server) | `sidecar.rs` + the `saacp-sidecar` binary (`src/bin/saacp_sidecar.rs`, this crate's first `[[bin]]` target) — see "Sidecar Proxy / Python Translation Layer" below. |
+| `command-center` | nothing new — reuses the already-optional `axum` and `futures-util` | `command_center.rs` + the `saacp-command-center` binary (`src/bin/saacp_command_center.rs`) — see "SAACP Command Center" below. |
 
 `tokio`'s own feature set is trimmed (not a togglable feature, just a direct dependency choice) from `full` to `["rt", "rt-multi-thread", "net", "io-util", "time", "macros"]` — verified against actual `tokio::` usage across `src/` (only `daemon.rs`/`transport/ws.rs` touch it, via `spawn`/`spawn_blocking`, `TcpListener`, `AsyncRead`/`WriteExt`, and `timeout`). `signal`/`process`/`fs`/`io-std`/`sync` were dead weight. `[dev-dependencies]` still uses `full` since dev-deps never ship to downstream consumers of this library crate.
 
@@ -241,6 +242,68 @@ new field a backward-compatible default):
   `SendResult.ok`. Skips gracefully (not a hard failure) if the binary hasn't been built
   locally.
 
+## SAACP Command Center (`command_center.rs`) — *new in Rust, no Python parity*
+
+A live web dashboard for operators: which agents are trusted right now, who has delegated
+capability to whom (the trust mesh), when Gate 4.0 blocks a prompt-injection attempt, and
+how much claimed token spend the Financial Circuit Breaker (Gate 0.5) has prevented.
+Feature-gated (`command-center`, off by default — see "Optional Cargo Features" above),
+adding **zero new dependencies**: reuses the already-optional `axum` (shared with
+`sidecar`) and `futures-util` (`stream::unfold`, to adapt a `tokio::sync::broadcast`
+receiver into an SSE `Stream` without pulling in `tokio-stream`).
+
+**Architecture: in-process, not a separate observer.** `command_center::run` is meant to
+run in the **same process** as a real `daemon::SAACPNetworkDaemon` — one more async task
+alongside it, reading `security::ImmutableAuditLog::global()` /
+`trust_decay::TrustDecayEngine::global()` / `telemetry::global_telemetry()` /
+`telemetry::global_alert_feed()` directly via in-process subscriber callbacks. There is no
+cross-process channel and no support for observing a *different* process's state.
+`src/bin/saacp_command_center.rs` also stands up its own bare demo `SAACPNetworkDaemon`
+(set `SAACP_DISABLE_DEMO_DAEMON=1` to skip it) purely so the dashboard has example traffic
+out of the box.
+
+**Prerequisite plumbing** (none of this data existed in a durable/enumerable form before
+this feature was added):
+
+| Need | Fix | Where |
+|---|---|---|
+| Live agent list + trust scores | `TrustDecayEngine::snapshot()` | `trust_decay.rs` |
+| Trust-mesh delegation graph | `sidecar.rs::send_message` logs a real `FAITFAuditLog::log_delegation` entry per dispatch — hooked at token *issuance* (low-frequency, semantically real), not per-packet Gate 1.0 validation, which only ever sees the bootstrap `"unknown"` identity (see pitfall #20) | `sidecar.rs`, `faitf_audit.rs` |
+| Security alert feed | `telemetry::SecurityAlertFeed` (network-safe by design — deliberately NOT `pecf.rs`'s `SecureDiagnosticLedger`, whose own doc comment forbids network exposure) | `telemetry.rs` |
+| "Tokens Blocked" financial metric | `Counters::financial_tokens_rejected`, summed at `gate_financial_cb`'s `BudgetExceeded` site | `telemetry.rs`, `handler.rs` |
+| Gate-rejection counters actually incremented | `telemetry::report_gate_rejection` wired at every gate-reject site | `handler.rs` |
+| Live audit-log tail | `ImmutableAuditLog::subscribe` (push hook, fires after the hash-chain lock is released — never touches `CanonicalAuditRecord`/chain-hash integrity) | `security.rs` |
+
+**HTTP API** (`saacp-command-center` binary, default `127.0.0.1:9090`): `GET /healthz`
+(no auth), `GET /events` (SSE, live feed of `DashboardEvent::{InjectionAlert,
+DelegationEdge, TrustSignal, AuditEntry}`), and bearer-token-protected
+`GET /api/agents`, `/api/trust-mesh`, `/api/alerts?limit=N`, `/api/financial`,
+`/api/metrics` (Prometheus text). The dashboard bearer secret is compared via the same
+branch-resistant `constant_time_eq` idiom used throughout this crate (`gateway.rs`,
+`security.rs`), never a plain `==`. `/events` also accepts `?token=` as a query parameter
+(browsers' native `EventSource` cannot set custom headers) — a stated v1 simplification,
+see scope limits below.
+
+**Frontend** (`dashboard-ui/`, untracked by design — see its own `.gitignore`): a Next.js
+16 / React 19 app (`npm install && npm run dev` from `dashboard-ui/`, configured via
+`.env.local` — copy `.env.local.example`) with pages for agents, the trust-mesh graph
+(`react-force-graph-2d`), the live alert feed, and the financial dashboard. Talks to the
+backend purely over the REST+SSE API above — no server-side rendering of backend state,
+no shared Rust/TS types.
+
+**V1 scope limits (honest, not hidden)**:
+- The trust-mesh graph's edges are `(from_agent, to_agent)` capability-grant pairs, not a
+  genuine multi-hop delegation lineage — a full fix needs a wire-protocol change (a
+  `parent_rid`/`parent_jti` field on every packet) touching Gate 11.0/12.0's live
+  governance code, out of proportion to a dashboard feature.
+- No de-dup on delegation edges in the live SSE feed (a chatty pair produces one event per
+  message); the `/api/trust-mesh` REST snapshot itself IS deduped, one entry per pair.
+- "Tokens Blocked" / "dollars saved" (`/api/financial`) measures *rejected claimed cost*,
+  never *actual* prevented spend, which this system has no way to observe — label any UI
+  built on it "Estimated Exposure Prevented," not an unqualified "$ Saved."
+- `pecf.rs::SecureDiagnosticLedger` is never used here (see the prerequisite-plumbing
+  table above for why `SecurityAlertFeed` is the network-safe one).
+
 ## Gate 6.0 Backpressure Contract (`security.rs`)
 
 Any gate that touches disk, does unbounded-size work, or depends on external system throughput must declare an explicit backpressure contract with the packet pipeline instead of an ad-hoc drop-and-print. For the audit log (Gate 6.0 / WAL writer), that contract is `security::AuditHealth`:
@@ -300,6 +363,7 @@ This does not reorder the gate pipeline: Gate 2.5 still runs at its existing pos
 | `state_backend.rs` | `StateBackend` trait, `InMemoryBackend`, `RedisBackend` (`redis-backend` feature) — pluggable KV+TTL storage for horizontal scaling | *new in Rust* |
 | `trust_decay.rs` | `TrustDecayEngine` (continuous behavioral trust scoring sidecar), `IntentDriftTracker` (chain-wide drift ceiling) — see "Trust Decay Engine" section above | *new in Rust* |
 | `sidecar.rs` | `SidecarConfig` (per-peer secrets, concurrency/retry limits), `Inbox`, `send_message`, `run` — local HTTP proxy for non-Rust agents (`sidecar` feature); `src/bin/saacp_sidecar.rs` binary; see "Sidecar Proxy / Python Translation Layer" + "Production hardening + `saacp.wrap()`" sections above | *new in Rust* |
+| `command_center.rs` | `CommandCenterConfig`, `TrustMeshStore`, `DashboardEvent`, `run` — REST+SSE dashboard backend (`command-center` feature); `src/bin/saacp_command_center.rs` binary; `dashboard-ui/` (Next.js/React frontend, untracked, separate `npm` project); see "SAACP Command Center" section above | *new in Rust* |
 
 ## Gate Pipeline (Authorization Invariance)
 
@@ -505,7 +569,9 @@ rrbc_gateway.redeem_token_with_pop(token_b64, rnonce, agent, sid, cid, oaid, sec
 | `tests/test_gate5_scope_consistency_rs.rs` | 7 | Gate 5.0b regression proof: Attack 7.2 (fake high confidence on off-scope `data` claim), on-scope controls, no-op conditions (no root intent / missing / non-string `data`) |
 | `tests/test_blackhat_agent_hijack_rs.rs` | 15 | The 20-year black-hat multi-step chain attack: delegation-depth escalation (Act I, live `validate_lateral_movement` path) → confused-deputy intent-padding incl. Unicode-confusable evasion (Act II, `gate_1_5c_dangerous_action_consistency`) → chain-wide cumulative drift (Act III, `gate_1_5_reinforcement`) → context-provenance capability check (Act IV, `FederatedMemory::save_context_with_provenance`) → Finale chaining all three live techniques + a "legitimate traffic still works" check. Calls gate functions directly with hand-built `payload_dict`s, matching this repo's established Gate-1.5-family test convention (see the module doc comment for why, and `trust_decay.rs`'s "Gate 1.5 reinforcement" section above) |
 | `tests/test_daemon_encrypted_rs.rs` | 5 | DAEMON-NO-AEAD / DAEMON-NO-TOKEN-VERIFY regression proof: real `SAACPNetworkDaemon` over real loopback TCP with `.with_gateway()`/`.with_encrypted_transport()` — validly-signed encrypted frame accepted and decoded via `on_delivered`, tampered ciphertext AEAD-rejected, wrong-issuer-secret token rejected, two independent sessions don't cross-contaminate, and a plain `SAACPNetworkDaemon::new()` (no builders) is unchanged |
-| `tests/test_sidecar_rs.rs` | 8 | `sidecar` feature only. In-process `sidecar::run()` instances driven purely via HTTP/JSON (`reqwest`, mirroring a Python caller) — real send/receive round trip, `/receive` 204-on-timeout, wrong-shared-secret rejection, `/healthz`; plus this session's production-hardening regression proofs: a registered peer's pairwise secret accepted, an unregistered issuer rejected once any `peer_secrets` entry exists (real allowlist behavior, not just "wrong secret"), `/healthz`'s new `inbox_depth`/`inbox_capacity`/`peers_configured` fields, and `503`/`"saturated"` when `max_concurrent_sends` is exhausted |
+| `tests/test_sidecar_rs.rs` | 9 | `sidecar` feature only. In-process `sidecar::run()` instances driven purely via HTTP/JSON (`reqwest`, mirroring a Python caller) — real send/receive round trip, `/receive` 204-on-timeout, wrong-shared-secret rejection, `/healthz`; production-hardening regression proofs: a registered peer's pairwise secret accepted, an unregistered issuer rejected once any `peer_secrets` entry exists (real allowlist behavior, not just "wrong secret"), `/healthz`'s new `inbox_depth`/`inbox_capacity`/`peers_configured` fields, `503`/`"saturated"` when `max_concurrent_sends` is exhausted; plus `sidecar_send_logs_delegation_edge_with_real_target_agent` proving `send_message` logs a real `[FAITF:DELEGATION]` audit entry carrying the actual semantic recipient (Command Center trust-mesh wiring) |
+| `tests/test_telemetry_wiring_rs.rs` | 3 | Default feature, no gate. Proves `telemetry`'s counters/alert feed are wired to real gate-pipeline outcomes, not just unit-tested in isolation: a Gate 4.0 injection rejection increments both the telemetry counter and the security-alert feed, a Gate 0.5 `BudgetExceeded` rejection increments the financial-tokens-rejected accumulator, and overall accept/reject counters increment on real accepted/rejected packets. The prerequisite plumbing `command_center.rs`'s `/api/alerts`/`/api/financial` read from |
+| `tests/test_command_center_rs.rs` | 7 | `command-center` feature only. Real `command_center::run()` instances driven purely via HTTP/JSON/SSE (`reqwest`) against a real gate pipeline: `/healthz` reachable without auth, `/api/agents` reflects a real `TrustDecayEngine::penalize()` call, `/api/financial` reflects a real Gate 0.5 `BudgetExceeded` rejection, `/api/alerts` reflects a real Gate 4.0 rejection, `/api/trust-mesh` reflects a real delegation edge from `sidecar.rs::send_message`, `/events` (SSE) delivers all `DashboardEvent` variants, and protected routes reject wrong/missing bearer tokens |
 
 ## Common Pitfalls
 
