@@ -534,23 +534,48 @@ impl ImmutableAuditLog {
     }
 
     /// Initialize the chain from an existing log file (re-reads disk state).
-    pub fn initialize_chain(&self) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
-        let log_file = inner.log_file.clone();
+    ///
+    /// SECURITY (H-6): the on-disk tail entry is untrusted input — a corrupted
+    /// or attacker-tampered log file must not be silently adopted as the new
+    /// chain head. This calls `verify_chain_disk()` (full HMAC recomputation +
+    /// sentinel check) before trusting the re-read state; on failure the
+    /// in-memory chain is reset to genesis and an error is returned, per the
+    /// fail-closed architecture principle (never keep unverified state).
+    ///
+    /// The disk read (which populates `event_count`/`last_hash`) must release
+    /// `self.inner`'s lock before calling `verify_chain_disk`, which re-locks
+    /// `self.inner` itself — `std::sync::Mutex` is not reentrant.
+    pub fn initialize_chain(&self, issuer_secret: &[u8]) -> Result<(), String> {
+        {
+            let mut inner = self.inner.lock().expect("lock poisoned");
+            let log_file = inner.log_file.clone();
 
-        if Path::new(&log_file).exists() {
-            if let Ok(content) = fs::read_to_string(&log_file) {
-                let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-                inner.event_count = lines.len() as u64;
-                if let Some(last_line) = lines.last() {
-                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line) {
-                        if let Some(hash) = entry["chain_hash"].as_str() {
-                            inner.last_hash = hash.to_string();
+            if Path::new(&log_file).exists() {
+                if let Ok(content) = fs::read_to_string(&log_file) {
+                    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+                    inner.event_count = lines.len() as u64;
+                    if let Some(last_line) = lines.last() {
+                        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line) {
+                            if let Some(hash) = entry["chain_hash"].as_str() {
+                                inner.last_hash = hash.to_string();
+                            }
                         }
                     }
                 }
             }
+        } // `inner` lock released before verify_chain_disk re-locks it.
+
+        if !self.verify_chain_disk(issuer_secret) {
+            let mut inner = self.inner.lock().expect("lock poisoned");
+            inner.event_count = 0;
+            inner.last_hash = GENESIS_HASH.to_string();
+            return Err(
+                "audit chain integrity verification failed on load — chain reset to genesis"
+                    .to_string(),
+            );
         }
+
+        Ok(())
     }
 
     /// Append one audit event to the in-memory chain and enqueue for WAL persistence.
@@ -1296,6 +1321,91 @@ mod tests {
         log.reset();
         assert_eq!(log.event_count(), 0);
         assert!(log.verify_chain(secret));
+    }
+
+    /// Guarantees every event appended so far is actually flushed+synced to
+    /// disk: sleeps past `AUDIT_WAL_FLUSH_INTERVAL_MS` (so the elapsed-time
+    /// flush condition is armed on the WAL worker thread), then appends one
+    /// more throwaway event — whose `write_entry()` call observes the
+    /// elapsed time and flushes the `BufWriter`, which is cumulative and
+    /// therefore also flushes every entry buffered before it.
+    ///
+    /// Rather than trusting a fixed sleep for the flush itself to land
+    /// (unreliable under parallel-test scheduler load), this polls the
+    /// actual log file on disk for `expected_lines` with a bounded timeout.
+    fn force_wal_flush_and_drain(
+        log: &ImmutableAuditLog,
+        secret: &[u8],
+        log_file: &str,
+        expected_lines: usize,
+    ) {
+        thread::sleep(Duration::from_millis(AUDIT_WAL_FLUSH_INTERVAL_MS + 20));
+        log.append_event(secret, "__flush__", "__flush__", "__flush__", "__flush__", "__flush__");
+        for _ in 0..500 {
+            if let Ok(content) = fs::read_to_string(log_file) {
+                if content.lines().filter(|l| !l.is_empty()).count() >= expected_lines {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("WAL flush did not land on disk within timeout");
+    }
+
+    /// H-6 regression: `initialize_chain` must verify disk state, not blindly
+    /// trust it. A valid, untampered log file is accepted.
+    #[test]
+    fn test_initialize_chain_accepts_valid_disk_state() {
+        let log = test_audit_log("init_chain_valid");
+        let log_file = "test_audit_init_chain_valid.log";
+        let secret = b"init_chain_secret";
+        log.append_event(secret, "a", "b", "sig-1", "intent-1", "trace-1");
+        log.append_event(secret, "b", "c", "sig-2", "intent-2", "trace-2");
+        // 2 real events + 1 flush-forcing event.
+        force_wal_flush_and_drain(&log, secret, log_file, 3);
+
+        assert!(log.initialize_chain(secret).is_ok());
+        assert_eq!(log.event_count(), 3);
+        log.reset();
+    }
+
+    /// H-6 regression: a tampered on-disk chain_hash must be rejected, not
+    /// silently adopted as the new chain head — this was the core vulnerability
+    /// (chain integrity bypass via untrusted disk data).
+    #[test]
+    fn test_initialize_chain_rejects_tampered_disk_state() {
+        let log = test_audit_log("init_chain_tampered");
+        let log_file = "test_audit_init_chain_tampered.log";
+        let secret = b"init_chain_secret_2";
+        log.append_event(secret, "a", "b", "sig-1", "intent-1", "trace-1");
+        // 1 real event + 1 flush-forcing event.
+        force_wal_flush_and_drain(&log, secret, log_file, 2);
+
+        // Tamper with the on-disk chain_hash of the first entry.
+        let content = fs::read_to_string(log_file).expect("log file must exist");
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 2, "expected both entries flushed to disk");
+        let mut entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        entry["chain_hash"] = serde_json::Value::String("deadbeef".repeat(8));
+        lines[0] = entry.to_string();
+        fs::write(log_file, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+
+        let result = log.initialize_chain(secret);
+        assert!(result.is_err());
+        // Fail-closed: in-memory state must be reset to genesis, not left
+        // trusting the tampered tail hash.
+        assert_eq!(log.event_count(), 0);
+        log.reset();
+    }
+
+    /// H-6 regression: a missing log file is valid empty state (matches
+    /// `verify_chain_disk`'s existing missing-file semantics).
+    #[test]
+    fn test_initialize_chain_missing_file_is_valid_empty() {
+        let log = test_audit_log("init_chain_missing");
+        // test_audit_log() -> reset() already deletes any existing files.
+        assert!(log.initialize_chain(b"any_secret").is_ok());
+        assert_eq!(log.event_count(), 0);
     }
 
     #[test]

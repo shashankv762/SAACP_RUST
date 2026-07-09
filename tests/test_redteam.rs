@@ -536,9 +536,9 @@ fn redteam_psk_recovery_steps_6_7_8_all_fire() {
     let c3 = Arc::clone(&counter);
 
     let recovery = PSKCompromiseRecovery::new(Arc::clone(&mgr), None)
-        .with_capability_revoke(Box::new(move || { c1.fetch_add(1, Ordering::SeqCst); }))
-        .with_key_rotation(Box::new(move || { c2.fetch_add(1, Ordering::SeqCst); }))
-        .with_audit(Box::new(move || { c3.fetch_add(1, Ordering::SeqCst); }));
+        .with_capability_revoke(Box::new(move || { c1.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+        .with_key_rotation(Box::new(move || { c2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+        .with_audit(Box::new(move || { c3.fetch_add(1, Ordering::SeqCst); Ok(()) }));
 
     recovery.execute(None);
     assert_eq!(counter.load(Ordering::SeqCst), 3, "All 3 extended callbacks must fire");

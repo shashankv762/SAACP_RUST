@@ -66,7 +66,7 @@ fn psk_recovery_callback_fires() {
     let clone = fired.clone();
     let recovery = PSKCompromiseRecovery::new(
         manager,
-        Some(Box::new(move || clone.store(true, Ordering::SeqCst))),
+        Some(Box::new(move || { clone.store(true, Ordering::SeqCst); Ok(()) })),
     );
     recovery.execute(Some(1));
     assert!(fired.load(Ordering::SeqCst), "gateway callback must fire on recovery");

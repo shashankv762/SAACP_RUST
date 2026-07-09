@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use saacp::transport::ws::SAACPWebSocketDaemon;
-use saacp::{FLAG_COVER_TRAFFIC, MEASCFrame, SessionEpochManager};
+use saacp::FLAG_COVER_TRAFFIC;
 
 /// Bind to an ephemeral port, read back the assigned port, then drop the
 /// listener so the daemon can bind it. Small TOCTOU window is acceptable for
@@ -101,20 +101,30 @@ async fn ws_tunnel_cover_traffic_roundtrip() {
     // Cover traffic (FLAG_COVER_TRAFFIC) is authenticated by Gate 0 but
     // short-circuits before token validation — no capability token needed —
     // and the daemon always acks cover traffic with WIRE_SUCCESS (b"SUCCESS").
-    let sid = [0xCCu8; 16];
-    let mgr = SessionEpochManager::new();
-    mgr.create_session(sid, session_key, 1_000_000, 3600.0, None)
-        .expect("create_session");
-    let eid = mgr.get_current_epoch_id(&sid).expect("epoch id");
-    let (frame, _psn) = mgr
-        .with_epoch_mut(&sid, eid, |epoch| {
-            MEASCFrame::build_frame(
-                epoch, 1, 0x10, FLAG_COVER_TRAFFIC, 0,
-                b"", &[0u8; 32], &[0u8; 24], 0,
-            )
-            .expect("build_frame")
-        })
-        .expect("with_epoch_mut");
+    //
+    // A plain `SAACPWebSocketDaemon::new()` (no `.with_encrypted_transport(...)`)
+    // uses the structural default Gate 0 path — `framing::MEASCFrame::parse_header`,
+    // which (post CRIT-1 fix) performs real AES-256-GCM verification keyed directly
+    // off the ECDH `session_key` via `framing::MEASCFrame::derive_frame_key_iv`. That
+    // is a different derivation from `measc::MEASCFrame`'s `SessionEpochManager`-based
+    // scheme (see `tests/test_daemon_encrypted_rs.rs`'s
+    // `daemon_plain_new_default_behavior_unchanged` for the equivalent raw-TCP case),
+    // so the wire frame here must be built with `framing::MEASCFrame::encode_encrypted`,
+    // the matching counterpart to `parse_header`.
+    let header = saacp::framing::MEASCFrame {
+        schema_id: 1,
+        status_code: 0x10,
+        flags: FLAG_COVER_TRAFFIC,
+        action_class: 0,
+        payload_length: 0,
+        session_id: [0xCCu8; 16],
+        epoch_id: 0,
+        psn: 0,
+        context_ref_id: [0u8; 32],
+        context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    let frame = header.encode_encrypted(b"", &session_key).expect("encode_encrypted");
 
     ws_stream.send(Message::Binary(frame)).await.expect("send frame");
 
@@ -147,19 +157,24 @@ async fn ws_tunnel_two_connections_independent_sessions() {
     assert_ne!(key_a, key_b, "each WS connection must derive an independent session key");
 
     for (ws, key, sid_byte) in [(&mut ws_a, key_a, 0xAAu8), (&mut ws_b, key_b, 0xBBu8)] {
-        let sid = [sid_byte; 16];
-        let mgr = SessionEpochManager::new();
-        mgr.create_session(sid, key, 1_000_000, 3600.0, None).expect("create_session");
-        let eid = mgr.get_current_epoch_id(&sid).expect("epoch id");
-        let (frame, _psn) = mgr
-            .with_epoch_mut(&sid, eid, |epoch| {
-                MEASCFrame::build_frame(
-                    epoch, 1, 0x10, FLAG_COVER_TRAFFIC, 0,
-                    b"", &[0u8; 32], &[0u8; 24], 0,
-                )
-                .expect("build_frame")
-            })
-            .expect("with_epoch_mut");
+        // See `ws_tunnel_cover_traffic_roundtrip`'s comment: the structural default Gate 0
+        // path verifies real AES-256-GCM keyed off the ECDH session key via
+        // `framing::MEASCFrame::encode_encrypted`/`derive_frame_key_iv`, not
+        // `measc::MEASCFrame`'s `SessionEpochManager`-based scheme.
+        let header = saacp::framing::MEASCFrame {
+            schema_id: 1,
+            status_code: 0x10,
+            flags: FLAG_COVER_TRAFFIC,
+            action_class: 0,
+            payload_length: 0,
+            session_id: [sid_byte; 16],
+            epoch_id: 0,
+            psn: 0,
+            context_ref_id: [0u8; 32],
+            context_version: 0,
+            w3c_traceparent: [0u8; 24],
+        };
+        let frame = header.encode_encrypted(b"", &key).expect("encode_encrypted");
         ws.send(Message::Binary(frame)).await.expect("send frame");
         let response = recv_exact(ws, 7).await;
         assert_eq!(&response, b"SUCCESS");

@@ -199,6 +199,20 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     // Regression guard: a plain `SAACPNetworkDaemon::new()` with no builders must still
     // ack cover traffic with WIRE_SUCCESS exactly as before this fix — proving the
     // structural (non-encrypted, non-gateway-verified) path is untouched by default.
+    //
+    // Gate 0 for this path is `framing::MEASCFrame::parse_header`, which (post CRIT-1
+    // fix) performs REAL AES-256-GCM verification keyed directly off the ECDH
+    // `session_key` via `framing::MEASCFrame::derive_frame_key_iv` — a different
+    // derivation from `measc::MEASCFrame`'s `SessionEpochManager`-based scheme used
+    // by the `.with_encrypted_transport(...)` tests above (see that scheme's own
+    // "SAACP-MEASC-epoch-key-v1" HKDF info string vs. this one's
+    // "SAACP-FRAMING-MEASCFrame-key-iv-v1" — they can never produce the same key).
+    // So the wire frame here must be built with `framing::MEASCFrame::encode_encrypted`,
+    // the matching counterpart to `parse_header` — its own doc comment notes this is
+    // exactly what it's for ("this exists for tests"). Building it with
+    // `measc::MEASCFrame::build_frame` (as this test previously did, before the CRIT-1
+    // fix made Gate 0 verify real crypto instead of accepting any well-shaped bytes)
+    // now fails AES-GCM authentication unconditionally.
     let port = free_port().await;
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
     tokio::spawn(async move { daemon.start().await; });
@@ -207,18 +221,20 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
     let session_key = tcp_client_handshake(&mut stream).await;
 
-    let sid = [0xDDu8; 16];
-    let mgr = SessionEpochManager::new();
-    mgr.create_session(sid, session_key, 1_000_000, 3600.0, None).expect("create_session");
-    let eid = mgr.get_current_epoch_id(&sid).expect("epoch id");
-    let (frame, _psn) = mgr
-        .with_epoch_mut(&sid, eid, |epoch| {
-            MEASCFrame::build_frame(
-                epoch, 1, 0x10, FLAG_COVER_TRAFFIC, 0,
-                b"", &[0u8; 32], &[0u8; 24], 0,
-            ).expect("build_frame")
-        })
-        .expect("with_epoch_mut");
+    let header = saacp::framing::MEASCFrame {
+        schema_id: 1,
+        status_code: 0x10,
+        flags: FLAG_COVER_TRAFFIC,
+        action_class: 0,
+        payload_length: 0,
+        session_id: [0xDDu8; 16],
+        epoch_id: 0,
+        psn: 0,
+        context_ref_id: [0u8; 32],
+        context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    let frame = header.encode_encrypted(b"", &session_key).expect("encode_encrypted");
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;

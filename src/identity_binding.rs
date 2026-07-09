@@ -338,6 +338,32 @@ struct CAKeyRecord {
     _kid: String,
 }
 
+/// Constant-time comparison of two byte slices.
+/// Returns true iff a.len() == b.len() AND all bytes are equal,
+/// without short-circuiting on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Constant-time comparison of two hex-encoded digests (as strings).
+/// Decodes both to raw bytes before comparing so no timing information
+/// about the first differing hex character leaks. A decode failure on
+/// either side is treated as a non-match (fail-closed) rather than a panic
+/// or permissive default.
+fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+    match (hex::decode(a), hex::decode(b)) {
+        (Ok(ab), Ok(bb)) => constant_time_eq(&ab, &bb),
+        _ => false,
+    }
+}
+
 /// Validates AgentIdentityCertificates and enforces transcript binding.
 ///
 /// All methods raise SAACPHardDrop on any C-3 violation.
@@ -376,9 +402,15 @@ impl IdentityVerifier {
     }
 
     /// Mark a certificate as revoked.
+    ///
+    /// CRIT-8 fix: also purges any `verified` cache entries pinned to this cert_id.
+    /// Without this, an agent that completed identity verification before revocation
+    /// would keep passing `is_identity_verified`/`require_identity_verified` forever —
+    /// revocation had no effect on the cached "verified" status.
     pub fn revoke_certificate(&self, cert_id: &str) {
         let mut inner = self.inner.lock().expect("lock poisoned");
         inner.revoked_certs.insert(cert_id.to_string());
+        inner.verified.retain(|_, verified_cert_id| verified_cert_id != cert_id);
     }
 
     /// Verify an AgentIdentityCertificate.
@@ -451,8 +483,15 @@ impl IdentityVerifier {
             (&session.server_public_key_hex, &session.server_agent_id)
         };
 
-        // Key mismatch → key-swap attack
-        if claimed_public_key_hex != transcript_key {
+        // Key mismatch → key-swap attack.
+        // H-3 fix: constant-time comparison. `claimed_public_key_hex` is
+        // attacker-controlled (a claimed field presented by the connecting
+        // party); a naive `!=` on `&str` short-circuits on the first
+        // differing byte, leaking timing information about how many leading
+        // hex characters of a guess are correct — the same class of bug
+        // fixed for `verify_thash_matches_capability` under H-4. Decoding to
+        // bytes and comparing in constant time removes that side channel.
+        if !constant_time_eq_hex(claimed_public_key_hex, transcript_key) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::IdentityMisbinding,
                 format!("C-3: Public key presented by '{}' does not match the {} key \
@@ -480,7 +519,12 @@ impl IdentityVerifier {
         session: &TranscriptBoundSession,
         capability_thash: &str,
     ) -> Result<(), SAACPHardDrop> {
-        if capability_thash != session.thash {
+        // H-4 fix: constant-time comparison. capability_thash is attacker-controlled
+        // (a claimed field on a presented capability token); a naive `!=` on &str
+        // short-circuits on the first differing byte, leaking timing information about
+        // how many leading hex characters of a guess are correct. Decoding to bytes and
+        // comparing in constant time removes that side channel.
+        if !constant_time_eq_hex(capability_thash, &session.thash) {
             let cap_prefix: String = capability_thash.chars().take(16).collect();
             let thash_prefix: String = session.thash.chars().take(16).collect();
             return Err(SAACPHardDrop::new(
@@ -494,18 +538,33 @@ impl IdentityVerifier {
     }
 
     /// Check if an agent's identity has been verified.
+    ///
+    /// CRIT-8 fix: re-checks `revoked_certs` against the agent's cached cert_id on every
+    /// call, rather than trusting bare presence in `verified`. `revoke_certificate` already
+    /// evicts the cache eagerly, but this defends in depth against any code path that could
+    /// otherwise leave a stale, revoked cert_id in `verified`.
     pub fn is_identity_verified(&self, agent_id: &str) -> bool {
         let inner = self.inner.lock().expect("lock poisoned");
-        inner.verified.contains_key(agent_id)
+        match inner.verified.get(agent_id) {
+            Some(cert_id) => !inner.revoked_certs.contains(cert_id),
+            None => false,
+        }
     }
 
-    /// Gate: raise SAACPHardDrop if agent_id has not completed identity verification.
+    /// Gate: raise SAACPHardDrop if agent_id has not completed identity verification, or if
+    /// the certificate it was verified against has since been revoked.
     pub fn require_identity_verified(&self, agent_id: &str, operation: &str) -> Result<(), SAACPHardDrop> {
-        if !self.is_identity_verified(agent_id) {
+        let inner = self.inner.lock().expect("lock poisoned");
+        let cert_id = inner.verified.get(agent_id).ok_or_else(|| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityNotVerified,
+            format!("C-3: Identity verification for agent '{}' must be completed before {}.",
+                agent_id, operation),
+        ))?;
+        if inner.revoked_certs.contains(cert_id) {
             return Err(SAACPHardDrop::new(
-                SAACPBytecodes::IdentityNotVerified,
-                format!("C-3: Identity verification for agent '{}' must be completed before {}.",
-                    agent_id, operation),
+                SAACPBytecodes::KeyRevoked,
+                format!("C-3: Identity certificate for agent '{}' has been revoked; \
+                    re-verification is required before {}.", agent_id, operation),
             ));
         }
         Ok(())
@@ -864,6 +923,82 @@ mod tests {
         assert_eq!(err.bytecode, SAACPBytecodes::KeyRevoked);
     }
 
+    /// CRIT-8 regression test: revoking a certificate AFTER the agent has already
+    /// completed identity verification must immediately invalidate the cached
+    /// "verified" status — not leave it valid until some unrelated re-verification.
+    #[test]
+    fn test_crit8_revocation_invalidates_verified_cache() {
+        let (ca_sk, ca_vk) = make_ca_keypair();
+        let (_, agent_vk) = make_agent_keypair();
+        let agent_pk_hex = hex::encode(agent_vk.as_bytes());
+
+        let cert = AgentIdentityCertificate::issue(
+            "agent-cached", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+        );
+
+        let verifier = IdentityVerifier::new();
+        verifier.register_ca_key("ca-01", ca_vk);
+
+        // Agent completes identity verification — cached as verified.
+        assert!(verifier.verify_certificate(&cert).is_ok());
+        assert!(verifier.is_identity_verified("agent-cached"));
+        assert!(verifier.require_identity_verified("agent-cached", "test op").is_ok());
+
+        // Certificate is revoked (e.g. compromise detected) AFTER caching.
+        verifier.revoke_certificate(&cert.cert_id);
+
+        // The cached "verified" status must no longer be trusted. `revoke_certificate`
+        // eagerly purges the `verified` entry, so the subsequent read sees no cached
+        // entry at all (IdentityNotVerified) rather than a revoked one (KeyRevoked) —
+        // either way it fails closed, which is what matters here.
+        assert!(
+            !verifier.is_identity_verified("agent-cached"),
+            "CRIT-8: revocation must invalidate the cached verified status"
+        );
+        let err = verifier.require_identity_verified("agent-cached", "test op").unwrap_err();
+        assert_eq!(
+            err.bytecode, SAACPBytecodes::IdentityNotVerified,
+            "CRIT-8: eager purge removes the cache entry entirely, so re-verification is required"
+        );
+    }
+
+    /// CRIT-8: even if a stale `verified` entry somehow survives `revoke_certificate`'s
+    /// eager purge, `is_identity_verified`/`require_identity_verified` must independently
+    /// re-check `revoked_certs` at read time (defense in depth).
+    #[test]
+    fn test_crit8_defensive_recheck_on_read() {
+        let (ca_sk, ca_vk) = make_ca_keypair();
+        let (_, agent_vk) = make_agent_keypair();
+        let agent_pk_hex = hex::encode(agent_vk.as_bytes());
+
+        let cert = AgentIdentityCertificate::issue(
+            "agent-defense", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+        );
+
+        let verifier = IdentityVerifier::new();
+        verifier.register_ca_key("ca-01", ca_vk);
+        assert!(verifier.verify_certificate(&cert).is_ok());
+
+        // Simulate a stale cache entry bypassing revoke_certificate's purge by
+        // revoking the cert_id directly in the inner revoked set.
+        {
+            let mut inner = verifier.inner.lock().unwrap();
+            inner.revoked_certs.insert(cert.cert_id.clone());
+            // `verified` intentionally left untouched here.
+        }
+
+        assert!(
+            !verifier.is_identity_verified("agent-defense"),
+            "CRIT-8: read-time recheck must catch a revoked cert_id even without eager purge"
+        );
+        let err = verifier.require_identity_verified("agent-defense", "test op").unwrap_err();
+        assert_eq!(
+            err.bytecode, SAACPBytecodes::KeyRevoked,
+            "CRIT-8: require_identity_verified must report KeyRevoked when the cached \
+                cert_id is present in revoked_certs"
+        );
+    }
+
     #[test]
     fn test_identity_verifier_unknown_ca() {
         let (ca_sk, _) = make_ca_keypair();
@@ -909,6 +1044,40 @@ mod tests {
         assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
     }
 
+    /// H-3 regression: `verify_transcript_binding`'s public-key comparison must
+    /// use `constant_time_eq_hex` rather than a short-circuiting `&str` `!=`
+    /// (mirrors the H-4 fix for `verify_thash_matches_capability`). Exercises
+    /// exact match, well-formed-but-wrong hex differing only in the last byte,
+    /// and malformed non-hex input — all must produce the same pass/fail
+    /// outcome as before the fix, without the timing side-channel.
+    #[test]
+    fn test_verify_transcript_binding_constant_time() {
+        let sid = vec![0xAB; 16];
+        let client_pk = "aa".repeat(32);
+        let session = TranscriptBoundSession::establish(
+            sid, "client-a", "server-b",
+            &client_pk, &"bb".repeat(32),
+            &"cc".repeat(16), &"dd".repeat(16),
+            "v1", "cs1", None,
+        );
+        let verifier = IdentityVerifier::new();
+
+        // Exact match still succeeds.
+        assert!(verifier.verify_transcript_binding(&session, "client-a", &client_pk, "client").is_ok());
+
+        // Well-formed hex, same length, differing only in the final byte.
+        let mut tampered = client_pk.clone();
+        let last = tampered.pop().unwrap();
+        let flipped = if last == 'a' { 'b' } else { 'a' };
+        tampered.push(flipped);
+        let err = verifier.verify_transcript_binding(&session, "client-a", &tampered, "client").unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
+
+        // Malformed non-hex input must be rejected (fail-closed), not panic.
+        let err = verifier.verify_transcript_binding(&session, "client-a", "not-valid-hex!!", "client").unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
+    }
+
     #[test]
     fn test_verify_thash_matches_capability() {
         let sid = vec![0xAB; 16];
@@ -919,6 +1088,38 @@ mod tests {
         let verifier = IdentityVerifier::new();
         assert!(verifier.verify_thash_matches_capability(&session, &session.thash).is_ok());
         let err = verifier.verify_thash_matches_capability(&session, "wrong_hash").unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
+    }
+
+    /// H-4 regression: `verify_thash_matches_capability` must now compare via
+    /// `constant_time_eq_hex` rather than a short-circuiting `&str` `!=`. This test
+    /// exercises the three cases the fix must preserve correctness for: exact match,
+    /// well-formed-but-wrong-content hex (differs only in the last byte, so a
+    /// short-circuiting compare would previously have leaked the most timing signal
+    /// here), and malformed non-hex input — all with the same pass/fail outcome as
+    /// before the fix, just without the timing side-channel.
+    #[test]
+    fn test_verify_thash_matches_capability_constant_time() {
+        let sid = vec![0xAB; 16];
+        let session = TranscriptBoundSession::establish(
+            sid, "c", "s", &"aa".repeat(32), &"bb".repeat(32),
+            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+        );
+        let verifier = IdentityVerifier::new();
+
+        // Exact match still succeeds.
+        assert!(verifier.verify_thash_matches_capability(&session, &session.thash).is_ok());
+
+        // Well-formed hex, same length, differing only in the final byte.
+        let mut tampered = session.thash.clone();
+        let last = tampered.pop().unwrap();
+        let flipped = if last == '0' { '1' } else { '0' };
+        tampered.push(flipped);
+        let err = verifier.verify_thash_matches_capability(&session, &tampered).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
+
+        // Malformed non-hex input must be rejected (fail-closed), not panic.
+        let err = verifier.verify_thash_matches_capability(&session, "not-valid-hex!!").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
     }
 

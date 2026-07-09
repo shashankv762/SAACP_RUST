@@ -8,10 +8,10 @@
 //!   * Audit trail per key identifier
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -118,10 +118,24 @@ impl KeyCategory {
 
 /// Full descriptor for a single version of a managed cryptographic key.
 ///
-/// SECURITY FIX (FINDING-2): derives Zeroize/ZeroizeOnDrop so `key_material`
-/// is wiped when the descriptor is dropped (rotation, revocation, scope exit),
-/// matching the pattern already used by `KeyEvolutionEngine`/`SessionMeta` in
-/// measc.rs. Non-sensitive fields are `#[zeroize(skip)]`.
+/// SECURITY FIX (FINDING-2): `key_material` is wiped on drop, matching the
+/// pattern already used by `KeyEvolutionEngine`/`SessionMeta` in measc.rs.
+///
+/// SECURITY FIX (H-11): `key_material` is `Arc<Zeroizing<Vec<u8>>>` rather
+/// than a bare `Vec<u8>`. `KeyDescriptor` is cloned by `KeyRegistry`/
+/// `KeyLifecycleManager` on every read (`get_active`, `get_version`,
+/// `all_for_kid`, `rotate_key`); with a bare `Vec<u8>` each such clone was a
+/// full byte-for-byte copy of the raw secret key onto the heap, so a single
+/// "read the active key" call could leave 2+ simultaneous unprotected
+/// plaintext copies of the same key material alive in process memory at
+/// once. Wrapping it in `Arc` makes `.clone()` a refcount bump instead of a
+/// copy: there is exactly one heap allocation of any given key version's
+/// bytes, shared by reference across every live `KeyDescriptor` clone, and
+/// it is zeroized exactly once — via `Zeroizing<Vec<u8>>`'s own unconditional
+/// `Drop` impl — at the moment the last referencing `Arc` is dropped. Because
+/// `Arc<T>` does not itself implement `Zeroize`, `key_material` is marked
+/// `#[zeroize(skip)]` here; that's not a gap, zeroization is guaranteed by
+/// the `Zeroizing` wrapper regardless of this struct's own derive.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct KeyDescriptor {
     /// Key identifier — a 32-character hexadecimal UUID4 string (no hyphens).
@@ -136,8 +150,9 @@ pub struct KeyDescriptor {
     /// The KeyCategory denoting the key's role in SAACP.
     #[zeroize(skip)]
     pub category: KeyCategory,
-    /// Raw key bytes.
-    pub key_material: Vec<u8>,
+    /// Raw key bytes, shared by reference across clones (see H-11 note above).
+    #[zeroize(skip)]
+    pub key_material: Arc<Zeroizing<Vec<u8>>>,
     /// Unix epoch timestamp (seconds) at which this descriptor was created.
     #[zeroize(skip)]
     pub created_at: f64,
@@ -187,7 +202,7 @@ impl KeyDescriptor {
             version,
             algorithm,
             category,
-            key_material,
+            key_material: Arc::new(Zeroizing::new(key_material)),
             created_at,
             expires_at,
             rotated_at,
@@ -675,6 +690,29 @@ mod tests {
         let active = reg.get_active(&test_kid()).unwrap();
         assert_eq!(active.version, 1);
         assert_eq!(active.status, KeyStatus::Active);
+    }
+
+    /// H-11 regression: `KeyDescriptor::clone()` must share the underlying
+    /// key material allocation (an `Arc` refcount bump) rather than
+    /// deep-copying the raw secret bytes onto the heap a second time.
+    #[test]
+    fn test_key_descriptor_clone_shares_key_material_allocation() {
+        let reg = KeyRegistry::new();
+        let kid = test_kid();
+        reg.register(test_descriptor(&kid)).unwrap();
+
+        let first = reg.get_active(&kid).unwrap();
+        let second = reg.get_active(&kid).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first.key_material, &second.key_material),
+            "two independent reads of the same key version must share one \
+             key_material allocation, not duplicate it"
+        );
+        assert!(Arc::strong_count(&first.key_material) >= 2);
+
+        let cloned = first.clone();
+        assert!(Arc::ptr_eq(&first.key_material, &cloned.key_material));
     }
 
     #[test]

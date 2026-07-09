@@ -91,7 +91,7 @@ fn test_rotate_key_changes_bytes() {
     let mgr = KeyLifecycleManager::new(reg, None);
     let new_bytes = vec![0x22u8; 32];
     let rotated = mgr.rotate_key(&kid, new_bytes.clone(), KeyAlgorithm::Ed25519).unwrap();
-    assert_eq!(rotated.key_material, new_bytes);
+    assert_eq!(rotated.key_material.as_slice(), new_bytes.as_slice());
 }
 
 #[test]

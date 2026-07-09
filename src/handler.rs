@@ -39,6 +39,18 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
+/// Hex-encode the wire-level session_id (header bytes [16..32], `framing::MEASC_HEADER_SIZE`
+/// layout) directly from an undecrypted packet. Used only at the pre-Gate-0 trust-decay
+/// checkpoints (`intercept_packet_full`/`intercept_packet_encrypted` and their post-result
+/// generic-hard-drop penalty), where no `ParsedPacket` exists yet to read `session_uuid`
+/// from — session_id must be plaintext-visible pre-decrypt anyway so the daemon can pick
+/// the right per-session key (see `daemon.rs`'s epoch lookup at the same offset). Returns
+/// an empty string for a too-short/malformed packet, which safely misses any registered
+/// `TranscriptBoundSession` and falls back to the agent_id-keyed trust key.
+fn wire_session_id_hex(packet: &[u8]) -> String {
+    packet.get(16..32).map(hex::encode).unwrap_or_default()
+}
+
 use crate::aegf::AEGFGovernor;
 use crate::cscs::CSCSLoopDetector;
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
@@ -51,7 +63,7 @@ use crate::security::ImmutableAuditLog;
 use crate::streaming::StreamRegistry;
 use crate::telemetry::report_gate_rejection;
 use crate::temporal::DeadMansSwitch;
-use crate::trust_decay::{TrustDecayEngine, PenaltyKind, IntentDriftTracker, CHAIN_DRIFT_CEILING};
+use crate::trust_decay::{TrustDecayEngine, PenaltyKind, IntentDriftTracker, CHAIN_DRIFT_CEILING, trust_key_for};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -545,13 +557,16 @@ impl PromptInjectionScanner {
                     }
                 }
             }
-            // Percent-encoding (URL encoding): scan decoded form
-            if trimmed.contains('%') {
-                let decoded = percent_decode(trimmed);
-                let norm = Self::normalize(&decoded);
-                Self::scan_string_patterns(&norm)?;
-                Self::scan_encoded_layers(&decoded, layer + 1)?;
-            }
+        }
+        // Percent-encoding (URL encoding): scan decoded form. Checked regardless
+        // of length — unlike base64/hex, a short encoded fragment (e.g. "%2e%2e")
+        // can still smuggle meaningful content, so this must not sit behind the
+        // >= 8 char guard used for the denser base64/hex heuristics above.
+        if trimmed.contains('%') {
+            let decoded = percent_decode(trimmed);
+            let norm = Self::normalize(&decoded);
+            Self::scan_string_patterns(&norm)?;
+            Self::scan_encoded_layers(&decoded, layer + 1)?;
         }
         Ok(())
     }
@@ -633,6 +648,12 @@ pub struct ParsedPacket {
     pub source_agent: String,
     /// Whether this packet requires binary stream handling.
     pub is_binary_stream: bool,
+    /// Gate 1.0's validated, trust-decay-capped `max_action_class` ceiling for
+    /// this packet's token. 0 (READ_ONLY) until Gate 1.0 runs in
+    /// `run_gates_1_through_12`. CRIT-2 fix: stashed on `StreamSession` at
+    /// STREAM_START so Gate 2.5 (kinetic firewall) can be re-enforced on every
+    /// CONTINUATION/END frame instead of only the first frame of a stream.
+    pub max_action_class: u8,
 }
 
 /// Deprecated: cached token result type kept for Python API parity.
@@ -721,14 +742,15 @@ impl SAACPProtocolHandler {
             is_cover_traffic: is_cover,
             source_agent: String::new(),
             is_binary_stream: is_binary,
+            max_action_class: 0,
         })
     }
 
     /// Gate 0 (encrypted-transport variant): real AES-256-GCM decryption + replay-window
-    /// enforcement via `measc::MEASCFrame::parse_frame`, instead of the structural-only
-    /// `framing::MEASCFrame::parse_header` that `gate_0_crypto_integrity` uses. Produces the
-    /// same `ParsedPacket` shape so `run_gates_1_through_12` can consume either. Passes
-    /// `skip_schema_validation: true` to `parse_frame` because Gate 9.0
+    /// enforcement via `measc::MEASCFrame::parse_frame`, instead of the (also real-crypto,
+    /// post-CRIT-1-fix) `framing::MEASCFrame::parse_header` that `gate_0_crypto_integrity`
+    /// uses. Produces the same `ParsedPacket` shape so `run_gates_1_through_12` can consume
+    /// either. Passes `skip_schema_validation: true` to `parse_frame` because Gate 9.0
     /// (`run_gates_1_through_12`) already validates the decoded payload against
     /// `PreCompiledSchemas` — validating twice would just duplicate work.
     fn gate_0_crypto_integrity_encrypted(
@@ -764,6 +786,7 @@ impl SAACPProtocolHandler {
             is_cover_traffic: is_cover,
             source_agent: String::new(),
             is_binary_stream: is_binary,
+            max_action_class: 0,
         })
     }
 
@@ -942,7 +965,7 @@ impl SAACPProtocolHandler {
         flags: u8,
         payload_dict: &HashMap<String, JsonValue>,
     ) -> Result<(), SAACPHardDrop> {
-        if flags == 0x0B && !payload_dict.contains_key("_secondary_token") {
+        if (flags & 0x0B) == 0x0B && !payload_dict.contains_key("_secondary_token") {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::LateralMovementBlocked,
                 "High-Risk Mutative Operation (0x0B) requires secondary validation token.",
@@ -1348,7 +1371,14 @@ impl SAACPProtocolHandler {
         // (accumulated across multiple gate violations, possibly of different
         // kinds) rather than a fixed error count in a fixed window. See
         // `trust_decay.rs` module docs for the full model.
-        if TrustDecayEngine::global().requires_reauth(current_agent_name) {
+        //
+        // S-2 fix: keyed by `trust_key_for` (Ed25519 public-key fingerprint when this
+        // connection is identity-bound, agent_id string otherwise) rather than the bare
+        // self-claimed `current_agent_name` — see that function's doc comment for why.
+        // session_id is read straight off the (still-encrypted) wire header since no
+        // `ParsedPacket` exists yet at this pre-Gate-0 checkpoint.
+        let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
+        if TrustDecayEngine::global().requires_reauth(&trust_key) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -1383,7 +1413,7 @@ impl SAACPProtocolHandler {
             // `LateralMovementBlocked` covers both Gate 3.0 and an unrelated
             // missing-token failure), so bytecode identity is not a reliable
             // signal for "was this already penalized more specifically."
-            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::GenericHardDrop);
             crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
         } else {
             crate::telemetry::global_telemetry().record_packet_accepted();
@@ -1400,11 +1430,14 @@ impl SAACPProtocolHandler {
                 // Start the stream session (idempotent if already registered).
                 let _ = crate::streaming::StreamRegistry::global()
                     .start_stream(stream_id, source_agent, current_agent_name);
-                // Register token sig hash and expiry for Gate 1.0 on continuations.
+                // Register token sig hash, expiry, and max_action_class (CRIT-2 fix)
+                // for Gate 1.0 / Gate 2.5 on continuations.
                 if let Some(JsonValue::String(ref cap_tok)) =
                     parsed.payload_dict.get("_capability_token")
                 {
-                    Self::register_stream_start_token(stream_id, cap_tok, source_agent);
+                    Self::register_stream_start_token(
+                        stream_id, cap_tok, source_agent, parsed.max_action_class,
+                    );
                 }
             }
         }
@@ -1418,7 +1451,8 @@ impl SAACPProtocolHandler {
     /// wire payload as already-plaintext. Mirrors `intercept_packet_full`'s pre/post-gate
     /// wrapper (circuit breaker, trust-decay reauth, rate-limiter error recording,
     /// STREAM_START auto-registration) but decrypts via `gate_0_crypto_integrity_encrypted`
-    /// instead of the structural-only `gate_0_crypto_integrity`.
+    /// (epoch-manager-based replay window) instead of `gate_0_crypto_integrity`'s
+    /// static-secret AES-256-GCM path.
     ///
     /// `audit_secret` plays the same dual role `secret_key` already plays on the structural
     /// path: it HMAC-binds Gate 6.0 audit entries, and (via `run_gates_1_through_12` → Gate
@@ -1432,9 +1466,12 @@ impl SAACPProtocolHandler {
     ///
     /// V1 scope limit: `STREAM_CONTINUATION`/`STREAM_END` are rejected outright rather than
     /// routed to `handle_stream_continuation`/`handle_stream_end`, since those two handlers
-    /// each call the structural (non-decrypting) `gate_0_crypto_integrity` internally —
-    /// routing an encrypted frame there would silently treat ciphertext as plaintext.
-    /// Mirroring them onto the encrypted path is real, scoped-out follow-up work.
+    /// each call `gate_0_crypto_integrity` internally, which derives its AES-256-GCM key
+    /// from the static `secret_key` rather than this path's per-epoch traffic key —
+    /// routing an encrypted frame there would authenticate against the wrong key material
+    /// and always fail closed (not silently accept ciphertext as plaintext, but the two
+    /// paths are still not interchangeable). Mirroring them onto the encrypted path is
+    /// real, scoped-out follow-up work.
     #[allow(clippy::too_many_arguments)]
     pub fn intercept_packet_encrypted(
         packet: &[u8],
@@ -1456,7 +1493,9 @@ impl SAACPProtocolHandler {
             ));
         }
 
-        if TrustDecayEngine::global().requires_reauth(current_agent_name) {
+        // S-2 fix: see the identical comment in `intercept_packet_full` above.
+        let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
+        if TrustDecayEngine::global().requires_reauth(&trust_key) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -1490,7 +1529,7 @@ impl SAACPProtocolHandler {
 
         if result.is_err() {
             let _ = effective_rl.record_error(current_agent_name);
-            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::GenericHardDrop);
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::GenericHardDrop);
             crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
         } else {
             crate::telemetry::global_telemetry().record_packet_accepted();
@@ -1505,7 +1544,9 @@ impl SAACPProtocolHandler {
                 if let Some(JsonValue::String(ref cap_tok)) =
                     parsed.payload_dict.get("_capability_token")
                 {
-                    Self::register_stream_start_token(stream_id, cap_tok, source_agent);
+                    Self::register_stream_start_token(
+                        stream_id, cap_tok, source_agent, parsed.max_action_class,
+                    );
                 }
             }
         }
@@ -1560,13 +1601,19 @@ impl SAACPProtocolHandler {
         _aegf_governor: Option<&AEGFGovernor>,
         _cscs: Option<&CSCSLoopDetector>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
+        // S-2 fix: every Trust Decay Engine call below uses this fingerprint-preferring
+        // key instead of the bare `current_agent_name` — see `trust_key_for`'s doc comment.
+        let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
+
         // ── Stream fast-path routing (P1-1) ──────────────────────────────────
         // Route STREAM_CONTINUATION and STREAM_END to their dedicated handlers.
-        // These handlers enforce the applicable security gates (Gate 0, Gate 1.0,
-        // sequence monotonicity, Gate 4.0 for text streams, Gate 6.0 for END).
+        // CRIT-2 fix: these handlers now enforce the full minimum gate set
+        // (Authorization Invariance, opusplan.md Part 1.4/CRIT-2) — Gate 0,
+        // Gate 1.0 (expiry + revocation), Gate 2.5 (kinetic firewall), sequence
+        // monotonicity, Gate 4.0 (text streams), and Gate 6.0 (audit, every frame).
         if parsed.status_code == SAACPBytecodes::StreamContinuation as u8 {
             return Self::handle_stream_continuation(
-                packet, secret_key, current_agent_name, gateway, rate_limiter,
+                packet, secret_key, current_agent_name, gateway, rate_limiter, audit_log,
             );
         }
         if parsed.status_code == SAACPBytecodes::StreamEnd as u8 {
@@ -1723,10 +1770,60 @@ impl SAACPProtocolHandler {
         // authorization ceiling from, so Gate 2.5/3.0/etc. all inherit the
         // downgrade for free without needing their own trust-aware branch.
         // The token itself is untouched; this is a runtime-only cap.
-        let max_action_class_from_token = match TrustDecayEngine::global().scope_cap(current_agent_name) {
+        let max_action_class_from_token = match TrustDecayEngine::global().scope_cap(&trust_key) {
             Some(cap) => token_result.max_action_class.min(cap),
             None => token_result.max_action_class,
         };
+        // CRIT-2 fix: stash Gate 1.0's validated ceiling on the packet itself so that,
+        // if this turns out to be a STREAM_START, `intercept_packet_full`'s
+        // auto-registration can persist it on the `StreamSession` — letting Gate 2.5
+        // re-enforce the SAME (already trust-decay-capped) ceiling on every later
+        // CONTINUATION/END frame instead of only this first frame.
+        parsed.max_action_class = max_action_class_from_token;
+
+        // ── C-3: Identity binding cross-check ────────────────────────────────
+        // If this connection completed an identity-bound handshake (`daemon.rs`'s
+        // `with_identity_binding`), a `TranscriptBoundSession` was registered for its
+        // session_id, proving — via Ed25519 possession, not a bearer secret — which
+        // agent is actually on the other end of the wire. A capability token is just a
+        // signed JSON blob: whoever holds a copy of it (a leaked log line, a compromised
+        // relay, a replayed transcript) can present it claiming to be any `iss` the
+        // issuer trusts. Cross-checking the token's claimed identity against the
+        // cryptographically proven one closes exactly that gap. When no session is
+        // registered for this session_id (identity binding not enabled for this
+        // deployment/connection), this is a no-op — preserves today's behavior exactly.
+        if let Some(mismatch) = crate::identity_binding::DEFAULT_IDENTITY_REGISTRY
+            .get_by_session_id(&parsed.session_uuid, |session| {
+                (session.client_agent_id != source_agent).then(|| session.client_agent_id.clone())
+            })
+            .flatten()
+        {
+            let e = SAACPHardDrop::new(
+                SAACPBytecodes::SessionSpliceDetected,
+                format!(
+                    "C-3: Capability token claims identity '{}' but the identity-bound \
+                     handshake for this session proved '{}'. Token replay or identity \
+                     substitution detected.",
+                    source_agent, mismatch,
+                ),
+            );
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
+            report_gate_rejection("gate_1_0_identity_binding", current_agent_name, &e);
+            return Err(e);
+        }
+        // Record that identity + authorization have now both been established for this
+        // (agent, session) pair, per the six-phase C-3 ordering invariant
+        // (`identity_binding::IDENTITY_GATE_PHASES`). `ecdh_handshake` already advanced
+        // IDENTITY_VERIFIED at handshake time when identity binding is enabled; advancing
+        // it again here is idempotent (the phase set is a HashSet) and also covers
+        // deployments where identity binding is off but a caller still wants ordering
+        // bookkeeping. AUTHORIZED reflects that Gate 1.0 (this function) has just
+        // validated the capability token.
+        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
+            .advance(&source_agent, &parsed.session_uuid, "IDENTITY_VERIFIED");
+        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
+            .advance(&source_agent, &parsed.session_uuid, "AUTHORIZED");
+
         parsed.source_agent = token_result.source_agent;
 
         // Extract token signature hash for audit log + stream session registration.
@@ -1747,7 +1844,7 @@ impl SAACPProtocolHandler {
             // In the Python, root_intent is fetched from FederatedMemory.
             // Here we use the hash directly as the intent string for structural check.
             if let Err(e) = Self::enforce_root_intent(rint, &parsed.payload_dict) {
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
@@ -1757,7 +1854,7 @@ impl SAACPProtocolHandler {
             // doc comment. Runs before the per-hop/chain-drift reinforcement
             // below since it's the cheaper, more targeted check.
             if let Err(e) = Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict) {
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
@@ -1766,7 +1863,7 @@ impl SAACPProtocolHandler {
             if let Err(e) = Self::gate_1_5_reinforcement(
                 rint, &parsed.payload_dict, delegation_depth, &parsed.session_uuid,
             ) {
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::IntentDriftCeiling);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
@@ -1805,7 +1902,7 @@ impl SAACPProtocolHandler {
 
         // ── Gate 3.0: Lateral Movement Guard (secondary token for high-risk) ──
         if let Err(e) = Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict) {
-            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::ScopeViolation);
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
             report_gate_rejection("gate_3_0_lateral", current_agent_name, &e);
             return Err(e);
         }
@@ -1815,7 +1912,7 @@ impl SAACPProtocolHandler {
         if !parsed.is_binary_stream {
             let jv = json_value_from_map(&parsed.payload_dict);
             if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::InjectionAttempt);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
@@ -1823,7 +1920,7 @@ impl SAACPProtocolHandler {
 
         // ── Gate 5.0: Epistemic Circuit Breaker ───────────────────────────────
         if let Err(e) = Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict) {
-            let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
             report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
             return Err(e);
         }
@@ -1832,7 +1929,7 @@ impl SAACPProtocolHandler {
         // Additive; only engages for schema_id == 3 with a bound root intent.
         if parsed.schema_id == 3 {
             if let Err(e) = Self::gate_5_0b_scope_consistency(&parsed.payload_dict, root_intent_hash.as_deref()) {
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::EpistemicOverclaim);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
                 report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
                 return Err(e);
             }
@@ -1877,13 +1974,25 @@ impl SAACPProtocolHandler {
         // Authorization Invariance: framing auto-detects via status_code.
         use crate::framing::is_schema_exempt;
         if !parsed.is_binary_stream && !is_schema_exempt(parsed.status_code) {
-            if let Ok(s) = std::str::from_utf8(&parsed.payload) {
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(s) {
-                    PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val).inspect_err(|e| {
-                        report_gate_rejection("gate_9_0_schema", current_agent_name, e);
-                    })?;
-                }
-            }
+            let s = std::str::from_utf8(&parsed.payload).map_err(|_| {
+                let e = SAACPHardDrop::new(
+                    SAACPBytecodes::SchemaMismatch,
+                    "Gate 9.0: payload is not valid UTF-8",
+                );
+                report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                e
+            })?;
+            let json_val = serde_json::from_str::<serde_json::Value>(s).map_err(|_| {
+                let e = SAACPHardDrop::new(
+                    SAACPBytecodes::SchemaMismatch,
+                    "Gate 9.0: payload is not valid JSON",
+                );
+                report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                e
+            })?;
+            PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val).inspect_err(|e| {
+                report_gate_rejection("gate_9_0_schema", current_agent_name, e);
+            })?;
         }
 
         // ── Gate 11.0: AEGF Hop-Limit + Causal Graph (DEG) ───────────────────
@@ -2002,27 +2111,44 @@ impl SAACPProtocolHandler {
 
     /// Handle STREAM_CONTINUATION frames.
     ///
-    /// Security Gate Invariants (Authorization Invariance, SAACP/0.1-beta2):
+    /// Security Gate Invariants (Authorization Invariance, SAACP/0.1-beta2).
+    /// CRIT-2 fix (opusplan.md Part 1.4 / Part 2): continuation frames previously
+    /// bypassed 10 of 12 gates — an agent that passed the full pipeline on
+    /// STREAM_START could inject arbitrary content via continuation frames that
+    /// skipped intent checking, the kinetic firewall, and audit. This handler now
+    /// enforces the documented minimum gate set for stream frames:
     ///   Gate 0: AES-GCM integrity (always runs via parse_header).
     ///   Gate 1.0 (capability expiry): enforced on stored originating token.
     ///   Gate 1.0 (capability revocation): token_sig_hash checked vs live revocation list.
     ///   Gate 1.0 (stream session validity): stream must exist and be active.
+    ///   Gate 2.5 (kinetic firewall): re-enforces the SAME trust-decay-capped
+    ///     max_action_class Gate 1.0 validated at STREAM_START — a token that
+    ///     could only authorize e.g. REVERSIBLE actions cannot use continuation
+    ///     frames to smuggle an IRREVERSIBLE action_class past the pipeline.
     ///   AEGF hop-limit: sequence_id monotonicity enforced via StreamRegistry.
     ///   Gate 4.0 (C-2 fix): injection scan on TEXT streams (not binary).
+    ///   Gate 6.0: audit checkpoint written for every accepted frame, not just
+    ///     STREAM_END — closes the unlogged-mid-stream-activity gap.
+    /// Schema (Gate 9.0) and governance (Gate 11.0/12.0) are stateless per-packet
+    /// checks that reasonably apply only to the final reassembled stream content,
+    /// not to each binary/text fragment — see opusplan.md Part 1.4.
     pub fn handle_stream_continuation(
         packet: &[u8],
         secret_key: &[u8],
         current_agent_name: &str,
         gateway: Option<&ZeroTrustGateway>,
         _rate_limiter: Option<&AgentRateLimiter>,
+        audit_log: Option<&ImmutableAuditLog>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
         let mut parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
         let stream_id = parsed.session_uuid.clone();
+        // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
+        let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
 
         // Verify the stream exists and its originating token hasn't been revoked
         let session_info = StreamRegistry::global().get_stream_info(&stream_id);
-        let (token_exp, token_sig_hash, last_seq) = match session_info {
+        let (token_exp, token_sig_hash, last_seq, max_action_class, stream_source_agent) = match session_info {
             Some(info) => info,
             None => {
                 return Err(SAACPHardDrop::new(
@@ -2063,6 +2189,19 @@ impl SAACPProtocolHandler {
             }
         }
 
+        // ── Gate 2.5: Kinetic Firewall (CRIT-2 fix) ───────────────────────────
+        // Re-enforce the originating token's validated max_action_class ceiling on
+        // THIS frame's action_class. Without this, a continuation frame could
+        // declare a higher action_class than the stream was ever authorized for
+        // and it would sail through unchecked. A violation here is treated with
+        // the same severity as expiry/revocation — abort the whole stream rather
+        // than let an attacker keep probing escalation on later frames.
+        if let Err(e) = Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class, audit_log) {
+            StreamRegistry::global().abort_stream(&stream_id);
+            report_gate_rejection("gate_2_5_kinetic", current_agent_name, &e);
+            return Err(e);
+        }
+
         // AEGF hop-limit: enforce sequence monotonicity before advancing stream state.
         // sequence_id must be strictly greater than the last accepted frame.
         if let Some(last) = last_seq {
@@ -2077,7 +2216,7 @@ impl SAACPProtocolHandler {
                 // which shares this branch but is comparatively weak
                 // evidence) — penalize regardless, ReplaySuspicion already
                 // reflects the stronger end of the weight scale.
-                let _ = TrustDecayEngine::global().penalize(current_agent_name, PenaltyKind::ReplaySuspicion);
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ReplaySuspicion);
                 return Err(SAACPHardDrop::new(
                     code,
                     format!(
@@ -2108,8 +2247,38 @@ impl SAACPProtocolHandler {
             let jv = JsonValue::Object(vec![
                 ("_stream_data".to_string(), JsonValue::String(stream_text.clone())),
             ]);
-            Self::gate_4_0_injection_scan(&jv)?;
+            if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
+                // Parity with Gate 4.0's penalty in run_gates_1_through_12 — a
+                // detected injection costs behavioral trust regardless of which
+                // pipeline caught it.
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
+                return Err(e);
+            }
         }
+
+        // ── Gate 6.0: Immutable Audit Checkpoint (CRIT-2 fix) ─────────────────
+        // Every accepted continuation frame is now audited, not just STREAM_END —
+        // previously a mid-stream attacker with a valid key could push arbitrary
+        // authorized-looking activity with zero forensic trail between START and END.
+        let traceparent_hex: String = parsed.traceparent.iter()
+            .map(|b| format!("{:02x}", b)).collect();
+        let frame_summary = format!(
+            "[STREAM_CONTINUATION seq={}] {} bytes",
+            parsed.sequence_id, actual_data_len
+        );
+        let log: &ImmutableAuditLog = match audit_log {
+            Some(l) => l,
+            None => ImmutableAuditLog::global(),
+        };
+        log.append_event(
+            secret_key,
+            &stream_source_agent,
+            current_agent_name,
+            &token_sig_hash,
+            &frame_summary,
+            &traceparent_hex,
+        );
 
         // Advance stream state only after all security gates have passed.
         let _ = StreamRegistry::global().continue_stream(&stream_id, parsed.sequence_id, actual_data_len);
@@ -2130,9 +2299,12 @@ impl SAACPProtocolHandler {
 
     /// Handle STREAM_END frames. Finalize the stream and write an audit summary.
     ///
-    /// Security Gate Invariants (Authorization Invariance, SAACP/0.1-beta2):
-    ///   Same gate applicability as handle_stream_continuation.
-    ///   Additionally writes finalization entry to ImmutableAuditLog (Gate 6.0 equivalent).
+    /// Security Gate Invariants (Authorization Invariance, SAACP/0.1-beta2).
+    /// CRIT-2 fix (opusplan.md Part 1.4 / Part 2): same minimum gate set as
+    /// `handle_stream_continuation` — Gate 2.5 (kinetic firewall) and Gate 4.0
+    /// (injection scan on text streams) now also run on the terminal frame,
+    /// before the stream is finalized, not just on continuation frames.
+    /// Additionally writes finalization entry to ImmutableAuditLog (Gate 6.0 equivalent).
     pub fn handle_stream_end(
         packet: &[u8],
         secret_key: &[u8],
@@ -2143,9 +2315,11 @@ impl SAACPProtocolHandler {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
         let mut parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
         let stream_id = parsed.session_uuid.clone();
+        // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
+        let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
 
         let session_info = StreamRegistry::global().get_stream_info(&stream_id);
-        if let Some((token_exp, token_sig_hash, _last_seq)) = &session_info {
+        if let Some((token_exp, token_sig_hash, _last_seq, max_action_class, _stream_source_agent)) = &session_info {
             // Gate 1.0 (capability expiry)
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2173,6 +2347,34 @@ impl SAACPProtocolHandler {
                         SAACPBytecodes::LateralMovementBlocked,
                         "Stream aborted at END: originating token has been REVOKED.",
                     ));
+                }
+            }
+
+            // ── Gate 2.5: Kinetic Firewall (CRIT-2 fix) ───────────────────────
+            // Same rationale as handle_stream_continuation: the terminal frame's
+            // action_class must not exceed what the originating token was ever
+            // validated for.
+            if let Err(e) = Self::gate_2_5_kinetic_firewall(parsed.action_class, *max_action_class, audit_log) {
+                StreamRegistry::global().abort_stream(&stream_id);
+                report_gate_rejection("gate_2_5_kinetic", current_agent_name, &e);
+                return Err(e);
+            }
+
+            // ── Gate 4.0: Injection scan on text streams (CRIT-2 fix) ─────────
+            // Mirrors handle_stream_continuation's C-2 fix — the final frame can
+            // carry trailing payload text too, and it was previously never scanned.
+            // Runs BEFORE end_stream() finalizes/removes the session so a detected
+            // injection prevents finalization rather than racing it.
+            let is_binary_stream = parsed.flags & FLAG_BINARY_STREAM != 0;
+            let end_text = String::from_utf8_lossy(&parsed.payload).to_string();
+            if !is_binary_stream && !end_text.trim().is_empty() {
+                let jv = JsonValue::Object(vec![
+                    ("_stream_data".to_string(), JsonValue::String(end_text)),
+                ]);
+                if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
+                    let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                    report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
+                    return Err(e);
                 }
             }
         }
@@ -2214,15 +2416,18 @@ impl SAACPProtocolHandler {
         Ok(parsed)
     }
 
-    /// Register a STREAM_START frame's token metadata for Gate 1.0 on continuations.
+    /// Register a STREAM_START frame's token metadata for Gate 1.0/2.5 on continuations.
     ///
     /// Call this AFTER a successful `intercept_packet()` on a STREAM_START frame.
-    /// Extracts token_sig_hash and token_exp from the capability token and registers
-    /// them on the StreamSession for enforcement on all subsequent continuation frames.
+    /// Extracts token_sig_hash and token_exp from the capability token and, together
+    /// with `max_action_class` (Gate 1.0's already-validated, trust-decay-capped
+    /// ceiling — see `run_gates_1_through_12`), registers them on the StreamSession
+    /// for enforcement on all subsequent continuation/end frames (CRIT-2 fix).
     pub fn register_stream_start_token(
         stream_id: &str,
         capability_token_b64: &str,
         source_agent: &str,
+        max_action_class: u8,
     ) {
         let token_sig_hex = extract_token_sig_hex(capability_token_b64.as_bytes());
         let token_exp = extract_token_exp(capability_token_b64.as_bytes());
@@ -2231,6 +2436,7 @@ impl SAACPProtocolHandler {
             &token_sig_hex,
             token_exp,
             source_agent,
+            max_action_class,
         );
     }
 
@@ -2293,6 +2499,7 @@ fn extract_token_sig_hex(token_b64: &[u8]) -> String {
     if 4 + json_len > raw.len() { return "malformed_token".to_string(); }
     let sig = &raw[4 + json_len..];
     if sig.is_empty() { return "empty_sig".to_string(); }
+    if sig.len() < 64 { return "short_sig".to_string(); }
     let mut hasher = Sha256::new();
     hasher.update(sig);
     hex::encode(hasher.finalize())

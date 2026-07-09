@@ -28,7 +28,7 @@ use saacp::{
     AEGFGovernor, AEGFMetadata, GovernanceDecision,
     CSCSLoopDetector, GLOBAL_DAEG, CSCS_MAX_OSCILLATION_COUNT,
     DeadMansSwitch,
-    SessionEpochManager, MEASCFrame,
+    SessionEpochManager,
     CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
     ThresholdAuthorityIssuer,
     TrustMeshFederation,
@@ -36,6 +36,7 @@ use saacp::{
     MEASC_MAX_PSN_ADVANCE,
     MANDATORY_GATES,
 };
+use saacp::framing::MEASCFrame as StructuralFrame;
 
 // ─── Fixture Helpers ──────────────────────────────────────────────────────────
 
@@ -72,15 +73,23 @@ fn issue_token(
     cia.issue(claims).expect("issue")
 }
 
+/// Builds a genuinely AES-256-GCM-encrypted `framing::MEASCFrame` wire packet
+/// via `encode_encrypted`. CRIT-1 made Gate 0 (`framing::MEASCFrame::
+/// parse_header`) perform real cryptographic verification, so frames fed into
+/// `gate_0_crypto_integrity` / `intercept_packet` must now be encrypted under
+/// the SAME `secret` passed to those functions — the previous
+/// `measc::MEASCFrame::build_frame` + `SessionEpochManager` key schedule is
+/// entirely incompatible with `framing::MEASCFrame::parse_header`'s HKDF
+/// derivation and would (correctly) fail to decrypt.
 fn build_frame(secret: &[u8; 32], payload: &[u8], schema: u16, flags: u8, ac: u8) -> Vec<u8> {
-    let sid = [0xA1u8; 16];
-    let mgr = SessionEpochManager::new();
-    mgr.create_session(sid, *secret, 1_000_000, 3600.0, None).unwrap();
-    let eid = mgr.get_current_epoch_id(&sid).unwrap();
-    mgr.with_epoch_mut(&sid, eid, |epoch| {
-        MEASCFrame::build_frame(epoch, schema, 0x10, flags, ac, payload, &[0u8;32], &[0u8;24], 0)
-            .unwrap().0
-    }).unwrap()
+    let frame = StructuralFrame {
+        schema_id: schema, status_code: 0x10, flags, action_class: ac,
+        payload_length: 0, // auto-corrected by encode_encrypted
+        session_id: [0xA1u8; 16], epoch_id: 0, psn: 1,
+        context_ref_id: [0u8; 32], context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    frame.encode_encrypted(payload, secret).expect("encode_encrypted must succeed")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -660,11 +669,11 @@ fn redteam_scenario_13b_psk_recovery_fires_all_callbacks() {
 
     let recovery = PSKCompromiseRecovery::new(
             manager,
-            Some(Box::new(move || { gw2.fetch_add(1, Ordering::SeqCst); })),
+            Some(Box::new(move || { gw2.fetch_add(1, Ordering::SeqCst); Ok(()) })),
         )
-        .with_capability_revoke(Box::new(move || { cap2.fetch_add(1, Ordering::SeqCst); }))
-        .with_key_rotation(Box::new(move || { key2.fetch_add(1, Ordering::SeqCst); }))
-        .with_audit(Box::new(move || { aud2.fetch_add(1, Ordering::SeqCst); }));
+        .with_capability_revoke(Box::new(move || { cap2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+        .with_key_rotation(Box::new(move || { key2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+        .with_audit(Box::new(move || { aud2.fetch_add(1, Ordering::SeqCst); Ok(()) }));
 
     let report = recovery.execute(Some(99));
 

@@ -21,6 +21,12 @@ pub const MEASC_MAGIC: &[u8; 4] = b"SACP";
 pub const MEASC_HEADER_SIZE: usize = 128;
 pub const MAX_PAYLOAD_SIZE: usize = 10_000_000; // 10 MB MTU
 
+/// AES-GCM auth tag size for `framing::MEASCFrame`'s wire format. Numerically
+/// identical to (but a distinct constant from) `measc::MEASC_AUTH_TAG_SIZE` —
+/// the two types are independent and this avoids any accidental cross-module
+/// coupling between their key schedules.
+pub const MEASC_AUTH_TAG_SIZE: usize = 16;
+
 // ── SAACPFrame application-layer header sizes ─────────────────────────────────
 /// 101-byte prefix matching Python's struct.calcsize(">4s H B B B I I 16s 24s 32s I Q")
 pub const SAACPFRAME_PREFIX_SIZE: usize = 101;
@@ -655,9 +661,66 @@ impl MEASCFrame {
         })
     }
 
-    /// Parse a raw packet: decode transport header, extract payload (after MEASC header).
-    /// Note: For full security, AES-GCM decryption is handled by the SAACPFrame layer.
-    pub fn parse_header(packet: &[u8], _secret_key: &[u8]) -> Result<ParsedFrame, SAACPHardDrop> {
+    /// HKDF info prefix distinct from `measc.rs`'s own info strings
+    /// (`"SAACP-MEASC-epoch-key-v1"` / `"SAACP-MEASC-iv-v1"`) so the two
+    /// derivation schemes can never collide even if the same secret_key bytes
+    /// were ever (mis)used with both APIs.
+    const FRAMING_MEASC_HKDF_INFO: &'static [u8] = b"SAACP-FRAMING-MEASCFrame-key-iv-v1";
+
+    /// Derive a per-frame (key, iv) pair via one HKDF-SHA256 extract-and-expand call.
+    ///
+    /// - IKM  = `secret_key` (accepted at ANY length — HKDF-Extract has no length
+    ///   requirement on IKM; this is what lets both a stable out-of-band
+    ///   `token_issuer_secret: Vec<u8>` of arbitrary length and a 32-byte ECDH
+    ///   `session_key` work as-is with zero caller-side change).
+    /// - salt = `session_id` (16 bytes from the header) — domain-separates frames
+    ///   belonging to different sessions even under an (unlikely) secret_key
+    ///   reuse across sessions, matching the precedent set by
+    ///   `SAACPFrame::derive_iv` mixing `session_uuid` into its IV.
+    /// - info = `FRAMING_MEASC_HKDF_INFO || epoch_id_be4 || psn_be8` — binds the
+    ///   derived key+iv to this exact (session, epoch, psn) triple.
+    ///
+    /// Returns (key: [u8;32], iv: [u8;12]) — 44 bytes of HKDF output key
+    /// material, split key-then-iv.
+    fn derive_frame_key_iv(
+        secret_key: &[u8],
+        session_id: &[u8; 16],
+        epoch_id: u32,
+        psn: u64,
+    ) -> ([u8; 32], [u8; 12]) {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(Some(session_id), secret_key);
+        let mut info = Vec::with_capacity(Self::FRAMING_MEASC_HKDF_INFO.len() + 4 + 8);
+        info.extend_from_slice(Self::FRAMING_MEASC_HKDF_INFO);
+        info.extend_from_slice(&epoch_id.to_be_bytes());
+        info.extend_from_slice(&psn.to_be_bytes());
+        let mut okm = [0u8; 44];
+        hk.expand(&info, &mut okm)
+            .expect("HKDF expand output length 44 is always valid for HKDF-SHA256 (max 8160)");
+        let mut key = [0u8; 32];
+        let mut iv = [0u8; 12];
+        key.copy_from_slice(&okm[0..32]);
+        iv.copy_from_slice(&okm[32..44]);
+        (key, iv)
+    }
+
+    /// Parse a raw packet: decode transport header, then verify and decrypt the
+    /// payload via AES-256-GCM.
+    ///
+    /// Wire layout: `[128-byte header][16-byte auth tag][ciphertext]`. The
+    /// 128-byte header is authenticated as AAD. The per-frame AES-256-GCM key
+    /// and IV are derived from `secret_key` via HKDF-SHA256 (see
+    /// `derive_frame_key_iv`), bound to this frame's `(session_id, epoch_id, psn)`.
+    ///
+    /// Security gate ordering (MUST NOT be reordered — fail cheap before fail
+    /// expensive, matching every other wire-parsing entry point in this crate):
+    ///   1. Header decode + magic check.
+    ///   2. `payload_length` bound against `MAX_PAYLOAD_SIZE` (buffer-safety,
+    ///      before any offset math).
+    ///   3. Buffer-length check against the full `header + tag + ciphertext` size.
+    ///   4. AES-256-GCM authentication tag verification + decryption.
+    pub fn parse_header(packet: &[u8], secret_key: &[u8]) -> Result<ParsedFrame, SAACPHardDrop> {
         let frame = Self::decode(packet)?;
         // SECURITY FIX (BUFFER-SAFETY): `payload_length` is an attacker-controlled
         // u32 read directly from the wire header, and this function (unlike its
@@ -672,6 +735,71 @@ impl MEASCFrame {
         // `packet[payload_start..payload_end]` ("slice index starts at higher than
         // ends"). Reject oversized claims up front, exactly like every other
         // wire-parsing entry point in this crate does.
+        if frame.payload_length as usize > MAX_PAYLOAD_SIZE {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PayloadTooLarge,
+                format!(
+                    "MEASCFrame: payload_length {} exceeds {} byte MTU",
+                    frame.payload_length, MAX_PAYLOAD_SIZE
+                ),
+            ));
+        }
+        // Locate tag + ciphertext. Extended from the pre-fix `payload_start`
+        // (which pointed directly at byte 128, treating it as plaintext) to
+        // also reserve the 16-byte tag slot before the ciphertext begins.
+        let ciphertext_start = MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE; // 128 + 16 = 144
+        let ciphertext_end = ciphertext_start + frame.payload_length as usize;
+        if packet.len() < ciphertext_end {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                format!(
+                    "MEASCFrame: packet too short for tag+payload: need {} bytes, got {}",
+                    ciphertext_end, packet.len()
+                ),
+            ));
+        }
+        let header_bytes = &packet[0..MEASC_HEADER_SIZE];
+        let tag_slice = &packet[MEASC_HEADER_SIZE..ciphertext_start];
+        let ciphertext = &packet[ciphertext_start..ciphertext_end];
+
+        // AES-256-GCM decryption + authentication. No byte of `payload` is
+        // trusted until this call succeeds (Architecture Principle #1).
+        let (key, iv) =
+            Self::derive_frame_key_iv(secret_key, &frame.session_id, frame.epoch_id, frame.psn);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(tag_slice);
+        let payload = SAACPFrame::aes_gcm_decrypt(&key, &iv, &tag, header_bytes, ciphertext)?;
+
+        let session_uuid     = hex::encode(frame.session_id);
+        let context_state_id = hex::encode(frame.context_ref_id);
+        let traceparent      = frame.w3c_traceparent.to_vec();
+        Ok(ParsedFrame {
+            schema_id:        frame.schema_id,
+            status_code:      frame.status_code,
+            flags:            frame.flags,
+            action_class:     frame.action_class,
+            session_uuid,
+            sequence_id:      frame.psn,
+            context_state_id,
+            context_version:  frame.context_version as u64,
+            traceparent,
+            payload,
+        })
+    }
+
+    /// UNSAFE: structural-only parse with NO cryptographic verification.
+    /// Preserves the exact pre-CRIT-1-fix behavior of `parse_header` — header
+    /// decode + buffer-safety checks only, raw post-header bytes returned as
+    /// "payload" with no decryption or authentication whatsoever.
+    ///
+    /// Gated behind the `unsafe-structural-only` feature, which is NOT in
+    /// `default = []` and MUST NEVER be enabled in a production build. Exists
+    /// solely as an explicit, auditable escape hatch for local wire-format /
+    /// interop debugging tooling that needs to inspect MEASCFrame headers
+    /// without possessing the session key. See CRIT-1 in opusplan.md.
+    #[cfg(feature = "unsafe-structural-only")]
+    pub fn parse_header_structural(packet: &[u8]) -> Result<ParsedFrame, SAACPHardDrop> {
+        let frame = Self::decode(packet)?;
         if frame.payload_length as usize > MAX_PAYLOAD_SIZE {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::PayloadTooLarge,
@@ -708,6 +836,44 @@ impl MEASCFrame {
             traceparent,
             payload,
         })
+    }
+
+    /// Encrypt `payload` under this frame's header fields and `secret_key`,
+    /// returning a complete, self-consistent wire packet:
+    ///   `[128-byte header (payload_length auto-corrected)][16-byte tag][ciphertext]`
+    ///
+    /// This is the only supported way to construct a `framing::MEASCFrame` wire
+    /// packet that will successfully round-trip through `parse_header` after
+    /// the CRIT-1 fix. Production code has never constructed this format on
+    /// the wire (`framing::MEASCFrame` is receive-only in this codebase —
+    /// senders use `measc::MEASCFrame::build_frame` instead); this exists for
+    /// tests and any future protocol-debugging tooling.
+    ///
+    /// Note: unlike `measc::MEASCFrame::build_frame`, this does NOT EASI-encrypt
+    /// `context_ref_id` — that field is carried in the header as-is.
+    pub fn encode_encrypted(&self, payload: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, SAACPHardDrop> {
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PayloadTooLarge,
+                "MEASCFrame: payload exceeds 10MB MTU limit",
+            ));
+        }
+        // Auto-correct payload_length so callers can't desync header vs.
+        // actual ciphertext length (same "compute it ourselves" precedent as
+        // SAACPFrame::build_frame, which ignores any caller-supplied length too).
+        let mut hdr = self.clone();
+        hdr.payload_length = payload.len() as u32;
+        let header = hdr.encode();
+
+        let (key, iv) =
+            Self::derive_frame_key_iv(secret_key, &hdr.session_id, hdr.epoch_id, hdr.psn);
+        let (ciphertext, tag) = SAACPFrame::aes_gcm_encrypt(&key, &iv, &header, payload)?;
+
+        let mut wire = Vec::with_capacity(MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE + ciphertext.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&tag);
+        wire.extend_from_slice(&ciphertext);
+        Ok(wire)
     }
 }
 
@@ -1008,6 +1174,79 @@ mod tests {
         assert_eq!(dec.epoch_id, 7);
         assert_eq!(dec.psn, 12345678);
         assert_eq!(dec.context_ref_id, [0xAAu8; 32]);
+    }
+
+    // ── CRIT-1 fix: MEASCFrame::parse_header real AES-256-GCM verification ──
+
+    fn measc_test_secret() -> [u8; 32] { [0x5Au8; 32] }
+
+    fn measc_valid_frame(payload: &[u8]) -> Vec<u8> {
+        let f = MEASCFrame {
+            schema_id: 1, status_code: 0x10, flags: 0, action_class: 0,
+            payload_length: 0, // auto-corrected by encode_encrypted
+            session_id: [0x11u8; 16], epoch_id: 3, psn: 42,
+            context_ref_id: [0x22u8; 32], context_version: 1,
+            w3c_traceparent: [0x33u8; 24],
+        };
+        f.encode_encrypted(payload, &measc_test_secret()).expect("encode_encrypted must succeed")
+    }
+
+    #[test]
+    fn test_measc_encode_encrypted_round_trip() {
+        let payload = b"{\"task\":\"hello framing measc\"}";
+        let wire = measc_valid_frame(payload);
+        let parsed = MEASCFrame::parse_header(&wire, &measc_test_secret())
+            .expect("valid encrypted frame must parse");
+        assert_eq!(parsed.payload, payload.as_ref());
+        assert_eq!(parsed.schema_id, 1);
+        assert_eq!(parsed.sequence_id, 42);
+    }
+
+    #[test]
+    fn test_measc_tamper_ciphertext_rejected() {
+        let mut wire = measc_valid_frame(b"tamper-ct-test");
+        let off = MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE; // first ciphertext byte
+        wire[off] ^= 0xFF;
+        let err = MEASCFrame::parse_header(&wire, &measc_test_secret()).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[test]
+    fn test_measc_tamper_header_aad_rejected() {
+        let mut wire = measc_valid_frame(b"tamper-header-test");
+        wire[6] ^= 0xFF; // status_code byte, inside the 128-byte AAD
+        let err = MEASCFrame::parse_header(&wire, &measc_test_secret()).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[test]
+    fn test_measc_wrong_secret_key_rejected() {
+        let wire = measc_valid_frame(b"wrong-key-test");
+        let err = MEASCFrame::parse_header(&wire, &[0x00u8; 32]).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[test]
+    fn test_measc_wrong_secret_key_length_still_rejected_not_panics() {
+        // secret_key of a DIFFERENT length than 32 (e.g. a stable out-of-band
+        // token_issuer_secret) must still work for HKDF (any-length IKM) and
+        // must still correctly reject when wrong, never panic.
+        let wire = measc_valid_frame(b"variable-length-key-test");
+        let err = MEASCFrame::parse_header(&wire, b"a-short-issuer-secret").unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[cfg(feature = "unsafe-structural-only")]
+    #[test]
+    fn test_parse_header_structural_bypasses_crypto_when_feature_enabled() {
+        let mut f = MEASCFrame::new();
+        f.payload_length = 5;
+        let mut packet = f.encode();
+        packet.extend_from_slice(b"junk!"); // NOT valid ciphertext/tag -- no crypto involved
+        let parsed = MEASCFrame::parse_header_structural(&packet).expect("structural parse ignores crypto");
+        assert_eq!(parsed.payload, b"junk!");
+        // Confirm the REAL parse_header rejects the identical bytes (no valid tag):
+        assert!(MEASCFrame::parse_header(&packet, &[0u8; 32]).is_err());
     }
 
     #[test]

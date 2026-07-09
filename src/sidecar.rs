@@ -60,7 +60,7 @@
 //! convention elsewhere (`trust_decay.rs`, this module's own scope notes above).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,12 +133,27 @@ pub struct SidecarConfig {
     pub max_concurrent_sends: usize,
     /// Retries for a transient failure at the initial TCP-connect step only.
     pub send_retry_attempts: u32,
+    /// H-21 (SSRF) fix: explicit allowlist of private/link-local CIDR ranges `/send` is
+    /// permitted to dial, as `(network_address, prefix_len)` pairs (e.g.
+    /// `(Ipv4Addr::new(10,0,0,0).into(), 8)` for all of `10.0.0.0/8`). Empty by default.
+    /// Only consulted for addresses that `is_default_blocked_target` would otherwise
+    /// reject (RFC 1918 + link-local); addresses outside those ranges never need an
+    /// allowlist entry. Ignored entirely when `allow_private_targets` is `true`.
+    pub target_allowlist: Vec<(IpAddr, u8)>,
+    /// H-21 (SSRF) fix escape hatch: when `true`, disables the RFC-1918/link-local
+    /// default-block entirely (equivalent to an allowlist matching everything). Intended
+    /// only for deployments where the entire mesh deliberately lives inside one private
+    /// network and every peer is already trusted at the network layer. Defaults to
+    /// `false` — the safe, fail-closed setting.
+    pub allow_private_targets: bool,
 }
 
 impl SidecarConfig {
     /// Convenience constructor for the common case: single shared mesh secret, default
-    /// concurrency/retry limits, no per-peer overrides. Use struct-update syntax
-    /// (`SidecarConfig { peer_secrets, ..SidecarConfig::new(...) }`) to customize.
+    /// concurrency/retry limits, no per-peer overrides, and the default (safe) SSRF
+    /// posture — RFC 1918 + link-local targets blocked, loopback and public addresses
+    /// allowed. Use struct-update syntax (`SidecarConfig { peer_secrets,
+    /// ..SidecarConfig::new(...) }`) to customize.
     pub fn new(
         agent_id: impl Into<String>,
         token_issuer_secret: [u8; 32],
@@ -153,8 +168,93 @@ impl SidecarConfig {
             peer_secrets: HashMap::new(),
             max_concurrent_sends: SIDECAR_DEFAULT_MAX_CONCURRENT_SENDS,
             send_retry_attempts: SIDECAR_DEFAULT_SEND_RETRY_ATTEMPTS,
+            target_allowlist: Vec::new(),
+            allow_private_targets: false,
         }
     }
+}
+
+// ─── SSRF target validation (H-21) ────────────────────────────────────────────
+
+/// Is `ip` inside one of the RFC 1918 private ranges, or link-local (v4
+/// `169.254.0.0/16`, v6 `fe80::/10`), or IPv6 unique-local (`fc00::/7`)?
+///
+/// Deliberately does NOT include loopback: sidecars routinely dial peer sidecars on
+/// `127.0.0.1` in same-host dev/test/container-per-agent deployments (see
+/// `tests/test_sidecar_rs.rs`), and blocking it would break that common, legitimate
+/// topology without meaningfully closing a different attack surface than blocking RFC
+/// 1918 already does. The cloud-metadata endpoint (`169.254.169.254`) — the highest-value
+/// SSRF target in practice — is covered by the v4 link-local check.
+fn is_default_blocked_target(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || v4.is_link_local()
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            (seg0 & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+        }
+    }
+}
+
+/// Does `ip` fall within the `(network, prefix_len)` CIDR block? Mismatched address
+/// families (v4 ip vs v6 network or vice versa) never match.
+fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            let bits = prefix_len.min(32);
+            let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            (u32::from(*ip) & mask) == (u32::from(*net) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            let bits = prefix_len.min(128);
+            let mask: u128 = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            (u128::from(*ip) & mask) == (u128::from(*net) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// H-21 (SSRF) fix: is `ip` a permitted `/send` target? Public and loopback addresses are
+/// always allowed. RFC-1918/link-local addresses are allowed only if `allow_private` is
+/// set, or `ip` matches an entry in `allowlist`.
+fn target_ip_allowed(ip: &IpAddr, allowlist: &[(IpAddr, u8)], allow_private: bool) -> bool {
+    if !is_default_blocked_target(ip) {
+        return true;
+    }
+    allow_private || allowlist.iter().any(|(net, len)| ip_in_cidr(ip, net, *len))
+}
+
+/// Resolve `target_addr` (a `host:port` string) exactly once and return the first
+/// candidate `SocketAddr` that passes [`target_ip_allowed`]. Resolving once — rather than
+/// letting `TcpStream::connect` re-resolve the hostname on every retry — closes a
+/// DNS-rebinding variant of the SSRF: a malicious/compromised DNS answer can't swap from a
+/// public IP (that passed validation) to an internal one between the initial check and a
+/// later connection attempt, because every subsequent retry dials the same validated
+/// `SocketAddr`, never the hostname again.
+async fn resolve_allowed_target(
+    target_addr: &str,
+    allowlist: &[(IpAddr, u8)],
+    allow_private: bool,
+) -> Result<SocketAddr, SidecarError> {
+    let mut first_seen: Option<IpAddr> = None;
+    let candidates = tokio::net::lookup_host(target_addr).await.map_err(SidecarError::Io)?;
+    for addr in candidates {
+        if first_seen.is_none() {
+            first_seen = Some(addr.ip());
+        }
+        if target_ip_allowed(&addr.ip(), allowlist, allow_private) {
+            return Ok(addr);
+        }
+    }
+    Err(SidecarError::TargetForbidden(
+        first_seen.map(|ip| ip.to_string()).unwrap_or_else(|| target_addr.to_string()),
+    ))
 }
 
 // ─── Inbox ────────────────────────────────────────────────────────────────────
@@ -233,6 +333,11 @@ pub enum SidecarError {
     /// retried, since it indicates a live but misbehaving/slow peer, not a transient
     /// connect failure.
     Timeout,
+    /// H-21 (SSRF) fix: `target_addr` resolved to an address in a blocked range (RFC
+    /// 1918 / link-local) with no matching allowlist entry and `allow_private_targets`
+    /// unset. Carries the offending IP for diagnostics. No socket is ever opened for a
+    /// forbidden target.
+    TargetForbidden(String),
 }
 
 impl std::fmt::Display for SidecarError {
@@ -244,23 +349,29 @@ impl std::fmt::Display for SidecarError {
             Self::Session(e) => write!(f, "session setup failed: {}", e.message),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Timeout => write!(f, "timed out waiting for a response"),
+            Self::TargetForbidden(ip) => {
+                write!(f, "target address '{ip}' is not permitted (private/link-local range blocked)")
+            }
         }
     }
 }
 
 impl std::error::Error for SidecarError {}
 
-/// Connect to `target_addr`, retrying only a transient failure/timeout at this exact step
+/// Connect to `target` (a pre-resolved, allowlist-validated `SocketAddr` — see
+/// `resolve_allowed_target`), retrying only a transient failure/timeout at this exact step
 /// up to `retry_attempts` times with a fixed short backoff. See this module's doc comment
-/// for why only the connect step is retried.
+/// for why only the connect step is retried. Takes a concrete `SocketAddr` rather than a
+/// hostname so retries never re-resolve DNS (see `resolve_allowed_target`'s doc comment on
+/// why that matters for H-21).
 async fn connect_with_retry(
-    target_addr: &str,
+    target: SocketAddr,
     retry_attempts: u32,
     timeout: Duration,
 ) -> Result<TcpStream, SidecarError> {
     let mut attempt = 0u32;
     loop {
-        match tokio::time::timeout(timeout, TcpStream::connect(target_addr)).await {
+        match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => {
                 if attempt >= retry_attempts {
@@ -296,13 +407,24 @@ pub async fn send_message(
     priority: i64,
     action_class: u8,
     retry_attempts: u32,
+    target_allowlist: &[(IpAddr, u8)],
+    allow_private_targets: bool,
     audit_log: Option<&ImmutableAuditLog>,
 ) -> Result<SendOutcome, SidecarError> {
     let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
 
-    let mut stream = connect_with_retry(target_addr, retry_attempts, timeout).await?;
+    // H-21 (SSRF) fix: resolve and validate BEFORE ever opening a socket. A rejected
+    // target never reaches `connect_with_retry`.
+    let validated_target = tokio::time::timeout(
+        timeout,
+        resolve_allowed_target(target_addr, target_allowlist, allow_private_targets),
+    )
+        .await
+        .map_err(|_| SidecarError::Timeout)??;
 
-    let session_key = tokio::time::timeout(timeout, client_handshake(&mut stream))
+    let mut stream = connect_with_retry(validated_target, retry_attempts, timeout).await?;
+
+    let (session_key, _identity_session_id) = tokio::time::timeout(timeout, client_handshake(&mut stream, None))
         .await
         .map_err(|_| SidecarError::Timeout)?
         .map_err(SidecarError::Handshake)?;
@@ -403,6 +525,10 @@ struct SidecarState {
     send_semaphore: tokio::sync::Semaphore,
     inbox: Inbox,
     inbox_capacity: usize,
+    /// H-21 (SSRF) fix — see `SidecarConfig::target_allowlist`.
+    target_allowlist: Vec<(IpAddr, u8)>,
+    /// H-21 (SSRF) fix — see `SidecarConfig::allow_private_targets`.
+    allow_private_targets: bool,
 }
 
 impl SidecarState {
@@ -461,6 +587,7 @@ async fn handle_send(
     match send_message(
         &req.target_addr, &req.to_agent, &state.agent_id, &secret,
         &req.task, req.priority, req.action_class, state.send_retry_attempts,
+        &state.target_allowlist, state.allow_private_targets,
         Some(ImmutableAuditLog::global()),
     ).await {
         Ok(SendOutcome::Success) => (
@@ -470,6 +597,12 @@ async fn handle_send(
         Ok(SendOutcome::Rejected) => (
             StatusCode::OK,
             Json(SendResponse { status: "rejected", detail: Some("peer rejected the packet".into()) }),
+        ),
+        // H-21 (SSRF) fix: a forbidden target is a client-request problem (bad/malicious
+        // `target_addr`), not an upstream failure — 403, not 502.
+        Err(e @ SidecarError::TargetForbidden(_)) => (
+            StatusCode::FORBIDDEN,
+            Json(SendResponse { status: "error", detail: Some(e.to_string()) }),
         ),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -552,6 +685,8 @@ pub async fn run(config: SidecarConfig) {
         send_semaphore: tokio::sync::Semaphore::new(config.max_concurrent_sends.max(1)),
         inbox: Inbox { rx: Mutex::new(rx) },
         inbox_capacity: SIDECAR_INBOX_CAPACITY,
+        target_allowlist: config.target_allowlist,
+        allow_private_targets: config.allow_private_targets,
     });
 
     let app = Router::new()
@@ -569,4 +704,118 @@ pub async fn run(config: SidecarConfig) {
     axum::serve(listener, app)
         .await
         .unwrap_or_else(|e| panic!("saacp-sidecar: HTTP server failed: {}", e));
+}
+
+#[cfg(test)]
+mod ssrf_target_validation_tests {
+    use super::*;
+
+    fn v4(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn rfc1918_ranges_are_blocked_by_default() {
+        assert!(is_default_blocked_target(&v4("10.0.0.1")));
+        assert!(is_default_blocked_target(&v4("10.255.255.255")));
+        assert!(is_default_blocked_target(&v4("172.16.0.1")));
+        assert!(is_default_blocked_target(&v4("172.31.255.255")));
+        assert!(is_default_blocked_target(&v4("192.168.1.1")));
+    }
+
+    #[test]
+    fn adjacent_ranges_outside_rfc1918_are_not_blocked() {
+        // 172.15.x and 172.32.x are outside the 172.16.0.0/12 block.
+        assert!(!is_default_blocked_target(&v4("172.15.255.255")));
+        assert!(!is_default_blocked_target(&v4("172.32.0.0")));
+        // 11.x is outside 10.0.0.0/8.
+        assert!(!is_default_blocked_target(&v4("11.0.0.1")));
+        // 193.168.x is not 192.168.x.
+        assert!(!is_default_blocked_target(&v4("193.168.1.1")));
+    }
+
+    #[test]
+    fn link_local_and_cloud_metadata_are_blocked() {
+        assert!(is_default_blocked_target(&v4("169.254.169.254"))); // AWS/GCP/Azure metadata
+        assert!(is_default_blocked_target(&v4("169.254.1.1")));
+    }
+
+    #[test]
+    fn ipv6_unique_local_and_link_local_are_blocked() {
+        assert!(is_default_blocked_target(&"fc00::1".parse().unwrap()));
+        assert!(is_default_blocked_target(&"fd12:3456::1".parse().unwrap()));
+        assert!(is_default_blocked_target(&"fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn loopback_and_public_addresses_are_not_blocked() {
+        assert!(!is_default_blocked_target(&v4("127.0.0.1")));
+        assert!(!is_default_blocked_target(&v4("8.8.8.8")));
+        assert!(!is_default_blocked_target(&"::1".parse().unwrap()));
+        assert!(!is_default_blocked_target(&"2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
+    fn target_ip_allowed_respects_allow_private_flag() {
+        let ip = v4("10.1.2.3");
+        assert!(!target_ip_allowed(&ip, &[], false));
+        assert!(target_ip_allowed(&ip, &[], true));
+    }
+
+    #[test]
+    fn target_ip_allowed_respects_explicit_allowlist_entry() {
+        let ip = v4("10.1.2.3");
+        let allowlist = vec![(v4("10.1.0.0"), 16)];
+        assert!(target_ip_allowed(&ip, &allowlist, false));
+
+        let outside = v4("10.2.0.1");
+        assert!(!target_ip_allowed(&outside, &allowlist, false));
+    }
+
+    #[test]
+    fn ip_in_cidr_handles_exact_and_boundary_prefixes() {
+        assert!(ip_in_cidr(&v4("192.168.5.9"), &v4("192.168.0.0"), 16));
+        assert!(!ip_in_cidr(&v4("192.169.5.9"), &v4("192.168.0.0"), 16));
+        // /32 = exact match only.
+        assert!(ip_in_cidr(&v4("1.2.3.4"), &v4("1.2.3.4"), 32));
+        assert!(!ip_in_cidr(&v4("1.2.3.5"), &v4("1.2.3.4"), 32));
+        // /0 matches everything of the same family.
+        assert!(ip_in_cidr(&v4("255.255.255.255"), &v4("0.0.0.0"), 0));
+    }
+
+    #[test]
+    fn ip_in_cidr_never_matches_across_address_families() {
+        let v4_ip = v4("10.0.0.1");
+        let v6_net: IpAddr = "fc00::".parse().unwrap();
+        assert!(!ip_in_cidr(&v4_ip, &v6_net, 8));
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_target_rejects_blocked_target_before_connecting() {
+        let err = resolve_allowed_target("10.55.66.77:9", &[], false).await.unwrap_err();
+        assert!(matches!(err, SidecarError::TargetForbidden(_)), "expected TargetForbidden, got {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_target_permits_loopback_by_default() {
+        // Port 0 target won't actually accept a connection, but resolution + the
+        // allowlist check must succeed (this only tests validation, not connect).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resolved = resolve_allowed_target(&addr.to_string(), &[], false).await.unwrap();
+        assert_eq!(resolved, addr);
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_target_permits_private_target_when_allowlisted() {
+        let allowlist = vec![(v4("10.55.0.0"), 16)];
+        let resolved = resolve_allowed_target("10.55.66.77:9", &allowlist, false).await.unwrap();
+        assert_eq!(resolved.ip(), v4("10.55.66.77"));
+    }
+
+    #[tokio::test]
+    async fn resolve_allowed_target_permits_private_target_when_flag_set() {
+        let resolved = resolve_allowed_target("10.55.66.77:9", &[], true).await.unwrap();
+        assert_eq!(resolved.ip(), v4("10.55.66.77"));
+    }
 }

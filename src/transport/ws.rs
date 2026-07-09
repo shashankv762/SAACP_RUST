@@ -24,19 +24,35 @@
 //! already speaks HTTP/WebSocket, not a bespoke binary protocol).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use futures_util::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::daemon::CircuitBreakerEntry;
+use crate::daemon::{
+    CircuitBreakerEntry, PerIpConnectionGuard, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
+    MAX_PAYLOAD_SIZE,
+};
+use crate::handler::ParsedPacket;
+use crate::measc::SessionEpochManager;
+
+/// H-18 fix: maximum seconds to complete the WebSocket HTTP-Upgrade handshake before the
+/// connection is dropped. Without a deadline here, a peer that opens the TCP socket and
+/// then never completes (or trickles one byte at a time) the Upgrade request ties up a
+/// spawned task, a `connection_semaphore` permit, and a per-IP connection slot
+/// indefinitely — a slow-loris DoS that, unlike a stalled MEASC handshake on the raw-TCP
+/// path (bounded by `daemon::HANDSHAKE_TIMEOUT_SECS`), previously had no bound at all.
+const WS_UPGRADE_TIMEOUT_SECS: u64 = 5;
 
 // ─── WsByteStream ────────────────────────────────────────────────────────────
 
@@ -189,6 +205,24 @@ pub struct SAACPWebSocketDaemon {
     token_issuer_secret: Option<Vec<u8>>,
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
     server_ed25519_seed: Option<[u8; 32]>,
+    /// CRIT-9 fix: caps total concurrent connections at `MAX_CONNECTIONS`.
+    connection_semaphore: Arc<Semaphore>,
+    /// CRIT-9 fix: caps concurrent connections per source IP at `MAX_CONNECTIONS_PER_IP`.
+    per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    /// H-20 fix: opt-in real Gate 1.0 capability-token signature verification. See
+    /// `SAACPNetworkDaemon`'s field of the same name — identical semantics; `None`
+    /// preserves the structural-only default.
+    gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
+    /// H-20 fix: opt-in real AES-256-GCM decryption + replay-window enforcement. See
+    /// `SAACPNetworkDaemon`'s field of the same name — identical semantics; `None`
+    /// preserves the structural-only default.
+    epoch_manager: Option<Arc<SessionEpochManager>>,
+    /// H-20 fix: opt-in observer invoked with every successfully-verified `ParsedPacket`.
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
+    /// H-20 fix: opt-in C-3 identity binding. See `SAACPNetworkDaemon`'s field of the
+    /// same name — identical semantics; `None` preserves today's handshake wire format.
+    server_agent_id: Option<String>,
 }
 
 impl SAACPWebSocketDaemon {
@@ -199,6 +233,12 @@ impl SAACPWebSocketDaemon {
             token_issuer_secret,
             circuit_breakers: Arc::new(Mutex::new(HashMap::new())),
             server_ed25519_seed: None,
+            connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
+            gateway: None,
+            epoch_manager: None,
+            on_delivered: None,
+            server_agent_id: None,
         }
     }
 
@@ -207,6 +247,51 @@ impl SAACPWebSocketDaemon {
     /// `SAACPNetworkDaemon::with_server_auth` — identical semantics.
     pub fn with_server_auth(mut self, seed: [u8; 32]) -> Self {
         self.server_ed25519_seed = Some(seed);
+        self
+    }
+
+    /// H-20 fix: opt in to real Gate 1.0 capability-token signature verification instead
+    /// of the structural-only presence check every connection gets by default. See
+    /// `SAACPNetworkDaemon::with_gateway` — identical semantics.
+    pub fn with_gateway(mut self, gateway: Arc<crate::gateway::ZeroTrustGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
+    }
+
+    /// H-20 fix: opt in to real AES-256-GCM decryption + replay-window enforcement of
+    /// incoming packets instead of the structural-only Gate 0. See
+    /// `SAACPNetworkDaemon::with_encrypted_transport` — identical semantics.
+    pub fn with_encrypted_transport(mut self, epoch_manager: Arc<SessionEpochManager>) -> Self {
+        self.epoch_manager = Some(epoch_manager);
+        self
+    }
+
+    /// H-20 fix: observe every successfully-verified `ParsedPacket`. See
+    /// `SAACPNetworkDaemon::with_on_delivered` — identical semantics.
+    pub fn with_on_delivered(
+        mut self,
+        callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>,
+    ) -> Self {
+        self.on_delivered = Some(callback);
+        self
+    }
+
+    /// H-20 fix: opt in to C-3 identity binding — every connecting client must present an
+    /// `AgentIdentityCertificate` signed by one of `ca_keys` and prove possession of the
+    /// certified private key during the ECDH handshake, before any packet is processed.
+    /// Implies `with_server_auth(seed)`, exactly like the TCP daemon. See
+    /// `SAACPNetworkDaemon::with_identity_binding` — identical semantics.
+    pub fn with_identity_binding(
+        mut self,
+        seed: [u8; 32],
+        server_agent_id: &str,
+        ca_keys: &[(&str, ed25519_dalek::VerifyingKey)],
+    ) -> Self {
+        for (kid, vk) in ca_keys {
+            crate::identity_binding::DEFAULT_IDENTITY_VERIFIER.register_ca_key(kid, *vk);
+        }
+        self.server_ed25519_seed = Some(seed);
+        self.server_agent_id = Some(server_agent_id.to_string());
         self
     }
 
@@ -222,11 +307,47 @@ impl SAACPWebSocketDaemon {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    // CRIT-9 fix: same total + per-IP concurrency bound as the raw-TCP
+                    // daemon — see `daemon::SAACPNetworkDaemon::start`'s doc comment.
+                    let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            eprintln!(
+                                "[SAACP Daemon/WS] Connection limit ({}) reached — rejecting {}",
+                                MAX_CONNECTIONS, peer_addr,
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let per_ip_guard = match PerIpConnectionGuard::acquire(
+                        &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
+                    ) {
+                        Some(guard) => guard,
+                        None => {
+                            eprintln!(
+                                "[SAACP Daemon/WS] Per-IP connection limit ({}) reached for {} — rejecting",
+                                MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     let cbs    = Arc::clone(&self.circuit_breakers);
                     let secret = self.token_issuer_secret.clone();
                     let seed   = self.server_ed25519_seed;
+                    let gateway         = self.gateway.clone();
+                    let epoch_manager   = self.epoch_manager.clone();
+                    let on_delivered    = self.on_delivered.clone();
+                    let server_agent_id = self.server_agent_id.clone();
                     tokio::spawn(async move {
-                        serve_ws_connection(stream, peer_addr, cbs, secret, seed).await;
+                        let _permit = permit; // released on drop when this task ends
+                        let _per_ip_guard = per_ip_guard;
+                        serve_ws_connection(
+                            stream, peer_addr, cbs, secret, seed,
+                            gateway, epoch_manager, on_delivered, server_agent_id,
+                        ).await;
                     });
                 }
                 Err(e) => {
@@ -242,30 +363,63 @@ impl SAACPWebSocketDaemon {
 /// `daemon::handle_client` pipeline. Every MEASC frame is tunneled inside
 /// WebSocket binary messages — the ECDH handshake, AES-256-GCM crypto, replay
 /// window, and full 12-gate pipeline are byte-identical to the raw-TCP path.
+#[allow(clippy::too_many_arguments)]
 async fn serve_ws_connection(
     raw: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
     token_issuer_secret: Option<Vec<u8>>,
     server_ed25519_seed: Option<[u8; 32]>,
+    gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
+    epoch_manager: Option<Arc<SessionEpochManager>>,
+    on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
+    server_agent_id: Option<String>,
 ) {
-    let ws_stream = match tokio_tungstenite::accept_async(raw).await {
-        Ok(s) => s,
-        Err(e) => {
+    // H-19 fix: cap the incoming WebSocket message/frame size at the same
+    // `MAX_PAYLOAD_SIZE` the raw-TCP path already enforces for MEASC payloads (+1024
+    // bytes slack for the 128-byte MEASC header and framing overhead), instead of
+    // trusting tokio-tungstenite's generic 64 MiB / 16 MiB defaults — a malicious peer
+    // could otherwise force each WS connection to buffer up to 64 MiB before the byte
+    // stream ever reaches `handle_client`'s own payload-length check.
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_PAYLOAD_SIZE + 1024),
+        max_frame_size: Some(MAX_PAYLOAD_SIZE + 1024),
+        ..Default::default()
+    };
+
+    // H-18 fix: bound the HTTP-Upgrade handshake itself, so a peer that opens the TCP
+    // socket and then never completes (or trickles) the Upgrade request cannot hold a
+    // spawned task / connection-semaphore permit / per-IP slot forever (slow-loris DoS).
+    let upgrade = tokio_tungstenite::accept_async_with_config(raw, Some(ws_config));
+    let ws_stream = match tokio::time::timeout(Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS), upgrade).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             eprintln!("[SAACP Daemon/WS] Upgrade handshake failed from {}: {}", peer_addr, e);
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "[SAACP Daemon/WS] Upgrade handshake from {} exceeded {}s — dropping",
+                peer_addr, WS_UPGRADE_TIMEOUT_SECS,
+            );
             return;
         }
     };
     let adapted = WsByteStream::new(ws_stream);
+    // H-20 fix: forward the daemon's configured security opt-ins through to the shared
+    // pipeline instead of hardcoding `None` — gives the WS transport full feature parity
+    // with `SAACPNetworkDaemon`'s raw-TCP path (real Gate 1.0 verification, real AEAD
+    // decryption, C-3 identity binding, delivered-packet observability).
     crate::daemon::handle_client(
         adapted,
         peer_addr,
         circuit_breakers,
         token_issuer_secret,
         server_ed25519_seed,
-        None, // gateway — WS transport does not yet opt into real Gate 1.0 verification
-        None, // epoch_manager — WS transport does not yet opt into real AEAD decryption
-        None, // on_delivered
+        gateway,
+        epoch_manager,
+        on_delivered,
+        server_agent_id,
     )
     .await;
 }

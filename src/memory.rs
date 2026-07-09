@@ -195,6 +195,9 @@ struct FederatedInner {
     store: HashMap<Vec<u8>, FederatedRecord>,
 }
 
+/// Backing store for [`FederatedMemory::global`] / [`FederatedMemory::set_global_backend`] (H-29).
+static FEDERATED_MEMORY_GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync::OnceLock::new();
+
 impl FederatedMemory {
     /// Create a new, process-local FederatedMemory store.
     pub fn new() -> Self {
@@ -218,8 +221,20 @@ impl FederatedMemory {
     }
 
     /// Stores the massive history/context and returns a 32-byte SHA-256 hash (Context-State-ID).
-    pub fn store_context(&self, massive_context_string: &str, version: u32) -> Vec<u8> {
-        let state_id = Sha256::digest(massive_context_string.as_bytes()).to_vec();
+    ///
+    /// `agent_id` is folded into the hash so two agents that happen to submit
+    /// byte-identical content never collide on the same Context-State-ID and
+    /// silently alias each other's storage slot (H-25). The agent_id is
+    /// length-prefixed before the content rather than plainly concatenated —
+    /// otherwise `("ab", "cdef")` and `("abcd", "ef")` would hash identically,
+    /// the same boundary-ambiguity class already fixed elsewhere in this
+    /// crate for `NegotiationTranscript` suite lists (H-9).
+    pub fn store_context(&self, agent_id: &str, massive_context_string: &str, version: u32) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update((agent_id.len() as u64).to_le_bytes());
+        hasher.update(agent_id.as_bytes());
+        hasher.update(massive_context_string.as_bytes());
+        let state_id = hasher.finalize().to_vec();
         self.put_record(&state_id, massive_context_string.to_string(), version, FEDERATED_TTL_SECONDS);
         state_id
     }
@@ -509,10 +524,34 @@ impl FederatedMemory {
         }
     }
 
-    /// Process-wide singleton FederatedMemory.
+    /// Process-wide singleton FederatedMemory. Defaults to process-local
+    /// storage unless [`FederatedMemory::set_global_backend`] was called
+    /// first (see H-29).
     pub fn global() -> &'static FederatedMemory {
-        static GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync::OnceLock::new();
-        GLOBAL.get_or_init(FederatedMemory::new)
+        FEDERATED_MEMORY_GLOBAL.get_or_init(FederatedMemory::new)
+    }
+
+    /// (H-29) Configure the process-wide [`FederatedMemory::global`]
+    /// singleton to use a shared [`StateBackend`] (e.g. Redis) instead of
+    /// the process-local `HashMap` default, so multi-node deployments get
+    /// cross-node visibility from the singleton every gate actually calls
+    /// (`handler.rs`), not just from manually-constructed instances.
+    ///
+    /// Must be called before the first call to [`FederatedMemory::global`]
+    /// — typically once at process startup, before the gateway starts
+    /// accepting connections. Returns `Err` if the singleton was already
+    /// initialized (by a prior call to this function, or by an earlier
+    /// `global()` call defaulting to process-local storage) rather than
+    /// silently discarding the caller's intent — a misordered startup
+    /// sequence should be observable, not a silent correctness gap.
+    pub fn set_global_backend(backend: Arc<dyn StateBackend>) -> Result<(), String> {
+        FEDERATED_MEMORY_GLOBAL
+            .set(FederatedMemory::with_backend(backend))
+            .map_err(|_| {
+                "FederatedMemory::global() singleton already initialized; \
+                 set_global_backend() must be called before the first use of global()."
+                    .to_string()
+            })
     }
 
     /// Fetch context by hex-encoded context state ID.
@@ -657,6 +696,16 @@ impl SecureContextStore {
     /// 1. SCR must exist and not be expired or revoked.
     /// 2. requester_id must be the owner OR in the audience list.
     /// 3. AES-GCM tag must verify (detects tampering).
+    ///
+    /// (H-27) The existence/expiry/revoked/authorization checks and the
+    /// AES-GCM decrypt all run inside a single lock acquisition. Splitting
+    /// these across two critical sections (checks under the lock, decrypt
+    /// after releasing it) opened a TOCTOU window: a concurrent `revoke()`
+    /// between lock release and decrypt completion would still let this call
+    /// return plaintext for a context that is, by the time the caller sees
+    /// it, already revoked. Holding the lock across the (microsecond-scale,
+    /// in-memory) decrypt closes that window entirely — `revoke()` takes the
+    /// same `Mutex<ScrInner>`, so the two can never interleave.
     pub fn retrieve(
         &self,
         scr_hex: &str,
@@ -669,8 +718,11 @@ impl SecureContextStore {
                 "master_key must be at least 32 bytes.",
             ));
         }
+        let scr = hex::decode(scr_hex).map_err(|_| {
+            SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Invalid SCR hex.")
+        })?;
 
-        let (ciphertext, aad, owner, audience) = {
+        let buffer = {
             let mut inner = self.inner.lock().expect("lock poisoned");
             let record = inner.store.get(scr_hex).ok_or_else(|| {
                 SAACPHardDrop::new(SAACPBytecodes::ScrNotFound,
@@ -685,33 +737,27 @@ impl SecureContextStore {
                 return Err(SAACPHardDrop::new(SAACPBytecodes::ScrNotFound,
                     "Secure Context Reference not found or expired."));
             }
-            (record.ciphertext.clone(), record.aad.clone(),
-             record.owner.clone(), record.audience.clone())
+            if requester_id != record.owner && !record.audience.contains(&requester_id.to_string()) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::ScrUnauthorized,
+                    "Access denied: requester not authorized for this Secure Context Reference.",
+                ));
+            }
+
+            // AES-GCM decryption — still inside the lock (see doc comment above).
+            let iv = derive_iv(master_key, &scr);
+            let key = Key::<Aes256Gcm>::from_slice(&master_key[..32]);
+            let cipher = Aes256Gcm::new(key);
+            let nonce = Nonce::from_slice(&iv);
+
+            let mut buffer = record.ciphertext.clone();
+            cipher.decrypt_in_place(nonce, &record.aad, &mut buffer)
+                .map_err(|_| SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "Secure Context Reference authentication failed — tampering detected.",
+                ))?;
+            buffer
         };
-
-        // Authorization check
-        if requester_id != owner && !audience.contains(&requester_id.to_string()) {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::ScrUnauthorized,
-                "Access denied: requester not authorized for this Secure Context Reference.",
-            ));
-        }
-
-        // AES-GCM decryption
-        let scr = hex::decode(scr_hex).map_err(|_| {
-            SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Invalid SCR hex.")
-        })?;
-        let iv = derive_iv(master_key, &scr);
-        let key = Key::<Aes256Gcm>::from_slice(&master_key[..32]);
-        let cipher = Aes256Gcm::new(key);
-        let nonce = Nonce::from_slice(&iv);
-
-        let mut buffer = ciphertext;
-        cipher.decrypt_in_place(nonce, &aad, &mut buffer)
-            .map_err(|_| SAACPHardDrop::new(
-                SAACPBytecodes::InvalidSignature,
-                "Secure Context Reference authentication failed — tampering detected.",
-            ))?;
 
         String::from_utf8(buffer).map_err(|_| {
             SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Decrypted content is not valid UTF-8.")
@@ -831,7 +877,7 @@ mod tests {
     fn test_store_and_fetch_context() {
         let fm = FederatedMemory::new();
         let data = "Hello, SAACP world!";
-        let state_id = fm.store_context(data, 1);
+        let state_id = fm.store_context("agent-alpha", data, 1);
         assert_eq!(state_id.len(), 32);
         let fetched = fm.fetch_context(&state_id, 1).unwrap();
         assert_eq!(fetched, data);
@@ -840,7 +886,7 @@ mod tests {
     #[test]
     fn test_fetch_wrong_version() {
         let fm = FederatedMemory::new();
-        let state_id = fm.store_context("data", 1);
+        let state_id = fm.store_context("agent-alpha", "data", 1);
         assert!(fm.fetch_context(&state_id, 2).is_err());
     }
 
@@ -894,10 +940,39 @@ mod tests {
     #[test]
     fn test_evict_expired() {
         let fm = FederatedMemory::new();
-        fm.store_context("data", 1);
+        fm.store_context("agent-alpha", "data", 1);
         assert_eq!(fm.count(), 1);
         // Nothing expired yet
         assert_eq!(fm.evict_expired(), 0);
+    }
+
+    // -- FederatedMemory::global() / set_global_backend() (H-29) --
+    //
+    // `FEDERATED_MEMORY_GLOBAL` is a genuine process-wide static shared by
+    // every test in this binary (and by `handler.rs` in a real process), so
+    // these tests only assert invariants that hold regardless of which test
+    // happens to touch the singleton first — they must not assume they win
+    // the initialization race.
+
+    #[test]
+    fn h29_global_returns_same_instance_across_calls() {
+        let a = FederatedMemory::global() as *const FederatedMemory;
+        let b = FederatedMemory::global() as *const FederatedMemory;
+        assert_eq!(a, b, "global() must return the same singleton instance across calls");
+    }
+
+    #[test]
+    fn h29_set_global_backend_rejects_double_init() {
+        use crate::state_backend::InMemoryBackend;
+        // Whether this call wins the race to initialize the process-wide
+        // singleton or loses it to another test/call site, the singleton is
+        // guaranteed initialized by the time it returns.
+        let _ = FederatedMemory::set_global_backend(Arc::new(InMemoryBackend::new()));
+        let second = FederatedMemory::set_global_backend(Arc::new(InMemoryBackend::new()));
+        assert!(
+            second.is_err(),
+            "set_global_backend must reject re-initialization instead of silently discarding it"
+        );
     }
 
     // -- FederatedMemory::with_backend tests (state_backend.rs wiring) --
@@ -911,7 +986,7 @@ mod tests {
     fn test_backend_store_and_fetch_context() {
         let fm = backend_fm();
         let data = "Hello, backend-mode SAACP world!";
-        let state_id = fm.store_context(data, 1);
+        let state_id = fm.store_context("agent-alpha", data, 1);
         assert_eq!(state_id.len(), 32);
         let fetched = fm.fetch_context(&state_id, 1).unwrap();
         assert_eq!(fetched, data);
@@ -920,7 +995,7 @@ mod tests {
     #[test]
     fn test_backend_fetch_wrong_version() {
         let fm = backend_fm();
-        let state_id = fm.store_context("data", 1);
+        let state_id = fm.store_context("agent-alpha", "data", 1);
         assert!(fm.fetch_context(&state_id, 2).is_err());
     }
 
@@ -969,8 +1044,8 @@ mod tests {
     fn test_backend_count_reflects_scan_prefix() {
         let fm = backend_fm();
         assert_eq!(fm.count(), 0);
-        fm.store_context("a", 1);
-        fm.store_context("b", 1);
+        fm.store_context("agent-alpha", "a", 1);
+        fm.store_context("agent-alpha", "b", 1);
         assert_eq!(fm.count(), 2);
     }
 
@@ -978,10 +1053,35 @@ mod tests {
     fn test_backend_and_local_instances_are_independent() {
         let local = FederatedMemory::new();
         let backend = backend_fm();
-        let state_id = local.store_context("only-local", 1);
+        let state_id = local.store_context("agent-alpha", "only-local", 1);
         // The backend-mode instance has an entirely separate store — it must
         // not see data written to the local, process-only instance.
         assert!(backend.fetch_context(&state_id, 1).is_err());
+    }
+
+    /// H-25: two different agents storing byte-identical content must land on
+    /// different Context-State-IDs — the state_id must not be a pure content
+    /// hash an attacker can collide across identities.
+    #[test]
+    fn test_store_context_cross_agent_no_collision() {
+        let fm = FederatedMemory::new();
+        let payload = "identical payload submitted by two different agents";
+        let id_a = fm.store_context("agent-alpha", payload, 1);
+        let id_b = fm.store_context("agent-beta", payload, 1);
+        assert_ne!(id_a, id_b);
+        assert_eq!(fm.fetch_context(&id_a, 1).unwrap(), payload);
+        assert_eq!(fm.fetch_context(&id_b, 1).unwrap(), payload);
+    }
+
+    /// H-25: the hash input must be unambiguous about the agent_id/content
+    /// boundary — a naive concatenation would let ("ab","cdef") collide with
+    /// ("abcd","ef"). The length-prefixed hash must not.
+    #[test]
+    fn test_store_context_boundary_ambiguity_no_collision() {
+        let fm = FederatedMemory::new();
+        let id_1 = fm.store_context("ab", "cdef", 1);
+        let id_2 = fm.store_context("abcd", "ef", 1);
+        assert_ne!(id_1, id_2);
     }
 
     // -- SecureContextStore tests --
@@ -1046,6 +1146,56 @@ mod tests {
 
         let err = scs.retrieve(&scr_hex, "agent-a", &key).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::ScrNotFound);
+    }
+
+    #[test]
+    fn h27_retrieve_cannot_return_plaintext_after_concurrent_revoke() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scs = Arc::new(SecureContextStore::new());
+        let key = test_master_key();
+        let audience: Vec<String> = vec![];
+        let scr_hex = scs.store("top secret", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+
+        let revoked = Arc::new(AtomicBool::new(false));
+        let revoker_store = Arc::clone(&scs);
+        let revoker_flag = Arc::clone(&revoked);
+        let revoker_scr = scr_hex.clone();
+        let revoker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            revoker_store.revoke(&revoker_scr, "agent-a").unwrap();
+            // Release ordering: everything revoke() did (including releasing
+            // the store's internal lock) happens-before this store is
+            // observed by any thread that then loads it with Acquire below.
+            revoker_flag.store(true, Ordering::Release);
+        });
+
+        let mut post_revoke_calls = 0usize;
+        let mut violations = 0usize;
+        for _ in 0..5000 {
+            // Check the flag BEFORE calling retrieve(): if it's already true,
+            // revoke() has fully completed (Acquire pairs with the Release
+            // above), so this retrieve() call is guaranteed to start after
+            // the revocation — under the H-27 fix it must therefore fail.
+            let already_revoked = revoked.load(Ordering::Acquire);
+            let res = scs.retrieve(&scr_hex, "agent-a", &key);
+            if already_revoked {
+                post_revoke_calls += 1;
+                if res.is_ok() {
+                    violations += 1;
+                }
+            }
+        }
+        revoker.join().unwrap();
+
+        assert_eq!(
+            violations, 0,
+            "retrieve() returned plaintext for an already-revoked SCR — H-27 TOCTOU regression"
+        );
+        assert!(
+            post_revoke_calls > 0,
+            "test did not exercise any post-revoke retrieve() calls; increase loop iterations"
+        );
     }
 
     #[test]

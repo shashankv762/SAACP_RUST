@@ -163,6 +163,41 @@ pub trait StateBackend: Send + Sync {
         }
         Ok(v)
     }
+
+    /// Atomically replace the value at `key` with `new` (applying `ttl`), but only if the
+    /// value currently stored there equals `expected` byte-for-byte (`expected: None`
+    /// means "only swap if `key` does not currently exist"). Returns `Ok(true)` if the
+    /// swap happened, `Ok(false)` if the current value didn't match `expected` — in which
+    /// case the caller must re-`get` the fresh value and retry its own read-modify-write
+    /// logic against it, exactly as any optimistic-concurrency-control primitive requires.
+    ///
+    /// This is the primitive that lets callers turn a get-mutate-put sequence (otherwise
+    /// racy across two writers sharing this backend, e.g. two SAACP daemon nodes handling
+    /// frames for the same stream — see the H-23 fix in `streaming.rs::validate_frame`)
+    /// into a safe compare-and-swap retry loop, without this trait needing to know
+    /// anything about the caller's data model.
+    ///
+    /// The default body below is a **non-atomic** get-then-compare-then-set fallback,
+    /// provided only so a third-party `StateBackend` implementor doesn't fail to compile
+    /// after this method was added — correct only under a single writer, exactly like
+    /// `incr_with_ttl`'s default body above. Both backends shipped in this module
+    /// (`InMemoryBackend`, `RedisBackend`) override this with a genuinely atomic
+    /// implementation; any caller relying on cross-writer correctness requires one of
+    /// those two, not the default body.
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+        ttl: Option<Duration>,
+    ) -> BackendResult<bool> {
+        let current = self.get(key)?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        self.set(key, new, ttl)?;
+        Ok(true)
+    }
 }
 
 // ─── InMemoryBackend ─────────────────────────────────────────────────────────
@@ -268,6 +303,30 @@ impl StateBackend for InMemoryBackend {
                 Ok(next)
             }
         }
+    }
+
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+        ttl: Option<Duration>,
+    ) -> BackendResult<bool> {
+        // Single lock acquisition spanning compare-and-write: atomic with respect to
+        // every other `InMemoryBackend` method, which all take this same lock.
+        let mut store = self.store.lock().expect("lock poisoned");
+        let current = match store.get(key) {
+            Some(e) if !e.is_expired() => Some(e.value.as_slice()),
+            _ => None,
+        };
+        if current != expected {
+            return Ok(false);
+        }
+        store.insert(key.to_string(), Entry {
+            value: new.to_vec(),
+            expires_at: ttl.map(|d| Instant::now() + d),
+        });
+        Ok(true)
     }
 }
 
@@ -379,6 +438,52 @@ impl StateBackend for RedisBackend {
             .arg(ttl.as_secs().max(1))
             .invoke(&mut conn)
             .map_err(|e| BackendError(e.to_string()))
+    }
+
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+        ttl: Option<Duration>,
+    ) -> BackendResult<bool> {
+        // Atomic server-side: a Lua script runs to completion with no other Redis
+        // command interleaved, so GET-compare-SET here needs no client-side
+        // WATCH/MULTI/EXEC transaction (and its own retry-on-conflict handling) — the
+        // script IS the atomic unit. ARGV[2] is a presence flag ('1' if `expected` is
+        // `Some`, '0' if `None`) since a Lua string can't distinguish "absent" from
+        // "empty string" the way `Option<&[u8]>` can.
+        const SCRIPT: &str = r#"
+            local cur = redis.call('GET', KEYS[1])
+            local has_expected = ARGV[2] == '1'
+            local matches
+            if cur == false then
+                matches = not has_expected
+            else
+                matches = has_expected and cur == ARGV[1]
+            end
+            if not matches then
+                return 0
+            end
+            if ARGV[3] == '0' then
+                redis.call('SET', KEYS[1], ARGV[4])
+            else
+                redis.call('SET', KEYS[1], ARGV[4], 'EX', ARGV[3])
+            end
+            return 1
+        "#;
+        let mut conn = self.conn()?;
+        let has_expected = if expected.is_some() { "1" } else { "0" };
+        let ttl_secs = ttl.map(|d| d.as_secs().max(1)).unwrap_or(0);
+        let result: i64 = redis::Script::new(SCRIPT)
+            .key(key)
+            .arg(expected.unwrap_or(&[]))
+            .arg(has_expected)
+            .arg(ttl_secs)
+            .arg(new)
+            .invoke(&mut conn)
+            .map_err(|e| BackendError(e.to_string()))?;
+        Ok(result == 1)
     }
 }
 
@@ -544,5 +649,98 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(b.get("shared").unwrap(), Some(b"800".to_vec()));
+    }
+
+    // ─── compare_and_swap (H-23 fix support) ──────────────────────────────────
+
+    #[test]
+    fn cas_succeeds_when_key_absent_and_expected_is_none() {
+        let b = InMemoryBackend::new();
+        assert!(b.compare_and_swap("k", None, b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn cas_fails_when_key_absent_but_expected_is_some() {
+        let b = InMemoryBackend::new();
+        assert!(!b.compare_and_swap("k", Some(b"v0"), b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_fails_when_key_present_but_expected_is_none() {
+        let b = InMemoryBackend::new();
+        b.set("k", b"v0", None).unwrap();
+        assert!(!b.compare_and_swap("k", None, b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v0".to_vec()));
+    }
+
+    #[test]
+    fn cas_succeeds_when_current_value_matches_expected() {
+        let b = InMemoryBackend::new();
+        b.set("k", b"v0", None).unwrap();
+        assert!(b.compare_and_swap("k", Some(b"v0"), b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn cas_fails_when_current_value_diverged_and_leaves_value_unchanged() {
+        let b = InMemoryBackend::new();
+        b.set("k", b"v0", None).unwrap();
+        // Simulate a concurrent writer changing the value out from under us.
+        b.set("k", b"v_other", None).unwrap();
+        assert!(!b.compare_and_swap("k", Some(b"v0"), b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v_other".to_vec()));
+    }
+
+    #[test]
+    fn cas_applies_ttl_on_success() {
+        let b = InMemoryBackend::new();
+        b.set("k", b"v0", None).unwrap();
+        assert!(b
+            .compare_and_swap("k", Some(b"v0"), b"v1", Some(Duration::from_millis(20)))
+            .unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v1".to_vec()));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(b.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_treats_expired_entry_as_absent() {
+        let b = InMemoryBackend::new();
+        b.set("k", b"v0", Some(Duration::from_millis(20))).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        // The entry has expired, so it should behave as if absent: `expected: None` wins.
+        assert!(b.compare_and_swap("k", None, b"v1", None).unwrap());
+        assert_eq!(b.get("k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn only_one_of_many_racing_cas_attempts_against_the_same_expected_value_wins() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let b = Arc::new(InMemoryBackend::new());
+        b.set("k", b"v0", None).unwrap();
+        let successes = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = vec![];
+        for i in 0..16 {
+            let b = Arc::clone(&b);
+            let successes = Arc::clone(&successes);
+            handles.push(thread::spawn(move || {
+                let new_val = format!("v_from_{i}");
+                if b.compare_and_swap("k", Some(b"v0"), new_val.as_bytes(), None).unwrap() {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly one racer should observe the original "v0" and win the swap — all
+        // others must see the post-swap value and fail, proving no lost updates.
+        assert_eq!(successes.load(Ordering::SeqCst), 1);
     }
 }

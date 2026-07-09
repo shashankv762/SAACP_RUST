@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
+use zeroize::Zeroizing;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::faitf::TrustStore;
@@ -497,10 +498,24 @@ struct CacheEntry {
 pub struct ZeroTrustGateway {
     revoked_tokens: Mutex<HashSet<String>>,
     token_cache: Mutex<HashMap<String, CacheEntry>>,
-    trusted_issuer_keys: Mutex<HashMap<String, Vec<u8>>>,
+    // S-3 fix: issuer secrets are long-term key material held for the life of the
+    // process — wrapped in `Zeroizing` so a value is cleared from heap memory
+    // the moment it's overwritten (`register_issuer_key` re-registration),
+    // removed (`clear_trusted_issuers`/`revoke_all_tokens`), or the map itself
+    // is dropped, rather than lingering for forensic recovery (core dump, cold
+    // boot attack, use-after-free in unrelated code).
+    trusted_issuer_keys: Mutex<HashMap<String, Zeroizing<Vec<u8>>>>,
     strict_asymmetric_mode: Mutex<bool>,
     revocation_epoch: Mutex<u64>,
     issuer_registry_epoch: Mutex<u64>,
+    /// H-2 fix: epoch-based blanket rejection for PSK compromise recovery.
+    /// `revoke_all_tokens()` sets this to the recovery timestamp instead of
+    /// clearing `revoked_tokens` — clearing that set would silently un-revoke
+    /// every individually-revoked token, a fail-open bug. Any capability
+    /// token whose `iat` claim predates this timestamp is rejected in
+    /// `validate_lateral_movement`, covering tokens that were never
+    /// individually enumerated in `revoked_tokens`.
+    blanket_revoked_before: Mutex<f64>,
     /// T3.1 — TrustStore integration (FAITF identity verification)
     trust_store: Mutex<Option<Arc<TrustStore>>>,
     /// T3.2 — ACSVAF capability verification authority
@@ -516,6 +531,7 @@ impl ZeroTrustGateway {
             strict_asymmetric_mode: Mutex::new(false),
             revocation_epoch: Mutex::new(0),
             issuer_registry_epoch: Mutex::new(0),
+            blanket_revoked_before: Mutex::new(0.0),
             trust_store: Mutex::new(None),
             capability_authority: Mutex::new(None),
         }
@@ -575,7 +591,7 @@ impl ZeroTrustGateway {
         self.trusted_issuer_keys
             .lock()
             .unwrap()
-            .insert(issuer_agent.to_string(), issuer_secret.to_vec());
+            .insert(issuer_agent.to_string(), Zeroizing::new(issuer_secret.to_vec()));
         self.token_cache.lock().unwrap().clear();
         *self.issuer_registry_epoch.lock().unwrap() += 1;
         Ok(())
@@ -604,10 +620,14 @@ impl ZeroTrustGateway {
     ) -> Vec<u8> {
         // f64→u64: epoch seconds always positive, fractional part discarded intentionally.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let expiry = now_epoch_secs() as u64 + ttl_seconds;
+        let iat = now_epoch_secs() as u64;
+        let expiry = iat + ttl_seconds;
 
         let mut token_data = HashMap::new();
         token_data.insert("iss".into(), serde_json::Value::String(issuer_agent.into()));
+        // H-2 fix: `iat` claim feeds the blanket-revocation check in
+        // `validate_lateral_movement` (`blanket_revoked_before`).
+        token_data.insert("iat".into(), serde_json::Value::Number(iat.into()));
         token_data.insert("exp".into(), serde_json::Value::Number(expiry.into()));
         // T3.6: sort lists for deterministic cross-language HMAC
         token_data.insert("allow".into(), sorted_str_array(allowed_agents));
@@ -660,8 +680,19 @@ impl ZeroTrustGateway {
     }
 
     /// PSK Compromise Recovery: revoke ALL tokens, flush ALL caches (M-6 fix).
+    ///
+    /// H-2 fix: this must NOT clear `revoked_tokens` — doing so silently
+    /// un-revokes every token an operator individually revoked before the
+    /// compromise event, a fail-open bug. Instead it records a blanket
+    /// revocation timestamp (`blanket_revoked_before`): any token issued
+    /// (`iat`) before this moment is rejected on next validation regardless
+    /// of whether its specific signature hash is in `revoked_tokens`.
     pub fn revoke_all_tokens(&self) -> u64 {
-        self.revoked_tokens.lock().unwrap().clear();
+        // Floored to whole seconds to match `iat`'s granularity (tokens embed
+        // `iat` as a `u64`) — comparing a fractional timestamp against a
+        // floored one could spuriously reject a token issued in the same
+        // wall-clock second as this call, after it.
+        *self.blanket_revoked_before.lock().unwrap() = now_epoch_secs().floor();
         self.token_cache.lock().unwrap().clear();
         self.trusted_issuer_keys.lock().unwrap().clear();
         let mut rev_epoch = self.revocation_epoch.lock().unwrap();
@@ -775,12 +806,38 @@ impl ZeroTrustGateway {
                 ));
             }
 
-            let verification_secret = trusted_secret.unwrap_or_else(|| issuer_secret.to_vec());
-            let expected_sig = hmac_sha256(&verification_secret, &token_json);
+            // S-3 fix: both the resolved signing secret and the resulting MAC tag are
+            // ephemeral, function-local copies of security-sensitive material — wrap
+            // in `Zeroizing` so they're cleared from heap memory as soon as they go
+            // out of scope, rather than lingering for forensic recovery.
+            let verification_secret: Zeroizing<Vec<u8>> =
+                trusted_secret.unwrap_or_else(|| Zeroizing::new(issuer_secret.to_vec()));
+            let expected_sig: Zeroizing<Vec<u8>> =
+                Zeroizing::new(hmac_sha256(&verification_secret, &token_json));
             if !constant_time_eq(&expected_sig, &signature) {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::InvalidSignature,
                     "Capability Token has been tampered with!",
+                ));
+            }
+        }
+
+        // H-2 fix: blanket, epoch-based rejection for PSK compromise recovery.
+        // `revoke_all_tokens()` no longer clears `revoked_tokens` (that would
+        // silently un-revoke every individually-revoked token) and instead
+        // records the recovery timestamp in `blanket_revoked_before`. Any
+        // token whose `iat` predates the last blanket revocation is rejected
+        // here, covering tokens that were never individually enumerated in
+        // `revoked_tokens`. A token missing `iat` (pre-fix wire format) is
+        // treated as issued at time 0 — fail-closed once any blanket
+        // revocation has occurred.
+        let blanket_revoked_before = *self.blanket_revoked_before.lock().unwrap();
+        if blanket_revoked_before > 0.0 {
+            let iat = obj.get("iat").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+            if iat < blanket_revoked_before {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::LateralMovementBlocked,
+                    "Capability Token was issued before the most recent PSK compromise revocation.",
                 ));
             }
         }
@@ -1130,6 +1187,7 @@ impl RRBCGateway {
         max_use: i64,
         ttl_seconds: u64,
         max_action_class: u8,
+        pop_verifying_key: Option<&[u8]>,
     ) -> Vec<u8> {
         let now = now_epoch_secs();
         let jti = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -1166,6 +1224,11 @@ impl RRBCGateway {
         token_data.insert("max_action_class".into(), serde_json::json!(max_action_class));
         // PoP key embedded in token if provided (spec §8.2 step 4).
         // Absent = no PoP required; present = redeem_token enforces Ed25519 proof.
+        if let Some(pop_key) = pop_verifying_key {
+            use base64::Engine;
+            let pop_key_b64 = base64::engine::general_purpose::STANDARD.encode(pop_key);
+            token_data.insert("pop_key".into(), serde_json::Value::String(pop_key_b64));
+        }
 
         let token_json = serde_json::to_vec(&serde_json::Value::Object(token_data)).unwrap_or_default();
         let signature = hmac_sha256(issuer_secret, &token_json);
@@ -1236,7 +1299,9 @@ impl RRBCGateway {
         // Verify HMAC — SECURITY: must compare full-length signatures.
         // Truncated comparison (e.g. signature[..N]) allows a 1-byte signature
         // to pass if its first byte matches the expected HMAC output.
-        let expected_sig = hmac_sha256(issuer_secret, &token_json);
+        // S-3 fix: the MAC tag is ephemeral security-sensitive material — wrap in
+        // `Zeroizing` so it's cleared from heap memory as soon as it goes out of scope.
+        let expected_sig: Zeroizing<Vec<u8>> = Zeroizing::new(hmac_sha256(issuer_secret, &token_json));
         if signature.len() != expected_sig.len()
             || !constant_time_eq(&expected_sig, &signature)
         {
@@ -1401,6 +1466,24 @@ impl RRBCGateway {
                 .unwrap_or_default()
         };
 
+        // H-1 fix: validate max_action_class fits in u8 before casting, instead of
+        // truncating out-of-range values to u8::MAX. The token JSON is attacker-visible
+        // (only HMAC-signed, not encrypted), so a forged or tampered token could carry a
+        // max_action_class > 255. Falling back to u8::MAX on overflow was a fail-open bug:
+        // it silently granted the *highest* possible action class (IRREVERSIBLE) instead
+        // of rejecting. Mirrors the pattern already used in
+        // `ZeroTrustGateway::validate_lateral_movement` above.
+        let mac_raw = obj.get("max_action_class").and_then(|v| v.as_u64()).unwrap_or(0);
+        if mac_raw > u8::MAX as u64 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::ActionClassEscalation,
+                format!(
+                    "RRBC: max_action_class value {mac_raw} exceeds valid range 0-255 (rejected, not truncated)."
+                ),
+            ));
+        }
+        let max_action_class = mac_raw as u8;
+
         Ok(RRBCRedemptionResult {
             jti,
             issuer_agent: obj.get("iss").and_then(|v| v.as_str()).unwrap_or("").into(),
@@ -1412,10 +1495,7 @@ impl RRBCGateway {
             cid: token_cid.into(),
             oaid: token_oaid.into(),
             remaining_uses: remaining,
-            max_action_class: {
-                let v = obj.get("max_action_class").and_then(|v| v.as_u64()).unwrap_or(0);
-                u8::try_from(v).unwrap_or(u8::MAX)
-            },
+            max_action_class,
         })
     }
 
@@ -1659,6 +1739,154 @@ mod tests {
         assert_eq!(epoch, 1);
     }
 
+    /// H-2 regression: `revoke_all_tokens()` must NOT clear `revoked_tokens` —
+    /// doing so would silently un-revoke a token an operator individually
+    /// revoked before the PSK compromise event (fail-open). An individually
+    /// revoked token must stay revoked across a `revoke_all_tokens()` call.
+    #[test]
+    fn test_revoke_all_tokens_preserves_individual_revocations() {
+        let gw = ZeroTrustGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+        let token = gw.issue_capability_token(
+            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
+        );
+        gw.revoke_token(&token).unwrap();
+        assert!(gw.validate_lateral_movement("agent-b", &token, secret).is_err());
+
+        gw.revoke_all_tokens();
+
+        assert!(
+            gw.validate_lateral_movement("agent-b", &token, secret).is_err(),
+            "a token individually revoked before revoke_all_tokens() must remain revoked \
+             afterwards — revoke_all_tokens() must not clear revoked_tokens"
+        );
+    }
+
+    /// H-2 regression: `revoke_all_tokens()` must reject tokens issued before
+    /// the recovery event even when they were never individually revoked,
+    /// via the blanket `iat`-based check — not just tokens explicitly listed
+    /// in `revoked_tokens`. A hand-crafted token with `iat: 0` simulates a
+    /// pre-compromise token (avoids any real-clock timing flakiness).
+    #[test]
+    fn test_revoke_all_tokens_blanket_rejects_pre_compromise_iat() {
+        let gw = ZeroTrustGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+
+        let json = serde_json::json!({
+            "iss": "agent-a",
+            "iat": 0,
+            "exp": 9_999_999_999u64,
+            "allow": ["agent-b"],
+            "forbid": [],
+            "max_action_class": 0,
+        });
+        let token_json = serde_json::to_vec(&json).unwrap();
+        let signature = hmac_sha256(secret, &token_json);
+        let mut packed = Vec::with_capacity(4 + token_json.len() + signature.len());
+        packed.extend_from_slice(&(token_json.len() as u32).to_be_bytes());
+        packed.extend_from_slice(&token_json);
+        packed.extend_from_slice(&signature);
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes();
+
+        // Valid before any blanket revocation has occurred.
+        assert!(gw.validate_lateral_movement("agent-b", &token, secret).is_ok());
+
+        gw.revoke_all_tokens();
+
+        let err = gw.validate_lateral_movement("agent-b", &token, secret).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::LateralMovementBlocked);
+    }
+
+    /// H-2 regression: a token issued AFTER `revoke_all_tokens()` must remain
+    /// valid — the blanket check must not reject everything indiscriminately.
+    #[test]
+    fn test_revoke_all_tokens_does_not_reject_freshly_issued_tokens() {
+        let gw = ZeroTrustGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+        gw.revoke_all_tokens();
+        let token = gw.issue_capability_token(
+            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
+        );
+        assert!(
+            gw.validate_lateral_movement("agent-b", &token, secret).is_ok(),
+            "a token issued after revoke_all_tokens() must still validate"
+        );
+    }
+
+    /// S-3 regression: `validate_lateral_movement` must verify against the
+    /// per-issuer secret held in the (now `Zeroizing`-wrapped) `trusted_issuer_keys`
+    /// registry, not the caller-supplied fallback `issuer_secret` param, once a
+    /// registry entry exists for the token's issuer. Proven here by issuing the
+    /// token with the REGISTERED secret while passing a completely different,
+    /// wrong fallback secret to `validate_lateral_movement` — it must still
+    /// validate successfully, which is only possible if the registered
+    /// `Zeroizing<Vec<u8>>` value round-trips correctly through the registry
+    /// lookup/clone and is usable as real HMAC key material.
+    #[test]
+    fn test_validate_lateral_movement_uses_registered_issuer_key() {
+        let gw = ZeroTrustGateway::new();
+        let registered_secret = b"registered-issuer-secret-32bytes";
+        let wrong_fallback_secret = b"totally-different-fallback-key!!";
+        gw.register_issuer_key("agent-a", registered_secret).unwrap();
+
+        let token = gw.issue_capability_token(
+            registered_secret,
+            "agent-a",
+            &["agent-b"],
+            &[],
+            3600,
+            None,
+            0x01,
+            None,
+        );
+
+        let result = gw.validate_lateral_movement("agent-b", &token, wrong_fallback_secret);
+        assert!(result.is_ok(), "must validate against the registered issuer key, not the fallback param");
+        assert_eq!(result.unwrap().source_agent, "agent-a");
+
+        // A token signed with the WRONG secret must still be rejected even though
+        // a (mismatched) fallback secret was supplied — the registry takes priority.
+        let forged_token = gw.issue_capability_token(
+            wrong_fallback_secret,
+            "agent-a",
+            &["agent-b"],
+            &[],
+            3600,
+            None,
+            0x01,
+            None,
+        );
+        assert!(gw.validate_lateral_movement("agent-b", &forged_token, wrong_fallback_secret).is_err());
+    }
+
+    /// S-3 regression: once ANY issuer key is registered, an issuer with no
+    /// registry entry must be rejected outright ("issuer is not trusted"),
+    /// regardless of what fallback `issuer_secret` is supplied — the registry,
+    /// once non-empty, is authoritative.
+    #[test]
+    fn test_validate_lateral_movement_rejects_unregistered_issuer_when_registry_configured() {
+        let gw = ZeroTrustGateway::new();
+        let registered_secret = b"registered-issuer-secret-32bytes";
+        let untrusted_secret = b"untrusted-issuer-own-secret-key!";
+        gw.register_issuer_key("agent-a", registered_secret).unwrap();
+
+        // "agent-x" has no registry entry, even though its own token is
+        // internally self-consistent (signed with a secret only it knows).
+        let token = gw.issue_capability_token(
+            untrusted_secret,
+            "agent-x",
+            &["agent-b"],
+            &[],
+            3600,
+            None,
+            0x01,
+            None,
+        );
+        let result = gw.validate_lateral_movement("agent-b", &token, untrusted_secret);
+        assert!(result.is_err(), "an issuer absent from a non-empty registry must be rejected");
+    }
+
     #[test]
     fn test_delegation_guard() {
         let secret = b"root-orchestrator-key-32-bytes!!";
@@ -1723,6 +1951,7 @@ mod tests {
             1,
             3600,
             0x00,
+            None,
         );
         let result = rbc.redeem_token(
             &token,
@@ -1745,7 +1974,7 @@ mod tests {
         let secret = b"test-secret-key-32-bytes-long!!!";
         let token = rbc.issue_token(
             secret, "a", &["b"], &[], &["read"], &["b"],
-            "s1", "c1", "b", 1, 3600, 0x00,
+            "s1", "c1", "b", 1, 3600, 0x00, None,
         );
         assert!(rbc.redeem_token(&token, "rn", "b", "s1", "c1", "b", secret).is_ok());
         // Second redemption with same rnonce should fail
@@ -1758,9 +1987,77 @@ mod tests {
         let secret = b"test-secret-key-32-bytes-long!!!";
         let token = rbc.issue_token(
             secret, "a", &["b"], &[], &["read"], &["b"],
-            "s1", "c1", "b", 1, 3600, 0x00,
+            "s1", "c1", "b", 1, 3600, 0x00, None,
         );
         assert!(rbc.redeem_token(&token, "rn", "b", "wrong-sid", "c1", "b", secret).is_err());
+    }
+
+    /// H-8 regression: `issue_token` must actually embed the PoP verifying key
+    /// so `redeem_token_with_pop` enforces proof-of-possession end-to-end —
+    /// previously the field was never written, making PoP permanently dead.
+    #[test]
+    fn test_rrbc_pop_enforced_when_key_embedded() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let rbc = RRBCGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+        let mut csprng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut csprng);
+        let verifying_key_bytes = signing_key.verifying_key().to_bytes();
+
+        let token = rbc.issue_token(
+            secret, "a", &["b"], &[], &["read"], &["b"],
+            "s1", "c1", "b", 2, 3600, 0x00, Some(&verifying_key_bytes),
+        );
+
+        // No PoP proof supplied — must be rejected.
+        let no_proof = rbc.redeem_token_with_pop(
+            &token, "rn-1", "b", "s1", "c1", "b", secret, None,
+        );
+        assert!(no_proof.is_err());
+
+        // Correct Ed25519 proof over the rnonce — must succeed.
+        let sig = signing_key.sign(b"rn-2").to_bytes();
+        let with_proof = rbc.redeem_token_with_pop(
+            &token, "rn-2", "b", "s1", "c1", "b", secret, Some(&sig),
+        );
+        assert!(with_proof.is_ok());
+    }
+
+    /// H-1 regression: a forged/tampered RRBC token carrying an out-of-range
+    /// `max_action_class` (> 255) must be hard-rejected, not silently truncated to
+    /// `u8::MAX` (which would grant maximum privilege on parse overflow). `issue_token`
+    /// always emits an in-range value, so this test hand-crafts the wire format
+    /// directly to simulate an attacker-forged (but correctly HMAC-signed) token.
+    #[test]
+    fn test_rrbc_forged_max_action_class_rejected_not_truncated() {
+        let rbc = RRBCGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+        let json = serde_json::json!({
+            "jti": "forged-jti-1",
+            "iss": "attacker",
+            "aud": ["b"],
+            "sid": "s1",
+            "cid": "c1",
+            "oaid": "b",
+            "nbf": 0,
+            "exp": 9_999_999_999.0,
+            "max_use": 1,
+            "max_action_class": 999,
+        });
+        let token_json = serde_json::to_vec(&json).unwrap();
+        let signature = hmac_sha256(secret, &token_json);
+        let mut packed = Vec::with_capacity(4 + token_json.len() + signature.len());
+        packed.extend_from_slice(&(token_json.len() as u32).to_be_bytes());
+        packed.extend_from_slice(&token_json);
+        packed.extend_from_slice(&signature);
+        use base64::Engine;
+        let forged_token = base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes();
+
+        let result = rbc.redeem_token(&forged_token, "rn-forged", "b", "s1", "c1", "b", secret);
+        let err = result.expect_err(
+            "out-of-range max_action_class must be rejected, not truncated to u8::MAX",
+        );
+        assert_eq!(err.bytecode, SAACPBytecodes::ActionClassEscalation);
     }
 
     #[test]

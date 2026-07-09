@@ -157,6 +157,7 @@ fn blackhat_3e_psk_recovery_callback_can_close_streams() {
         Some(Box::new(move || {
             let _ = StreamRegistry::global().close(&sid_c);
             f2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         })),
     ).execute(None);
 
@@ -472,7 +473,7 @@ fn blackhat_8f_dri_revocation_immediately_visible() {
         "Agent must not be revoked before revoke() is called");
 
     // Revoke.
-    dri.revoke(agent_id, "security-incident-8f", &revoker, cred_fingerprint);
+    dri.revoke(agent_id, "security-incident-8f", &revoker, cred_fingerprint).unwrap();
 
     // Immediately revoked.
     assert!(dri.is_revoked(agent_id, cred_fingerprint),
@@ -608,11 +609,12 @@ fn blackhat_9d_full_psk_recovery_destroys_sessions_fires_all_callbacks() {
         Some(Box::new(move || {
             for s in &sids { let _ = StreamRegistry::global().close(s); }
             g2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         })),
     )
-    .with_capability_revoke(Box::new(move || { c2.fetch_add(1, Ordering::SeqCst); }))
-    .with_key_rotation(    Box::new(move || { k2.fetch_add(1, Ordering::SeqCst); }))
-    .with_audit(           Box::new(move || { a2.fetch_add(1, Ordering::SeqCst); }))
+    .with_capability_revoke(Box::new(move || { c2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+    .with_key_rotation(    Box::new(move || { k2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+    .with_audit(           Box::new(move || { a2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
     .execute(None);
 
     assert!(report.recovery_complete);

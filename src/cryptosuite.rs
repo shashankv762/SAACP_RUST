@@ -5,6 +5,7 @@
 
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier};
 use sha2::{Sha256, Digest};
+use zeroize::Zeroizing;
 
 use crate::crypto_governance::{
     CryptoLedgerEntry, CryptoTransparencyLedger, SuiteStatus,
@@ -91,7 +92,7 @@ impl CryptoSuite for Ed25519Suite {
         if private_key.len() != 32 {
             return Err(format!("Ed25519 private key must be 32 bytes, got {}", private_key.len()));
         }
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         key_bytes.copy_from_slice(private_key);
         let signing_key = SigningKey::from_bytes(&key_bytes);
         let signature = signing_key.sign(message);

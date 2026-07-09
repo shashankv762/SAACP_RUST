@@ -80,7 +80,7 @@ impl CapabilitySigningKey {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs_f64();
 
         Self {
@@ -411,7 +411,7 @@ impl CapabilityVerificationAuthority {
         // 6. Check temporal bounds
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs_f64();
 
         let nbf = token
@@ -671,7 +671,7 @@ mod tests {
         delegation_depth: u32,
         exp: f64,
     ) -> Map<String, Value> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
         let mut claims = Map::new();
         claims.insert("kid".into(), Value::String(kid.to_string()));
         claims.insert("iss".into(), Value::String(issuer_id.to_string()));
@@ -688,7 +688,7 @@ mod tests {
     fn uuid_hex() -> String {
         use sha2::{Sha256, Digest};
         let mut h = Sha256::new();
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().to_le_bytes();
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().to_le_bytes();
         h.update(t);
         hex::encode(h.finalize()[..16].as_ref())
     }
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn test_acsvaf_delegation_depth_rejected() {
         let (cia, cva) = make_authority_pair("issuer-test");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
         // depth=4 > ACSVAF_MAX_DELEGATION_DEPTH (3) — must be rejected on verify
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-x", 4, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn test_acsvaf_delegation_depth_at_max_allowed() {
         let (cia, cva) = make_authority_pair("issuer-test");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
         // depth=ACSVAF_MAX_DELEGATION_DEPTH (3) — exactly at max, must pass
         let claims = make_token_claims(
             cia.kid(), cia.issuer_id(), "agent-y",
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn test_revoke_token_blocks_verification() {
         let (cia, cva) = make_authority_pair("issuer-revo");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-z", 0, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
         // Initially valid

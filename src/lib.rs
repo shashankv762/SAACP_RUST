@@ -81,7 +81,7 @@ pub use aegf::{
 };
 pub use faitf::{
     AgentIdentity, AgentCredential, TrustAnchor, TrustStore,
-    DistributedRevocationInfrastructure, TrustMeshFederation,
+    DistributedRevocationInfrastructure, DRIError, TrustMeshFederation,
     SignedFederationAgreement, IdentityProver, DelegationChain,
     DelegatedCredential, CredentialRenewal, CredentialRenewalRecord,
     HardwareAttestationStub, TrustModel, AttestationType,
@@ -216,6 +216,7 @@ pub use faitf_audit::FAITFAuditLog;
 pub use daemon::{
     SAACPNetworkDaemon,
     MAX_ASSEMBLY_TIME, MAX_CIRCUIT_BREAKER_IPS, HANDSHAKE_TIMEOUT_SECS,
+    IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS,
 };
 pub use easi::EasiEncryptor;
 pub use telemetry::{TelemetryCollector, global_telemetry, GLOBAL_TELEMETRY};

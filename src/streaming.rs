@@ -75,6 +75,14 @@ pub struct StreamSession {
     pub token_sig_hash: String,
     /// Expiry of the originating token (Gate 1.0 expiry check, 0.0 = no expiry).
     pub token_exp: f64,
+    /// Trust-decay-capped `max_action_class` the originating token was validated
+    /// against at STREAM_START (Gate 1.0 output — see `run_gates_1_through_12`'s
+    /// `max_action_class_from_token`). CRIT-2 fix: enforced via Gate 2.5 (kinetic
+    /// firewall) on every CONTINUATION/END frame, not just the first frame of the
+    /// stream — closes the privilege-escalation-via-continuation-frame gap.
+    /// Defaults to 0 (READ_ONLY) — the same safe default Gate 1.0 uses when no
+    /// gateway is injected.
+    pub max_action_class: u8,
 }
 
 impl StreamSession {
@@ -94,6 +102,7 @@ impl StreamSession {
             closed: false,
             token_sig_hash: String::new(),
             token_exp: 0.0,
+            max_action_class: 0,
         }
     }
 
@@ -327,17 +336,7 @@ impl StreamRegistry {
         frame_bytes: usize,
     ) -> Result<(), SAACPHardDrop> {
         match &self.backend {
-            Some(backend) => {
-                let mut session = Self::get_session_backend(backend, stream_id).ok_or_else(|| {
-                    SAACPHardDrop::new(
-                        SAACPBytecodes::StreamAbort,
-                        format!("No active stream with id '{}'.", stream_id),
-                    )
-                })?;
-                let result = session.validate_continuation(sequence, frame_bytes);
-                Self::put_session_backend(backend, &session);
-                result
-            }
+            Some(backend) => self.validate_frame_backend(backend, stream_id, sequence, frame_bytes),
             None => {
                 let mut streams = self.streams.lock().unwrap();
                 let session = streams.get_mut(stream_id).ok_or_else(|| {
@@ -349,6 +348,85 @@ impl StreamRegistry {
                 session.validate_continuation(sequence, frame_bytes)
             }
         }
+    }
+
+    /// H-23 fix: backend-mode frame validation used a non-atomic get -> mutate -> put
+    /// sequence, which races when two frames for the same `stream_id` are processed
+    /// concurrently — e.g. two daemon nodes sharing this backend both handling a frame
+    /// for the same stream without session-affinity routing, or two racing in-process
+    /// tasks. Both could validate against the same stale snapshot, and whichever `put`
+    /// landed last would silently clobber the other's update — bypassing the sequence
+    /// ordering, cumulative byte cap, or frame-gap enforcement `validate_continuation`
+    /// exists to provide (Architecture Principle 8: "Atomic State Transitions").
+    ///
+    /// Fixed with a bounded compare-and-swap retry loop: each attempt re-fetches the
+    /// current raw bytes, validates a working copy against them, and commits via
+    /// [`StateBackend::compare_and_swap`] only if nobody else wrote to this key in the
+    /// meantime. A concurrent writer causes a retry against the now-current state —
+    /// never a lost update. `validate_continuation` only mutates its receiver on the
+    /// `Ok` path (every rejection returns before touching any field — see its doc
+    /// comment), so a rejected frame needs no write and never enters the CAS race.
+    /// Exhausting the retry budget under sustained same-stream contention fails closed
+    /// (`StreamAbort`) rather than silently applying a stale mutation.
+    fn validate_frame_backend(
+        &self,
+        backend: &Arc<dyn StateBackend>,
+        stream_id: &str,
+        sequence: u64,
+        frame_bytes: usize,
+    ) -> Result<(), SAACPHardDrop> {
+        /// Small fixed bound, matching this codebase's preference for bounded retry
+        /// loops over unbounded ones (see `sidecar.rs`'s connect-retry idiom).
+        const MAX_CAS_ATTEMPTS: u32 = 5;
+        let key = Self::stream_key(stream_id);
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let raw = backend.get(&key).ok().flatten().ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::StreamAbort,
+                    format!("No active stream with id '{}'.", stream_id),
+                )
+            })?;
+            let mut session: StreamSession = serde_json::from_slice(&raw).map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::StreamAbort,
+                    format!("Corrupt stream state for id '{}'.", stream_id),
+                )
+            })?;
+
+            // `?` propagates a rejection immediately — `validate_continuation` only
+            // mutates `session` on its `Ok` path, so a rejected frame has nothing to
+            // persist and never enters the CAS race below.
+            session.validate_continuation(sequence, frame_bytes)?;
+
+            let new_bytes = serde_json::to_vec(&session).map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::StreamAbort,
+                    format!("Failed to serialize updated stream state for id '{}'.", stream_id),
+                )
+            })?;
+
+            match backend.compare_and_swap(&key, Some(&raw), &new_bytes, Some(stream_backend_ttl())) {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue, // lost the race — retry against the fresh state
+                Err(_) => {
+                    // Fail closed: don't report acceptance of a frame whose acceptance
+                    // was never durably recorded.
+                    return Err(SAACPHardDrop::new(
+                        SAACPBytecodes::StreamAbort,
+                        format!("Failed to persist stream state for id '{}'.", stream_id),
+                    ));
+                }
+            }
+        }
+
+        Err(SAACPHardDrop::new(
+            SAACPBytecodes::StreamAbort,
+            format!(
+                "Stream '{}' has too much concurrent write contention; frame rejected.",
+                stream_id
+            ),
+        ))
     }
 
     /// Close and remove a stream session.
@@ -481,25 +559,36 @@ impl StreamRegistry {
 
     /// Get lightweight stream info without removing the stream.
     ///
-    /// Returns `(token_exp, token_sig_hash, last_sequence_id)` for Gate 1.0 checks.
-    pub fn get_stream_info(&self, stream_id: &str) -> Option<(f64, String, Option<u64>)> {
+    /// Returns `(token_exp, token_sig_hash, last_sequence_id, max_action_class,
+    /// source_agent)` for Gate 1.0 / Gate 2.5 / Gate 6.0 checks on continuation
+    /// and end frames. New fields are appended after the original three so
+    /// existing positional destructuring (`.0`/`.1`/`.2`) keeps working.
+    pub fn get_stream_info(&self, stream_id: &str) -> Option<(f64, String, Option<u64>, u8, String)> {
         match &self.backend {
             Some(backend) => Self::get_session_backend(backend, stream_id)
-                .map(|s| (s.token_exp, s.token_sig_hash, s.last_sequence_id)),
+                .map(|s| (s.token_exp, s.token_sig_hash, s.last_sequence_id, s.max_action_class, s.source_agent)),
             None => {
                 let streams = self.streams.lock().unwrap();
-                streams.get(stream_id).map(|s| (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id))
+                streams.get(stream_id).map(|s| {
+                    (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id, s.max_action_class, s.source_agent.clone())
+                })
             }
         }
     }
 
     /// Update token auth info on an existing stream (called after STREAM_START validation).
+    ///
+    /// `max_action_class` is Gate 1.0's already-validated, trust-decay-capped
+    /// ceiling for the originating token (CRIT-2 fix) — stored so Gate 2.5 can
+    /// re-enforce it on every subsequent CONTINUATION/END frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_stream_token_info(
         &self,
         stream_id: &str,
         token_sig_hash: &str,
         token_exp: f64,
         source_agent: &str,
+        max_action_class: u8,
     ) {
         match &self.backend {
             Some(backend) => {
@@ -507,6 +596,7 @@ impl StreamRegistry {
                     s.token_sig_hash = token_sig_hash.to_string();
                     s.token_exp = token_exp;
                     s.source_agent = source_agent.to_string();
+                    s.max_action_class = max_action_class;
                     Self::put_session_backend(backend, &s);
                 }
             }
@@ -516,6 +606,7 @@ impl StreamRegistry {
                     s.token_sig_hash = token_sig_hash.to_string();
                     s.token_exp = token_exp;
                     s.source_agent = source_agent.to_string();
+                    s.max_action_class = max_action_class;
                 }
             }
         }
@@ -760,11 +851,12 @@ mod tests {
     fn test_backend_set_stream_token_info() {
         let reg = backend_registry();
         reg.start_stream("s1", "src-agent", "agent-a").unwrap();
-        reg.set_stream_token_info("s1", "sighash123", 999.0, "src-agent-2");
+        reg.set_stream_token_info("s1", "sighash123", 999.0, "src-agent-2", 1);
         let session = reg.get_stream("s1").unwrap();
         assert_eq!(session.token_sig_hash, "sighash123");
         assert_eq!(session.token_exp, 999.0);
         assert_eq!(session.source_agent, "src-agent-2");
+        assert_eq!(session.max_action_class, 1);
     }
 
     #[test]
