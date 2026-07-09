@@ -132,6 +132,19 @@ impl ExternalCode {
 // ---------------------------------------------------------------------------
 
 /// Map an internal SAACPBytecodes value to a generic ExternalCode.
+///
+/// H-34: bytecodes 0x1B-0x40 (PSN/replay, AEGF governance, SCR, RRBC, RGC,
+/// KLMS key, the ACSVAF delegation/authority family, and the identity-binding
+/// family) previously had no explicit arm here and fell through to the
+/// generic `InternalFailure` catch-all — masking real auth failures,
+/// session-terminating conditions, and rate-limit conditions behind an
+/// opaque "internal error" code. Each is now classified by caller-actionable
+/// semantics, consistent with the other groups below: RequestRejected =
+/// malformed/structural, retrying the same request will not help;
+/// AccessDenied = credential/authorization/identity failure; SessionTerminated
+/// = session-level protocol violation, caller must re-establish a session;
+/// RateLimited = quota/throttling, caller should back off and retry;
+/// ServiceUnavailable = transient state issue, caller may retry.
 pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
     use SAACPBytecodes as B;
     match bytecode {
@@ -142,7 +155,15 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         | B::PayloadTooLarge
         | B::StreamStart
         | B::StreamContinuation
-        | B::StreamEnd => ExternalCode::RequestRejected,
+        | B::StreamEnd
+        // H-34: structural/resource-shape violations inherent to the
+        // request itself — retrying the identical request cannot succeed.
+        | B::RgcResourceLimitExceeded
+        | B::ScrNotFound
+        | B::AcsvafManifestInvalid
+        | B::DelegationMetadataIncomplete
+        | B::AegfHopLimitExceeded
+        | B::AegfDepthLimitExceeded => ExternalCode::RequestRejected,
 
         // ── ACCESS_DENIED ───────────────────────────────────────────────
         B::InvalidSignature
@@ -152,21 +173,59 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         | B::PromptInjectionDetected
         | B::ActionClassEscalation
         | B::DelegationRejected
-        | B::ExternalInputTainted => ExternalCode::AccessDenied,
+        | B::ExternalInputTainted
+        // H-34: credential / authorization / identity failures.
+        | B::PsnReplayDetected
+        | B::EpochExpired
+        | B::ScrUnauthorized
+        | B::RrbcReplayDetected
+        | B::RrbcBindingMismatch
+        | B::RrbcPopFailed
+        | B::KeyRevoked
+        | B::KeyVersionMismatch
+        | B::AcsvafDelegationAmplification
+        | B::AcsvafDelegationDepthExceeded
+        | B::AcsvafCircularDelegation
+        | B::AcsvafOrphanChain
+        | B::AcsvafMissingCapabilityAuthority
+        | B::AcsvafKeyNotTrusted
+        | B::AcsvafThresholdNotReached
+        | B::AcsvafSessionBindingViolated
+        | B::SelfIssuedCapability
+        | B::UnauthorizedIssuerClass
+        | B::AuthorityClassViolation
+        | B::FederationRootRequired
+        | B::IdentityBindingMissing
+        | B::IdentityMisbinding
+        | B::TranscriptHashMismatch
+        | B::IdentityNotVerified => ExternalCode::AccessDenied,
 
         // ── SESSION_TERMINATED ──────────────────────────────────────────
         B::EpistemicUncertainty
         | B::BudgetExceeded
-        | B::StreamAbort => ExternalCode::SessionTerminated,
+        | B::StreamAbort
+        // H-34: session-level protocol violations — the daemon/handler
+        // layer terminates the connection for each of these; the caller
+        // must re-establish a session rather than retry.
+        | B::SequenceOverflow
+        | B::AegfLoopDetected
+        | B::AegfTtlExpired
+        | B::AegfInvalidTransition
+        | B::SessionSpliceDetected => ExternalCode::SessionTerminated,
 
         // ── RATE_LIMITED ────────────────────────────────────────────────
-        B::CircuitBreakerOpen => ExternalCode::RateLimited,
+        B::CircuitBreakerOpen
+        // H-34: quota / throttling conditions.
+        | B::PsnOutOfWindow
+        | B::RrbcUsageExhausted => ExternalCode::RateLimited,
 
         // ── SERVICE_UNAVAILABLE ─────────────────────────────────────────
         B::StateExpiredOrStale
         | B::StateSyncRequired
         | B::TemporalTimeout
-        | B::AuditSubsystemDegraded => ExternalCode::ServiceUnavailable,
+        | B::AuditSubsystemDegraded
+        // H-34: caller should rotate credentials and retry.
+        | B::KeyEvolutionRequired => ExternalCode::ServiceUnavailable,
 
         // CRIT-11: 0x42/0x43 previously fell through to INTERNAL_FAILURE,
         // hiding an auth-failure (retry won't help, re-auth will) and a
@@ -175,6 +234,9 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         B::IntentChainDriftExceeded => ExternalCode::SessionTerminated,
 
         // ── Everything else maps to INTERNAL_FAILURE ────────────────────
+        // Only genuinely internal-only codes remain here (Success,
+        // InputRequired, PreFlightBudget, CostEstimate, HeartbeatPing) —
+        // none of which should ever reach this function as a rejection.
         _ => ExternalCode::InternalFailure,
     }
 }
@@ -700,6 +762,38 @@ mod tests {
         assert_eq!(internal_to_external_raw(0x01), ExternalCode::RequestRejected);
         assert_eq!(internal_to_external_raw(0x03), ExternalCode::AccessDenied);
         assert_eq!(internal_to_external_raw(0xFF), ExternalCode::InternalFailure);
+    }
+
+    /// H-34 regression: every named bytecode from 0x1B through 0x43 must
+    /// resolve to a specific ExternalCode, not silently fall through to the
+    /// generic INTERNAL_FAILURE catch-all. Exhaustive so that a future
+    /// bytecode added in this range without an explicit mapping fails this
+    /// test immediately rather than surviving as a silent confidentiality
+    /// regression.
+    #[test]
+    fn test_internal_to_external_h34_no_catchall_in_named_range() {
+        for raw in 0x1Bu8..=0x43u8 {
+            let code = internal_to_external_raw(raw);
+            assert_ne!(
+                code,
+                ExternalCode::InternalFailure,
+                "bytecode 0x{:02X} must not fall through to INTERNAL_FAILURE",
+                raw
+            );
+        }
+    }
+
+    /// H-34 spot checks: representative bytecode from each newly-mapped group.
+    #[test]
+    fn test_internal_to_external_h34_representative_mappings() {
+        assert_eq!(internal_to_external(SAACPBytecodes::RgcResourceLimitExceeded), ExternalCode::RequestRejected);
+        assert_eq!(internal_to_external(SAACPBytecodes::PsnReplayDetected), ExternalCode::AccessDenied);
+        assert_eq!(internal_to_external(SAACPBytecodes::IdentityNotVerified), ExternalCode::AccessDenied);
+        assert_eq!(internal_to_external(SAACPBytecodes::SessionSpliceDetected), ExternalCode::SessionTerminated);
+        assert_eq!(internal_to_external(SAACPBytecodes::SequenceOverflow), ExternalCode::SessionTerminated);
+        assert_eq!(internal_to_external(SAACPBytecodes::RrbcUsageExhausted), ExternalCode::RateLimited);
+        assert_eq!(internal_to_external(SAACPBytecodes::PsnOutOfWindow), ExternalCode::RateLimited);
+        assert_eq!(internal_to_external(SAACPBytecodes::KeyEvolutionRequired), ExternalCode::ServiceUnavailable);
     }
 
     #[test]

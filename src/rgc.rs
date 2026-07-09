@@ -18,9 +18,6 @@
 //! * [`DEFAULT_POLICY`] — Module-level default policy singleton.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::Instant;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
@@ -95,17 +92,22 @@ pub const EXECUTION_BUDGET_MAX_SECONDS: f64 = 30.0;
 /// Wall-clock deadline enforcer for agent execution blocks.
 ///
 /// Wraps any agent execution.  If the block does not complete within
-/// `timeout_seconds`, the guard flags a timeout and `check()` raises
-/// [`SAACPHardDrop`].
+/// `timeout_seconds`, `check()` raises [`SAACPHardDrop`].
+///
+/// H-33: this guard is purely a deadline comparison — `Instant::now() >
+/// self.deadline` — and previously spawned a redundant background OS thread
+/// per instance just to flip an `AtomicBool` at the same deadline `check()`
+/// already computes independently. Guards are constructed per
+/// agent-execution block, so that thread leaked one OS thread (living for
+/// up to `EXECUTION_BUDGET_MAX_SECONDS`) for every call. Removed entirely;
+/// `deadline: Instant` is the sole source of truth.
 pub struct ExecutionBudgetGuard {
     timeout_seconds: f64,
     deadline: Instant,
-    timed_out: Arc<AtomicBool>,
-    _timer_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ExecutionBudgetGuard {
-    /// Create and start a new budget guard.
+    /// Create a new budget guard with the given wall-clock deadline.
     ///
     /// Returns an error if `timeout_seconds` is non-positive or exceeds the
     /// hard ceiling of `EXECUTION_BUDGET_MAX_SECONDS` (30 s, spec §12.3).
@@ -121,25 +123,16 @@ impl ExecutionBudgetGuard {
         }
         let deadline = Instant::now()
             + std::time::Duration::from_secs_f64(timeout_seconds);
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&timed_out);
-
-        let handle = thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_secs_f64(timeout_seconds));
-            flag.store(true, Ordering::SeqCst);
-        });
 
         Ok(Self {
             timeout_seconds,
             deadline,
-            timed_out,
-            _timer_handle: Some(handle),
         })
     }
 
     /// Raise [`SAACPHardDrop`] if the execution deadline has been exceeded.
     pub fn check(&self) -> Result<(), SAACPHardDrop> {
-        if self.timed_out.load(Ordering::SeqCst) || Instant::now() > self.deadline {
+        if Instant::now() > self.deadline {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::RgcResourceLimitExceeded,
                 format!(
@@ -163,7 +156,7 @@ impl ExecutionBudgetGuard {
 
     /// Whether the guard has timed out.
     pub fn is_timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::SeqCst) || Instant::now() > self.deadline
+        Instant::now() > self.deadline
     }
 }
 
@@ -251,10 +244,18 @@ impl ResourceGovernanceParser {
     }
 
     /// Character-level scanner.  Walks `text` and returns statistics.
+    ///
+    /// H-35: walks a `Peekable<CharIndices>` directly over the original
+    /// `&str` instead of collecting the whole payload into a `Vec<char>`
+    /// first. The old `Vec<char>` collect allocated a second buffer up to
+    /// ~4x the payload's UTF-8 byte size (each `char` is 4 bytes) purely
+    /// for random-access indexing — memory amplification RGC exists to
+    /// prevent, happening inside RGC's own pre-parse hot path. No upfront
+    /// allocation proportional to payload size remains; the only
+    /// allocations left are the per-depth bookkeeping maps below, which
+    /// scale with nesting depth (bounded by `max_depth`), not payload size.
     fn scan_tokens(text: &str, policy: &RGCPolicy) -> Result<ScanStats, SAACPHardDrop> {
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
-        let mut i: usize = 0;
+        let mut chars = text.char_indices().peekable();
 
         let mut depth: usize = 0;
         let mut max_depth_seen: usize = 0;
@@ -279,17 +280,16 @@ impl ResourceGovernanceParser {
         let mut aggregate_resource_units: usize = 0;
         let mut expecting_key: bool = false;
 
-        while i < n {
-            let ch = chars[i];
-
+        while let Some(&(byte_i, ch)) = chars.peek() {
             // Whitespace
             if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-                i += 1;
+                chars.next();
                 continue;
             }
 
             // Opening brace
             if ch == '{' {
+                chars.next();
                 depth += 1;
                 if max_depth_seen < depth {
                     max_depth_seen = depth;
@@ -306,12 +306,12 @@ impl ResourceGovernanceParser {
                 container_stack.push('o');
                 field_counts.insert(depth, 0);
                 expecting_key = true;
-                i += 1;
                 continue;
             }
 
             // Opening bracket
             if ch == '[' {
+                chars.next();
                 depth += 1;
                 if max_depth_seen < depth {
                     max_depth_seen = depth;
@@ -328,12 +328,12 @@ impl ResourceGovernanceParser {
                 container_stack.push('a');
                 array_element_counts.insert(depth, 0);
                 expecting_key = false;
-                i += 1;
                 continue;
             }
 
             // Closing brace
             if ch == '}' {
+                chars.next();
                 if let Some(last) = container_stack.last() {
                     let _ = *last;
                     if let Some(fc) = field_counts.remove(&depth) {
@@ -345,12 +345,12 @@ impl ResourceGovernanceParser {
                 }
                 depth = depth.saturating_sub(1);
                 expecting_key = container_stack.last() == Some(&'o');
-                i += 1;
                 continue;
             }
 
             // Closing bracket
             if ch == ']' {
+                chars.next();
                 if let Some(_last) = container_stack.last() {
                     if let Some(ac) = array_element_counts.remove(&depth) {
                         if ac > max_array_length_seen {
@@ -361,12 +361,12 @@ impl ResourceGovernanceParser {
                 }
                 depth = depth.saturating_sub(1);
                 expecting_key = container_stack.last() == Some(&'o');
-                i += 1;
                 continue;
             }
 
             // Colon
             if ch == ':' {
+                chars.next();
                 schema_complexity += 1;
                 Self::check_limit("max_schema_complexity", schema_complexity, policy.max_schema_complexity)?;
                 expecting_key = false;
@@ -379,12 +379,12 @@ impl ResourceGovernanceParser {
                     }
                     Self::check_limit("max_field_count", fc_val, policy.max_field_count)?;
                 }
-                i += 1;
                 continue;
             }
 
             // Comma
             if ch == ',' {
+                chars.next();
                 if container_stack.last() == Some(&'a') {
                     let ac = array_element_counts.entry(depth).or_insert(0);
                     *ac += 1;
@@ -396,26 +396,28 @@ impl ResourceGovernanceParser {
                 } else if container_stack.last() == Some(&'o') {
                     expecting_key = true;
                 }
-                i += 1;
                 continue;
             }
 
             // String
             if ch == '"' {
-                i += 1; // consume opening quote
+                chars.next(); // consume opening quote
                 let mut char_count: usize = 0;
 
-                while i < n {
-                    let sc = chars[i];
-                    if sc == '\\' {
-                        i += 2;
-                        char_count += 2;
-                    } else if sc == '"' {
-                        i += 1; // consume closing quote
-                        break;
-                    } else {
-                        i += 1;
-                        char_count += 1;
+                loop {
+                    match chars.next() {
+                        Some((_, '\\')) => {
+                            // Blindly consume the escaped character as a second
+                            // "position" without validating it — matches the
+                            // original scanner's behavior exactly. Full escape
+                            // validation happens later in the real serde_json
+                            // parse; RGC is a pre-filter, not a validator.
+                            chars.next();
+                            char_count += 2;
+                        }
+                        Some((_, '"')) => break, // consumed closing quote
+                        Some(_) => char_count += 1,
+                        None => break, // unterminated string; scanner stops here
                     }
                 }
 
@@ -443,30 +445,33 @@ impl ResourceGovernanceParser {
 
             // Number
             if ch == '-' || ch.is_ascii_digit() {
-                let num_start = i;
-                if chars[i] == '-' {
-                    i += 1;
+                let num_start = byte_i;
+                chars.next(); // consume leading '-' or first digit
+
+                while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                    chars.next();
                 }
-                while i < n && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i < n && chars[i] == '.' {
-                    i += 1;
-                    while i < n && chars[i].is_ascii_digit() {
-                        i += 1;
+                if chars.peek().map(|(_, c)| *c) == Some('.') {
+                    chars.next();
+                    while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                        chars.next();
                     }
                 }
-                if i < n && (chars[i] == 'e' || chars[i] == 'E') {
-                    i += 1;
-                    if i < n && (chars[i] == '+' || chars[i] == '-') {
-                        i += 1;
+                if matches!(chars.peek().map(|(_, c)| *c), Some('e') | Some('E')) {
+                    chars.next();
+                    if matches!(chars.peek().map(|(_, c)| *c), Some('+') | Some('-')) {
+                        chars.next();
                     }
-                    while i < n && chars[i].is_ascii_digit() {
-                        i += 1;
+                    while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                        chars.next();
                     }
                 }
 
-                let num_str: String = chars[num_start..i].iter().collect();
+                // End of the numeric token = byte offset of whatever is peeked
+                // next (or end-of-text). Always a char boundary since it comes
+                // straight from char_indices.
+                let num_end = chars.peek().map(|(bi, _)| *bi).unwrap_or(text.len());
+                let num_str = &text[num_start..num_end];
                 let num_val: f64 = num_str.parse().unwrap_or(0.0);
                 let magnitude = num_val.abs();
 
@@ -489,21 +494,21 @@ impl ResourceGovernanceParser {
             }
 
             // Literals: true, false, null
-            if ch == 't' && i + 4 <= n && chars[i..i + 4].iter().collect::<String>() == "true" {
-                i += 4;
+            if ch == 't' && text[byte_i..].starts_with("true") {
+                for _ in 0..4 { chars.next(); }
                 continue;
             }
-            if ch == 'f' && i + 5 <= n && chars[i..i + 5].iter().collect::<String>() == "false" {
-                i += 5;
+            if ch == 'f' && text[byte_i..].starts_with("false") {
+                for _ in 0..5 { chars.next(); }
                 continue;
             }
-            if ch == 'n' && i + 4 <= n && chars[i..i + 4].iter().collect::<String>() == "null" {
-                i += 4;
+            if ch == 'n' && text[byte_i..].starts_with("null") {
+                for _ in 0..4 { chars.next(); }
                 continue;
             }
 
             // Unknown — advance defensively
-            i += 1;
+            chars.next();
         }
 
         // Final bookkeeping for unclosed containers
