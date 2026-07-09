@@ -165,7 +165,14 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         // ── SERVICE_UNAVAILABLE ─────────────────────────────────────────
         B::StateExpiredOrStale
         | B::StateSyncRequired
-        | B::TemporalTimeout => ExternalCode::ServiceUnavailable,
+        | B::TemporalTimeout
+        | B::AuditSubsystemDegraded => ExternalCode::ServiceUnavailable,
+
+        // CRIT-11: 0x42/0x43 previously fell through to INTERNAL_FAILURE,
+        // hiding an auth-failure (retry won't help, re-auth will) and a
+        // policy violation (session must terminate) behind a generic code.
+        B::TrustReauthRequired => ExternalCode::AccessDenied,
+        B::IntentChainDriftExceeded => ExternalCode::SessionTerminated,
 
         // ── Everything else maps to INTERNAL_FAILURE ────────────────────
         _ => ExternalCode::InternalFailure,
@@ -242,6 +249,9 @@ pub fn internal_to_external_raw(bytecode: u8) -> ExternalCode {
         0x3E => B::TranscriptHashMismatch,
         0x3F => B::IdentityNotVerified,
         0x40 => B::SessionSpliceDetected,
+        0x41 => B::AuditSubsystemDegraded,
+        0x42 => B::TrustReauthRequired,
+        0x43 => B::IntentChainDriftExceeded,
         _ => return ExternalCode::InternalFailure,
     };
     internal_to_external(bc)
@@ -524,7 +534,14 @@ fn infer_stage(bytecode: u8) -> &'static str {
 }
 
 /// Generate a cryptographically random correlation ID (16 random bytes → 32 hex chars).
-fn generate_correlation_id() -> String {
+///
+/// `pub(crate)` (rather than private): `daemon.rs`'s fast hard-drop paths
+/// (`send_hard_drop` and the main connection-loop error arm) build their wire
+/// response directly via `SREL::normalize_response` without going through the
+/// full `PECFFilter::translate`/SDL-logging pipeline, but still owe the wire
+/// format a real 32-hex-char correlation ID — reuse this generator rather than
+/// duplicate the random-byte-to-hex logic in `daemon.rs`.
+pub(crate) fn generate_correlation_id() -> String {
     use rand::RngCore;
     let mut buf = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut buf);
@@ -654,6 +671,28 @@ mod tests {
         // Unmapped code → InternalFailure
         assert_eq!(internal_to_external(SAACPBytecodes::Success), ExternalCode::InternalFailure);
         assert_eq!(internal_to_external(SAACPBytecodes::HeartbeatPing), ExternalCode::InternalFailure);
+    }
+
+    /// CRIT-11 regression: 0x41-0x43 must resolve to their intended external
+    /// codes, not the generic INTERNAL_FAILURE catch-all.
+    #[test]
+    fn test_internal_to_external_crit11_bytecodes() {
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::AuditSubsystemDegraded),
+            ExternalCode::ServiceUnavailable
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::TrustReauthRequired),
+            ExternalCode::AccessDenied
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::IntentChainDriftExceeded),
+            ExternalCode::SessionTerminated
+        );
+
+        assert_eq!(internal_to_external_raw(0x41), ExternalCode::ServiceUnavailable);
+        assert_eq!(internal_to_external_raw(0x42), ExternalCode::AccessDenied);
+        assert_eq!(internal_to_external_raw(0x43), ExternalCode::SessionTerminated);
     }
 
     #[test]

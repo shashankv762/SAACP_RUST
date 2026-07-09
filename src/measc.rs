@@ -1035,28 +1035,41 @@ pub struct PSKCompromiseReport {
     pub session_ids_hex: Vec<String>,
     pub revocation_epoch: u64,
     pub recovery_complete: bool,
+    /// Whether Step 1 (gateway `revoke_all_tokens()`) confirmed success. `true` if no
+    /// gateway callback was registered (caller handles revocation out of band) or the
+    /// registered callback returned `Ok(())`. `false` if it returned `Err` or panicked —
+    /// in that case `recovery_complete` is also `false` and no further steps ran.
+    pub gateway_revocation_ok: bool,
+    /// Step 6 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub capability_revocation_ok: Option<bool>,
+    /// Step 7 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub key_rotation_ok: Option<bool>,
+    /// Step 8 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub audit_ok: Option<bool>,
 }
 
 pub struct PSKCompromiseRecovery {
     manager: Arc<SessionEpochManager>,
     /// Step 1/2 gateway callback: called to execute `revoke_all_tokens()`.
-    gateway_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Must return `Ok(())` only if revocation actually succeeded — an `Err` or a panic
+    /// aborts the entire recovery (H-5 fix: previously panics were silently swallowed).
+    gateway_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
     /// Step 6 callback: revoke all SignedCapabilityTokens via ACSVAF/FACTF.
     /// Caller should close/revoke all active capability tokens.
-    capability_revoke_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    capability_revoke_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
     /// Step 7 callback: rotate all Ed25519 keys via `KeyLifecycleManager`.
     /// Caller should call `KeyLifecycleManager::rotate_key()` for every key.
-    key_rotation_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    key_rotation_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
     /// Step 8 callback: audit `SecureDiagnosticLedger` (PECF) for anomalies.
     /// Caller should scan SDL for anomalous session records and log/alert.
-    audit_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    audit_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
 }
 
 impl PSKCompromiseRecovery {
     /// Create with only the mandatory gateway callback (steps 1–5 only).
     pub fn new(
         manager: Arc<SessionEpochManager>,
-        gateway_callback: Option<Box<dyn Fn() + Send + Sync>>,
+        gateway_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
     ) -> Self {
         Self {
             manager,
@@ -1071,7 +1084,7 @@ impl PSKCompromiseRecovery {
     ///
     /// # Python parity
     /// Matches README §5.6 Step 6: "Revoke all SignedCapabilityTokens via ACSVAF/FACTF".
-    pub fn with_capability_revoke(mut self, cb: Box<dyn Fn() + Send + Sync>) -> Self {
+    pub fn with_capability_revoke(mut self, cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>) -> Self {
         self.capability_revoke_callback = Some(cb);
         self
     }
@@ -1080,7 +1093,7 @@ impl PSKCompromiseRecovery {
     ///
     /// # Python parity
     /// Matches README §5.6 Step 7: "Rotate all Ed25519 signing keys via KeyLifecycleManager".
-    pub fn with_key_rotation(mut self, cb: Box<dyn Fn() + Send + Sync>) -> Self {
+    pub fn with_key_rotation(mut self, cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>) -> Self {
         self.key_rotation_callback = Some(cb);
         self
     }
@@ -1089,7 +1102,7 @@ impl PSKCompromiseRecovery {
     ///
     /// # Python parity
     /// Matches README §5.6 Step 8: "Audit SecureDiagnosticLedger for anomalous sessions".
-    pub fn with_audit(mut self, cb: Box<dyn Fn() + Send + Sync>) -> Self {
+    pub fn with_audit(mut self, cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>) -> Self {
         self.audit_callback = Some(cb);
         self
     }
@@ -1109,8 +1122,29 @@ impl PSKCompromiseRecovery {
     /// Fully implements the 8-step procedure documented in README §5.6 and measc.py.
     pub fn execute(&self, gateway_revocation_epoch: Option<u64>) -> PSKCompromiseReport {
         // ── Step 1: Gateway revoke_all_tokens ──────────────────────────────
-        if let Some(cb) = &self.gateway_callback {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb));
+        // MANDATORY security boundary. A panic or an explicit `Err` here means
+        // tokens were NOT revoked — abort the entire recovery rather than
+        // silently reporting success (H-5 fix: previously the panic result was
+        // discarded via `let _ = ...` and recovery always proceeded/succeeded).
+        let gateway_revocation_ok = match &self.gateway_callback {
+            None => true,
+            Some(cb) => matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                Ok(Ok(()))
+            ),
+        };
+
+        if !gateway_revocation_ok {
+            return PSKCompromiseReport {
+                sessions_destroyed: 0,
+                session_ids_hex: Vec::new(),
+                revocation_epoch: gateway_revocation_epoch.unwrap_or(0),
+                recovery_complete: false,
+                gateway_revocation_ok: false,
+                capability_revocation_ok: None,
+                key_rotation_ok: None,
+                audit_ok: None,
+            };
         }
 
         // ── Step 2: Destroy ALL active MEASC sessions ──────────────────────
@@ -1125,26 +1159,39 @@ impl PSKCompromiseRecovery {
             destroyed_hex.push(hex::encode(sid));
         }
 
-        // ── Step 6: Revoke all capability tokens (ACSVAF/FACTF) ────────────
-        if let Some(cb) = &self.capability_revoke_callback {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb));
-        }
+        // ── Steps 6-8: best-effort extended remediation ────────────────────
+        // Outcomes are tracked (not silently discarded) so partial failures
+        // remain observable even though they don't gate `recovery_complete`.
+        let capability_revocation_ok = self.capability_revoke_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                Ok(Ok(()))
+            )
+        });
 
-        // ── Step 7: Rotate all Ed25519 keys (KLMS) ─────────────────────────
-        if let Some(cb) = &self.key_rotation_callback {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb));
-        }
+        let key_rotation_ok = self.key_rotation_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                Ok(Ok(()))
+            )
+        });
 
-        // ── Step 8: Audit SDL (PECF) for anomalous sessions ────────────────
-        if let Some(cb) = &self.audit_callback {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb));
-        }
+        let audit_ok = self.audit_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                Ok(Ok(()))
+            )
+        });
 
         PSKCompromiseReport {
             sessions_destroyed: destroyed,
             session_ids_hex: destroyed_hex,
             revocation_epoch: gateway_revocation_epoch.unwrap_or(0),
             recovery_complete: true,
+            gateway_revocation_ok: true,
+            capability_revocation_ok,
+            key_rotation_ok,
+            audit_ok,
         }
     }
 }
@@ -1336,9 +1383,9 @@ mod tests {
         let s8 = StdArc::clone(&step8_fired);
 
         let recovery = PSKCompromiseRecovery::new(Arc::clone(&mgr), None)
-            .with_capability_revoke(Box::new(move || { s6.store(true, Ordering::SeqCst); }))
-            .with_key_rotation(Box::new(move || { s7.store(true, Ordering::SeqCst); }))
-            .with_audit(Box::new(move || { s8.store(true, Ordering::SeqCst); }));
+            .with_capability_revoke(Box::new(move || { s6.store(true, Ordering::SeqCst); Ok(()) }))
+            .with_key_rotation(Box::new(move || { s7.store(true, Ordering::SeqCst); Ok(()) }))
+            .with_audit(Box::new(move || { s8.store(true, Ordering::SeqCst); Ok(()) }));
 
         let report = recovery.execute(Some(99));
         assert_eq!(report.sessions_destroyed, 1);

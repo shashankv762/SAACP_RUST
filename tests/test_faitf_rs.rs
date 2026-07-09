@@ -273,7 +273,7 @@ fn test_trust_store_pin_identity() {
 fn test_dri_revoke_and_check() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-1", "iss-rev", 3600);
-    dri.revoke("agent-rev", "test reason", &revoker, "cred-fp-1");
+    dri.revoke("agent-rev", "test reason", &revoker, "cred-fp-1").unwrap();
     assert!(dri.is_revoked("agent-rev", "cred-fp-1"));
 }
 
@@ -288,7 +288,7 @@ fn test_dri_epoch_increments_on_revocation() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-2", "iss-rev", 3600);
     let e0 = dri.epoch();
-    dri.revoke("agent-epoch", "test reason", &revoker, "fp-epoch");
+    dri.revoke("agent-epoch", "test reason", &revoker, "fp-epoch").unwrap();
     let e1 = dri.epoch();
     assert!(e1 > e0, "Epoch must increment on revocation");
 }
@@ -297,7 +297,7 @@ fn test_dri_epoch_increments_on_revocation() {
 fn test_dri_clear() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-3", "iss-rev", 3600);
-    dri.revoke("agent-clear", "test reason", &revoker, "fp-clear");
+    dri.revoke("agent-clear", "test reason", &revoker, "fp-clear").unwrap();
     assert!(dri.is_revoked("agent-clear", "fp-clear"));
     dri.clear();
     assert!(!dri.is_revoked("agent-clear", "fp-clear"), "DRI must be empty after clear");

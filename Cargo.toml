@@ -13,17 +13,23 @@ sha2 = "0.10"
 hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: H-6 fix uncovered that without it, `serde_json::from_str`
+# can lose a few ULPs of precision on high-precision f64 values (e.g. our
+# sub-second audit-log timestamps), so parse(print(x)) != x in rare cases —
+# breaking `ImmutableAuditLog::verify_chain`/`verify_chain_disk`'s HMAC
+# recomputation, which re-serializes a parsed `serde_json::Value` and expects
+# byte-identical output to the original canonical serialization.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4"] }
-# IoT / low-resource fix: "full" pulled in signal/process/fs/io-std/sync — none
-# of which src/ actually uses (only daemon.rs and transport/ws.rs touch tokio,
-# and only via spawn/spawn_blocking, TcpListener, AsyncRead/WriteExt, and
-# timeout — verified by grep across src/). Trimming to just what's used cuts
-# compile time and binary size for embedded-Linux-class deployments (Raspberry
-# Pi / OpenWrt-class routers) without losing any functionality. Left at "full"
-# in [dev-dependencies] below since dev-deps never ship to downstream consumers
-# of this library crate.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros"] }
+# IoT / low-resource fix: "full" pulled in signal/process/fs/io-std — none of
+# which src/ actually uses (only daemon.rs and transport/ws.rs touch tokio, and
+# only via spawn/spawn_blocking, TcpListener, AsyncRead/WriteExt, timeout, and
+# sync::Semaphore for the CRIT-9 connection limiter — verified by grep across
+# src/). Trimming to just what's used cuts compile time and binary size for
+# embedded-Linux-class deployments (Raspberry Pi / OpenWrt-class routers)
+# without losing any functionality. Left at "full" in [dev-dependencies] below
+# since dev-deps never ship to downstream consumers of this library crate.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 base64 = "0.22"
 adler2 = "2"
 unicode-normalization = "0.1"
@@ -75,6 +81,16 @@ sidecar = ["dep:axum"]
 # (for `futures_util::stream::unfold`, used to turn a `tokio::sync::broadcast`
 # receiver into an SSE `Stream` without pulling in `tokio-stream`).
 command-center = ["dep:axum", "dep:futures-util"]
+# UNSAFE: exposes framing::MEASCFrame::parse_header_structural, which preserves
+# the PRE-CRIT-1-FIX behavior — structural header parsing with ZERO AES-GCM
+# authentication. Off by default and MUST remain off in every real deployment;
+# it exists solely as an explicit, auditable escape hatch for local wire-format
+# / interop debugging tooling that needs to inspect MEASCFrame headers without
+# possessing the session key. No test in this crate's default test suite
+# requires it — every test that previously relied on the unauthenticated
+# structural path was migrated to build genuinely-encrypted frames via
+# `encode_encrypted` instead. See CRIT-1 in opusplan.md.
+unsafe-structural-only = []
 
 [dev-dependencies]
 serial_test = "3"
@@ -82,7 +98,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

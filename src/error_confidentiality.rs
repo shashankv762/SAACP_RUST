@@ -95,6 +95,11 @@ static BYTECODE_CATEGORY_MAP: LazyLock<HashMap<u8, ErrorCategory>> = LazyLock::n
         (0x39, PolicyViolation), (0x3A, GovernanceViolation), (0x3B, GovernanceViolation),
         (0x3C, AuthFailure), (0x3D, AuthFailure), (0x3E, AuthFailure),
         (0x3F, AuthFailure), (0x40, AuthFailure),
+        // CRIT-11: 0x41-0x43 previously fell through to the Internal
+        // catch-all, masking auth/retry semantics from callers.
+        (0x41, ResourceLimit),   // AuditSubsystemDegraded -> ServiceUnavailable
+        (0x42, AuthFailure),     // TrustReauthRequired -> AccessDenied
+        (0x43, PolicyViolation), // IntentChainDriftExceeded -> SessionTerminated
     ];
     for &(bytecode, cat) in entries {
         m.insert(bytecode, cat);
@@ -417,5 +422,26 @@ mod tests {
                 "0x{code:02X} must be AuthFailure"
             );
         }
+    }
+
+    /// CRIT-11 regression: 0x41-0x43 must not fall through to the Internal
+    /// catch-all — each has a distinct, caller-actionable category.
+    #[test]
+    fn crit11_bytecodes_0x41_to_0x43_mapped() {
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x41),
+            ErrorCategory::ResourceLimit,
+            "0x41 (AuditSubsystemDegraded) must be ResourceLimit"
+        );
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x42),
+            ErrorCategory::AuthFailure,
+            "0x42 (TrustReauthRequired) must be AuthFailure"
+        );
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x43),
+            ErrorCategory::PolicyViolation,
+            "0x43 (IntentChainDriftExceeded) must be PolicyViolation"
+        );
     }
 }

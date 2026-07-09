@@ -29,6 +29,13 @@ pub const FAITF_VERSION: &str = "1.0";
 pub const FAITF_MAX_DELEGATION_DEPTH: usize = 3;
 pub const IDENTITY_PROOF_TTL: f64 = 30.0;
 pub const MAX_CLOCK_SKEW: f64 = 5.0;
+/// (H-28) Maximum distinct challenges tracked in `IdentityProver::used_challenges`
+/// before oldest-first eviction runs, bounding memory even if a caller floods
+/// `verify_proof` with fresh, never-reused challenges faster than
+/// `IDENTITY_PROOF_TTL` ages them out. Same order of magnitude as
+/// `trust_decay::DRIFT_MAX_TRACKED_SESSIONS`, which bounds a structurally
+/// similar per-key map.
+pub const IDENTITY_PROVER_MAX_CHALLENGES: usize = 50_000;
 pub const CREDENTIAL_SIG_MARKER: &str = "ed25519";
 pub const PSK_SIG_MARKER: &str = "hmac-sha256";
 
@@ -608,6 +615,27 @@ impl SignedRevocationRecord {
         let body = self.body_bytes();
         verify_data(anchor_key, &body, &self.revoker_signature)
     }
+
+    /// Age of this record in days, computed from `revoked_at` (unix seconds)
+    /// to now. Never negative — clock skew or a future timestamp clamps to 0.
+    pub fn age_days(&self) -> f64 {
+        (now_f64() - self.revoked_at).max(0.0) / 86_400.0
+    }
+
+    /// Whether this revocation's `reason` indicates a high-severity security
+    /// event (compromise, collusion, active-malicious-use, etc.) that must
+    /// never be evicted from the DRI under capacity pressure, regardless of
+    /// age. Matched case-insensitively against known critical markers.
+    ///
+    /// The record has no dedicated severity field — adding one would change
+    /// the signed wire format — so severity is inferred from `reason`, which
+    /// is itself part of the signed body and therefore tamper-evident.
+    pub fn is_high_severity(&self) -> bool {
+        let reason_lower = self.reason.to_ascii_lowercase();
+        HIGH_SEVERITY_REASON_MARKERS
+            .iter()
+            .any(|marker| reason_lower.contains(marker))
+    }
 }
 
 /// Thread-safe, in-memory DRI with signed revocation records.
@@ -619,6 +647,60 @@ pub struct DistributedRevocationInfrastructure {
 
 const DRI_MAX_RECORDS: usize = 100_000;
 
+/// Reason-string substrings (case-insensitive) that mark a revocation record
+/// as high-severity. High-severity records are exempt from capacity-driven
+/// eviction (CRIT-5 fix) — see [`SignedRevocationRecord::is_high_severity`].
+const HIGH_SEVERITY_REASON_MARKERS: &[&str] = &[
+    "compromise",
+    "collusion",
+    "security-incident",
+    "security_incident",
+    "malicious",
+    "key-leak",
+    "key_leak",
+    "critical",
+];
+
+/// Minimum age, in days, a non-high-severity record must reach before it
+/// becomes eligible for capacity-driven eviction. Protects freshly-issued
+/// revocations from being flushed out by a burst of throwaway
+/// self-revocations (CRIT-5 fix).
+const REVOCATION_RETENTION_DAYS: f64 = 90.0;
+
+/// Maximum number of stale, low-severity records evicted per capacity-
+/// triggered sweep. Batching amortizes the O(n) eligibility scan across many
+/// subsequent inserts instead of rescanning on every single insert.
+const DRI_EVICT_BATCH: usize = 64;
+
+/// Errors returned by [`DistributedRevocationInfrastructure`] storage
+/// operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DRIError {
+    /// The revocation store is at capacity (`DRI_MAX_RECORDS`) and contains
+    /// no records eligible for eviction — every remaining entry in the
+    /// target map is either high-severity or still within the
+    /// `REVOCATION_RETENTION_DAYS` retention window. The new record was
+    /// NOT stored. Callers MUST treat this as revocation failure, not
+    /// silent success — never surface the record as "revoked" if this is
+    /// returned.
+    AtCapacity,
+}
+
+impl std::fmt::Display for DRIError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DRIError::AtCapacity => write!(
+                f,
+                "DRI at capacity ({DRI_MAX_RECORDS} records) with no evictable \
+                 entries (remaining records are all high-severity or within the \
+                 {REVOCATION_RETENTION_DAYS}-day retention window)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DRIError {}
+
 impl DistributedRevocationInfrastructure {
     pub fn new() -> Self {
         Self {
@@ -629,13 +711,20 @@ impl DistributedRevocationInfrastructure {
     }
 
     /// Revoke an agent or a specific credential. Returns the signed record.
+    ///
+    /// # Errors
+    /// Returns `Err(DRIError::AtCapacity)` if the DRI is full and contains no
+    /// evictable entries (all remaining records are high-severity or within
+    /// the retention window). In that case the record is NOT stored — the
+    /// agent/credential is NOT revoked. Callers MUST NOT treat this as
+    /// success.
     pub fn revoke(
         &self,
         agent_id: &str,
         reason: &str,
         revoker_identity: &AgentIdentity,
         credential_fingerprint: &str,
-    ) -> SignedRevocationRecord {
+    ) -> Result<SignedRevocationRecord, DRIError> {
         let mut record = SignedRevocationRecord {
             agent_id: agent_id.to_string(),
             credential_fingerprint: credential_fingerprint.to_string(),
@@ -646,8 +735,8 @@ impl DistributedRevocationInfrastructure {
             revoker_key_id: revoker_identity.fingerprint(),
         };
         record.revoker_signature = sign_data(&revoker_identity.signing_key, &record.body_bytes());
-        self.store_record(record.clone());
-        record
+        self.store_record(record.clone())?;
+        Ok(record)
     }
 
     /// Accept a signed revocation from a federation peer.
@@ -679,22 +768,58 @@ impl DistributedRevocationInfrastructure {
             return false;
         }
 
-        self.store_record(record);
-        true
+        self.store_record(record).is_ok()
     }
 
-    fn store_record(&self, record: SignedRevocationRecord) {
-        let mut agents = self.revoked_agents.lock().unwrap();
-        let mut creds = self.revoked_credentials.lock().unwrap();
-        let mut epoch = self.revocation_epoch.lock().unwrap();
+    /// Store a signed revocation record, evicting stale low-severity entries
+    /// if the store is at capacity.
+    ///
+    /// Eviction policy (CRIT-5 / CRIT-6 fix):
+    /// - Capacity is checked against the sum of both maps, but eviction is
+    ///   performed against whichever map is currently the LARGER of the two
+    ///   (CRIT-6: previously eviction always targeted `revoked_agents` even
+    ///   when `revoked_credentials` was the map actually growing unbounded).
+    /// - Only entries that are BOTH older than `REVOCATION_RETENTION_DAYS`
+    ///   AND not high-severity are eligible for eviction, oldest-first, up
+    ///   to `DRI_EVICT_BATCH` per call (CRIT-5: previously eviction picked
+    ///   the single globally-oldest entry with no regard for why it was
+    ///   revoked, letting an attacker flood the store with disposable
+    ///   self-revocations to age out and displace legitimate high-severity
+    ///   revocations — "un-revoking" a compromised agent).
+    /// - If no entries in the target map are eligible, the insert is
+    ///   rejected with `DRIError::AtCapacity` rather than silently evicting
+    ///   a protected record or silently discarding the new one. This keeps
+    ///   revocation monotonic: an attacker cannot use flooding to weaken a
+    ///   previously-established security condition.
+    fn store_record(&self, record: SignedRevocationRecord) -> Result<(), DRIError> {
+        let mut agents = self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut creds = self
+            .revoked_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut epoch = self
+            .revocation_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         if agents.len() + creds.len() >= DRI_MAX_RECORDS {
-            if let Some(oldest_key) = agents
-                .iter()
-                .min_by(|a, b| a.1.revoked_at.partial_cmp(&b.1.revoked_at).unwrap())
-                .map(|(k, _)| k.clone())
-            {
-                agents.remove(&oldest_key);
+            // Evict from whichever map is currently larger — fixes CRIT-6,
+            // where eviction always targeted `revoked_agents` regardless of
+            // which map was actually driving growth past the cap.
+            let evict_from_agents = agents.len() >= creds.len();
+
+            let evicted = if evict_from_agents {
+                Self::evict_stale_low_severity(&mut agents)
+            } else {
+                Self::evict_stale_low_severity(&mut creds)
+            };
+
+            if evicted == 0 {
+                // Every entry in the larger map is high-severity or still
+                // within the retention window — nothing may be displaced.
+                // Fail closed: reject the new record rather than evict a
+                // protected one or silently drop the incoming revocation.
+                return Err(DRIError::AtCapacity);
             }
         }
 
@@ -704,6 +829,30 @@ impl DistributedRevocationInfrastructure {
             agents.insert(record.agent_id.clone(), record);
         }
         *epoch += 1;
+        Ok(())
+    }
+
+    /// Remove up to `DRI_EVICT_BATCH` entries from `map` that are both older
+    /// than `REVOCATION_RETENTION_DAYS` and not high-severity, oldest-first.
+    /// Returns the number of entries actually removed.
+    fn evict_stale_low_severity(map: &mut HashMap<String, SignedRevocationRecord>) -> usize {
+        let mut candidates: Vec<(String, f64)> = map
+            .iter()
+            .filter(|(_, r)| {
+                r.age_days() > REVOCATION_RETENTION_DAYS && !r.is_high_severity()
+            })
+            .map(|(k, r)| (k.clone(), r.revoked_at))
+            .collect();
+
+        // Oldest first (smallest revoked_at first).
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(DRI_EVICT_BATCH);
+
+        let count = candidates.len();
+        for (key, _) in candidates {
+            map.remove(&key);
+        }
+        count
     }
 
     /// Check if an agent or specific credential is revoked.
@@ -963,6 +1112,25 @@ impl IdentityProver {
             if challenges.contains_key(challenge) {
                 return (false, "challenge_already_used".to_string());
             }
+            // (H-28) Age-based eviction above only bounds growth if callers
+            // legitimately reuse `verify_proof` faster than challenges expire.
+            // The insert below runs regardless of whether the signature check
+            // that follows ever succeeds, so a flood of distinct, never-valid
+            // challenges within one TTL window would otherwise grow this map
+            // without bound. Hard-cap it with the same oldest-first eviction
+            // idiom used by `TrustDecayEngine`/`IntentDriftTracker`.
+            if challenges.len() >= IDENTITY_PROVER_MAX_CHALLENGES
+                && !challenges.contains_key(challenge)
+            {
+                let evict_count = challenges.len() + 1 - IDENTITY_PROVER_MAX_CHALLENGES;
+                let mut by_expiry: Vec<(Vec<u8>, f64)> = challenges.iter()
+                    .map(|(k, exp)| (k.clone(), *exp))
+                    .collect();
+                by_expiry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (k, _) in by_expiry.into_iter().take(evict_count) {
+                    challenges.remove(&k);
+                }
+            }
             challenges.insert(challenge.to_vec(), now + IDENTITY_PROOF_TTL);
         }
 
@@ -993,6 +1161,23 @@ impl IdentityProver {
     fn evict_expired_challenges(challenges: &mut HashMap<Vec<u8>, f64>) {
         let now = now_f64();
         challenges.retain(|_, exp| *exp >= now);
+    }
+
+    /// (H-28) Remove expired challenges. Standalone from `verify_proof` so a
+    /// background maintenance task can reclaim memory on a timer even when
+    /// `verify_proof` traffic has gone idle — mirrors
+    /// `memory::SecureContextStore::evict_expired`. Returns the number of
+    /// entries removed.
+    pub fn sweep_expired_challenges(&self) -> usize {
+        let mut challenges = self.used_challenges.lock().unwrap();
+        let before = challenges.len();
+        Self::evict_expired_challenges(&mut challenges);
+        before - challenges.len()
+    }
+
+    /// Number of challenges currently tracked (for observability/tests).
+    pub fn tracked_challenge_count(&self) -> usize {
+        self.used_challenges.lock().unwrap().len()
     }
 
     pub fn clear(&self) {
@@ -1495,5 +1680,245 @@ mod tests {
                 || reason.contains("already"),
             "reason must indicate circular detection: got '{reason}'"
         );
+    }
+
+    // ─── CRIT-5 / CRIT-6: DRI eviction hardening ─────────────────────────────
+    //
+    // White-box tests: they populate `revoked_agents` / `revoked_credentials`
+    // directly and call the private `store_record` so the fix can be
+    // exercised at the real `DRI_MAX_RECORDS` boundary without paying for
+    // 100,000 real Ed25519 signatures per test.
+
+    fn synthetic_record(id: &str, reason: &str, revoked_at: f64) -> SignedRevocationRecord {
+        SignedRevocationRecord {
+            agent_id: id.to_string(),
+            credential_fingerprint: String::new(),
+            reason: reason.to_string(),
+            revoked_at,
+            revoker_id: "synthetic-revoker".to_string(),
+            revoker_signature: Vec::new(),
+            revoker_key_id: "synthetic-key".to_string(),
+        }
+    }
+
+    /// CRIT-5: a high-severity revocation must never be evicted, even when it
+    /// is the oldest record in the store and the store is at capacity.
+    #[test]
+    fn crit5_high_severity_record_survives_capacity_eviction() {
+        let dri = DistributedRevocationInfrastructure::new();
+        let stale_ts = now_f64() - (REVOCATION_RETENTION_DAYS + 1.0) * 86_400.0;
+
+        {
+            let mut agents = dri.revoked_agents.lock().unwrap();
+            // Fill the store to one below capacity with stale, low-severity
+            // (evictable) records...
+            for i in 0..DRI_MAX_RECORDS - 1 {
+                let id = format!("stale-agent-{i}");
+                agents.insert(id.clone(), synthetic_record(&id, "routine cleanup", stale_ts));
+            }
+            // ...plus one stale but HIGH-SEVERITY record, which must be
+            // protected from eviction regardless of its age.
+            agents.insert(
+                "compromised-agent".to_string(),
+                synthetic_record("compromised-agent", "agent compromised - key exfiltration", stale_ts),
+            );
+        }
+        assert_eq!(dri.revoked_agents.lock().unwrap().len(), DRI_MAX_RECORDS);
+
+        // One more insert triggers capacity-driven eviction.
+        let new_record = synthetic_record("new-agent", "test reason", now_f64());
+        let result = dri.store_record(new_record);
+        assert!(result.is_ok(), "insert must succeed by evicting stale low-severity entries");
+
+        let agents = dri.revoked_agents.lock().unwrap();
+        assert!(
+            agents.contains_key("compromised-agent"),
+            "CRIT-5: high-severity revocation must survive capacity-driven eviction"
+        );
+        assert!(agents.contains_key("new-agent"), "new record must have been stored");
+    }
+
+    /// CRIT-5: if every record in the target map is protected (high-severity
+    /// or within the retention window), the store must fail closed —
+    /// `AtCapacity` — rather than silently evicting a protected record or
+    /// silently discarding the new one.
+    #[test]
+    fn crit5_store_rejects_insert_when_no_evictable_entries() {
+        let dri = DistributedRevocationInfrastructure::new();
+        let stale_ts = now_f64() - (REVOCATION_RETENTION_DAYS + 1.0) * 86_400.0;
+
+        {
+            let mut agents = dri.revoked_agents.lock().unwrap();
+            for i in 0..DRI_MAX_RECORDS {
+                let id = format!("critical-agent-{i}");
+                // High-severity AND stale — still must never be evicted.
+                agents.insert(id.clone(), synthetic_record(&id, "collusion_detected", stale_ts));
+            }
+        }
+
+        let result = dri.store_record(synthetic_record("agent-overflow", "test reason", now_f64()));
+        assert_eq!(
+            result,
+            Err(DRIError::AtCapacity),
+            "CRIT-5: store must fail closed when no entries are evictable"
+        );
+
+        // The rejected record must genuinely not be present anywhere.
+        assert!(!dri.is_revoked("agent-overflow", ""));
+    }
+
+    /// CRIT-5 (public API surface): `revoke()` must propagate the same
+    /// fail-closed behavior — callers must not be able to mistake a rejected
+    /// revocation for a successful one.
+    #[test]
+    fn crit5_revoke_returns_err_and_does_not_silently_revoke() {
+        let dri = DistributedRevocationInfrastructure::new();
+        let stale_ts = now_f64() - (REVOCATION_RETENTION_DAYS + 1.0) * 86_400.0;
+
+        {
+            let mut agents = dri.revoked_agents.lock().unwrap();
+            for i in 0..DRI_MAX_RECORDS {
+                let id = format!("critical-agent-{i}");
+                agents.insert(id.clone(), synthetic_record(&id, "collusion_detected", stale_ts));
+            }
+        }
+
+        let revoker = AgentIdentity::generate(
+            "revoker-full", "iss-full", 3600, None, None, "", AttestationType::None,
+        );
+        let result = dri.revoke("agent-overflow", "test reason", &revoker, "");
+        assert_eq!(result.unwrap_err(), DRIError::AtCapacity);
+        assert!(
+            !dri.is_revoked("agent-overflow", ""),
+            "a record rejected with AtCapacity must never be reported as revoked"
+        );
+    }
+
+    /// CRIT-6: capacity is checked against the sum of both maps, but eviction
+    /// must target whichever map is actually the larger one — not
+    /// unconditionally `revoked_agents`.
+    #[test]
+    fn crit6_eviction_targets_larger_map_not_always_agents() {
+        let dri = DistributedRevocationInfrastructure::new();
+        let stale_ts = now_f64() - (REVOCATION_RETENTION_DAYS + 1.0) * 86_400.0;
+
+        const SMALL_MAP_SIZE: usize = 100;
+        let large_map_size = DRI_MAX_RECORDS - SMALL_MAP_SIZE;
+
+        {
+            let mut agents = dri.revoked_agents.lock().unwrap();
+            for i in 0..SMALL_MAP_SIZE {
+                let id = format!("small-agent-{i}");
+                agents.insert(id.clone(), synthetic_record(&id, "routine cleanup", stale_ts));
+            }
+        }
+        {
+            let mut creds = dri.revoked_credentials.lock().unwrap();
+            for i in 0..large_map_size {
+                let fp = format!("stale-cred-{i}");
+                creds.insert(fp.clone(), synthetic_record(&fp, "routine cleanup", stale_ts));
+            }
+        }
+        assert_eq!(
+            dri.revoked_agents.lock().unwrap().len() + dri.revoked_credentials.lock().unwrap().len(),
+            DRI_MAX_RECORDS
+        );
+
+        // New record targets `revoked_agents` (empty credential_fingerprint),
+        // but eviction must come from `revoked_credentials` because it is
+        // the larger of the two maps.
+        let result = dri.store_record(synthetic_record("new-agent", "test reason", now_f64()));
+        assert!(result.is_ok());
+
+        let agents_len = dri.revoked_agents.lock().unwrap().len();
+        let creds_len = dri.revoked_credentials.lock().unwrap().len();
+
+        assert_eq!(
+            agents_len,
+            SMALL_MAP_SIZE + 1,
+            "CRIT-6: the smaller map must be untouched by eviction (only gains the new record)"
+        );
+        assert_eq!(
+            creds_len,
+            large_map_size - DRI_EVICT_BATCH,
+            "CRIT-6: eviction must target the larger map (revoked_credentials), not revoked_agents"
+        );
+    }
+
+    /// `SignedRevocationRecord::is_high_severity` matches known critical
+    /// markers case-insensitively and does not false-positive on ordinary
+    /// reasons.
+    #[test]
+    fn signed_revocation_record_high_severity_classification() {
+        let r = |reason: &str| synthetic_record("a", reason, now_f64());
+        assert!(r("Agent COMPROMISED").is_high_severity());
+        assert!(r("collusion_detected").is_high_severity());
+        assert!(r("security-incident-42").is_high_severity());
+        assert!(r("flagged as malicious").is_high_severity());
+        assert!(!r("test reason").is_high_severity());
+        assert!(!r("routine credential rotation").is_high_severity());
+    }
+
+    /// `SignedRevocationRecord::age_days` reflects elapsed time and never
+    /// goes negative for a future timestamp (clock skew).
+    #[test]
+    fn signed_revocation_record_age_days() {
+        let now = now_f64();
+        let day_old = synthetic_record("a", "x", now - 86_400.0);
+        assert!((day_old.age_days() - 1.0).abs() < 0.01);
+
+        let future = synthetic_record("a", "x", now + 3600.0);
+        assert_eq!(future.age_days(), 0.0, "future timestamps must clamp to age 0, not negative");
+    }
+
+    // ── IdentityProver::used_challenges bounded growth (H-28) ──────────────────
+
+    /// A flood of distinct, never-legitimate challenges (garbage proof bytes,
+    /// so signature verification always fails) must still be capped — the
+    /// challenge is recorded before signature verification runs, so age-based
+    /// eviction alone doesn't bound memory if challenges arrive faster than
+    /// `IDENTITY_PROOF_TTL` ages them out.
+    #[test]
+    fn h28_used_challenges_capacity_is_bounded_under_flood() {
+        let (_issuer_identity, cred, _anchor) = make_issuer("h28-flood");
+        let prover = IdentityProver::new();
+        let timestamp = now_f64();
+        let bogus_proof = vec![0u8; 64];
+
+        for _ in 0..(IDENTITY_PROVER_MAX_CHALLENGES + 500) {
+            let challenge = IdentityProver::generate_challenge();
+            let _ = prover.verify_proof(&bogus_proof, &cred, &challenge, timestamp, MAX_CLOCK_SKEW);
+        }
+
+        assert!(
+            prover.tracked_challenge_count() <= IDENTITY_PROVER_MAX_CHALLENGES,
+            "used_challenges must not grow past IDENTITY_PROVER_MAX_CHALLENGES under sustained flooding"
+        );
+    }
+
+    /// `sweep_expired_challenges` reclaims memory independent of `verify_proof`
+    /// traffic — a background maintenance task can call it on a timer even
+    /// when no proofs are being verified.
+    #[test]
+    fn h28_sweep_expired_challenges_independent_of_verify_proof() {
+        let (_issuer_identity, cred, _anchor) = make_issuer("h28-sweep");
+        let prover = IdentityProver::new();
+        // A timestamp far enough in the past that, combined with a
+        // synthetically old challenge expiry, the sweep has something to
+        // reclaim. We can't rewind wall-clock time, so instead we verify the
+        // sweep API is callable standalone and returns a count without
+        // requiring a `verify_proof` call in between — the actual
+        // expiry-based removal logic is already covered by the existing
+        // `evict_expired_challenges` behavior exercised inside `verify_proof`.
+        assert_eq!(prover.sweep_expired_challenges(), 0, "nothing tracked yet, nothing to sweep");
+
+        let challenge = IdentityProver::generate_challenge();
+        let bogus_proof = vec![0u8; 64];
+        let _ = prover.verify_proof(&bogus_proof, &cred, &challenge, now_f64(), MAX_CLOCK_SKEW);
+        assert_eq!(prover.tracked_challenge_count(), 1);
+
+        // Not yet expired — sweep must not remove live entries.
+        assert_eq!(prover.sweep_expired_challenges(), 0);
+        assert_eq!(prover.tracked_challenge_count(), 1);
     }
 }

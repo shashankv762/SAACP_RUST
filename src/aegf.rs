@@ -504,6 +504,21 @@ struct DEGNode {
     children: HashSet<String>,
 }
 
+/// Combined DEG state. `nodes` and `path_counts` are always read/written
+/// together by every non-trivial DEG operation, so they are protected by a
+/// single `Mutex` rather than two separately-locked fields (H-16). Two
+/// independently-locked maps require callers to acquire both in a
+/// consistent order to avoid deadlock, and create a TOCTOU window between
+/// the two acquisitions unless every call site is audited to hold both
+/// locks continuously across check-then-act sequences (see the CRIT-7 fix
+/// below, which had to hand-inline that invariant). A single lock makes
+/// that invariant structural instead of a convention every future edit
+/// must remember to preserve.
+struct DegState {
+    nodes: HashMap<String, DEGNode>,
+    path_counts: HashMap<(String, String), u32>,
+}
+
 /// Directed graph of active agent interactions.
 ///
 /// Invariants (checked before processing every request):
@@ -513,22 +528,23 @@ struct DEGNode {
 /// 4. No repeated unresolved (parent_oaid, child_oaid) path beyond threshold
 /// 5. TTL not expired
 pub struct DistributedExecutionGraph {
-    nodes: Mutex<HashMap<String, DEGNode>>,
-    path_counts: Mutex<HashMap<(String, String), u32>>,
+    state: Mutex<DegState>,
 }
 
 impl DistributedExecutionGraph {
     pub fn new() -> Self {
         Self {
-            nodes: Mutex::new(HashMap::new()),
-            path_counts: Mutex::new(HashMap::new()),
+            state: Mutex::new(DegState {
+                nodes: HashMap::new(),
+                path_counts: HashMap::new(),
+            }),
         }
     }
 
     /// Register a new request in the graph (does NOT validate).
     pub fn add_node(&self, meta: &AEGFMetadata) {
-        let mut nodes = self.nodes.lock().unwrap();
-        let mut path_counts = self.path_counts.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let DegState { nodes, path_counts } = &mut *guard;
         let rid = meta.rid.clone();
         let prid = meta.prid.clone();
 
@@ -557,8 +573,8 @@ impl DistributedExecutionGraph {
 
     /// Remove a request from the graph.
     pub fn remove_request(&self, rid: &str) {
-        let mut nodes = self.nodes.lock().unwrap();
-        let mut path_counts = self.path_counts.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let DegState { nodes, path_counts } = &mut *guard;
         if let Some(node) = nodes.remove(rid) {
             if node.prid != RID_ROOT {
                 if let Some(parent) = nodes.get_mut(&node.prid) {
@@ -576,7 +592,8 @@ impl DistributedExecutionGraph {
 
     /// Return ancestor RIDs from root to the given node.
     pub fn get_ancestors(&self, rid: &str) -> Vec<String> {
-        let nodes = self.nodes.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let nodes = &guard.nodes;
         let mut ancestors = Vec::new();
         let mut current = rid.to_string();
         let mut visited = HashSet::new();
@@ -593,13 +610,13 @@ impl DistributedExecutionGraph {
 
     /// Current node count.
     pub fn node_count(&self) -> usize {
-        self.nodes.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).nodes.len()
     }
 
     /// Return true if `rid` has a cycle in its ancestor chain (DFS).
     pub fn detect_cycle(&self, rid: &str) -> bool {
-        let nodes = self.nodes.lock().unwrap();
-        Self::has_cycle_inner(&nodes, rid)
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::has_cycle_inner(&guard.nodes, rid)
     }
 
     fn has_cycle_inner(nodes: &HashMap<String, DEGNode>, start: &str) -> bool {
@@ -639,13 +656,13 @@ impl DistributedExecutionGraph {
         if meta.prid == RID_ROOT {
             return false;
         }
-        let nodes = self.nodes.lock().unwrap();
-        let path_counts = self.path_counts.lock().unwrap();
-        let parent_oaid = match nodes.get(&meta.prid) {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let parent_oaid = match guard.nodes.get(&meta.prid) {
             Some(p) => p.meta.oaid.clone(),
             None => return false,
         };
-        let count = path_counts
+        let count = guard
+            .path_counts
             .get(&(parent_oaid, meta.oaid.clone()))
             .copied()
             .unwrap_or(0);
@@ -669,8 +686,8 @@ impl DistributedExecutionGraph {
         // 0. Graph node cap — cheap early-exit pre-check (not authoritative;
         // see the re-check below held under the same lock as the insert).
         {
-            let nodes = self.nodes.lock().unwrap();
-            if nodes.len() >= policy.max_graph_nodes as usize {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.nodes.len() >= policy.max_graph_nodes as usize {
                 return GovernanceDecision::Pause;
             }
         }
@@ -690,16 +707,32 @@ impl DistributedExecutionGraph {
             return GovernanceDecision::Pause;
         }
 
-        // 4. Repeated path
-        if self.detect_repeated_path(meta) {
-            return GovernanceDecision::Review;
-        }
-
-        // 5. Cycle detection — add node, check, remove if cycle
-        let mut nodes = self.nodes.lock().unwrap();
+        // 4 & 5. Repeated-path check, cap re-check, and insert all happen
+        // under ONE continuous hold of the combined state lock below.
+        //
+        // SECURITY FIX (CRIT-7): previously `detect_repeated_path` acquired
+        // and released `nodes`/`path_counts` on its own, then this function
+        // re-acquired both locks separately to perform the insert. Between
+        // the release and the re-acquisition, concurrent callers sharing the
+        // same (parent_oaid, child_oaid) pair could all observe a count below
+        // `REPEATED_PATH_THRESHOLD`, all pass, and all insert — bypassing the
+        // repeated-path governance control under load. The check is now
+        // inlined here, using the same lock guard held for the insert, so
+        // there is no window between "check" and "act".
+        //
+        // SECURITY FIX (H-16): `nodes` and `path_counts` used to be two
+        // separately-locked `Mutex` fields, acquired in sequence here. That
+        // required every call site combining both to acquire them in a
+        // fixed order to avoid deadlock, and offered no compiler-enforced
+        // guarantee that a future edit wouldn't reorder them or acquire one
+        // without the other mid-critical-section. They are now one
+        // `Mutex<DegState>`, acquired once, so the ordering invariant is
+        // structural rather than a convention to remember.
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let DegState { nodes, path_counts } = &mut *guard;
 
         // SECURITY FIX (FINDING-7): the step-0 cap check above releases the
-        // `nodes` lock before this point, so concurrent callers can all pass
+        // state lock before this point, so concurrent callers can all pass
         // it and then all insert, exceeding `max_graph_nodes` by up to
         // (thread count - 1). Re-check the cap here, atomically with the
         // insert, under the single lock acquisition that performs it.
@@ -707,7 +740,17 @@ impl DistributedExecutionGraph {
             return GovernanceDecision::Pause;
         }
 
-        let mut path_counts = self.path_counts.lock().unwrap();
+        if meta.prid != RID_ROOT {
+            if let Some(parent) = nodes.get(&meta.prid) {
+                let count = path_counts
+                    .get(&(parent.meta.oaid.clone(), meta.oaid.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                if count >= REPEATED_PATH_THRESHOLD {
+                    return GovernanceDecision::Review;
+                }
+            }
+        }
 
         let rid = meta.rid.clone();
         let prid = meta.prid.clone();
@@ -727,7 +770,7 @@ impl DistributedExecutionGraph {
             }
         }
 
-        let has_cycle = Self::has_cycle_inner(&nodes, &rid);
+        let has_cycle = Self::has_cycle_inner(nodes, &rid);
         if has_cycle {
             nodes.remove(&rid);
             if prid != RID_ROOT {
@@ -754,8 +797,8 @@ impl DistributedExecutionGraph {
     /// Remove all nodes whose TTL has passed. Returns eviction count.
     pub fn evict_expired(&self) -> usize {
         let now = now_epoch_f64();
-        let mut nodes = self.nodes.lock().unwrap();
-        let mut path_counts = self.path_counts.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let DegState { nodes, path_counts } = &mut *guard;
         let expired: Vec<String> = nodes
             .iter()
             .filter(|(_, node)| node.meta.ttl < now)

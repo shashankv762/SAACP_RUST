@@ -45,12 +45,14 @@ export function AlertFeed() {
             {a.gate}
           </span>
           <div style={{ flex: 1, minWidth: 0 }}>
-            {/* Plain text node only — never dangerouslySetInnerHTML. `message` and
-                `bytecode` can carry attacker-influenced content (this is exactly what
-                Gate 4.0 flagged), so React's default escaping is the mitigation. */}
-            <div style={{ fontSize: 13, color: "var(--text-primary)" }}>{a.message}</div>
+            {/* Plain text node only — never dangerouslySetInnerHTML. `bytecode`
+                can carry attacker-influenced content (this is exactly what
+                Gate 4.0 flagged), so React's default escaping is the mitigation.
+                No internal diagnostic message is sent by the backend (CRIT-10):
+                the feed only ever carries the gate name + bytecode classifier. */}
+            <div style={{ fontSize: 13, color: "var(--text-primary)" }}>{a.bytecode}</div>
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-              {a.agent_id} · {a.bytecode}
+              {a.agent_id}
             </div>
           </div>
           <span className="tabular" style={{ fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>

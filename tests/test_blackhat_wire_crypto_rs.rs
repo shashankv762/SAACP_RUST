@@ -271,7 +271,7 @@ fn blackhat_1h_psk_recovery_destroys_sessions_fires_callback() {
     let f2    = fired.clone();
     let r = PSKCompromiseRecovery::new(
         mgr.clone(),
-        Some(Box::new(move || { f2.fetch_add(1, Ordering::SeqCst); })),
+        Some(Box::new(move || { f2.fetch_add(1, Ordering::SeqCst); Ok(()) })),
     ).execute(None);
 
     assert_eq!(r.sessions_destroyed, 2, "Both sessions must be destroyed");

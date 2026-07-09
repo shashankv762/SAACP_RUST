@@ -13,6 +13,7 @@
 //! Python parity: matches the MPF threat-model section in README §3 and the
 //! cover-traffic budget tracking in gateway.py `AgentRateLimiter`.
 
+use rand::Rng;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -285,9 +286,6 @@ pub struct TimingObfuscator {
     total_delay_ms: u64,
     /// Total packets processed.
     packets_processed: u64,
-    /// Simple LCG state for deterministic pseudo-random jitter
-    /// (avoids pulling in rand crate dependency).
-    lcg_state: u64,
 }
 
 impl TimingObfuscator {
@@ -298,7 +296,6 @@ impl TimingObfuscator {
             min_jitter_ms: MPF_TIMING_JITTER_MIN_MS,
             total_delay_ms: 0,
             packets_processed: 0,
-            lcg_state: 6364136223846793005,
         }
     }
 
@@ -310,28 +307,19 @@ impl TimingObfuscator {
             min_jitter_ms: min_ms,
             total_delay_ms: 0,
             packets_processed: 0,
-            lcg_state: 6364136223846793005,
         }
-    }
-
-    /// Advance the internal LCG and return the next pseudo-random u64.
-    fn next_rand(&mut self) -> u64 {
-        // Knuth's multiplicative LCG (modulus 2^64)
-        self.lcg_state = self
-            .lcg_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.lcg_state
     }
 
     /// Compute a jitter delay in milliseconds for the next packet.
     ///
-    /// The delay is in `[min_jitter_ms, max_jitter_ms]`.
+    /// The delay is in `[min_jitter_ms, max_jitter_ms]`, drawn from the OS
+    /// CSPRNG via `rand::thread_rng()` so outbound timing is unpredictable
+    /// to a passive observer (a fixed-seed PRNG would leak the entire
+    /// jitter sequence to anyone who knows the algorithm).
     /// Callers should apply `tokio::time::sleep(Duration::from_millis(jitter))`
     /// or equivalent before sending the packet.
     pub fn jitter_ms(&mut self) -> u64 {
-        let range = self.max_jitter_ms.saturating_sub(self.min_jitter_ms) + 1;
-        let jitter = self.min_jitter_ms + (self.next_rand() % range);
+        let jitter = rand::thread_rng().gen_range(self.min_jitter_ms..=self.max_jitter_ms);
         self.total_delay_ms += jitter;
         self.packets_processed += 1;
         jitter
@@ -558,12 +546,18 @@ mod tests {
     }
 
     #[test]
-    fn test_jitter_deterministic_sequence() {
-        // Two instances with the same seed produce the same sequence
+    fn test_jitter_is_unpredictable_and_bounded() {
+        // H-31: jitter must NOT be reproducible from a fixed seed (that was the
+        // vulnerability — zero-entropy timing obfuscation is no obfuscation at
+        // all). Two independent instances must diverge, while every value
+        // stays within the documented [min, max] bound.
         let mut a = TimingObfuscator::new();
         let mut b = TimingObfuscator::new();
-        for _ in 0..10 {
-            assert_eq!(a.jitter_ms(), b.jitter_ms());
+        let seq_a: Vec<u64> = (0..20).map(|_| a.jitter_ms()).collect();
+        let seq_b: Vec<u64> = (0..20).map(|_| b.jitter_ms()).collect();
+        assert_ne!(seq_a, seq_b, "jitter sequences must not be deterministic across instances");
+        for &j in seq_a.iter().chain(seq_b.iter()) {
+            assert!(j >= MPF_TIMING_JITTER_MIN_MS && j <= MPF_TIMING_JITTER_MS);
         }
     }
 

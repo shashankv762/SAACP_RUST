@@ -78,6 +78,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -120,6 +121,47 @@ fn now_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Derive the map key used to track behavioral trust for an agent on a given
+/// wire session (S-2 hardening).
+///
+/// Prefers the SHA-256 fingerprint of the agent's Ed25519 public key over the
+/// bare, self-claimed `agent_id` string a capability token's `iss` claim
+/// asserts. The public key comes from a `TranscriptBoundSession`
+/// (`identity_binding.rs`'s C-3 subsystem) registered for `session_id_hex` —
+/// proven via ECDH possession, an `AgentIdentityCertificate`, and a
+/// proof-of-possession signature at handshake time, not a bearer claim.
+///
+/// Rationale: without this, an attacker who can mint or replay capability
+/// tokens for more than one `iss` value can "launder" an accumulated trust
+/// penalty by presenting a fresh, never-before-seen `agent_id` on its very
+/// next packet — instantly resetting back to `TRUST_SCORE_INITIAL` and
+/// defeating the entire point of a continuous behavioral signal (this is
+/// exactly the gap `daemon.rs`'s separate IP-keyed `requires_reauth` check
+/// was already working around at the connection level; this closes the same
+/// gap per-packet, at the source, for every gate violation tracked in this
+/// module). A cryptographic keypair cannot be rotated for free the way a
+/// self-chosen string can — doing so requires a genuinely different,
+/// CA-certified identity.
+///
+/// Falls back to a namespaced `agent_id`-keyed entry — preserving prior
+/// behavior exactly — when this connection did not opt into identity binding
+/// (`SAACPNetworkDaemon::with_identity_binding`), i.e. no
+/// `TranscriptBoundSession` is registered for `session_id_hex`. The `pk:`/
+/// `aid:` namespaces can never collide with each other or with the
+/// pre-existing `ip:`-prefixed keys `daemon.rs` writes into this same map.
+pub fn trust_key_for(agent_id: &str, session_id_hex: &str) -> String {
+    let fingerprint = crate::identity_binding::DEFAULT_IDENTITY_REGISTRY
+        .get_by_session_id(session_id_hex, |session| session.client_public_key_hex.clone())
+        .filter(|pk_hex| !pk_hex.is_empty())
+        .and_then(|pk_hex| hex::decode(&pk_hex).ok())
+        .map(|pk_bytes| hex::encode(Sha256::digest(&pk_bytes)));
+
+    match fingerprint {
+        Some(fp) => format!("pk:{fp}"),
+        None => format!("aid:{agent_id}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,8 +313,8 @@ impl TrustDecayEngine {
         //      having been tracked.
         //   2. If still over cap (e.g. many distinct agents each penalized
         //      exactly once and never touched again — recovery alone can't
-        //      reclaim those), fall back to oldest-touched-first eviction,
-        //      mirroring `streaming::StreamRegistry`'s eviction strategy.
+        //      reclaim those), evict from the *unlocked* remainder only,
+        //      closest-to-`TRUST_SCORE_INITIAL` first (H-24).
         if entries.len() >= TRUST_MAX_ENTRIES && !entries.contains_key(agent_id) {
             for e in entries.values_mut() {
                 e.recover_to(now);
@@ -281,11 +323,22 @@ impl TrustDecayEngine {
 
             if entries.len() >= TRUST_MAX_ENTRIES {
                 let evict_count = entries.len() + 1 - TRUST_MAX_ENTRIES;
-                let mut by_age: Vec<(String, f64)> = entries.iter()
-                    .map(|(k, v)| (k.clone(), v.last_update))
+                // H-24: a reauth-locked entry is precisely the record an
+                // attacker wants purged — flooding the map with fresh
+                // agent_ids to force this sweep must never be able to evict
+                // one, even if that means the map temporarily stays over
+                // TRUST_MAX_ENTRIES until enough locks clear naturally.
+                // Among the unlocked remainder, entries whose score sits
+                // closest to TRUST_SCORE_INITIAL carry the least signal
+                // (nearly/fully recovered, no active penalty) and are
+                // safest to forget first — evict those before anything with
+                // a lower, more diagnostic score.
+                let mut candidates: Vec<(String, f64)> = entries.iter()
+                    .filter(|(_, e)| e.locked_at.is_none())
+                    .map(|(k, e)| (k.clone(), e.score))
                     .collect();
-                by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (k, _) in by_age.into_iter().take(evict_count) {
+                candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (k, _) in candidates.into_iter().take(evict_count) {
                     entries.remove(&k);
                 }
             }
@@ -417,9 +470,31 @@ pub const DRIFT_MAX_TRACKED_SESSIONS: usize = 50_000;
 /// compounding into something the root task never asked for."
 pub const CHAIN_DRIFT_CEILING: f64 = 2.0;
 
+/// (H-30) Decay rate applied lazily to a session's cumulative drift total,
+/// based on elapsed wall-clock seconds since that session's last hop.
+/// Mirrors `TrustEntry::recover_to`'s lazy-decay idiom: no background sweep,
+/// folded in on next read/write. Defined relative to `CHAIN_DRIFT_CEILING` so
+/// it stays self-documenting if the ceiling is retuned — a session sitting
+/// exactly at the ceiling decays back to 0.0 after 10 minutes of total
+/// inactivity. Without this, `total` only ever grew, so a long-lived,
+/// otherwise well-behaved session would eventually and permanently trip the
+/// ceiling from distant history alone.
+pub const DRIFT_DECAY_PER_SECOND: f64 = CHAIN_DRIFT_CEILING / 600.0;
+
 struct DriftEntry {
     total: f64,
     last_update: f64,
+}
+
+impl DriftEntry {
+    /// Apply lazy time-based decay up to `now`, in place.
+    fn decay_to(&mut self, now: f64) {
+        let elapsed = (now - self.last_update).max(0.0);
+        if elapsed > 0.0 {
+            self.total = (self.total - elapsed * DRIFT_DECAY_PER_SECOND).max(0.0);
+        }
+        self.last_update = now;
+    }
 }
 
 /// Per-session running total of Gate 1.5 intent divergence, used to enforce
@@ -465,8 +540,13 @@ impl IntentDriftTracker {
 
         let entry = sessions.entry(session_uuid.to_string())
             .or_insert(DriftEntry { total: 0.0, last_update: now });
+        // (H-30) Decay before accumulating so a burst of hops in quick
+        // succession — the pattern this ceiling actually defends against —
+        // still accumulates fully (elapsed ~= 0 between hops), while a
+        // session that goes quiet for minutes isn't penalized by stale
+        // history when it resumes.
+        entry.decay_to(now);
         entry.total += divergence;
-        entry.last_update = now;
         entry.total
     }
 
@@ -658,13 +738,123 @@ mod tests {
         // Simulate the worst case for eviction: many distinct agents, each
         // penalized exactly once and never touched again, with essentially no
         // elapsed wall-clock time between them — so lazy time-based recovery
-        // cannot reclaim any of them and the oldest-touched-first fallback
-        // eviction (mirroring `streaming::StreamRegistry`) must be what bounds
-        // the map instead.
+        // cannot reclaim any of them and the closest-to-`TRUST_SCORE_INITIAL`
+        // fallback eviction (H-24) must be what bounds the map instead.
         for i in 0..(TRUST_MAX_ENTRIES + 500) {
             e.penalize(&format!("bounded-agent-{i}"), PenaltyKind::GenericHardDrop);
         }
         assert!(e.tracked_count() <= TRUST_MAX_ENTRIES, "map must not grow unbounded past its cap");
+    }
+
+    #[test]
+    fn h24_locked_entry_survives_eviction_flood() {
+        // A single agent is penalized hard enough to trip `requires_reauth`
+        // (score < TRUST_REAUTH_THRESHOLD), locking it. An attacker then
+        // floods the map with fresh agent_ids past TRUST_MAX_ENTRIES, trying
+        // to force the locked entry out via the cap-eviction sweep. Before
+        // the H-24 fix this succeeded whenever the locked entry happened to
+        // have the oldest `last_update` timestamp among all tracked agents —
+        // silently un-suspecting a compromised identity. It must not happen
+        // now, regardless of timestamp ordering.
+        let e = TrustDecayEngine::new();
+        let victim = "victim-agent";
+        // Three penalties of 0.40 (ReplaySuspicion) drop the victim well
+        // below TRUST_REAUTH_THRESHOLD (0.25) and below TRUST_DOWNGRADE_
+        // THRESHOLD too, locking it via `locked_at`.
+        e.penalize(victim, PenaltyKind::ReplaySuspicion);
+        e.penalize(victim, PenaltyKind::ReplaySuspicion);
+        e.penalize(victim, PenaltyKind::ReplaySuspicion);
+        assert!(e.requires_reauth(victim), "victim must be reauth-locked before the flood");
+
+        // Flood with enough distinct, freshly-penalized (near-full-trust)
+        // agents to blow well past the cap and force repeated eviction
+        // sweeps.
+        for i in 0..(TRUST_MAX_ENTRIES + 2_000) {
+            e.penalize(&format!("flood-agent-{i}"), PenaltyKind::GenericHardDrop);
+        }
+
+        assert!(
+            e.requires_reauth(victim),
+            "a locked (reauth-required) entry must never be evicted by the capacity sweep, \
+             even under sustained flooding past TRUST_MAX_ENTRIES"
+        );
+    }
+
+    // ── trust_key_for (S-2 fingerprint-keyed trust) ─────────────────────────
+
+    #[test]
+    fn trust_key_for_falls_back_to_agent_id_when_not_identity_bound() {
+        // No TranscriptBoundSession registered for this session_id — must fall
+        // back to the namespaced agent_id key, preserving prior behavior.
+        let key = trust_key_for("agent-plain", "no-such-session-id-hex");
+        assert_eq!(key, "aid:agent-plain");
+    }
+
+    #[test]
+    fn trust_key_for_uses_public_key_fingerprint_when_identity_bound() {
+        use crate::identity_binding::{TranscriptBoundSession, DEFAULT_IDENTITY_REGISTRY};
+
+        // Unique, test-local session_id so this can't collide with any other
+        // test's use of the process-wide DEFAULT_IDENTITY_REGISTRY singleton.
+        let sid = vec![0xE5; 16];
+        let client_pk_hex = "aa".repeat(32);
+        let session = TranscriptBoundSession::establish(
+            sid, "agent-claim-1", "server-x",
+            &client_pk_hex, &"bb".repeat(32),
+            &"cc".repeat(16), &"dd".repeat(16),
+            "v1", "cs1", None,
+        );
+        let session_id_hex = session.session_id_hex();
+        DEFAULT_IDENTITY_REGISTRY.register(session);
+
+        let key1 = trust_key_for("agent-claim-1", &session_id_hex);
+        // The whole point of the fix: a different self-claimed agent_id on the
+        // SAME identity-bound session resolves to the SAME trust key, because
+        // it's derived from the proven public key, not the bearer claim.
+        let key2 = trust_key_for("agent-claim-2-rotated", &session_id_hex);
+
+        DEFAULT_IDENTITY_REGISTRY.remove(&DEFAULT_IDENTITY_REGISTRY
+            .get_by_session_id(&session_id_hex, |s| s.thash.clone())
+            .unwrap());
+
+        assert!(key1.starts_with("pk:"), "expected a pk: fingerprint key, got {key1}");
+        assert_eq!(key1, key2, "rotating the claimed agent_id on a fixed identity-bound \
+            session must not change the trust key");
+        assert_ne!(key1, "aid:agent-claim-1");
+    }
+
+    #[test]
+    fn trust_key_for_differs_across_distinct_public_keys() {
+        use crate::identity_binding::{TranscriptBoundSession, DEFAULT_IDENTITY_REGISTRY};
+
+        let sid_a = vec![0xE6; 16];
+        let session_a = TranscriptBoundSession::establish(
+            sid_a, "agent-a", "server-x",
+            &"11".repeat(32), &"bb".repeat(32),
+            &"cc".repeat(16), &"dd".repeat(16),
+            "v1", "cs1", None,
+        );
+        let sid_b = vec![0xE7; 16];
+        let session_b = TranscriptBoundSession::establish(
+            sid_b, "agent-b", "server-x",
+            &"22".repeat(32), &"bb".repeat(32),
+            &"cc".repeat(16), &"dd".repeat(16),
+            "v1", "cs1", None,
+        );
+        let sid_hex_a = session_a.session_id_hex();
+        let sid_hex_b = session_b.session_id_hex();
+        let thash_a = session_a.thash.clone();
+        let thash_b = session_b.thash.clone();
+        DEFAULT_IDENTITY_REGISTRY.register(session_a);
+        DEFAULT_IDENTITY_REGISTRY.register(session_b);
+
+        let key_a = trust_key_for("agent-a", &sid_hex_a);
+        let key_b = trust_key_for("agent-b", &sid_hex_b);
+
+        DEFAULT_IDENTITY_REGISTRY.remove(&thash_a);
+        DEFAULT_IDENTITY_REGISTRY.remove(&thash_b);
+
+        assert_ne!(key_a, key_b, "distinct public keys must produce distinct trust keys");
     }
 
     // ── IntentDriftTracker ───────────────────────────────────────────────────
@@ -674,8 +864,13 @@ mod tests {
         let t = IntentDriftTracker::new();
         let total1 = t.accumulate("session-a", 0.3);
         assert!((total1 - 0.3).abs() < 1e-9);
+        // (H-30) `total` now decays lazily by real elapsed wall-clock time
+        // between calls, so the second call's result is `0.8` minus however
+        // many microseconds actually passed between these two statements —
+        // negligible (< 1e-4 even under heavy CI scheduling jitter) but no
+        // longer exactly zero, unlike before decay was introduced.
         let total2 = t.accumulate("session-a", 0.5);
-        assert!((total2 - 0.8).abs() < 1e-9);
+        assert!((total2 - 0.8).abs() < 1e-4, "unexpected drift beyond decay tolerance: total2={total2}");
     }
 
     #[test]
@@ -702,5 +897,53 @@ mod tests {
             t.accumulate(&format!("session-{i}"), 0.1);
         }
         assert!(t.tracked_count() <= DRIFT_MAX_TRACKED_SESSIONS, "session map must not grow unbounded past its cap");
+    }
+
+    #[test]
+    fn h30_intent_drift_total_decays_over_elapsed_time() {
+        let t = IntentDriftTracker::new();
+        let total1 = t.accumulate("session-decay", 1.0);
+        assert!((total1 - 1.0).abs() < 1e-9);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Accumulating zero additional divergence after a real delay must
+        // still show the existing total has decayed — proves `total` is no
+        // longer purely monotonic (the bug H-30 fixes).
+        let total2 = t.accumulate("session-decay", 0.0);
+        assert!(
+            total2 < total1,
+            "cumulative drift must decay over elapsed time (H-30): total1={total1} total2={total2}"
+        );
+        // Sanity bound: 150ms of decay at DRIFT_DECAY_PER_SECOND should be a
+        // small fraction of the total, not a cliff — confirms the *rate*, not
+        // just the direction, is sane.
+        let expected_decay = 0.150 * DRIFT_DECAY_PER_SECOND;
+        assert!(
+            (total1 - total2) < expected_decay * 3.0,
+            "decay over 150ms was implausibly large: total1={total1} total2={total2}"
+        );
+    }
+
+    #[test]
+    fn h30_drift_decay_rate_fully_clears_ceiling_within_documented_window() {
+        // DRIFT_DECAY_PER_SECOND is defined as CHAIN_DRIFT_CEILING / 600.0 —
+        // a session sitting exactly at the ceiling must decay to zero after
+        // 600s of total inactivity. Assert the relationship holds so a future
+        // edit to either constant can't silently break that invariant.
+        assert!(
+            (DRIFT_DECAY_PER_SECOND * 600.0 - CHAIN_DRIFT_CEILING).abs() < 1e-9,
+            "DRIFT_DECAY_PER_SECOND must fully decay CHAIN_DRIFT_CEILING within 600s"
+        );
+    }
+
+    #[test]
+    fn h30_quiet_session_after_reset_does_not_inherit_stale_drift() {
+        let t = IntentDriftTracker::new();
+        t.accumulate("session-quiet", CHAIN_DRIFT_CEILING - 0.1);
+        t.reset(Some("session-quiet"));
+        let total = t.accumulate("session-quiet", 0.05);
+        assert!(
+            total < CHAIN_DRIFT_CEILING,
+            "a reset session must not spuriously trip the ceiling from prior history"
+        );
     }
 }

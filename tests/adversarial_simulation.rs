@@ -526,7 +526,7 @@ fn attack_2_6_rrbc_replay_attack() -> AttackResult {
     let rbc = RRBCGateway::new();
     let token = rbc.issue_token(
         SECRET_KEY, "orchestrator", &["executor"], &[], &["read"],
-        &["executor"], "sid-1", "cid-1", "executor", 1, 3600, 0x00,
+        &["executor"], "sid-1", "cid-1", "executor", 1, 3600, 0x00, None,
     );
     // First redemption — valid
     let r1 = rbc.redeem_token(&token, "nonce-abc", "executor",
@@ -569,7 +569,7 @@ fn attack_2_7_rrbc_usage_exhaustion_then_replay() -> AttackResult {
     // Issue single-use token
     let token = rbc.issue_token(
         SECRET_KEY, "orchestrator", &["executor"], &[], &["read"],
-        &["executor"], "sid-2", "cid-2", "executor", 1, 3600, 0x00,
+        &["executor"], "sid-2", "cid-2", "executor", 1, 3600, 0x00, None,
     );
     let _ = rbc.redeem_token(&token, "nonce-1", "executor", "sid-2", "cid-2", "executor", SECRET_KEY);
     // Attempt second use with different nonce — usage exhausted
@@ -1517,7 +1517,7 @@ fn attack_recovery_psk_compromise() -> AttackResult {
     // Execute 8-step PSK compromise recovery
     let recovery = PSKCompromiseRecovery::new(
         Arc::clone(&mgr),
-        Some(Box::new(move || { gw_ref.store(true, std::sync::atomic::Ordering::SeqCst); })),
+        Some(Box::new(move || { gw_ref.store(true, std::sync::atomic::Ordering::SeqCst); Ok(()) })),
     );
     let report = recovery.execute(Some(99));
     let lat = t0.elapsed();

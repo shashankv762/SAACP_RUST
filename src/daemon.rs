@@ -4,12 +4,13 @@
 //! Async TCP server using Tokio. One task spawned per accepted connection.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use hkdf::Hkdf;
@@ -19,7 +20,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::handler::{ParsedPacket, SAACPProtocolHandler};
 use crate::measc::SessionEpochManager;
-use crate::pecf::{internal_to_external_raw, SREL};
+use crate::pecf::{generate_correlation_id, internal_to_external_raw, SREL};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -29,8 +30,26 @@ pub const MAX_ASSEMBLY_TIME: f64 = 30.0;
 /// Maximum seconds to complete the ECDH handshake before DDoS-dropping.
 pub const HANDSHAKE_TIMEOUT_SECS: f64 = 0.1;
 
+/// Maximum seconds to complete a C-3 identity-bound ECDH handshake (`with_identity_binding`)
+/// before DDoS-dropping. Larger than `HANDSHAKE_TIMEOUT_SECS` because this mode does
+/// genuinely more work on the same wire round-trip — reading a variable-length certificate,
+/// an Ed25519 CA-signature verification, and an Ed25519 proof-of-possession verification,
+/// versus the plain mode's single fixed-size read. Still tight enough to bound the
+/// resource cost of a slow-loris connection attempt to a small multiple of the plain mode.
+pub const IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS: f64 = 0.5;
+
 /// Maximum distinct IP addresses tracked by the circuit breaker.
 pub const MAX_CIRCUIT_BREAKER_IPS: usize = 10_000;
+
+/// CRIT-9 fix: maximum concurrent connections accepted across the whole listener.
+/// Without this, `tokio::spawn` is called for every accepted connection with no bound,
+/// and each connection can be forced (via a crafted header claiming a large payload) to
+/// hold up to `MAX_PAYLOAD_SIZE` (10MB) — ~1,000 slow-feed connections exhausts 10GB.
+pub const MAX_CONNECTIONS: usize = 10_000;
+
+/// CRIT-9 fix: maximum concurrent connections accepted from a single source IP.
+/// Bounds a single attacker from consuming the entire `MAX_CONNECTIONS` budget alone.
+pub const MAX_CONNECTIONS_PER_IP: usize = 100;
 
 /// Number of consecutive errors before an IP is locked out.
 const CIRCUIT_BREAKER_ERROR_THRESHOLD: u32 = 5;
@@ -42,7 +61,7 @@ const CIRCUIT_BREAKER_LOCKOUT_SECS: f64 = 30.0;
 const TOKEN_REVALIDATION_INTERVAL_SECS: f64 = 30.0;
 
 /// Maximum payload size (10 MB).
-const MAX_PAYLOAD_SIZE: usize = 10_000_000;
+pub(crate) const MAX_PAYLOAD_SIZE: usize = 10_000_000;
 
 /// MEASC header size in bytes.
 const HEADER_SIZE: usize = 128;
@@ -80,6 +99,47 @@ impl CircuitBreakerEntry {
         if self.error_count >= CIRCUIT_BREAKER_ERROR_THRESHOLD {
             self.lockout_until = Some(Instant::now()
                 + Duration::from_secs_f64(CIRCUIT_BREAKER_LOCKOUT_SECS));
+        }
+    }
+}
+
+// ─── PerIpConnectionGuard ────────────────────────────────────────────────────
+
+/// CRIT-9 fix: RAII guard enforcing `MAX_CONNECTIONS_PER_IP`. `acquire` increments the
+/// caller's IP's live-connection count (rejecting once at the per-IP cap); the count is
+/// decremented automatically when the guard is dropped (connection closes or errors),
+/// mirroring how `CircuitBreakerEntry` state is keyed per-IP.
+pub(crate) struct PerIpConnectionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl PerIpConnectionGuard {
+    /// Returns `None` if `ip` already has `max_per_ip` live connections.
+    pub(crate) fn acquire(
+        counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+        ip: IpAddr,
+        max_per_ip: usize,
+    ) -> Option<Self> {
+        let mut guard = counts.lock().unwrap_or_else(|e| e.into_inner());
+        let count = guard.entry(ip).or_insert(0);
+        if *count >= max_per_ip {
+            return None;
+        }
+        *count += 1;
+        drop(guard);
+        Some(Self { counts: Arc::clone(counts), ip })
+    }
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut guard = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = guard.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                guard.remove(&self.ip);
+            }
         }
     }
 }
@@ -124,6 +184,16 @@ pub struct SAACPNetworkDaemon {
     /// payloads without forking `handle_client`'s dispatch logic. Called from inside
     /// `spawn_blocking`, so implementations must not `.await` (use `try_send`/`blocking_send`).
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
+    /// Opt-in C-3 identity binding (see `identity_binding.rs` and `with_identity_binding`).
+    /// `None` preserves today's exact handshake wire format and behavior. `Some` requires
+    /// every connecting client to present an `AgentIdentityCertificate` and prove possession
+    /// of the certified private key during the ECDH handshake, before any packet is
+    /// processed.
+    server_agent_id: Option<String>,
+    /// CRIT-9 fix: caps total concurrent connections at `MAX_CONNECTIONS`.
+    connection_semaphore: Arc<Semaphore>,
+    /// CRIT-9 fix: caps concurrent connections per source IP at `MAX_CONNECTIONS_PER_IP`.
+    per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
 impl SAACPNetworkDaemon {
@@ -137,6 +207,9 @@ impl SAACPNetworkDaemon {
             gateway: None,
             epoch_manager: None,
             on_delivered: None,
+            server_agent_id: None,
+            connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -153,6 +226,37 @@ impl SAACPNetworkDaemon {
     /// Clients MUST verify the signature before accepting the DH exchange.
     pub fn with_server_auth(mut self, seed: [u8; 32]) -> Self {
         self.server_ed25519_seed = Some(seed);
+        self
+    }
+
+    /// Opt in to C-3 identity binding (`identity_binding.rs`): every connecting client
+    /// must present an `AgentIdentityCertificate` signed by one of `ca_keys` and prove
+    /// possession of the certified private key during the ECDH handshake, before any
+    /// packet is processed. Implies `with_server_auth(seed)` — a `TranscriptBoundSession`
+    /// needs a server identity key on both sides of the transcript, so the two cannot be
+    /// configured independently.
+    ///
+    /// Registers `ca_keys` into the process-wide `DEFAULT_IDENTITY_VERIFIER` (keyed by
+    /// `ca_kid`) so the handshake can validate certificates against them.
+    ///
+    /// When enabled, the client handshake message grows from
+    /// `[client_nonce(32)] || [client_x25519_pub(32)]` to additionally carry
+    /// `[session_id(16)] || [cert_len(u32 LE)] || [cert_json(cert_len)] || [pop_sig(64)]`,
+    /// where `pop_sig` is an Ed25519 signature — made with the certified private key —
+    /// over `client_nonce || client_x25519_pub || session_id`. A client not configured to
+    /// send this extended message will fail to complete the handshake against a daemon
+    /// built with `with_identity_binding`.
+    pub fn with_identity_binding(
+        mut self,
+        seed: [u8; 32],
+        server_agent_id: &str,
+        ca_keys: &[(&str, ed25519_dalek::VerifyingKey)],
+    ) -> Self {
+        for (kid, vk) in ca_keys {
+            crate::identity_binding::DEFAULT_IDENTITY_VERIFIER.register_ca_key(kid, *vk);
+        }
+        self.server_ed25519_seed = Some(seed);
+        self.server_agent_id = Some(server_agent_id.to_string());
         self
     }
 
@@ -194,16 +298,48 @@ impl SAACPNetworkDaemon {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    // CRIT-9 fix: bound total and per-IP concurrent connections before
+                    // spawning a handler task, so an unbounded flood of slow-feed
+                    // connections cannot exhaust memory (each connection can be forced
+                    // to hold up to MAX_PAYLOAD_SIZE via a crafted header).
+                    let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            eprintln!(
+                                "[SAACP Daemon] Connection limit ({}) reached — rejecting {}",
+                                MAX_CONNECTIONS, peer_addr,
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let per_ip_guard = match PerIpConnectionGuard::acquire(
+                        &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
+                    ) {
+                        Some(guard) => guard,
+                        None => {
+                            eprintln!(
+                                "[SAACP Daemon] Per-IP connection limit ({}) reached for {} — rejecting",
+                                MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     let cbs    = Arc::clone(&self.circuit_breakers);
                     let secret = self.token_issuer_secret.clone();
                     let seed   = self.server_ed25519_seed;
                     let gateway       = self.gateway.clone();
                     let epoch_manager = self.epoch_manager.clone();
                     let on_delivered  = self.on_delivered.clone();
+                    let server_agent_id = self.server_agent_id.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // released on drop when this task ends
+                        let _per_ip_guard = per_ip_guard;
                         handle_client(
                             stream, peer_addr, cbs, secret, seed,
-                            gateway, epoch_manager, on_delivered,
+                            gateway, epoch_manager, on_delivered, server_agent_id,
                         ).await;
                     });
                 }
@@ -249,6 +385,11 @@ pub(crate) async fn handle_client<S>(
     gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
     epoch_manager: Option<Arc<SessionEpochManager>>,
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
+    // C-3 fix: `Some(server_agent_id)` requires the connecting client to present an
+    // `AgentIdentityCertificate` + proof-of-possession during the ECDH handshake (see
+    // `SAACPNetworkDaemon::with_identity_binding`). `None` preserves today's exact
+    // handshake wire format and behavior.
+    server_agent_id: Option<String>,
 )
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -258,7 +399,11 @@ where
 
     // ── Step 0: Circuit breaker check ────────────────────────────────────────
     {
-        let cbs = circuit_breakers.lock().unwrap();
+        // H-22 fix: recover from a poisoned mutex instead of propagating the panic —
+        // a poisoned `circuit_breakers` lock would otherwise cascade into every future
+        // connection's Step 0 check panicking too, DoSing the whole daemon from one
+        // unrelated panic. Matches `PerIpConnectionGuard`'s existing recovery pattern.
+        let cbs = circuit_breakers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cbs.get(&ip_key) {
             if entry.is_locked() {
                 // Silent drop — no response, no logging (DDoS defence)
@@ -295,10 +440,15 @@ where
         return;
     }
 
-    // ── Step 1: X25519 ECDH handshake with 100ms timeout ─────────────────────
-    let session_key = match timeout(
-        Duration::from_secs_f64(HANDSHAKE_TIMEOUT_SECS),
-        ecdh_handshake(&mut stream, server_ed25519_seed),
+    // ── Step 1: X25519 ECDH handshake with a DDoS timeout ─────────────────────
+    let handshake_timeout_secs = if server_agent_id.is_some() {
+        IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS
+    } else {
+        HANDSHAKE_TIMEOUT_SECS
+    };
+    let (session_key, verified_identity) = match timeout(
+        Duration::from_secs_f64(handshake_timeout_secs),
+        ecdh_handshake(&mut stream, server_ed25519_seed, server_agent_id.as_deref()),
     ).await {
         Ok(Ok(k)) => k,
         _ => {
@@ -307,27 +457,44 @@ where
         }
     };
 
-    // Identity pinning state (VULN-04)
-    let mut pinned_agent: Option<String>           = None;
-    let mut last_validated_at: Option<Instant>    = None;
+    // C-3: the session_id every subsequent packet header on this connection must carry.
+    // `None` unless this daemon opted into identity binding (`with_identity_binding`).
+    let bound_session_id: Option<[u8; 16]> = verified_identity.as_ref().map(|v| v.session_id);
+    if let Some(ref v) = verified_identity {
+        eprintln!("[SAACP Daemon] {peer_addr}: C-3 identity-bound as agent '{}'", v.agent_id);
+    }
+
+    // Identity pinning state (VULN-04) — deliberately NOT pre-seeded from
+    // `verified_identity`, even though the agent is already cryptographically known at
+    // this point. `pinned_agent` doubles as `target_agent` fed into Gate 1.0's
+    // `validate_lateral_movement` (`current_agent_name` below), which enforces a
+    // self-issue guard rejecting any token whose `iss` equals `target_agent`. Pre-pinning
+    // to the proven agent_id would make a well-behaved agent's own correctly-self-named
+    // token collide with that guard on its very first packet. Identity binding is instead
+    // enforced independently and unconditionally in `handler.rs`'s Gate 1.0 — by comparing
+    // the token's claimed `source_agent` against the `TranscriptBoundSession` registered
+    // for this connection's session_id — so bootstrap pinning here is untouched.
+    let mut pinned_agent: Option<String>       = None;
+    let mut last_validated_at: Option<Instant> = None;
     // Track the revocation epoch at the time of last successful validation.
     // If the global epoch advances (i.e. all tokens are revoked), this connection
     // must be disconnected — continuing would accept a revoked token.
     let mut pinned_revocation_epoch: u64 =
         crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
-    
+
     // ── C-3 Identity Gate ──────────────────────────────────────────────────────
-    // NOTE: no phase is advanced here at connection-init time. A previous
-    // version of this code called `GLOBAL_IDENTITY_GATE.advance("unknown", ...,
-    // "connection_init")`, but `"connection_init"` is not one of the six
-    // canonical `IDENTITY_GATE_PHASES` (`identity_binding.rs`) — `advance()`
-    // rejects unknown phase names and returns `Err`, which the `let _ = ...`
-    // silently discarded. That call had done nothing, ever, since it was
-    // written: recording "unknown" as having completed a phase before any
-    // authentication has even happened would itself be a false security
-    // signal, not a fix, so it is removed outright rather than patched to a
-    // real phase name. The first real phase is advanced below, once Gate 1.0
-    // has actually validated a capability token for this connection.
+    // NOTE: no phase is advanced here at connection-init time beyond what
+    // `ecdh_handshake` itself already advanced (IDENTITY_VERIFIED, only when identity
+    // binding is configured). A previous version of this code called
+    // `GLOBAL_IDENTITY_GATE.advance("unknown", ..., "connection_init")`, but
+    // `"connection_init"` is not one of the six canonical `IDENTITY_GATE_PHASES`
+    // (`identity_binding.rs`) — `advance()` rejects unknown phase names and returns
+    // `Err`, which the `let _ = ...` silently discarded. That call had done nothing,
+    // ever, since it was written: recording "unknown" as having completed a phase
+    // before any authentication has even happened would itself be a false security
+    // signal, not a fix, so it is removed outright rather than patched to a real phase
+    // name. AUTHORIZED is advanced below, once Gate 1.0 has actually validated a
+    // capability token for this connection (`handler.rs`).
 
     // ── Step 2: Persistent connection loop ────────────────────────────────────
     loop {
@@ -372,6 +539,26 @@ where
         let mut full_packet = Vec::with_capacity(HEADER_SIZE + payload_buf.len());
         full_packet.extend_from_slice(&header_buf);
         full_packet.extend_from_slice(&payload_buf[..bytes_read]);
+
+        // 2d0. C-3 session-splice defense: when this connection is identity-bound, every
+        // packet's header session_id (bytes 16..32) must equal the one committed — and
+        // proof-of-possession signed — during the handshake. Without this check, a
+        // connection that proved identity X at handshake time could present a different
+        // session_id per packet, silently bypassing the Gate 1.0 identity cross-check in
+        // `handler.rs` (which looks up the registered `TranscriptBoundSession` by
+        // session_id: an unregistered session_id simply skips the check).
+        if let Some(bound_sid) = bound_session_id {
+            let packet_sid: Option<[u8; 16]> = full_packet.get(16..32).and_then(|s| s.try_into().ok());
+            if packet_sid != Some(bound_sid) {
+                send_hard_drop(
+                    &mut stream,
+                    SAACPBytecodes::SessionSpliceDetected,
+                    "Packet session_id does not match identity-bound handshake session_id",
+                ).await;
+                record_error(&circuit_breakers, &ip_key);
+                break;
+            }
+        }
 
         // 2d. Revocation epoch pinning check (C1 fix).
         // If the global revocation epoch has advanced since this connection last
@@ -530,7 +717,11 @@ where
                 // PECF error translation + SREL timing equalization
                 SREL::equalize_timing(start);
                 let ext  = internal_to_external_raw(drop.bytecode as u8);
-                let wire = SREL::normalize_response(ext, "");
+                // Wire format requires a real 32-hex-char correlation ID (spec §9.3);
+                // an empty string both violates that contract and previously produced
+                // a zero-filled correlation_id region on the wire (silently in release
+                // builds, via a debug_assert panic in debug/test builds).
+                let wire = SREL::normalize_response(ext, &generate_correlation_id());
                 let _ = stream.write_all(&wire).await;
                 // Clear pinned state on hard drops
                 pinned_agent       = None;
@@ -581,23 +772,110 @@ where
 ///
 /// The client nonce is also mixed into HKDF as the salt so every session key
 /// is unique even if the X25519 shared secret is somehow repeated.
+///
+/// ## C-3 identity binding mode (`identity_binding_server_agent_id = Some(..)`)
+/// Requires `with_identity_binding` on the daemon (which also forces
+/// `server_ed25519_seed = Some`). The client message grows to additionally carry:
+///   Client → Server: [client_nonce(32)] || [client_x25519_pub(32)] || [session_id(16)]
+///                    || [cert_len(u32 LE, 4)] || [cert_json(cert_len)] || [pop_sig(64)]
+/// where `pop_sig` = Ed25519.sign(client_nonce || client_x25519_pub || session_id) made
+/// with the private key certified in `cert_json` (an `AgentIdentityCertificate`). This
+/// proves possession of the agent's long-term identity key — something a stolen bearer
+/// capability token alone can never produce — closing the gap where any holder of a
+/// leaked token could otherwise impersonate the agent it names. On success, a
+/// `TranscriptBoundSession` is registered in `identity_binding::DEFAULT_IDENTITY_REGISTRY`
+/// keyed by this `session_id`, and `IDENTITY_VERIFIED` is advanced in
+/// `identity_binding::GLOBAL_IDENTITY_GATE` for (agent_id, session_id). See
+/// `handler.rs`'s Gate 1.0 for the corresponding capability-token cross-check.
 async fn ecdh_handshake<S>(
     stream: &mut S,
     server_ed25519_seed: Option<[u8; 32]>,
-) -> Result<[u8; 32], SAACPHardDrop>
+    identity_binding_server_agent_id: Option<&str>,
+) -> Result<([u8; 32], Option<VerifiedClientIdentity>), SAACPHardDrop>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use rand::rngs::OsRng;
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{SigningKey, Signer, Signature, VerifyingKey, Verifier};
 
     // Step 1: Read client's nonce (32B) + X25519 public key (32B)
     let mut client_msg = [0u8; 64];
     stream.read_exact(&mut client_msg).await.map_err(|_| SAACPHardDrop::new(
         SAACPBytecodes::MalformedHeader, "Handshake read (nonce+key) failed",
     ))?;
-    let client_nonce    = &client_msg[0..32];
+    let client_nonce: [u8; 32]   = client_msg[0..32].try_into().unwrap();
     let peer_pub_bytes: [u8; 32] = client_msg[32..64].try_into().unwrap();
+
+    // Step 1b: When identity binding is required, read the extended identity block and
+    // verify the certificate + proof-of-possession before proceeding with the DH exchange.
+    let pending_identity = if let Some(server_agent_id) = identity_binding_server_agent_id {
+        let mut fixed = [0u8; 16 + 4];
+        stream.read_exact(&mut fixed).await.map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityBindingMissing,
+            "Identity handshake block (session_id + cert_len) missing",
+        ))?;
+        let session_id: [u8; 16] = fixed[0..16].try_into().unwrap();
+        let cert_len = u32::from_le_bytes(fixed[16..20].try_into().unwrap()) as usize;
+
+        // Bound the certificate size to prevent unbounded allocation from a malicious peer.
+        const MAX_CERT_JSON_BYTES: usize = 16_384;
+        if cert_len == 0 || cert_len > MAX_CERT_JSON_BYTES {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                "Identity certificate length out of bounds",
+            ));
+        }
+
+        let mut cert_buf = vec![0u8; cert_len];
+        stream.read_exact(&mut cert_buf).await.map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityBindingMissing, "Identity certificate read failed",
+        ))?;
+        let mut pop_sig_buf = [0u8; 64];
+        stream.read_exact(&mut pop_sig_buf).await.map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityBindingMissing, "Proof-of-possession signature read failed",
+        ))?;
+
+        let cert_json = std::str::from_utf8(&cert_buf).map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityBindingMissing, "Identity certificate is not valid UTF-8",
+        ))?;
+        let cert = crate::identity_binding::AgentIdentityCertificate::from_json(cert_json)
+            .map_err(|_| SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing, "Identity certificate is malformed",
+            ))?;
+
+        // Verify the CA signature, expiry, and revocation status.
+        crate::identity_binding::DEFAULT_IDENTITY_VERIFIER.verify_certificate(&cert)?;
+
+        // Verify proof-of-possession: the peer must sign this exact handshake's
+        // (client_nonce || client_x25519_pub || session_id) with the certified key. Since
+        // client_nonce is fresh random per connection, this cannot be precomputed or
+        // replayed from a captured transcript — only possession of the actual private key
+        // (never present in a bearer capability token) can produce a valid signature here.
+        let cert_pk_bytes: [u8; 32] = hex::decode(&cert.public_key_hex)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding, "Identity certificate public key malformed",
+            ))?;
+        let cert_vk = VerifyingKey::from_bytes(&cert_pk_bytes).map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding, "Identity certificate public key invalid",
+        ))?;
+        let mut pop_transcript = Vec::with_capacity(64 + 16);
+        pop_transcript.extend_from_slice(&client_nonce);
+        pop_transcript.extend_from_slice(&peer_pub_bytes);
+        pop_transcript.extend_from_slice(&session_id);
+        let pop_sig = Signature::from_bytes(&pop_sig_buf);
+        if cert_vk.verify(&pop_transcript, &pop_sig).is_err() {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "Proof-of-possession signature verification failed",
+            ));
+        }
+
+        Some((cert, session_id, server_agent_id.to_string()))
+    } else {
+        None
+    };
 
     // Step 2: Generate our ephemeral X25519 keypair
     let local_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -610,7 +888,7 @@ where
         let signing_key   = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         let mut to_sign   = Vec::with_capacity(64);
-        to_sign.extend_from_slice(client_nonce);
+        to_sign.extend_from_slice(&client_nonce);
         to_sign.extend_from_slice(local_pub.as_bytes());
         let sig = signing_key.sign(&to_sign);
 
@@ -635,12 +913,60 @@ where
     // Step 5: HKDF-SHA256 key derivation.
     // Use the client nonce as salt so that even if the DH shared secret were
     // somehow repeated across sessions, each session derives a distinct key.
-    let hk = Hkdf::<Sha256>::new(Some(client_nonce), shared.as_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
     hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
         .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "HKDF expand failed"))?;
 
-    Ok(session_key)
+    // Step 6: On successful identity binding, establish and register the
+    // TranscriptBoundSession, then advance IDENTITY_VERIFIED. This runs only after the DH
+    // exchange (and thus the handshake write above) has completed, but the certificate +
+    // proof-of-possession were already verified in Step 1b before any server secret was
+    // committed to the wire.
+    let verified_identity = if let Some((cert, session_id, server_agent_id)) = pending_identity {
+        let server_pub_hex = server_ed25519_seed
+            .map(|seed| {
+                let vk = SigningKey::from_bytes(&seed).verifying_key();
+                hex::encode(vk.as_bytes())
+            })
+            .unwrap_or_default();
+        let server_nonce: [u8; 32] = rand::random();
+
+        let mut session = crate::identity_binding::TranscriptBoundSession::establish(
+            session_id.to_vec(),
+            &cert.agent_id,
+            &server_agent_id,
+            &cert.public_key_hex,
+            &server_pub_hex,
+            &hex::encode(client_nonce),
+            &hex::encode(server_nonce),
+            "SAACP/0.1-beta2",
+            "Ed25519-AES256GCM",
+            None,
+        );
+        session.mark_identity_verified();
+
+        let agent_id = cert.agent_id.clone();
+        let session_id_hex = hex::encode(session_id);
+        crate::identity_binding::DEFAULT_IDENTITY_REGISTRY.register(session);
+        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
+            .advance(&agent_id, &session_id_hex, "IDENTITY_VERIFIED");
+
+        Some(VerifiedClientIdentity { agent_id, session_id })
+    } else {
+        None
+    };
+
+    Ok((session_key, verified_identity))
+}
+
+/// Result of a successful C-3 identity-bound handshake (see `ecdh_handshake`'s doc
+/// comment). `agent_id` is the certified identity proven via proof-of-possession;
+/// `session_id` is the client-committed session identifier that every subsequent packet
+/// header on this connection must match (enforced in `handle_client`).
+pub(crate) struct VerifiedClientIdentity {
+    pub agent_id: String,
+    pub session_id: [u8; 16],
 }
 
 /// Client-side (initiator) counterpart of `ecdh_handshake`, unauthenticated mode only —
@@ -652,19 +978,35 @@ where
 /// role (`ecdh_handshake`); this is the first initiator-side implementation in the crate.
 ///
 /// Ed25519 server-authentication mode (mirroring `ecdh_handshake`'s `server_ed25519_seed`
-/// path) is intentionally not implemented here — a v1 scope limit, not a correctness gap:
-/// a client that needs to verify a server's signature would need the corresponding
-/// verifying key distributed out-of-band first, which is deployment-specific and not yet
-/// wired into any caller.
+/// path) is only implemented when `identity` (below) is supplied — a client not opting into
+/// C-3 identity binding still gets the plain unauthenticated read, matching today's exact
+/// behavior byte-for-byte.
 ///
-/// Wire protocol (must match `ecdh_handshake`'s unauthenticated mode exactly):
+/// Wire protocol (unauthenticated mode, `identity = None` — must match `ecdh_handshake`'s
+/// unauthenticated mode exactly):
 ///   Client → Server: [client_nonce(32)] || [client_x25519_pub(32)] = 64B
 ///   Server → Client: [server_x25519_pub(32)] = 32B
-pub async fn client_handshake<S>(stream: &mut S) -> Result<[u8; 32], SAACPHardDrop>
+///
+/// Wire protocol (C-3 identity-bound mode, `identity = Some(..)` — must match
+/// `ecdh_handshake`'s identity-binding mode exactly, and requires the target daemon be
+/// built with `SAACPNetworkDaemon::with_identity_binding`):
+///   Client → Server: [client_nonce(32)] || [client_x25519_pub(32)] || [session_id(16)]
+///                    || [cert_len(u32 LE, 4)] || [cert_json(cert_len)] || [pop_sig(64)]
+///   Server → Client: [server_x25519_pub(32)] || [ed25519_sig(64)] || [ed25519_vk(32)] = 128B
+///
+/// Returns `(session_key, session_id)` — `session_id` is `Some` only in identity-bound mode,
+/// and is the value the caller must place in every subsequent MEASC packet header's
+/// session_id field (bytes 16..32) — the daemon rejects any mismatch as a session-splice
+/// attempt.
+pub async fn client_handshake<S>(
+    stream: &mut S,
+    identity: Option<&ClientIdentityConfig>,
+) -> Result<([u8; 32], Option<[u8; 16]>), SAACPHardDrop>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use rand::rngs::OsRng;
+    use ed25519_dalek::{Signature, Signer, VerifyingKey, Verifier};
 
     let client_nonce: [u8; 32] = rand::random();
     let client_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -673,14 +1015,75 @@ where
     let mut client_msg = Vec::with_capacity(64);
     client_msg.extend_from_slice(&client_nonce);
     client_msg.extend_from_slice(client_pub.as_bytes());
+
+    let session_id: Option<[u8; 16]> = if let Some(cfg) = identity {
+        let sid: [u8; 16] = rand::random();
+
+        // Proof-of-possession: sign this exact handshake's transcript with the
+        // certificate's private key. Fresh per connection (client_nonce/sid), so it
+        // cannot be replayed from a captured transcript by anyone who only holds a
+        // bearer capability token, not the actual identity private key.
+        let mut pop_transcript = Vec::with_capacity(64 + 16);
+        pop_transcript.extend_from_slice(&client_nonce);
+        pop_transcript.extend_from_slice(client_pub.as_bytes());
+        pop_transcript.extend_from_slice(&sid);
+        let pop_sig = cfg.signing_key.sign(&pop_transcript);
+
+        let cert_json = cfg.certificate.to_json();
+        let cert_bytes = cert_json.as_bytes();
+        client_msg.extend_from_slice(&sid);
+        client_msg.extend_from_slice(&(cert_bytes.len() as u32).to_le_bytes());
+        client_msg.extend_from_slice(cert_bytes);
+        client_msg.extend_from_slice(&pop_sig.to_bytes());
+
+        Some(sid)
+    } else {
+        None
+    };
+
     stream.write_all(&client_msg).await.map_err(|_| SAACPHardDrop::new(
         SAACPBytecodes::MalformedHeader, "client_handshake: write failed",
     ))?;
 
-    let mut server_pub_bytes = [0u8; 32];
-    stream.read_exact(&mut server_pub_bytes).await.map_err(|_| SAACPHardDrop::new(
-        SAACPBytecodes::MalformedHeader, "client_handshake: read server pubkey failed",
-    ))?;
+    let server_pub_bytes: [u8; 32] = if let Some(cfg) = identity {
+        // Identity-bound mode implies the daemon was built with `with_identity_binding`,
+        // which always enables server auth — read and verify the full authenticated
+        // response rather than silently trusting an unauthenticated server pubkey.
+        let mut auth_msg = [0u8; 128];
+        stream.read_exact(&mut auth_msg).await.map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader, "client_handshake: read authenticated server response failed",
+        ))?;
+        let server_pub_bytes: [u8; 32] = auth_msg[0..32].try_into().unwrap();
+        let sig_bytes: [u8; 64]        = auth_msg[32..96].try_into().unwrap();
+        let vk_bytes: [u8; 32]         = auth_msg[96..128].try_into().unwrap();
+
+        if vk_bytes != cfg.expected_server_verifying_key {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server verifying key does not match pinned expectation",
+            ));
+        }
+        let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding, "client_handshake: server verifying key invalid",
+        ))?;
+        let mut to_verify = Vec::with_capacity(64);
+        to_verify.extend_from_slice(&client_nonce);
+        to_verify.extend_from_slice(&server_pub_bytes);
+        let sig = Signature::from_bytes(&sig_bytes);
+        if server_vk.verify(&to_verify, &sig).is_err() {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server signature verification failed",
+            ));
+        }
+        server_pub_bytes
+    } else {
+        let mut server_pub_bytes = [0u8; 32];
+        stream.read_exact(&mut server_pub_bytes).await.map_err(|_| SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader, "client_handshake: read server pubkey failed",
+        ))?;
+        server_pub_bytes
+    };
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
@@ -689,7 +1092,23 @@ where
     hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
         .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "HKDF expand failed"))?;
 
-    Ok(session_key)
+    Ok((session_key, session_id))
+}
+
+/// Client-side configuration for C-3 identity binding (see `client_handshake`'s doc
+/// comment and `ecdh_handshake`'s server-side counterpart). Constructing one requires an
+/// `AgentIdentityCertificate` already issued by a CA the target daemon trusts.
+pub struct ClientIdentityConfig {
+    /// This agent's CA-issued identity certificate.
+    pub certificate: crate::identity_binding::AgentIdentityCertificate,
+    /// Ed25519 signing key corresponding to `certificate.public_key_hex` — used to prove
+    /// possession via the handshake's proof-of-possession signature.
+    pub signing_key: ed25519_dalek::SigningKey,
+    /// The target daemon's expected Ed25519 verifying key (from
+    /// `SAACPNetworkDaemon::server_verifying_key`), distributed out-of-band. Required
+    /// because `with_identity_binding` always enables server authentication — an
+    /// identity-bound client must never accept an unauthenticated server response.
+    pub expected_server_verifying_key: [u8; 32],
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -702,7 +1121,9 @@ fn ip_trust_key(ip: &str) -> String {
 }
 
 fn record_error(cbs: &Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>, ip: &str) {
-    let mut map = cbs.lock().unwrap();
+    // H-22 fix: same poison-recovery as the Step 0 check above — this is the other
+    // call site sharing the same process-wide `Arc<Mutex<...>>`.
+    let mut map = cbs.lock().unwrap_or_else(|e| e.into_inner());
     // OOM guard: drop oldest 10% when at capacity
     if map.len() >= MAX_CIRCUIT_BREAKER_IPS && !map.contains_key(ip) {
         let drop_count = MAX_CIRCUIT_BREAKER_IPS / 10;
@@ -717,7 +1138,9 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let ext  = internal_to_external_raw(bc as u8);
-    let wire = SREL::normalize_response(ext, "");
+    // Wire format requires a real 32-hex-char correlation ID (spec §9.3); see the
+    // matching fix in the main connection-loop error arm above for the full rationale.
+    let wire = SREL::normalize_response(ext, &generate_correlation_id());
     let _ = stream.write_all(&wire).await;
 }
 

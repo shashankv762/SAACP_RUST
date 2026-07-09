@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use saacp::{
     CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
     DelegationChainValidator,
-    ThresholdAuthorityIssuer,
+    ThresholdAuthorityIssuer, ThresholdCapabilityToken, ThresholdSignatureEntry,
     CapabilityTransparencyLog,
     RiskAwareAuthorizationEvaluator, AuthorizationContext,
     PostCompromiseRecovery, CompromiseRecoveryReport,
@@ -211,6 +211,151 @@ fn test_threshold_assemble_fails_below_threshold() {
     assert!(issuer.assemble_threshold_token(&req).is_err());
 }
 
+// ─── CRIT-3 / CRIT-4: verify_threshold_token hardening ───────────────────────
+//
+// CRIT-3: verify_threshold_token must compare valid_count against the
+// issuer's own configured threshold (self.m), never the token's
+// self-declared threshold_m field.
+//
+// CRIT-4: every signature in a ThresholdCapabilityToken must be verified
+// against the token's shared base_claims — never against a per-entry
+// claims payload — so M signatures over M different payloads can never be
+// packaged as one valid M-of-N consensus.
+
+/// Generate a fresh keypair for `issuer_id`, register the verifying key with
+/// `cva`, sign `claims_for_signature`, and return a ThresholdSignatureEntry
+/// ready to be packaged into a ThresholdCapabilityToken.
+fn make_verified_entry(
+    cva: &CapabilityVerificationAuthority,
+    issuer_id: &str,
+    claims_for_signature: &[u8],
+) -> ThresholdSignatureEntry {
+    let sk = CapabilitySigningKey::generate(issuer_id, 3600);
+    let kid = sk.kid.clone();
+    cva.register_key(&kid, sk.verifying_key);
+    let sig = sk.sign(claims_for_signature);
+    ThresholdSignatureEntry {
+        kid,
+        issuer_id: issuer_id.to_string(),
+        signature_hex: hex::encode(sig.to_bytes()),
+        claims_bytes_hex: hex::encode(claims_for_signature),
+    }
+}
+
+#[test]
+fn test_crit3_verify_rejects_self_declared_low_threshold() {
+    // Issuer requires M=3, but the attacker forges a token declaring
+    // threshold_m=1 while attaching only one genuinely valid signature.
+    let auths = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(3, auths, 300.0).unwrap();
+    let cva = CapabilityVerificationAuthority::new();
+
+    let base_claims = serde_json::json!({"action": "wire_transfer", "amount": 100000});
+    let claims_bytes = serde_json::to_vec(&base_claims).unwrap();
+    let entry = make_verified_entry(&cva, "A", &claims_bytes);
+
+    let forged = ThresholdCapabilityToken {
+        request_id: "forged-req-crit3".to_string(),
+        base_claims,
+        signatures: vec![entry],
+        threshold_m: 1, // attacker-controlled field — must be ignored entirely
+        participating_authorities: vec!["A".to_string()],
+    };
+
+    assert!(
+        !issuer.verify_threshold_token(&forged, &cva),
+        "CRIT-3: a token with only 1 valid signature must be rejected when the \
+         issuer requires M=3, regardless of the token's self-declared threshold_m=1"
+    );
+}
+
+#[test]
+fn test_crit4_verify_rejects_signatures_over_different_claims() {
+    // Three authorities each sign a DIFFERENT (individually benign) payload.
+    // Packaging all three under one arbitrary base_claims must NOT satisfy
+    // consensus, even though each signature is individually valid.
+    let auths = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(3, auths, 300.0).unwrap();
+    let cva = CapabilityVerificationAuthority::new();
+
+    let entry_a = make_verified_entry(&cva, "A", br#"{"benign":"request-a"}"#);
+    let entry_b = make_verified_entry(&cva, "B", br#"{"benign":"request-b"}"#);
+    let entry_c = make_verified_entry(&cva, "C", br#"{"benign":"request-c"}"#);
+
+    let forged = ThresholdCapabilityToken {
+        request_id: "forged-req-crit4".to_string(),
+        base_claims: serde_json::json!({"action": "delete_production_database"}),
+        signatures: vec![entry_a, entry_b, entry_c],
+        threshold_m: 3,
+        participating_authorities: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+    };
+
+    assert!(
+        !issuer.verify_threshold_token(&forged, &cva),
+        "CRIT-4: signatures made over claims other than base_claims must never \
+         count towards the threshold, even if each is individually valid"
+    );
+}
+
+#[test]
+fn test_threshold_verify_accepts_genuine_consensus_over_base_claims() {
+    // Positive path: 3 authorities genuinely sign the exact base_claims bytes.
+    // Must be ACCEPTED — proves the CRIT-3/CRIT-4 fix does not break
+    // legitimate M-of-N consensus.
+    let auths = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(3, auths, 300.0).unwrap();
+    let cva = CapabilityVerificationAuthority::new();
+
+    let base_claims = serde_json::json!({"action": "approve_release", "version": "2.0"});
+    let claims_bytes = serde_json::to_vec(&base_claims).unwrap();
+
+    let entry_a = make_verified_entry(&cva, "A", &claims_bytes);
+    let entry_b = make_verified_entry(&cva, "B", &claims_bytes);
+    let entry_c = make_verified_entry(&cva, "C", &claims_bytes);
+
+    let token = ThresholdCapabilityToken {
+        request_id: "genuine-req".to_string(),
+        base_claims,
+        signatures: vec![entry_a, entry_b, entry_c],
+        threshold_m: 3,
+        participating_authorities: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+    };
+
+    assert!(
+        issuer.verify_threshold_token(&token, &cva),
+        "3 genuine signatures over the exact base_claims bytes with issuer m=3 \
+         must be accepted"
+    );
+}
+
+#[test]
+fn test_crit3_verify_rejects_when_below_real_threshold_even_if_token_claims_enough() {
+    // Attacker sets threshold_m equal to the real M, but only supplies fewer
+    // genuinely valid signatures than required — must still be rejected on
+    // signature count, independent of the CRIT-3 field-trust bug.
+    let auths = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(3, auths, 300.0).unwrap();
+    let cva = CapabilityVerificationAuthority::new();
+
+    let base_claims = serde_json::json!({"action": "approve_release"});
+    let claims_bytes = serde_json::to_vec(&base_claims).unwrap();
+    let entry_a = make_verified_entry(&cva, "A", &claims_bytes);
+    let entry_b = make_verified_entry(&cva, "B", &claims_bytes);
+
+    let token = ThresholdCapabilityToken {
+        request_id: "under-threshold-req".to_string(),
+        base_claims,
+        signatures: vec![entry_a, entry_b],
+        threshold_m: 3,
+        participating_authorities: vec!["A".to_string(), "B".to_string()],
+    };
+
+    assert!(
+        !issuer.verify_threshold_token(&token, &cva),
+        "2 valid signatures must not satisfy an issuer requiring M=3"
+    );
+}
+
 // ─── CapabilityTransparencyLog ───────────────────────────────────────────────
 
 #[test]
@@ -239,6 +384,37 @@ fn test_transparency_log_chain_integrity_after_appends() {
     }
     assert_eq!(log.count(), 5);
     assert!(log.verify_chain_integrity(), "Chain must be intact after sequential appends");
+}
+
+/// H-26: the backend must be capacity-bounded (not grow forever), must evict
+/// oldest-first, and must keep the hash chain verifiable over the retained
+/// window after eviction — rolling the log over must never look like
+/// tampering.
+#[test]
+fn h26_transparency_log_bounded_with_verifiable_chain_after_eviction() {
+    let log = CapabilityTransparencyLog::with_capacity(10);
+    for i in 0..25u32 {
+        let jti = format!("jti-{}", i);
+        log.append(
+            "ISSUED", "iss-tl", Some(jti.as_str()), None,
+            "sub", &[], &["read"], 0, None, None,
+        );
+    }
+    // Bounded: never exceeds the configured cap despite 25 appends.
+    assert_eq!(log.count(), 10);
+    // Honest about what rolled off.
+    assert_eq!(log.pruned_count(), 15);
+    // Oldest-first: the first 15 jtis must be gone, the last 10 retained.
+    assert!(log.get_entries_by_jti("jti-0").is_empty());
+    assert!(log.get_entries_by_jti("jti-14").is_empty());
+    assert!(!log.get_entries_by_jti("jti-15").is_empty());
+    assert!(!log.get_entries_by_jti("jti-24").is_empty());
+    // Re-anchored chain floor: verification over the retained window must
+    // still succeed, not fail closed just because the genesis entry aged out.
+    assert!(
+        log.verify_chain_integrity(),
+        "chain must verify over the retained window after oldest-first eviction"
+    );
 }
 
 #[test]

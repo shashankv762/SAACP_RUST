@@ -564,8 +564,10 @@ impl TelemetryCollector {
             let mut entries: Vec<(&String, &AgentErrorEntry)> = map.iter().collect();
             entries.sort_by_key(|b| core::cmp::Reverse(b.1.count));
             for (agent, rec) in entries.iter().take(AGENT_ERROR_TOP_N) {
-                // Sanitize agent name for Prometheus label (no quotes/newlines)
-                let safe = agent.replace(['"', '\n'], "_");
+                // Sanitize agent name for Prometheus label (no quotes/newlines/backslashes —
+                // an unescaped trailing backslash would escape our closing quote and let
+                // a crafted agent id splice fake label/metric data into the scrape output)
+                let safe = agent.replace(['"', '\n', '\\'], "_");
                 out.push_str(&format!(
                     "saacp_agent_errors_total{{agent=\"{safe}\"}} {}\n",
                     rec.count
@@ -623,13 +625,19 @@ impl Default for TelemetryCollector {
 // Built for the SAACP Command Center dashboard's live alert feed.
 
 /// One gate rejection, recorded for the live alert feed.
+///
+/// Deliberately does NOT carry `SAACPHardDrop::message` (CRIT-10): that field
+/// can contain key fingerprints, exact validation-failure detail, or other
+/// internal diagnostic state that PECF (`pecf.rs`) is expressly designed to
+/// strip from anything reachable off-box. `/api/alerts` is network-reachable,
+/// so only the bytecode + gate name (already non-sensitive, coarse-grained
+/// classifiers) are recorded here.
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityAlert {
     pub timestamp: f64,
     pub agent_id: String,
     pub gate: &'static str,
     pub bytecode: String,
-    pub message: String,
 }
 
 /// Bounded capacity of `SecurityAlertFeed`'s ring buffer — oldest entries
@@ -712,7 +720,6 @@ pub fn report_gate_rejection(gate: &'static str, agent_id: &str, err: &crate::er
         agent_id: agent_id.to_string(),
         gate,
         bytecode: format!("{:?}", err.bytecode),
-        message: err.message.clone(),
     });
 }
 
@@ -803,6 +810,22 @@ mod tests {
         assert!(map.len() <= AGENT_ERROR_TOP_N);
     }
 
+    /// H-32 regression: a trailing backslash in an agent id must not be able to
+    /// escape the closing quote of the `agent="..."` Prometheus label. If it
+    /// did, a Prometheus-compliant parser would treat the quote as escaped and
+    /// keep consuming subsequent exposition-format text as part of the label
+    /// value, corrupting/splicing later metric lines.
+    #[test]
+    fn test_agent_error_label_backslash_cannot_escape_quote() {
+        let t = TelemetryCollector::new();
+        t.record_packet_rejected("evil-agent\\");
+        let prom = t.render_prometheus();
+        // The rendered label must be properly terminated: a quote immediately
+        // followed by `}` and never preceded by an unescaped backslash.
+        assert!(prom.contains("agent=\"evil-agent_\"}"));
+        assert!(!prom.contains("agent=\"evil-agent\\\"}"));
+    }
+
     #[test]
     fn test_reset_clears_all() {
         let t = TelemetryCollector::new();
@@ -863,7 +886,6 @@ mod tests {
             agent_id: "agent-x".to_string(),
             gate: "gate_4_0_inject",
             bytecode: format!("{:?}", err.bytecode),
-            message: err.message.clone(),
         });
 
         assert_eq!(feed.len(), 1);
@@ -883,7 +905,6 @@ mod tests {
                 agent_id: format!("agent-{i}"),
                 gate: "gate_4_0_inject",
                 bytecode: "PromptInjectionDetected".to_string(),
-                message: "x".to_string(),
             });
         }
         assert_eq!(feed.len(), ALERT_FEED_MAX_ENTRIES);
@@ -904,5 +925,23 @@ mod tests {
         let after = global_telemetry().snapshot()["gate_4_0_injection_detected"];
         assert_eq!(after, before + 1);
         assert!(global_alert_feed().len() > before_alerts || global_alert_feed().len() == ALERT_FEED_MAX_ENTRIES);
+    }
+
+    /// CRIT-10 regression: a `SecurityAlert` built from a hard-drop carrying
+    /// sensitive diagnostic text must never serialize that text — the struct
+    /// has no `message` field at all, so this locks in the wire contract.
+    #[test]
+    #[serial]
+    fn test_security_alert_never_leaks_hard_drop_message() {
+        use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+
+        let secret_detail = "key fingerprint=deadbeef internal validation state XYZ";
+        let err = SAACPHardDrop::new(SAACPBytecodes::PromptInjectionDetected, secret_detail);
+        report_gate_rejection("gate_4_0_inject", "agent-leak-test", &err);
+
+        let recent = global_alert_feed().recent(1);
+        let json = serde_json::to_string(&recent[0]).unwrap();
+        assert!(!json.contains("message"));
+        assert!(!json.contains(secret_detail));
     }
 }

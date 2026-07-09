@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use sha2::{Sha256, Digest};
 
 fn now_epoch_secs() -> f64 {
@@ -95,6 +96,55 @@ pub struct CryptoLedgerEntry {
 // CryptoTransparencyLedger
 // ---------------------------------------------------------------------------
 
+/// Order-stable JSON view of a ledger entry used as the hash-chain input.
+///
+/// Excludes `entry_hash` itself (the value being computed from this
+/// canonical form) and mirrors every other `CryptoLedgerEntry` field.
+///
+/// SECURITY (H-10): the previous hand-rolled `format!`-based canonicalization
+/// escaped only `\` and `"`, leaving raw control characters (e.g. an embedded
+/// newline) unescaped. That produced non-canonical, ambiguous string output
+/// where two distinct `CryptoLedgerEntry` values could serialize to the same
+/// bytes and therefore hash-collide, letting a forged entry pass
+/// `verify_chain()`. `serde_json::to_string` performs complete, spec-correct
+/// JSON string escaping.
+#[derive(Serialize)]
+struct CanonicalLedgerEntry<'a> {
+    details: &'a str,
+    event_type: &'a str,
+    outcome: &'a str,
+    session_id: &'a str,
+    suite_name: &'a str,
+    timestamp: f64,
+    transcript_hash: &'a str,
+}
+
+impl<'a> From<&'a CryptoLedgerEntry> for CanonicalLedgerEntry<'a> {
+    fn from(e: &'a CryptoLedgerEntry) -> Self {
+        Self {
+            details: &e.details,
+            event_type: &e.event_type,
+            outcome: &e.outcome,
+            session_id: &e.session_id,
+            suite_name: &e.suite_name,
+            // JSON has no representation for non-finite floats; every real
+            // caller sources `timestamp` from `now_epoch_secs()` (which
+            // already falls back to 0.0 on clock error), so this clamp is a
+            // defensive no-op in practice, not a behavior change.
+            timestamp: if e.timestamp.is_finite() { e.timestamp } else { 0.0 },
+            transcript_hash: &e.transcript_hash,
+        }
+    }
+}
+
+/// Canonical JSON encoding of `entry`, used as hash-chain input by both
+/// `append` and `verify_chain` — a single shared implementation guarantees
+/// they can never drift out of sync with each other.
+fn canonical_json(entry: &CryptoLedgerEntry) -> String {
+    serde_json::to_string(&CanonicalLedgerEntry::from(entry))
+        .expect("CanonicalLedgerEntry serialization is infallible: every field is a &str or a finite f64")
+}
+
 /// Append-only, hash-chained ledger of all cryptographic governance events.
 pub struct CryptoTransparencyLedger {
     log: Mutex<Vec<CryptoLedgerEntry>>,
@@ -111,16 +161,7 @@ impl CryptoTransparencyLedger {
 
     /// Append an entry with hash-chaining.
     pub fn append(&self, mut entry: CryptoLedgerEntry) {
-        let canonical = format!(
-            "{{\"details\":\"{}\",\"event_type\":\"{}\",\"outcome\":\"{}\",\"session_id\":\"{}\",\"suite_name\":\"{}\",\"timestamp\":{},\"transcript_hash\":\"{}\"}}",
-            entry.details.replace('\\', "\\\\").replace('"', "\\\""),
-            entry.event_type,
-            entry.outcome,
-            entry.session_id,
-            entry.suite_name,
-            entry.timestamp,
-            entry.transcript_hash,
-        );
+        let canonical = canonical_json(&entry);
         let prev = self.last_hash.lock().unwrap().clone();
         let chain_input = format!("{}{}", prev, canonical);
         let hash = sha256_hex(chain_input.as_bytes());
@@ -139,16 +180,7 @@ impl CryptoTransparencyLedger {
         let log = self.log.lock().unwrap();
         let mut prev_hash = "0".repeat(64);
         for entry in log.iter() {
-            let canonical = format!(
-                "{{\"details\":\"{}\",\"event_type\":\"{}\",\"outcome\":\"{}\",\"session_id\":\"{}\",\"suite_name\":\"{}\",\"timestamp\":{},\"transcript_hash\":\"{}\"}}",
-                entry.details.replace('\\', "\\\\").replace('"', "\\\""),
-                entry.event_type,
-                entry.outcome,
-                entry.session_id,
-                entry.suite_name,
-                entry.timestamp,
-                entry.transcript_hash,
-            );
+            let canonical = canonical_json(entry);
             let chain_input = format!("{}{}", prev_hash, canonical);
             let expected = sha256_hex(chain_input.as_bytes());
             if entry.entry_hash != expected {
@@ -327,6 +359,23 @@ pub struct NegotiationTranscript {
     pub transcript_hash: Vec<u8>,
 }
 
+/// Appends a length-prefixed encoding of `items` to `out`: each element is
+/// written as a 4-byte big-endian length followed by its raw UTF-8 bytes.
+///
+/// SECURITY (H-9): plain separator-joining (e.g. `items.join(",")`) is
+/// ambiguous when elements may themselves contain the separator — the lists
+/// `["a,b", "c"]` and `["a", "b,c"]` both join to `"a,b,c"`, so two different
+/// suite negotiations could hash to an identical `transcript_hash`. Length
+/// prefixing removes that ambiguity: no two distinct `Vec<String>` values
+/// produce the same encoded byte sequence.
+fn encode_length_prefixed(items: &[String], out: &mut Vec<u8>) {
+    for item in items {
+        let len = u32::try_from(item.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(item.as_bytes());
+    }
+}
+
 impl NegotiationTranscript {
     pub fn new(
         peer_a_suites: Vec<String>,
@@ -337,9 +386,9 @@ impl NegotiationTranscript {
     ) -> Self {
         let mut canonical = Vec::new();
         canonical.extend_from_slice(b"|A|");
-        canonical.extend_from_slice(peer_a_suites.join(",").as_bytes());
+        encode_length_prefixed(&peer_a_suites, &mut canonical);
         canonical.extend_from_slice(b"|B|");
-        canonical.extend_from_slice(peer_b_suites.join(",").as_bytes());
+        encode_length_prefixed(&peer_b_suites, &mut canonical);
         canonical.extend_from_slice(b"|S|");
         canonical.extend_from_slice(selected_suite.as_bytes());
         canonical.extend_from_slice(b"|V|");
@@ -594,6 +643,67 @@ mod tests {
         assert!(ledger.verify_chain());
     }
 
+    /// H-10 regression: control characters and quote/backslash sequences in
+    /// ledger fields must round-trip through the hash chain correctly (full
+    /// JSON escaping), and two entries that would have collided under the
+    /// old partial-escaping `format!` encoding must now hash differently.
+    #[test]
+    fn test_ledger_entry_hash_full_json_escaping() {
+        let ledger = CryptoTransparencyLedger::new();
+        ledger.append(CryptoLedgerEntry {
+            timestamp: 1.0,
+            event_type: "TEST".into(),
+            suite_name: "ed25519".into(),
+            session_id: "sess-1".into(),
+            outcome: "APPROVED".into(),
+            transcript_hash: "".into(),
+            details: "evil\": \\ \n\t injected \"entry_hash\":\"forged".into(),
+            entry_hash: String::new(),
+        });
+        ledger.append(CryptoLedgerEntry {
+            timestamp: 2.0,
+            event_type: "TEST".into(),
+            suite_name: "ed25519".into(),
+            session_id: "sess-2".into(),
+            outcome: "APPROVED".into(),
+            transcript_hash: "".into(),
+            details: "control\r\nchars\u{0001}\u{0007}here".into(),
+            entry_hash: String::new(),
+        });
+        assert_eq!(ledger.entries().len(), 2);
+        assert!(
+            ledger.verify_chain(),
+            "hash chain must remain self-consistent with control characters and \
+             quote/backslash sequences embedded in ledger fields"
+        );
+
+        // Direct structural proof: the old `format!`-based encoding only ever
+        // escaped `\`/`"` inside `details` — every other field (event_type,
+        // outcome, session_id, suite_name, transcript_hash) was interpolated
+        // raw, so an embedded quote there corrupted the JSON structure
+        // itself (premature string close, attacker-controlled bytes spliced
+        // into the "canonical" form). Prove the new encoding is valid,
+        // round-trippable JSON even when the injection-prone characters are
+        // in one of those previously-unescaped fields.
+        let evil = CryptoLedgerEntry {
+            timestamp: 3.0,
+            event_type: "A\",\"outcome\":\"FORGED".into(),
+            suite_name: "ed25519\n".into(),
+            session_id: "sid\t\"".into(),
+            outcome: "APPROVED".into(),
+            transcript_hash: "".into(),
+            details: "x".into(),
+            entry_hash: String::new(),
+        };
+        let encoded = canonical_json(&evil);
+        let parsed: serde_json::Value = serde_json::from_str(&encoded)
+            .expect("canonical_json output must always be valid, parseable JSON");
+        assert_eq!(parsed["event_type"], "A\",\"outcome\":\"FORGED");
+        assert_eq!(parsed["outcome"], "APPROVED");
+        assert_eq!(parsed["suite_name"], "ed25519\n");
+        assert_eq!(parsed["session_id"], "sid\t\"");
+    }
+
     #[test]
     fn test_negotiation_success() {
         let ledger = CryptoTransparencyLedger::new();
@@ -674,6 +784,29 @@ mod tests {
             b"session".to_vec(),
         );
         assert_eq!(t1.transcript_hash_hex(), t2.transcript_hash_hex());
+    }
+
+    /// H-9 regression: separator-ambiguous suite lists must NOT collide.
+    /// `["a,b", "c"]` and `["a", "b,c"]` both joined to the byte-identical
+    /// string "a,b,c" under the old comma-join encoding, producing the same
+    /// transcript_hash for two genuinely different negotiations.
+    #[test]
+    fn test_negotiation_transcript_hash_no_suite_list_collision() {
+        let t1 = NegotiationTranscript::new(
+            vec!["a,b".into(), "c".into()],
+            vec!["ed25519".into()],
+            "ed25519".into(),
+            "SAACP/0.1-beta2".into(),
+            b"session".to_vec(),
+        );
+        let t2 = NegotiationTranscript::new(
+            vec!["a".into(), "b,c".into()],
+            vec!["ed25519".into()],
+            "ed25519".into(),
+            "SAACP/0.1-beta2".into(),
+            b"session".to_vec(),
+        );
+        assert_ne!(t1.transcript_hash_hex(), t2.transcript_hash_hex());
     }
 
     #[test]

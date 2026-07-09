@@ -40,6 +40,17 @@
 // Race D: PSN replay window under concurrent load
 //   ReplayWindow uses Mutex internally; check-mark-accept should be atomic.
 //   Verify no duplicate PSN acceptance under 16-thread concurrent load.
+//
+// Race E: AEGF repeated-path threshold enforcement (CRIT-7, FIXED)
+//   validate_and_add() used to call detect_repeated_path(), which acquired
+//   and released the `nodes`/`path_counts` locks on its own, THEN the caller
+//   re-acquired both locks separately to perform the insert. Concurrent
+//   callers sharing the same (parent_oaid, child_oaid) edge could all
+//   observe a count below REPEATED_PATH_THRESHOLD in the gap between the
+//   two lock acquisitions, all pass, and all insert — bypassing the
+//   repeated-path governance control. FIX: the repeated-path check is now
+//   inlined inside the single continuous hold of both locks that performs
+//   the insert (src/aegf.rs), closing the race window.
 
 use std::sync::Arc;
 use std::thread;
@@ -255,6 +266,108 @@ fn race_c_aegf_graph_cap_overflow() {
         THREADS, allowed
     );
     eprintln!("[RACE-C FIXED] Cap enforcement held under concurrent load: exactly 1/{} accepted.", THREADS);
+}
+
+// ─── Race E: AEGF repeated-path threshold enforcement (CRIT-7) ────────────────
+
+/// Race E regression guard: N threads race to add child nodes under the same
+/// parent, all sharing the same (parent_oaid, child_oaid) edge. The AEGF
+/// repeated-path threshold (REPEATED_PATH_THRESHOLD = 2 in src/aegf.rs) means
+/// only the first 2 should be Allowed; every subsequent racer on the same
+/// edge must get Review. Before the CRIT-7 fix, the check-then-act gap let
+/// far more than 2 threads slip through as Allow under concurrent load.
+#[test]
+fn race_e_aegf_repeated_path_toctou() {
+    use saacp::GovernanceDecision;
+
+    // Matches REPEATED_PATH_THRESHOLD in src/aegf.rs (private const — the
+    // detection triggers once an edge's count reaches this value).
+    const REPEATED_PATH_THRESHOLD: usize = 2;
+
+    let governor = Arc::new(AEGFGovernor::new(None));
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    // Seed a single parent node that every racing thread will attach under.
+    let parent_rid = format!("{:032x}", 0xAAAA_u32);
+    let parent_meta = AEGFMetadata {
+        rid: parent_rid.clone(),
+        prid: RID_ROOT.to_string(),
+        sid: parent_rid.clone(),
+        oaid: "agent-parent".to_string(),
+        cid: CID_NONE.to_string(),
+        hc: 0,
+        ed: 0,
+        ttl: now_ts + 3600.0,
+    };
+    assert_eq!(
+        governor.submit_request(&parent_meta),
+        GovernanceDecision::Allow,
+        "sanity: parent node must be admitted before the race starts"
+    );
+
+    const THREADS: usize = 32;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let mut handles = Vec::new();
+
+    for i in 0..THREADS {
+        let gv = governor.clone();
+        let bar = barrier.clone();
+        let prid = parent_rid.clone();
+        handles.push(thread::spawn(move || {
+            bar.wait(); // all threads start simultaneously
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            let meta = AEGFMetadata {
+                rid: format!("{:032x}", 0xBBBB_u32 + i as u32),
+                prid,
+                sid: format!("{:032x}", 0xBBBB_u32 + i as u32),
+                // Every racer shares the SAME child oaid, so they all
+                // compete for the SAME (parent_oaid, child_oaid) edge.
+                oaid: "agent-child".to_string(),
+                cid: CID_NONE.to_string(),
+                hc: 1,
+                ed: 1,
+                ttl: ts + 3600.0,
+            };
+            gv.submit_request(&meta)
+        }));
+    }
+
+    let decisions: Vec<GovernanceDecision> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let allowed = decisions.iter().filter(|&&d| d == GovernanceDecision::Allow).count();
+    let reviewed = decisions.iter().filter(|&&d| d == GovernanceDecision::Review).count();
+
+    eprintln!(
+        "[RACE-E] AEGF repeated-path race: {} threads competed on one edge, {} got Allow, \
+         {} got Review (threshold={}).",
+        THREADS, allowed, reviewed, REPEATED_PATH_THRESHOLD
+    );
+
+    assert!(
+        allowed <= REPEATED_PATH_THRESHOLD,
+        "RACE-E REGRESSED (CRIT-7): repeated-path threshold ({}) was bypassed under \
+         concurrent load — {} of {} racing threads got Allow on the same edge. \
+         The repeated-path check in validate_and_add() must be performed under the \
+         SAME continuous lock hold as the insert (src/aegf.rs).",
+        REPEATED_PATH_THRESHOLD, allowed, THREADS
+    );
+    assert_eq!(
+        allowed + reviewed,
+        THREADS,
+        "every racing thread must resolve to either Allow or Review (no other outcome \
+         is expected for well-formed, non-expired, in-bounds requests)"
+    );
+    eprintln!(
+        "[RACE-E FIXED] Repeated-path threshold held under concurrent load: {}/{} accepted, \
+         rest correctly reviewed.",
+        allowed, THREADS
+    );
 }
 
 // ─── Race D: StreamRegistry concurrent register + close ───────────────────────

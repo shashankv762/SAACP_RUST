@@ -36,7 +36,6 @@ export interface SecurityAlert {
   agent_id: string;
   gate: string;
   bytecode: string;
-  message: string;
 }
 
 export interface FinancialResponse {

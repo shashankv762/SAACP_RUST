@@ -33,8 +33,8 @@ use saacp::{
     ReplayWindow, ReplayWindowPolicy,
     MEASC_MAX_PSN_ADVANCE,
     CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
-    MEASCFrame, SessionEpochManager,
 };
+use saacp::framing::MEASCFrame as StructuralFrame;
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
 
@@ -68,19 +68,23 @@ fn issue_token(
     cia.issue(claims).expect("issue token")
 }
 
+/// Builds a genuinely AES-256-GCM-encrypted `framing::MEASCFrame` wire packet
+/// via `encode_encrypted`. CRIT-1 made Gate 0 (`framing::MEASCFrame::
+/// parse_header`) perform real cryptographic verification, so frames fed into
+/// `gate_0_crypto_integrity` / `intercept_packet` must now be encrypted under
+/// the SAME `secret_key` passed to those functions — the previous
+/// `measc::MEASCFrame::build_frame` + `SessionEpochManager` key schedule is
+/// entirely incompatible with `framing::MEASCFrame::parse_header`'s HKDF
+/// derivation and would (correctly) fail to decrypt.
 fn make_bench_frame(secret_key: &[u8; 32], payload_bytes: &[u8], schema_id: u16, flags: u8, action_class: u8) -> Vec<u8> {
-    let session_id = [0x77u8; 16];
-    let manager    = SessionEpochManager::new();
-    manager.create_session(session_id, *secret_key, 10_000_000, 3600.0, None).unwrap();
-    let epoch_id    = manager.get_current_epoch_id(&session_id).unwrap();
-    let ctx_ref_id  = [0u8; 32];
-    let traceparent = [0u8; 24];
-    manager.with_epoch_mut(&session_id, epoch_id, |epoch| {
-        MEASCFrame::build_frame(
-            epoch, schema_id, 0x10, flags, action_class,
-            payload_bytes, &ctx_ref_id, &traceparent, 0,
-        ).unwrap().0
-    }).unwrap()
+    let frame = StructuralFrame {
+        schema_id, status_code: 0x10, flags, action_class,
+        payload_length: 0, // auto-corrected by encode_encrypted
+        session_id: [0x77u8; 16], epoch_id: 0, psn: 1,
+        context_ref_id: [0u8; 32], context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    frame.encode_encrypted(payload_bytes, secret_key).expect("encode_encrypted must succeed")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

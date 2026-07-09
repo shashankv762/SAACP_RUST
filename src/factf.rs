@@ -474,7 +474,22 @@ impl ThresholdAuthorityIssuer {
             .count()
     }
 
-    /// Verify a threshold token — requires >= M distinct valid signatures.
+    /// Verify a threshold token — requires >= M distinct valid signatures,
+    /// where M is *this issuer's own configured threshold* (`self.m`), and
+    /// every signature MUST be over the token's shared `base_claims`.
+    ///
+    /// CRIT-3 fix: the pass/fail bar is `self.m`, never the token's
+    /// self-declared `threshold_m` field. `threshold_m` on the wire is
+    /// informational only — an attacker who controls the token cannot lower
+    /// the effective threshold by setting `threshold_m` to a smaller value.
+    ///
+    /// CRIT-4 fix: every `ThresholdSignatureEntry` is verified against the
+    /// single canonical `base_claims` bytes computed once up front.
+    /// `entry.claims_bytes_hex` is never consulted for the verification
+    /// decision (it remains on the wire struct for backward wire-format
+    /// compatibility only) — this prevents an attacker from packaging M
+    /// signatures that were each made over a *different* payload and passing
+    /// them off as one M-of-N consensus over `base_claims`.
     pub fn verify_threshold_token(
         &self,
         token: &ThresholdCapabilityToken,
@@ -500,22 +515,20 @@ impl ThresholdAuthorityIssuer {
                 Err(_) => continue,
             };
 
-            let actual_claims = if !entry.claims_bytes_hex.is_empty() {
-                hex::decode(&entry.claims_bytes_hex).unwrap_or_default()
-            } else {
-                claims_bytes.clone()
-            };
-
+            // CRIT-4: always verify against the shared base_claims. Never
+            // trust entry.claims_bytes_hex as an alternate signed payload.
             if DelegationChainValidator::verify_ed25519(
                 &key,
-                &actual_claims,
+                &claims_bytes,
                 &sig,
             ) {
                 valid_count += 1;
             }
         }
 
-        valid_count >= token.threshold_m
+        // CRIT-3: compare against the issuer's own configured threshold,
+        // never the token's self-declared threshold_m.
+        valid_count >= self.m
     }
 }
 
@@ -558,24 +571,55 @@ fn compute_entry_hash(e: &TransparencyLogEntry) -> String {
     sha256_hex(blob.as_bytes())
 }
 
+/// Maximum entries retained by [`InMemoryBackend`] before oldest-first
+/// eviction kicks in (H-26). Without this the log — append-only, one entry
+/// per capability issuance/delegation/revocation event — grows without
+/// bound for the lifetime of the process, an unbounded-memory-growth DoS
+/// surface on any long-lived gateway.
+pub const TRANSPARENCY_LOG_MAX_ENTRIES: usize = 100_000;
+
 /// Thread-safe in-memory transparency log backend.
+///
+/// Bounded at [`TRANSPARENCY_LOG_MAX_ENTRIES`]: once at capacity, the oldest
+/// entry is evicted before the new one is appended (H-26). [`Self::append`]
+/// returns the evicted entry, if any, so a hash-chained caller (see
+/// [`CapabilityTransparencyLog`]) can re-anchor its integrity-verification
+/// starting point instead of silently treating "the log rolled over" as "the
+/// log was tampered with".
 pub struct InMemoryBackend {
-    entries: Mutex<Vec<TransparencyLogEntry>>,
+    entries: Mutex<std::collections::VecDeque<TransparencyLogEntry>>,
+    max_entries: usize,
 }
 
 impl InMemoryBackend {
     pub fn new() -> Self {
+        Self::with_capacity(TRANSPARENCY_LOG_MAX_ENTRIES)
+    }
+
+    /// Like [`Self::new`], with a custom capacity — primarily for tests that
+    /// need to exercise the eviction path without appending 100K entries.
+    pub fn with_capacity(max_entries: usize) -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(std::collections::VecDeque::new()),
+            max_entries,
         }
     }
 
-    pub fn append(&self, entry: TransparencyLogEntry) {
-        self.entries.lock().unwrap().push(entry);
+    /// Appends `entry`, evicting the oldest entry first if already at
+    /// capacity. Returns the evicted entry, if one was removed.
+    pub fn append(&self, entry: TransparencyLogEntry) -> Option<TransparencyLogEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        let evicted = if entries.len() >= self.max_entries {
+            entries.pop_front()
+        } else {
+            None
+        };
+        entries.push_back(entry);
+        evicted
     }
 
     pub fn get_all(&self) -> Vec<TransparencyLogEntry> {
-        self.entries.lock().unwrap().clone()
+        self.entries.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
@@ -619,13 +663,32 @@ const GENESIS_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000
 pub struct CapabilityTransparencyLog {
     backend: InMemoryBackend,
     last_hash: Mutex<String>,
+    /// Chain-hash to treat as the verification starting point, in place of
+    /// `GENESIS_CHAIN_HASH`. Starts at `GENESIS_CHAIN_HASH` and advances to
+    /// the `chain_hash` of the most recently evicted entry whenever the
+    /// bounded `backend` prunes the oldest retained entry (H-26) — this
+    /// keeps [`Self::verify_chain_integrity`] exact over the retained window
+    /// instead of failing closed on every rollover.
+    chain_floor_hash: Mutex<String>,
+    /// Count of entries evicted over this log's lifetime, for audit-bundle
+    /// honesty about how many events predate the currently retained window.
+    pruned_count: std::sync::atomic::AtomicU64,
 }
 
 impl CapabilityTransparencyLog {
     pub fn new() -> Self {
+        Self::with_capacity(TRANSPARENCY_LOG_MAX_ENTRIES)
+    }
+
+    /// Like [`Self::new`], with a custom entry cap — primarily for tests that
+    /// need to exercise the H-26 eviction/re-anchoring path without
+    /// appending 100K entries.
+    pub fn with_capacity(max_entries: usize) -> Self {
         Self {
-            backend: InMemoryBackend::new(),
+            backend: InMemoryBackend::with_capacity(max_entries),
             last_hash: Mutex::new(GENESIS_CHAIN_HASH.to_string()),
+            chain_floor_hash: Mutex::new(GENESIS_CHAIN_HASH.to_string()),
+            pruned_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -686,14 +749,29 @@ impl CapabilityTransparencyLog {
 
         *last_hash = entry.chain_hash.clone();
         let chain_hash = entry.chain_hash.clone();
-        self.backend.append(entry);
+        drop(last_hash);
+
+        // H-26: the backend is capacity-bounded and evicts oldest-first.
+        // When it does, re-anchor the integrity-verification floor to the
+        // evicted entry's own chain_hash so `verify_chain_integrity` keeps
+        // verifying exactly the retained window rather than failing closed
+        // against a genesis hash that no longer matches the oldest surviving
+        // entry.
+        if let Some(evicted) = self.backend.append(entry) {
+            *self.chain_floor_hash.lock().unwrap() = evicted.chain_hash;
+            self.pruned_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         chain_hash
     }
 
-    /// Rehash all entries. Returns false if any has been tampered with.
+    /// Rehash all currently-retained entries. Returns false if any has been
+    /// tampered with. Verification starts from [`Self::chain_floor_hash`]
+    /// rather than the fixed genesis constant, so entries legitimately aged
+    /// out by the bounded backend's oldest-first eviction (H-26) are not
+    /// mistaken for tampering.
     pub fn verify_chain_integrity(&self) -> bool {
         let entries = self.backend.get_all();
-        let mut prev_hash = GENESIS_CHAIN_HASH.to_string();
+        let mut prev_hash = self.chain_floor_hash.lock().unwrap().clone();
 
         for entry in &entries {
             let recomputed = compute_entry_hash(entry);
@@ -722,6 +800,13 @@ impl CapabilityTransparencyLog {
         self.backend.count()
     }
 
+    /// Number of entries evicted over this log's lifetime by the bounded
+    /// backend's oldest-first eviction (H-26). `count() + pruned_count()` is
+    /// the total number of events ever appended.
+    pub fn pruned_count(&self) -> u64 {
+        self.pruned_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Return an audit bundle (no raw PII — only hashes).
     pub fn export_audit_bundle(&self, since: Option<f64>) -> serde_json::Value {
         let entries = match since {
@@ -731,6 +816,7 @@ impl CapabilityTransparencyLog {
         serde_json::json!({
             "generated_at": now_f64(),
             "entry_count": entries.len(),
+            "pruned_count": self.pruned_count(),
             "chain_valid": self.verify_chain_integrity(),
             "entries": entries.iter().map(|e| serde_json::json!({
                 "entry_id": e.entry_id,
@@ -1081,9 +1167,11 @@ impl FilesystemBackend {
 
 impl TransparencyLogBackend for FilesystemBackend {
     fn append(&self, entry: &TransparencyLogEntry) {
-        // Clone so InMemoryBackend's owned-value append works
-        let mut guard = self.mirror.entries.lock().unwrap();
-        guard.push(entry.clone());
+        // Routed through the mirror's own bounded, capacity-checked append
+        // (H-26) rather than a raw push — this dyn-dispatch path must not
+        // bypass the same eviction cap the direct `InMemoryBackend` API
+        // enforces.
+        self.mirror.append(entry.clone());
         // TODO: write to self.path as JSONL (future protocol version)
     }
 
@@ -1111,12 +1199,13 @@ impl TransparencyLogBackend for FilesystemBackend {
 // Implement TransparencyLogBackend for InMemoryBackend too (for dyn dispatch)
 impl TransparencyLogBackend for InMemoryBackend {
     fn append(&self, entry: &TransparencyLogEntry) {
-        let mut entries = self.entries.lock().unwrap();
-        entries.push(entry.clone());
+        // Delegate to the bounded inherent append (H-26) so this dyn-dispatch
+        // path enforces the same capacity cap as the direct API.
+        Self::append(self, entry.clone());
     }
 
     fn get_all(&self) -> Vec<TransparencyLogEntry> {
-        self.entries.lock().unwrap().clone()
+        Self::get_all(self)
     }
 
     fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
