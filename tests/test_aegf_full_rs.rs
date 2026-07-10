@@ -41,7 +41,7 @@ fn test_cid_none_is_all_zeros() {
 fn test_metadata_new() {
     let m = make_meta("agent-1", "session-1");
     assert_eq!(m.oaid, "agent-1");
-    assert_eq!(m.sid, "session-1");
+    assert_eq!(&*m.sid, "session-1");
     assert_eq!(m.hc, 0);
     assert_eq!(m.ed, 0);
 }
@@ -69,7 +69,7 @@ fn test_metadata_not_expired_immediately() {
 fn test_metadata_with_explicit_cid() {
     let cid = "abcdef0123456789abcdef0123456789";
     let m = AEGFMetadata::new("oaid", "sid", Some(cid), None, 60.0, 0, 0);
-    assert_eq!(m.cid, cid);
+    assert_eq!(&*m.cid, cid);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn test_metadata_pack_unpack_roundtrip() {
     assert!(recovered.is_ok(), "unpack must succeed: {:?}", recovered);
     let r = recovered.unwrap();
     assert_eq!(r.oaid, "agent-rtrip");
-    assert_eq!(r.sid, sid);
+    assert_eq!(&*r.sid, sid);
     assert_eq!(r.hc, 0);
     assert_eq!(r.ed, 0);
 }

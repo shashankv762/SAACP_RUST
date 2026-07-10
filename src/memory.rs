@@ -165,13 +165,18 @@ pub const INTENT_MAX_LIFETIME: f64 = 86400.0;
 /// Prevents Context Window Exhaustion by allowing agents to pass data by reference
 /// using a 32-byte Context-State-ID hash and enforcing TTLs.
 ///
-/// Backed by a process-local `HashMap` by default (`::new()` / `::global()`).
-/// [`FederatedMemory::with_backend`] instead routes every record through a
-/// shared [`StateBackend`] (e.g. Redis) so multiple SAACP gateway nodes can
-/// see the same context store — see `state_backend.rs` for the rationale and
-/// which other subsystems this is (and isn't) safe to do for.
+/// Backed by a process-local, **sharded** `HashMap` by default (`::new()` /
+/// `::global()`) — see [`FEDERATED_MEMORY_SHARDS`] and [`shard_index`] below
+/// (Phase 3 / P-1: a single process-wide `Mutex` serialized every context
+/// store/fetch across every agent and session, regardless of which entry was
+/// being touched). [`FederatedMemory::with_backend`] instead routes every
+/// record through a shared [`StateBackend`] (e.g. Redis) so multiple SAACP
+/// gateway nodes can see the same context store — see `state_backend.rs` for
+/// the rationale and which other subsystems this is (and isn't) safe to do
+/// for; that mode is unaffected by sharding (Redis handles its own
+/// concurrency).
 pub struct FederatedMemory {
-    inner: Mutex<FederatedInner>,
+    shards: Vec<Mutex<FederatedInner>>,
     backend: Option<Arc<dyn StateBackend>>,
 }
 
@@ -195,16 +200,47 @@ struct FederatedInner {
     store: HashMap<Vec<u8>, FederatedRecord>,
 }
 
+/// Number of independent lock shards for process-local `FederatedMemory` storage
+/// (Phase 3 / P-1 / Part 6.3: sharded on `context_state_id[0..2] % 16`). Unrelated
+/// entries now serialize only against other entries that happen to hash into the
+/// same shard, instead of every entry in the store sharing one lock.
+const FEDERATED_MEMORY_SHARDS: usize = 16;
+
+/// Per-shard soft capacity, chosen so the aggregate cap across all shards still
+/// matches [`FEDERATED_MAX_ENTRIES`] under a roughly uniform key distribution
+/// (SHA-256-derived Context-State-IDs are effectively uniformly distributed) —
+/// sharding must not silently multiply the effective capacity bound (Part 12
+/// principle 5, "Bounded Everything").
+const FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES: usize = FEDERATED_MAX_ENTRIES / FEDERATED_MEMORY_SHARDS;
+
+/// Maps a Context-State-ID (or intent-envelope hash) to its shard index, using
+/// the first two bytes as a big-endian `u16` modulo the shard count — ids
+/// shorter than 2 bytes (never produced by this module's own hashing, but
+/// guarded defensively since `save_context`/`fetch_context` accept
+/// caller-supplied byte slices) fall back to shard 0.
+fn shard_index(id: &[u8]) -> usize {
+    let key = match id {
+        [a, b, ..] => u16::from_be_bytes([*a, *b]),
+        [a] => *a as u16,
+        [] => 0,
+    };
+    (key as usize) % FEDERATED_MEMORY_SHARDS
+}
+
 /// Backing store for [`FederatedMemory::global`] / [`FederatedMemory::set_global_backend`] (H-29).
 static FEDERATED_MEMORY_GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync::OnceLock::new();
 
 impl FederatedMemory {
+    fn new_shards() -> Vec<Mutex<FederatedInner>> {
+        (0..FEDERATED_MEMORY_SHARDS)
+            .map(|_| Mutex::new(FederatedInner { store: HashMap::new() }))
+            .collect()
+    }
+
     /// Create a new, process-local FederatedMemory store.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(FederatedInner {
-                store: HashMap::new(),
-            }),
+            shards: Self::new_shards(),
             backend: None,
         }
     }
@@ -215,7 +251,7 @@ impl FederatedMemory {
     /// storage modes are never mixed within one instance.
     pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
         Self {
-            inner: Mutex::new(FederatedInner { store: HashMap::new() }),
+            shards: Self::new_shards(),
             backend: Some(backend),
         }
     }
@@ -325,6 +361,11 @@ impl FederatedMemory {
     // original in-process HashMap always had (context records and intent
     // envelopes are both just "a blob behind a hash, with a TTL").
 
+    /// Lock and return the shard responsible for `id` (process-local mode only).
+    fn shard(&self, id: &[u8]) -> std::sync::MutexGuard<'_, FederatedInner> {
+        self.shards[shard_index(id)].lock().expect("lock poisoned")
+    }
+
     fn put_record(&self, id: &[u8], data: String, version: u32, ttl_secs: f64) {
         match &self.backend {
             Some(backend) => {
@@ -338,13 +379,14 @@ impl FederatedMemory {
                 }
             }
             None => {
-                let mut inner = self.inner.lock().expect("lock poisoned");
+                let mut inner = self.shard(id);
                 inner.store.insert(id.to_vec(), FederatedRecord {
                     data, version, expires_at: now_secs() + ttl_secs,
                 });
-                // Evict expired entries if over capacity (in-process mode only —
-                // the backend mode relies on the backend's own TTL expiry).
-                if inner.store.len() > FEDERATED_MAX_ENTRIES {
+                // Evict expired entries if this shard is over its (aggregate-cap-
+                // preserving) per-shard capacity — in-process mode only, the
+                // backend mode relies on the backend's own TTL expiry.
+                if inner.store.len() > FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES {
                     let now = now_secs();
                     inner.store.retain(|_, v| v.expires_at > now);
                 }
@@ -360,7 +402,7 @@ impl FederatedMemory {
                 Some((record.data, record.version, record.expires_at))
             }
             None => {
-                let inner = self.inner.lock().expect("lock poisoned");
+                let inner = self.shard(id);
                 inner.store.get(id).map(|r| (r.data.clone(), r.version, r.expires_at))
             }
         }
@@ -369,7 +411,7 @@ impl FederatedMemory {
     fn remove_record(&self, id: &[u8]) {
         match &self.backend {
             Some(backend) => { let _ = backend.delete(&Self::backend_key(id)); }
-            None => { self.inner.lock().expect("lock poisoned").store.remove(id); }
+            None => { self.shard(id).store.remove(id); }
         }
     }
 
@@ -429,7 +471,7 @@ impl FederatedMemory {
         };
         match &self.backend {
             Some(backend) => backend.delete(&Self::backend_key(&intent_hash)).unwrap_or(false),
-            None => self.inner.lock().expect("lock poisoned").store.remove(&intent_hash).is_some(),
+            None => self.shard(&intent_hash).store.remove(&intent_hash).is_some(),
         }
     }
 
@@ -439,15 +481,23 @@ impl FederatedMemory {
     /// (e.g. Redis `EX`) enforces TTL expiry itself; there's no generically
     /// safe way to enumerate every key across the shared keyspace to sweep
     /// them client-side without a full scan on every call.
+    ///
+    /// In process-local mode this sweeps every shard in turn — each shard's
+    /// lock is held only for its own sweep, never all at once, so this never
+    /// blocks the whole store the way the pre-sharding single-lock sweep did.
     pub fn evict_expired(&self) -> usize {
         match &self.backend {
             Some(_) => 0,
             None => {
                 let now = now_secs();
-                let mut inner = self.inner.lock().expect("lock poisoned");
-                let before = inner.store.len();
-                inner.store.retain(|_, v| v.expires_at > now);
-                before - inner.store.len()
+                let mut evicted = 0usize;
+                for shard in &self.shards {
+                    let mut inner = shard.lock().expect("lock poisoned");
+                    let before = inner.store.len();
+                    inner.store.retain(|_, v| v.expires_at > now);
+                    evicted += before - inner.store.len();
+                }
+                evicted
             }
         }
     }
@@ -520,7 +570,7 @@ impl FederatedMemory {
     pub fn count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("fedmem:").map(|k| k.len()).unwrap_or(0),
-            None => self.inner.lock().expect("lock poisoned").store.len(),
+            None => self.shards.iter().map(|s| s.lock().expect("lock poisoned").store.len()).sum(),
         }
     }
 

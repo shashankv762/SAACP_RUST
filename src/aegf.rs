@@ -10,7 +10,7 @@
 //! - `AEGFGovernor`: Central coordinator — DEG + ESM + policy.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
@@ -175,10 +175,16 @@ fn allowed_transitions(state: ExecutionState) -> &'static [ExecutionState] {
 ///   Offset108: reserved (12 bytes, must be zero)
 #[derive(Debug, Clone)]
 pub struct AEGFMetadata {
-    pub cid: String,
+    /// Phase 3 / M-13 fix: `Arc<str>` (not `String`) — this field is set from the
+    /// same session identifier on every packet in a session, and cloning an
+    /// `Arc<str>` is an atomic refcount bump rather than a heap allocation +
+    /// byte copy. `rid`/`prid`/`oaid` stay `String`: `rid` is a fresh UUID
+    /// minted per request (nothing to share), `prid` mirrors a parent's `rid`
+    /// for the same reason, and `oaid` is an agent identifier, not a session one.
+    pub cid: Arc<str>,
     pub rid: String,
     pub prid: String,
-    pub sid: String,
+    pub sid: Arc<str>,
     pub oaid: String,
     pub hc: u16,
     pub ed: u16,
@@ -223,10 +229,13 @@ impl AEGFMetadata {
         ed: u16,
     ) -> Self {
         Self {
-            cid: cid.map_or_else(new_uuid_hex, |s| s.to_string()),
+            cid: match cid {
+                Some(s) => Arc::from(s),
+                None => Arc::from(new_uuid_hex()),
+            },
             rid: new_uuid_hex(),
             prid: prid.map_or_else(|| RID_ROOT.to_string(), |s| s.to_string()),
-            sid: sid.to_string(),
+            sid: Arc::from(sid),
             oaid: oaid.to_string(),
             hc,
             ed,
@@ -313,10 +322,10 @@ impl AEGFMetadata {
         ]);
 
         Ok(Self {
-            cid: bytes16_to_hex(&cid_b),
+            cid: Arc::from(bytes16_to_hex(&cid_b)),
             rid: bytes16_to_hex(&rid_b),
             prid: bytes16_to_hex(&prid_b),
-            sid: bytes16_to_hex(&sid_b),
+            sid: Arc::from(bytes16_to_hex(&sid_b)),
             oaid: bytes32_to_oaid(&oaid_b),
             hc,
             ed,
@@ -794,6 +803,74 @@ impl DistributedExecutionGraph {
         GovernanceDecision::Allow
     }
 
+    /// Phase 3 / P-2 fast path: validate a **root** request (`meta.prid ==
+    /// RID_ROOT`) that the caller will immediately discard (never inserted,
+    /// so nothing to remove afterward) — see `AEGFGovernor::submit_and_complete`,
+    /// which is the only intended caller.
+    ///
+    /// This is provably equivalent, for a root request only, to calling
+    /// `validate_and_add` followed immediately by `remove_request` on the
+    /// same rid with no other operation interleaved:
+    ///   - `has_cycle_inner` walks `node.prid` while `current != RID_ROOT` —
+    ///     a node whose OWN `prid` already equals `RID_ROOT` makes that loop
+    ///     never execute, so a root request can never be part of a cycle.
+    ///     The DFS `validate_and_add` would otherwise run is therefore
+    ///     always a no-op for this case.
+    ///   - Both the read and write sides of `path_counts` are gated on
+    ///     `prid != RID_ROOT` (`detect_repeated_path` returns `false`
+    ///     immediately for a root request; the commit step in
+    ///     `validate_and_add` is skipped the same way) — so a root request
+    ///     never touches `path_counts` either.
+    ///   - Since nothing is inserted here, no other caller can observe this
+    ///     request as a parent in the window between "add" and "remove" the
+    ///     way the full `validate_and_add`+`remove_request` pair briefly
+    ///     allows — there is no window at all, which is strictly *more*
+    ///     atomic than the general case, not less (Part 12 principle 8 is
+    ///     preserved, not weakened).
+    ///
+    /// The only genuinely observable effect `validate_and_add` has for a
+    /// root request is the graph-size cap check, so that is the only check
+    /// this function performs under the lock — one acquisition total,
+    /// instead of `validate_and_add`'s two plus `remove_request`'s one.
+    ///
+    /// Panics in debug builds if called with a non-root request — callers
+    /// must route those through `validate_and_add`/`remove_request` instead,
+    /// since a non-root request's cycle/repeated-path checks and its
+    /// availability as a future parent are genuinely observable and must
+    /// not be skipped.
+    pub fn validate_transient_root(
+        &self,
+        meta: &AEGFMetadata,
+        policy: &AEGFPolicy,
+    ) -> GovernanceDecision {
+        debug_assert_eq!(
+            meta.prid, RID_ROOT,
+            "validate_transient_root is only valid for root requests (prid == RID_ROOT)"
+        );
+
+        // TTL / hop / depth are pure metadata checks — identical to the
+        // first three guards in `validate_and_add`, no lock needed.
+        if meta.is_expired() {
+            return GovernanceDecision::Terminate;
+        }
+        if Self::detect_excessive_hops(meta, policy.max_hop_count) {
+            return GovernanceDecision::Pause;
+        }
+        if Self::detect_excessive_depth(meta, policy.max_execution_depth) {
+            return GovernanceDecision::Pause;
+        }
+
+        // Single lock acquisition: the graph-size cap is the only check
+        // that depends on shared state for a root request that is never
+        // actually inserted.
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.nodes.len() >= policy.max_graph_nodes as usize {
+            return GovernanceDecision::Pause;
+        }
+
+        GovernanceDecision::Allow
+    }
+
     /// Remove all nodes whose TTL has passed. Returns eviction count.
     pub fn evict_expired(&self) -> usize {
         let now = now_epoch_f64();
@@ -963,6 +1040,121 @@ impl AEGFGovernor {
         decision
     }
 
+    /// Phase 3 / P-2 fast path: fuses `submit_request` + an immediate
+    /// unconditional `complete_request(rid, None)` into a single call — the
+    /// exact pattern `handler.rs`'s Gate 11.0 uses for every non-exempt
+    /// packet (packets are processed synchronously; nothing keeps a DEG
+    /// entry alive across packets, so every submission is immediately
+    /// discarded again).
+    ///
+    /// For a **root** request (`meta.prid == RID_ROOT` — true for every
+    /// call `handler.rs` makes, since the handler layer has no hop-chain
+    /// context) this uses [`DistributedExecutionGraph::validate_transient_root`]
+    /// instead of `validate_and_add`, cutting the DEG lock acquisitions for
+    /// this call from 3 (validate_and_add's two + remove_request's one) down
+    /// to 1. This is observably identical to the original two-call sequence:
+    /// `validate_and_add` never leaves a node inserted for a root request in
+    /// any of the four `GovernanceDecision` outcomes (`Allow` inserts and
+    /// immediately keeps it — matched by `validate_transient_root` computing
+    /// the same decision without ever inserting, since a root request can
+    /// never fail cycle/repeated-path checks in the first place — see that
+    /// method's doc comment for the proof), so the `remove_request` call
+    /// `complete_request` would have made afterward is *always* a
+    /// documented no-op for this call site and is safely skipped entirely.
+    ///
+    /// Non-root requests (not produced by any current call site, but
+    /// supported for API completeness / future callers) fall back to the
+    /// exact original `validate_and_add` + `complete_request` sequence,
+    /// unchanged.
+    ///
+    /// ESM bookkeeping (`create`/`transition`) is untouched in both paths —
+    /// this optimizes DEG lock traffic only, per Part 6.2 row P-2 / Part 6.4
+    /// step 7 ("DEG fast-path... eliminate 3 lock acquisitions"); ESM's own
+    /// lock traffic is a separate concern not in this pass's scope.
+    pub fn submit_and_complete(&self, meta: &AEGFMetadata) -> GovernanceDecision {
+        let policy = self.policy.lock().unwrap().clone();
+        let is_root = meta.prid == RID_ROOT;
+
+        // Step 1: TTL — identical to submit_request's early-return path.
+        // `complete_request` is unconditionally called by the caller after
+        // `submit_request` returns (see `handler.rs`'s Gate 11.0 call site),
+        // but on this branch it is a guaranteed no-op: `transition` to
+        // `Completed` fails silently (the entry is already in the terminal
+        // `Expired` state, which has no outgoing transitions — see
+        // `allowed_transitions`), and `remove_request` is a no-op lookup
+        // since neither `validate_and_add` nor `validate_transient_root` was
+        // ever reached on this branch, so nothing was ever inserted into the
+        // DEG. Safe to return directly with no further work.
+        if meta.is_expired() {
+            let _ = self.esm.create(&meta.rid, "expired_on_arrival");
+            let _ = self.esm.transition(&meta.rid, ExecutionState::Expired, "TTL expired");
+            return GovernanceDecision::Terminate;
+        }
+
+        // Steps 2-3: DEG validation — fast path for root requests, full
+        // validate_and_add otherwise. `deg_may_have_inserted` tracks whether
+        // this call could possibly have left a node in the DEG that the
+        // cleanup step below must remove — `validate_transient_root` never
+        // inserts under any circumstance (see its doc comment), so the root
+        // case is always `false`; `validate_and_add` may or may not have
+        // inserted depending on which of its own guards fired, so the
+        // non-root case conservatively assumes `true` (an unconditional
+        // `remove_request` call on a key that was never inserted is a safe,
+        // cheap no-op — this fallback path isn't the one Phase 3 targets for
+        // lock-count reduction; no current caller in this crate produces a
+        // non-root request here — see this method's doc comment).
+        let (decision, deg_may_have_inserted) = if is_root {
+            (self.deg.validate_transient_root(meta, &policy), false)
+        } else {
+            (self.deg.validate_and_add(meta, &policy), true)
+        };
+
+        // Step 4: ESM — register and update state based on decision.
+        // Identical branching to submit_request's own Step 4: on an
+        // idempotent resubmit (rid already registered), submit_request
+        // returns immediately WITHOUT running the transition-by-decision
+        // match block below — `final_decision` captures that same override,
+        // and `skip_transition_match` suppresses that block accordingly.
+        let mut final_decision = decision;
+        let mut skip_transition_match = false;
+        if self.esm.create(&meta.rid, "submitted").is_err() {
+            final_decision = match self.esm.get_state(&meta.rid) {
+                Some(current) if current.is_terminal() => GovernanceDecision::Terminate,
+                _ => GovernanceDecision::Allow,
+            };
+            skip_transition_match = true;
+        }
+
+        if !skip_transition_match {
+            match decision {
+                GovernanceDecision::Allow => {
+                    let _ = self.esm.transition(&meta.rid, ExecutionState::Processing, "governance_allow");
+                }
+                GovernanceDecision::Pause => {
+                    let _ = self.esm.transition(&meta.rid, ExecutionState::Paused, "governance_pause");
+                }
+                GovernanceDecision::Review => {
+                    let _ = self.esm.transition(&meta.rid, ExecutionState::WaitingHumanReview, "governance_review");
+                }
+                GovernanceDecision::Terminate => {
+                    let _ = self.esm.transition(&meta.rid, ExecutionState::Terminated, "governance_terminate");
+                }
+            }
+        }
+
+        // complete_request(rid, None)'s body, inlined — called
+        // unconditionally on this path, exactly as `handler.rs` unconditionally
+        // calls `complete_request` after `submit_request` returns regardless
+        // of which internal branch fired (including the idempotent-resubmit
+        // branch above, matching that same unconditional-call behavior).
+        let _ = self.esm.transition(&meta.rid, ExecutionState::Completed, "completed");
+        if deg_may_have_inserted {
+            self.deg.remove_request(&meta.rid);
+        }
+
+        final_decision
+    }
+
     /// Mark a request as completed (or with specified terminal outcome).
     pub fn complete_request(&self, rid: &str, outcome: Option<ExecutionState>) {
         let terminal = match outcome {
@@ -1029,10 +1221,10 @@ mod tests {
         assert_eq!(AEGF_META_SIZE, 120, "AEGF_META_SIZE must be 120 bytes");
 
         let meta = AEGFMetadata {
-            cid:  "0".repeat(30) + "01",
+            cid:  Arc::from("0".repeat(30) + "01"),
             rid:  "0".repeat(30) + "02",
             prid: "0".repeat(32),
-            sid:  "0".repeat(30) + "03",
+            sid:  Arc::from("0".repeat(30) + "03"),
             oaid: "test-agent".to_string(),
             hc:   0,
             ed:   0,
@@ -1101,10 +1293,10 @@ mod tests {
 
         let make_meta = |suffix: &str| -> AEGFMetadata {
             AEGFMetadata {
-                cid: "aaa".to_string(),
+                cid: Arc::from("aaa"),
                 rid: format!("rid{}", suffix),
                 prid: RID_ROOT.to_string(),
-                sid: "sid1".to_string(),
+                sid: Arc::from("sid1"),
                 oaid: "agent".to_string(),
                 hc: 0,
                 ed: 0,
@@ -1116,6 +1308,190 @@ mod tests {
         assert_eq!(gov.submit_request(&make_meta("2")), GovernanceDecision::Allow);
         // Graph now has 2 nodes = max_graph_nodes; next must be Pause
         assert_eq!(gov.submit_request(&make_meta("3")), GovernanceDecision::Pause);
+    }
+
+    // ── Phase 3 / P-2: submit_and_complete fast-path equivalence ────────────
+
+    fn root_meta(rid: &str) -> AEGFMetadata {
+        AEGFMetadata {
+            cid: Arc::from("cid-fastpath"),
+            rid: rid.to_string(),
+            prid: RID_ROOT.to_string(),
+            sid: Arc::from("sid-fastpath"),
+            oaid: "agent-fastpath".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+        }
+    }
+
+    #[test]
+    fn submit_and_complete_allows_root_request_and_leaves_no_deg_residue() {
+        let gov = AEGFGovernor::new(None);
+        let meta = root_meta("fp-allow-1");
+        assert_eq!(gov.submit_and_complete(&meta), GovernanceDecision::Allow);
+        // A root request never gets inserted by the fast path, so the DEG
+        // node count must be unaffected — matching submit_request +
+        // complete_request's net-zero effect on node_count for a root rid.
+        assert_eq!(gov.deg().node_count(), 0);
+        // ESM ends in Completed, exactly as complete_request would leave it.
+        assert_eq!(gov.get_request_state("fp-allow-1"), Some(ExecutionState::Completed));
+    }
+
+    #[test]
+    fn submit_and_complete_matches_submit_then_complete_for_ttl_expired() {
+        let gov_fast = AEGFGovernor::new(None);
+        let gov_slow = AEGFGovernor::new(None);
+        let mut meta = root_meta("fp-expired");
+        meta.ttl = now_epoch_f64() - 10.0; // already expired
+
+        let fast_decision = gov_fast.submit_and_complete(&meta);
+
+        let slow_decision = gov_slow.submit_request(&meta);
+        gov_slow.complete_request(&meta.rid, None);
+
+        assert_eq!(fast_decision, slow_decision);
+        assert_eq!(fast_decision, GovernanceDecision::Terminate);
+        assert_eq!(
+            gov_fast.get_request_state(&meta.rid),
+            gov_slow.get_request_state(&meta.rid),
+        );
+    }
+
+    #[test]
+    fn submit_and_complete_matches_submit_then_complete_for_graph_cap_pause() {
+        let gov_fast = AEGFGovernor::new(None);
+        let gov_slow = AEGFGovernor::new(None);
+        let policy = AEGFPolicy { max_graph_nodes: 1, ..Default::default() };
+        gov_fast.set_policy(policy.clone());
+        gov_slow.set_policy(policy);
+
+        // Fill each governor's DEG to the cap with a non-root node that
+        // stays resident (root requests never stay resident under the
+        // fast path, so a non-root filler is required to actually exercise
+        // the cap for both governors identically).
+        let filler_parent = AEGFMetadata {
+            cid: Arc::from("cid-cap"),
+            rid: "cap-filler-parent".to_string(),
+            prid: RID_ROOT.to_string(),
+            sid: Arc::from("sid-cap"),
+            oaid: "agent-cap".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+        };
+        gov_fast.deg().add_node(&filler_parent);
+        gov_slow.deg().add_node(&filler_parent);
+        assert_eq!(gov_fast.deg().node_count(), 1);
+        assert_eq!(gov_slow.deg().node_count(), 1);
+
+        let meta = root_meta("fp-cap-overflow");
+        let fast_decision = gov_fast.submit_and_complete(&meta);
+        let slow_decision = gov_slow.submit_request(&meta);
+        gov_slow.complete_request(&meta.rid, None);
+
+        assert_eq!(fast_decision, GovernanceDecision::Pause);
+        assert_eq!(fast_decision, slow_decision);
+    }
+
+    #[test]
+    fn submit_and_complete_matches_submit_then_complete_for_idempotent_resubmit() {
+        let gov_fast = AEGFGovernor::new(None);
+        let gov_slow = AEGFGovernor::new(None);
+        let meta = root_meta("fp-idempotent");
+
+        // First submission on each governor.
+        assert_eq!(gov_fast.submit_and_complete(&meta), GovernanceDecision::Allow);
+        let first_slow = gov_slow.submit_request(&meta);
+        gov_slow.complete_request(&meta.rid, None);
+        assert_eq!(first_slow, GovernanceDecision::Allow);
+
+        // Resubmitting the SAME rid a second time exercises the
+        // idempotent-resubmit branch (esm.create returns Err) on both.
+        let second_fast = gov_fast.submit_and_complete(&meta);
+        let second_slow = gov_slow.submit_request(&meta);
+        gov_slow.complete_request(&meta.rid, None);
+
+        assert_eq!(second_fast, second_slow);
+        assert_eq!(
+            gov_fast.get_request_state(&meta.rid),
+            gov_slow.get_request_state(&meta.rid),
+        );
+    }
+
+    #[test]
+    fn submit_and_complete_matches_submit_then_complete_for_non_root_review_cycle() {
+        let gov_fast = AEGFGovernor::new(None);
+        let gov_slow = AEGFGovernor::new(None);
+
+        // Build an identical resident non-root parent chain on both
+        // governors, then submit a child whose prid points back at itself
+        // (a manufactured cycle) via submit_and_complete's non-root
+        // fallback path (full validate_and_add), matching submit_request
+        // exactly.
+        let parent = AEGFMetadata {
+            cid: Arc::from("cid-cycle"),
+            rid: "cycle-parent".to_string(),
+            prid: RID_ROOT.to_string(),
+            sid: Arc::from("sid-cycle"),
+            oaid: "agent-cycle".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+        };
+        gov_fast.deg().add_node(&parent);
+        gov_slow.deg().add_node(&parent);
+
+        // A node whose own prid equals its own rid is a self-cycle,
+        // detected by has_cycle_inner's `current == start` check.
+        let cyclic = AEGFMetadata {
+            cid: Arc::from("cid-cycle"),
+            rid: "cycle-self".to_string(),
+            prid: "cycle-self".to_string(),
+            sid: Arc::from("sid-cycle"),
+            oaid: "agent-cycle-child".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+        };
+
+        let fast_decision = gov_fast.submit_and_complete(&cyclic);
+        let slow_decision = gov_slow.submit_request(&cyclic);
+        gov_slow.complete_request(&cyclic.rid, None);
+
+        assert_eq!(fast_decision, GovernanceDecision::Review);
+        assert_eq!(fast_decision, slow_decision);
+        // Both governors must have rolled back the rejected insert — the
+        // resident parent is the only node left in each DEG.
+        assert_eq!(gov_fast.deg().node_count(), 1);
+        assert_eq!(gov_slow.deg().node_count(), 1);
+    }
+
+    #[test]
+    fn validate_transient_root_never_leaves_a_node_behind() {
+        let deg = DistributedExecutionGraph::new();
+        let policy = AEGFPolicy::default();
+        let meta = root_meta("transient-check");
+        assert_eq!(deg.validate_transient_root(&meta, &policy), GovernanceDecision::Allow);
+        assert_eq!(deg.node_count(), 0, "validate_transient_root must never insert a node");
+    }
+
+    #[test]
+    #[should_panic(expected = "validate_transient_root is only valid for root requests")]
+    fn validate_transient_root_rejects_non_root_in_debug() {
+        let deg = DistributedExecutionGraph::new();
+        let policy = AEGFPolicy::default();
+        let non_root = AEGFMetadata {
+            cid: Arc::from("cid"),
+            rid: "child".to_string(),
+            prid: "some-parent".to_string(),
+            sid: Arc::from("sid"),
+            oaid: "agent".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+        };
+        let _ = deg.validate_transient_root(&non_root, &policy);
     }
 
     #[test]
@@ -1138,10 +1514,10 @@ mod tests {
     fn test_aegf_test_vector_canonical_output() {
         // README §4.2 test vector: validates pack() produces exact canonical bytes
         let meta = AEGFMetadata {
-            cid: "00000000000000000000000000000001".to_string(),
+            cid: Arc::from("00000000000000000000000000000001"),
             rid: "00000000000000000000000000000002".to_string(),
             prid: "00000000000000000000000000000000".to_string(),
-            sid: "00000000000000000000000000000003".to_string(),
+            sid: Arc::from("00000000000000000000000000000003"),
             oaid: "test-agent".to_string(),
             hc: 0,
             ed: 0,

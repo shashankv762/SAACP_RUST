@@ -8,6 +8,8 @@
 //!   - Format version constant matches Python
 //!   - Pack/unpack roundtrip preserves all fields
 
+use std::sync::Arc;
+
 use saacp::{
     AEGFMetadata,
     AEGF_META_SIZE, AEGF_META_FORMAT_VERSION,
@@ -55,10 +57,10 @@ fn test_pack_produces_120_bytes() {
 #[test]
 fn test_field_offsets_cid_at_0() {
     let meta = AEGFMetadata {
-        cid: "aabbccdd00112233aabbccdd00112233".to_string(),
+        cid: Arc::from("aabbccdd00112233aabbccdd00112233"),
         rid: "0".repeat(32),
         prid: "0".repeat(32),
-        sid: "0".repeat(32),
+        sid: Arc::from("0".repeat(32)),
         oaid: String::new(),
         hc: 0,
         ed: 0,
@@ -74,10 +76,10 @@ fn test_field_offsets_cid_at_0() {
 #[test]
 fn test_field_offset_hc_at_96() {
     let meta = AEGFMetadata {
-        cid: "0".repeat(32),
+        cid: Arc::from("0".repeat(32)),
         rid: "0".repeat(32),
         prid: "0".repeat(32),
-        sid: "0".repeat(32),
+        sid: Arc::from("0".repeat(32)),
         oaid: String::new(),
         hc: 0x0042,  // 66 decimal
         ed: 0,
@@ -91,10 +93,10 @@ fn test_field_offset_hc_at_96() {
 #[test]
 fn test_field_offset_ed_at_98() {
     let meta = AEGFMetadata {
-        cid: "0".repeat(32),
+        cid: Arc::from("0".repeat(32)),
         rid: "0".repeat(32),
         prid: "0".repeat(32),
-        sid: "0".repeat(32),
+        sid: Arc::from("0".repeat(32)),
         oaid: String::new(),
         hc: 0,
         ed: 0x0007,
@@ -109,10 +111,10 @@ fn test_field_offset_ed_at_98() {
 fn test_field_offset_ttl_at_100() {
     let ttl_val: f64 = 1_700_000_000.0;
     let meta = AEGFMetadata {
-        cid: "0".repeat(32),
+        cid: Arc::from("0".repeat(32)),
         rid: "0".repeat(32),
         prid: "0".repeat(32),
-        sid: "0".repeat(32),
+        sid: Arc::from("0".repeat(32)),
         oaid: String::new(),
         hc: 0,
         ed: 0,
@@ -167,10 +169,10 @@ fn test_unpack_rejects_short_buffer() {
 fn test_pack_deterministic_for_same_fields() {
     // Same struct fields → same bytes (deterministic serialization)
     let meta = AEGFMetadata {
-        cid: "aabbccdd00112233aabbccdd00112233".to_string(),
+        cid: Arc::from("aabbccdd00112233aabbccdd00112233"),
         rid: "1122334455667788aabbccdd00112233".to_string(),
         prid: "0".repeat(32),
-        sid: "fedcba9876543210fedcba9876543210".to_string(),
+        sid: Arc::from("fedcba9876543210fedcba9876543210"),
         oaid: "deterministic-agent".to_string(),
         hc: 7,
         ed: 3,

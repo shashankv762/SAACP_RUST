@@ -9,7 +9,7 @@
 //! Gate pipeline order is a protocol invariant — reordering is a security bug.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use aho_corasick::AhoCorasick;
 use base64::Engine;
@@ -601,6 +601,46 @@ impl PromptInjectionScanner {
         }
         Ok(())
     }
+
+    /// Phase 3 / P-4 fast path: scan a payload dict's keys and values directly,
+    /// without first materializing it as a `JsonValue::Object` (which used to
+    /// require cloning every key and value in the map just to hand them back
+    /// to [`Self::scan_payload`] via a now-removed `json_value_from_map`
+    /// helper). Scans exactly the same content in exactly the same order as
+    /// `scan_payload(&JsonValue::Object(...), depth)` would: each key via
+    /// [`Self::normalize`]/[`Self::scan_string_patterns`]/
+    /// [`Self::scan_encoded_layers`] (the same helpers `scan_payload`'s own
+    /// `JsonValue::String` arm uses, just fed `&str` directly instead of via a
+    /// throwaway `JsonValue::String(k.clone())` wrapper), then each value via
+    /// `scan_payload` unchanged.
+    pub fn scan_payload_map(
+        map: &HashMap<String, JsonValue>,
+        depth: usize,
+    ) -> Result<(), SAACPHardDrop> {
+        if depth > Self::MAX_DEPTH {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::AmbiguousIntent,
+                format!("Payload nesting exceeds maximum depth of {}", Self::MAX_DEPTH),
+            ));
+        }
+        for (k, v) in map {
+            // Key scan mirrors scan_payload's `JsonValue::String` arm evaluated
+            // at depth + 1 (as if the key were wrapped in JsonValue::String and
+            // passed to scan_payload) — including its own depth-limit check —
+            // just without allocating that wrapper.
+            if depth + 1 > Self::MAX_DEPTH {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::AmbiguousIntent,
+                    format!("Payload nesting exceeds maximum depth of {}", Self::MAX_DEPTH),
+                ));
+            }
+            let normalized_key = Self::normalize(k);
+            Self::scan_string_patterns(&normalized_key)?;
+            Self::scan_encoded_layers(k, 0)?;
+            Self::scan_payload(v, depth + 1)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +671,11 @@ pub struct ParsedPacket {
     pub flags: u8,
     pub action_class: u8,
     pub status_code: u8,
-    pub session_uuid: String,
+    /// Phase 3 / M-13 fix: `Arc<str>`, not `String` — this value is cloned
+    /// several times per packet (AEGF/CSCS metadata construction, stream-id
+    /// locals). An `Arc<str>` clone is an atomic refcount bump; a `String`
+    /// clone is a heap allocation + byte copy. See `AEGFMetadata::cid`/`sid`.
+    pub session_uuid: Arc<str>,
     pub sequence_id: u64,
     pub context_state_id: String,
     pub context_version: u64,
@@ -731,7 +775,7 @@ impl SAACPProtocolHandler {
             flags: parsed.flags,
             action_class: parsed.action_class,
             status_code: parsed.status_code,
-            session_uuid: parsed.session_uuid,
+            session_uuid: Arc::from(parsed.session_uuid),
             sequence_id: parsed.sequence_id,
             context_state_id: parsed.context_state_id,
             context_version: parsed.context_version,
@@ -775,7 +819,7 @@ impl SAACPProtocolHandler {
             flags: parsed.flags,
             action_class: parsed.action_class,
             status_code: parsed.status_code,
-            session_uuid: hex::encode(parsed.session_id),
+            session_uuid: Arc::from(hex::encode(parsed.session_id)),
             sequence_id: parsed.psn,
             context_state_id: hex::encode(parsed.context_ref_id),
             context_version: parsed.context_version as u64,
@@ -979,6 +1023,19 @@ impl SAACPProtocolHandler {
         payload_dict: &JsonValue,
     ) -> Result<(), SAACPHardDrop> {
         PromptInjectionScanner::scan_payload(payload_dict, 0)
+    }
+
+    /// Gate 4.0, map-native form (Phase 3 / P-4): identical enforcement to
+    /// [`Self::gate_4_0_injection_scan`], but scans a `&HashMap<String,
+    /// JsonValue>` directly instead of requiring the caller to first wrap it
+    /// as a `JsonValue::Object` (which `json_value_from_map` did by deep-
+    /// cloning every entry). Internal hot-path use only — the public
+    /// `gate_4_0_injection_scan(&JsonValue)` API is unchanged and remains the
+    /// entry point for callers that already hold a `JsonValue`.
+    fn gate_4_0_injection_scan_map(
+        payload_dict: &HashMap<String, JsonValue>,
+    ) -> Result<(), SAACPHardDrop> {
+        PromptInjectionScanner::scan_payload_map(payload_dict, 0)
     }
 
     /// Gate 1.0: Financial Circuit Breaker.
@@ -1675,13 +1732,30 @@ impl SAACPProtocolHandler {
         parsed.gate_tier = Self::resolve_gate_tier(parsed.action_class, parsed.flags, is_pinned);
 
         // ── Decode JSON payload dict for downstream gates ─────────────────────
+        // Phase 3 / P-3 fix: this used to be a throwaway parse whose result fed
+        // only `payload_dict` — Gate 9.0 further below then re-parsed the exact
+        // same bytes from scratch for schema validation, a second full
+        // tokenize-and-parse pass over identical input on every non-binary
+        // packet. `parsed_payload_json` now remembers this parse's outcome
+        // (success, invalid UTF-8, or invalid JSON) so Gate 9.0 can reuse it
+        // instead of re-parsing — see that gate's block below for the reuse
+        // and its exact error-parity argument.
+        enum PayloadJsonParseOutcome { InvalidUtf8, InvalidJson }
+        let mut parsed_payload_json: Option<Result<serde_json::Value, PayloadJsonParseOutcome>> = None;
         if !parsed.payload.is_empty() && !parsed.is_binary_stream {
-            if let Ok(s) = std::str::from_utf8(&parsed.payload) {
-                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(s) {
-                    for (k, v) in map {
-                        parsed.payload_dict.insert(k, serde_value_to_json_value(v));
+            match std::str::from_utf8(&parsed.payload) {
+                Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) => {
+                        if let serde_json::Value::Object(ref map) = v {
+                            for (k, val) in map.iter() {
+                                parsed.payload_dict.insert(k.clone(), serde_value_to_json_value(val.clone()));
+                            }
+                        }
+                        parsed_payload_json = Some(Ok(v));
                     }
-                }
+                    Err(_) => { parsed_payload_json = Some(Err(PayloadJsonParseOutcome::InvalidJson)); }
+                },
+                Err(_) => { parsed_payload_json = Some(Err(PayloadJsonParseOutcome::InvalidUtf8)); }
             }
         }
 
@@ -1909,9 +1983,12 @@ impl SAACPProtocolHandler {
 
 
         // ── Gate 4.0: Prompt Injection Scan (text frames only — C-2 fix) ──────
+        // Phase 3 / P-4 fix: scan payload_dict directly instead of first
+        // deep-cloning it into a throwaway JsonValue::Object via
+        // json_value_from_map — see PromptInjectionScanner::scan_payload_map's
+        // doc comment for the equivalence argument.
         if !parsed.is_binary_stream {
-            let jv = json_value_from_map(&parsed.payload_dict);
-            if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
+            if let Err(e) = Self::gate_4_0_injection_scan_map(&parsed.payload_dict) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
@@ -1974,26 +2051,74 @@ impl SAACPProtocolHandler {
         // Authorization Invariance: framing auto-detects via status_code.
         use crate::framing::is_schema_exempt;
         if !parsed.is_binary_stream && !is_schema_exempt(parsed.status_code) {
-            let s = std::str::from_utf8(&parsed.payload).map_err(|_| {
-                let e = SAACPHardDrop::new(
-                    SAACPBytecodes::SchemaMismatch,
-                    "Gate 9.0: payload is not valid UTF-8",
-                );
-                report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
-                e
-            })?;
-            let json_val = serde_json::from_str::<serde_json::Value>(s).map_err(|_| {
-                let e = SAACPHardDrop::new(
-                    SAACPBytecodes::SchemaMismatch,
-                    "Gate 9.0: payload is not valid JSON",
-                );
-                report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
-                e
-            })?;
+            // Phase 3 / P-3 fix: reuse the parse already performed above instead
+            // of re-parsing `parsed.payload` from scratch. `Some(Ok(v))` /
+            // `Some(Err(..))` reproduce that earlier parse's outcome exactly —
+            // same UTF-8/JSON error messages and bytecode as before. `None`
+            // only occurs when the block above skipped parsing entirely
+            // (`parsed.payload.is_empty()` — `is_binary_stream` is already
+            // ruled out by this `if`'s own condition), so it falls back to
+            // parsing fresh here, identical to this gate's original behavior.
+            let json_val = match parsed_payload_json.take() {
+                Some(Ok(v)) => v,
+                Some(Err(PayloadJsonParseOutcome::InvalidUtf8)) => {
+                    let e = SAACPHardDrop::new(
+                        SAACPBytecodes::SchemaMismatch,
+                        "Gate 9.0: payload is not valid UTF-8",
+                    );
+                    report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                    return Err(e);
+                }
+                Some(Err(PayloadJsonParseOutcome::InvalidJson)) => {
+                    let e = SAACPHardDrop::new(
+                        SAACPBytecodes::SchemaMismatch,
+                        "Gate 9.0: payload is not valid JSON",
+                    );
+                    report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                    return Err(e);
+                }
+                None => {
+                    let s = std::str::from_utf8(&parsed.payload).map_err(|_| {
+                        let e = SAACPHardDrop::new(
+                            SAACPBytecodes::SchemaMismatch,
+                            "Gate 9.0: payload is not valid UTF-8",
+                        );
+                        report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                        e
+                    })?;
+                    serde_json::from_str::<serde_json::Value>(s).map_err(|_| {
+                        let e = SAACPHardDrop::new(
+                            SAACPBytecodes::SchemaMismatch,
+                            "Gate 9.0: payload is not valid JSON",
+                        );
+                        report_gate_rejection("gate_9_0_schema", current_agent_name, &e);
+                        e
+                    })?
+                }
+            };
             PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val).inspect_err(|e| {
                 report_gate_rejection("gate_9_0_schema", current_agent_name, e);
             })?;
         }
+
+
+        // Phase 3 fix: a single wall-clock read shared by Gate 11.0's and Gate
+        // 12.0's TTL computation below, replacing two separate SystemTime::now()
+        // calls a few dozen lines apart with no state change between them — both
+        // gates only ever add a fixed 3600-second window to "now", so sharing one
+        // timestamp is behaviorally identical while removing a redundant syscall
+        // from the hot path. Computed only when at least one of the two gates
+        // below will actually run (both share the exact same `is_schema_exempt`
+        // guard) — a schema-exempt packet still performs zero wall-clock reads
+        // here, exactly as before this change.
+        let pipeline_now_secs = if !is_schema_exempt(parsed.status_code) {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        } else {
+            0.0 // unused: both gates below are skipped for schema-exempt packets
+        };
 
         // ── Gate 11.0: AEGF Hop-Limit + Causal Graph (DEG) ───────────────────
         // Mandatory for ALL tiers on non-stream frames (Authorization Invariance).
@@ -2012,11 +2137,6 @@ impl SAACPProtocolHandler {
             rid_hasher.update(parsed.sequence_id.to_be_bytes());
             let aegf_rid = hex::encode(rid_hasher.finalize());
 
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
             let aegf_meta = AEGFMetadata {
                 cid: parsed.session_uuid.clone(),
                 rid: aegf_rid.clone(),
@@ -2025,13 +2145,19 @@ impl SAACPProtocolHandler {
                 oaid: source_agent.clone(),
                 hc: 0,  // handler layer has no hop-chain context; use 0
                 ed: 0,
-                ttl: now_secs + 3600.0,
+                ttl: pipeline_now_secs + 3600.0,
             };
 
-            let decision = gov.submit_request(&aegf_meta);
-            // Complete immediately — packet processing is synchronous; keeping
-            // the entry registered would cause unbounded DEG growth.
-            gov.complete_request(&aegf_rid, None);
+            // Phase 3 / P-2 fast path: `aegf_meta.prid` is always `RID_ROOT`
+            // here (the handler layer has no hop-chain context — see above),
+            // and this call site always completes the request immediately
+            // after submitting it (packet processing is synchronous; keeping
+            // the entry registered would cause unbounded DEG growth) —
+            // exactly the pattern `submit_and_complete` fuses into one call,
+            // cutting DEG lock acquisitions per packet from 3 down to 1 for
+            // the common case. See `AEGFGovernor::submit_and_complete`'s doc
+            // comment for the correctness argument.
+            let decision = gov.submit_and_complete(&aegf_meta);
 
             match decision {
                 GovernanceDecision::Allow => {} // proceed normally
@@ -2077,11 +2203,6 @@ impl SAACPProtocolHandler {
 
             let cscs_det = _cscs.unwrap_or_else(|| &*GLOBAL_CSCS);
 
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
             // RID unique per (session + sequence) → fingerprint unique per packet.
             // hc = truncated sequence_id represents progression within the session.
             let mut cscs_rid_hasher = Sha256::new();
@@ -2098,7 +2219,7 @@ impl SAACPProtocolHandler {
                 oaid: source_agent.clone(),
                 hc: (parsed.sequence_id & 0xFFFF) as u16,
                 ed: 0,
-                ttl: now_secs + 3600.0,
+                ttl: pipeline_now_secs + 3600.0,
             };
 
             cscs_det.cs_detect_loop(&parsed.session_uuid, &cscs_meta, parsed.action_class).inspect_err(|e| {
@@ -2477,14 +2598,6 @@ pub fn serde_value_to_json_value(v: serde_json::Value) -> JsonValue {
     }
 }
 
-/// Wrap a payload dict as a JsonValue::Object suitable for scan_payload.
-fn json_value_from_map(map: &HashMap<String, JsonValue>) -> JsonValue {
-    JsonValue::Object(
-        map.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    )
-}
 
 /// Extract SHA-256 hex of the signature bytes from a base64-encoded capability token.
 ///

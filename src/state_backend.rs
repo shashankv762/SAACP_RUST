@@ -341,10 +341,25 @@ impl StateBackend for InMemoryBackend {
 /// via `tokio::task::spawn_blocking` in `daemon.rs`); the plain synchronous
 /// client has no such hazard and keeps this trait's synchronous contract
 /// honest.
+///
+/// ## Connection pooling (Phase 3 / P-5)
+///
+/// Every call used to open a brand-new TCP connection via
+/// `get_connection_with_timeout` and drop it at the end of the method —
+/// correct, but thousands of TCP handshakes/sec under load. `checkout`/
+/// `checkin` below implement a small bounded free-list pool of already-open
+/// `redis::Connection`s: a call pops a live connection if one is idle (or
+/// opens a new one, up to `max_pool_size`, if the pool is empty), and pushes
+/// it back when done. A connection that errors mid-command is dropped rather
+/// than returned to the pool, since a Redis protocol/IO error typically means
+/// the connection is no longer in a known-good state — the next caller just
+/// opens a fresh one, which is exactly today's behaviour for that one call.
 #[cfg(feature = "redis-backend")]
 pub struct RedisBackend {
     client: redis::Client,
     timeout: Duration,
+    pool: Mutex<Vec<redis::Connection>>,
+    max_pool_size: usize,
 }
 
 /// Default connect timeout for `RedisBackend::new()`. Bounds how long a
@@ -354,23 +369,60 @@ pub struct RedisBackend {
 #[cfg(feature = "redis-backend")]
 const REDIS_DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Default cap on idle pooled connections. Bounded so a burst of concurrent
+/// callers can't grow the pool unboundedly (Part 12 principle 5, "Bounded
+/// Everything") — extra connections beyond this cap are simply closed
+/// instead of pooled once the burst subsides.
+#[cfg(feature = "redis-backend")]
+const REDIS_DEFAULT_MAX_POOL_SIZE: usize = 32;
+
 #[cfg(feature = "redis-backend")]
 impl RedisBackend {
     /// `redis_url` example: `"redis://127.0.0.1:6379/"`. Uses a 250ms connect
-    /// timeout; use [`Self::with_timeout`] to configure a different bound.
+    /// timeout and a 32-connection pool cap; use [`Self::with_timeout`] or
+    /// [`Self::with_pool_size`] to configure different bounds.
     pub fn new(redis_url: &str) -> BackendResult<Self> {
         Self::with_timeout(redis_url, REDIS_DEFAULT_CONNECT_TIMEOUT)
     }
 
     pub fn with_timeout(redis_url: &str, timeout: Duration) -> BackendResult<Self> {
-        let client = redis::Client::open(redis_url).map_err(|e| BackendError(e.to_string()))?;
-        Ok(Self { client, timeout })
+        Self::with_pool_size(redis_url, timeout, REDIS_DEFAULT_MAX_POOL_SIZE)
     }
 
-    fn conn(&self) -> BackendResult<redis::Connection> {
+    pub fn with_pool_size(redis_url: &str, timeout: Duration, max_pool_size: usize) -> BackendResult<Self> {
+        let client = redis::Client::open(redis_url).map_err(|e| BackendError(e.to_string()))?;
+        Ok(Self { client, timeout, pool: Mutex::new(Vec::new()), max_pool_size })
+    }
+
+    /// Take a pooled connection if one is idle, otherwise open a fresh one.
+    fn checkout(&self) -> BackendResult<redis::Connection> {
+        if let Some(conn) = self.pool.lock().expect("lock poisoned").pop() {
+            return Ok(conn);
+        }
         self.client
             .get_connection_with_timeout(self.timeout)
             .map_err(|e| BackendError(e.to_string()))
+    }
+
+    /// Return a still-healthy connection to the pool for reuse; drop it
+    /// (closing the TCP connection) if the pool is already at capacity.
+    fn checkin(&self, conn: redis::Connection) {
+        let mut pool = self.pool.lock().expect("lock poisoned");
+        if pool.len() < self.max_pool_size {
+            pool.push(conn);
+        }
+    }
+
+    /// Run `f` against a pooled connection, returning it to the pool only on
+    /// success — a command that errors may have left the connection in an
+    /// indeterminate protocol state, so it's dropped instead of reused.
+    fn with_conn<T>(&self, f: impl FnOnce(&mut redis::Connection) -> BackendResult<T>) -> BackendResult<T> {
+        let mut conn = self.checkout()?;
+        let result = f(&mut conn);
+        if result.is_ok() {
+            self.checkin(conn);
+        }
+        result
     }
 }
 
@@ -378,45 +430,45 @@ impl RedisBackend {
 impl StateBackend for RedisBackend {
     fn get(&self, key: &str) -> BackendResult<Option<Vec<u8>>> {
         use redis::Commands;
-        let mut conn = self.conn()?;
-        conn.get(key).map_err(|e| BackendError(e.to_string()))
+        self.with_conn(|conn| conn.get(key).map_err(|e| BackendError(e.to_string())))
     }
 
     fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> BackendResult<()> {
         use redis::Commands;
-        let mut conn = self.conn()?;
-        match ttl {
+        self.with_conn(|conn| match ttl {
             Some(d) => {
                 let secs = d.as_secs().max(1); // Redis EX requires a positive integer.
                 conn.set_ex(key, value, secs).map_err(|e| BackendError(e.to_string()))
             }
             None => conn.set(key, value).map_err(|e| BackendError(e.to_string())),
-        }
+        })
     }
 
     fn delete(&self, key: &str) -> BackendResult<bool> {
         use redis::Commands;
-        let mut conn = self.conn()?;
-        let removed: i64 = conn.del(key).map_err(|e| BackendError(e.to_string()))?;
-        Ok(removed > 0)
+        self.with_conn(|conn| {
+            let removed: i64 = conn.del(key).map_err(|e| BackendError(e.to_string()))?;
+            Ok(removed > 0)
+        })
     }
 
     fn incr(&self, key: &str, by: i64) -> BackendResult<i64> {
         use redis::Commands;
-        let mut conn = self.conn()?;
-        conn.incr(key, by).map_err(|e| BackendError(e.to_string()))
+        self.with_conn(|conn| conn.incr(key, by).map_err(|e| BackendError(e.to_string())))
     }
 
     fn scan_prefix(&self, prefix: &str) -> BackendResult<Vec<String>> {
         use redis::Commands;
-        let mut conn = self.conn()?;
-        let pattern = format!("{prefix}*");
         // SCAN (cursor-based, non-blocking), never KEYS (blocks the server
-        // for the duration of a full-keyspace scan).
-        let iter: redis::Iter<'_, String> = conn
-            .scan_match(pattern)
-            .map_err(|e| BackendError(e.to_string()))?;
-        Ok(iter.collect())
+        // for the duration of a full-keyspace scan). The iterator borrows the
+        // connection for its lifetime, so it's fully drained (collected)
+        // before the connection is returned to the pool.
+        self.with_conn(|conn| {
+            let pattern = format!("{prefix}*");
+            let iter: redis::Iter<'_, String> =
+                conn.scan_match(pattern).map_err(|e| BackendError(e.to_string()))?;
+            Ok(iter.collect())
+        })
     }
 
     fn incr_with_ttl(&self, key: &str, by: i64, ttl: Duration) -> BackendResult<i64> {
@@ -431,13 +483,14 @@ impl StateBackend for RedisBackend {
             end
             return v
         "#;
-        let mut conn = self.conn()?;
-        redis::Script::new(SCRIPT)
-            .key(key)
-            .arg(by)
-            .arg(ttl.as_secs().max(1))
-            .invoke(&mut conn)
-            .map_err(|e| BackendError(e.to_string()))
+        self.with_conn(|conn| {
+            redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(by)
+                .arg(ttl.as_secs().max(1))
+                .invoke(conn)
+                .map_err(|e| BackendError(e.to_string()))
+        })
     }
 
     fn compare_and_swap(
@@ -472,18 +525,19 @@ impl StateBackend for RedisBackend {
             end
             return 1
         "#;
-        let mut conn = self.conn()?;
         let has_expected = if expected.is_some() { "1" } else { "0" };
         let ttl_secs = ttl.map(|d| d.as_secs().max(1)).unwrap_or(0);
-        let result: i64 = redis::Script::new(SCRIPT)
-            .key(key)
-            .arg(expected.unwrap_or(&[]))
-            .arg(has_expected)
-            .arg(ttl_secs)
-            .arg(new)
-            .invoke(&mut conn)
-            .map_err(|e| BackendError(e.to_string()))?;
-        Ok(result == 1)
+        self.with_conn(|conn| {
+            let result: i64 = redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(expected.unwrap_or(&[]))
+                .arg(has_expected)
+                .arg(ttl_secs)
+                .arg(new)
+                .invoke(conn)
+                .map_err(|e| BackendError(e.to_string()))?;
+            Ok(result == 1)
+        })
     }
 }
 

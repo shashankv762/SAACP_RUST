@@ -1020,8 +1020,8 @@ fn attack_5_5_aegf_graph_inflation() -> AttackResult {
     use saacp::GovernanceDecision;
     for i in 0u64..10 {
         let meta = AEGFMetadata {
-            cid: format!("cid-{}", i), rid: format!("rid-{:032}", i),
-            prid: RID_ROOT.to_string(), sid: format!("sid-{}", i),
+            cid: Arc::from(format!("cid-{}", i)), rid: format!("rid-{:032}", i),
+            prid: RID_ROOT.to_string(), sid: Arc::from(format!("sid-{}", i)),
             oaid: "attacker".to_string(), hc: 0, ed: 0,
             ttl: 9999999999.0,
         };
@@ -1286,10 +1286,10 @@ fn attack_7_3_cscs_loop_detection() -> AttackResult {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
         let meta = AEGFMetadata {
-            cid: "cid-loop".to_string(),
+            cid: Arc::from("cid-loop"),
             rid: format!("rid-{}-{}", i, now as u64),
             prid: RID_ROOT.to_string(),
-            sid: session_id.to_string(),
+            sid: Arc::from(session_id),
             oaid: "loop-agent".to_string(),
             hc: 0, // same hop count — triggers fingerprint match
             ed: 0,
@@ -1372,10 +1372,10 @@ fn attack_7_5_recursive_task_injection() -> AttackResult {
     let mut blocked = false;
     for i in 0..6u32 {
         let meta = AEGFMetadata {
-            cid: session.to_string(),
+            cid: Arc::from(session),
             rid: format!("rid-recursive-{}", i),
             prid: RID_ROOT.to_string(),
-            sid: session.to_string(),
+            sid: Arc::from(session),
             oaid: "recursive-agent".to_string(),
             hc: 0, ed: 0,
             ttl: now + 300.0,
@@ -1479,8 +1479,8 @@ fn attack_compound_full_redteam() -> Vec<AttackResult> {
     let mut e_blocked = false;
     for i in 0..5u32 {
         let meta = AEGFMetadata {
-            cid: "compound-cid".to_string(), rid: format!("rd-{}", i),
-            prid: RID_ROOT.to_string(), sid: "compound-sid".to_string(),
+            cid: Arc::from("compound-cid"), rid: format!("rd-{}", i),
+            prid: RID_ROOT.to_string(), sid: Arc::from("compound-sid"),
             oaid: "compromised-planner".to_string(), hc: 0, ed: 0,
             ttl: now + 300.0,
         };

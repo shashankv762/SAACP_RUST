@@ -312,14 +312,9 @@ impl SAACPFrame {
         // Encrypt: AAD = prefix_bytes
         let (ciphertext, auth_tag) = Self::aes_gcm_encrypt(secret_key, &iv, &prefix_bytes, &payload_to_encrypt)?;
 
-        // Adler-32 over (prefix || auth_tag || ciphertext)
-        let checksum = {
-            let mut buf = Vec::with_capacity(SAACPFRAME_PREFIX_SIZE + 16 + ciphertext.len());
-            buf.extend_from_slice(&prefix_bytes);
-            buf.extend_from_slice(&auth_tag);
-            buf.extend_from_slice(&ciphertext);
-            adler32_checksum(&buf)
-        };
+        // Adler-32 over (prefix || auth_tag || ciphertext) — streamed directly
+        // into the hasher (Phase 3 / P-7), no intermediate concatenation buffer.
+        let checksum = adler32_checksum_multi(&[&prefix_bytes, &auth_tag, &ciphertext]);
 
         // Assemble wire packet
         let mut wire = Vec::with_capacity(SAACPFRAME_FIXED_OVERHEAD + ciphertext.len());
@@ -400,13 +395,8 @@ impl SAACPFrame {
         let ciphertext = &buffer[SAACPFRAME_PREFIX_SIZE + 20..ciphertext_end];
 
         // 5. Adler-32 fast corruption filter (NOT cryptographic — AES-GCM handles that)
-        let expected_checksum = {
-            let mut buf = Vec::with_capacity(SAACPFRAME_PREFIX_SIZE + 16 + ciphertext.len());
-            buf.extend_from_slice(prefix_bytes);
-            buf.extend_from_slice(auth_tag_slice);
-            buf.extend_from_slice(ciphertext);
-            adler32_checksum(&buf)
-        };
+        // Streamed directly into the hasher (Phase 3 / P-7), no intermediate buffer.
+        let expected_checksum = adler32_checksum_multi(&[prefix_bytes, auth_tag_slice, ciphertext]);
         let actual_checksum = u32::from_be_bytes([
             checksum_slice[0], checksum_slice[1], checksum_slice[2], checksum_slice[3],
         ]);
@@ -972,6 +962,21 @@ pub fn adler32_checksum(data: &[u8]) -> u32 {
     use adler2::Adler32;
     let mut a = Adler32::new();
     a.write_slice(data);
+    a.checksum()
+}
+
+/// Phase 3 / P-7: streaming variant of [`adler32_checksum`] that feeds each part
+/// to the hasher in sequence instead of requiring the caller to first
+/// concatenate them into one temporary `Vec<u8>` — Adler-32 is defined over a
+/// running sum, so `write_slice(a); write_slice(b); write_slice(c)` produces
+/// the exact same checksum as hashing `[a, b, c].concat()` in one call, with
+/// no intermediate allocation.
+pub fn adler32_checksum_multi(parts: &[&[u8]]) -> u32 {
+    use adler2::Adler32;
+    let mut a = Adler32::new();
+    for part in parts {
+        a.write_slice(part);
+    }
     a.checksum()
 }
 
