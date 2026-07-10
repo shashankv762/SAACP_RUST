@@ -288,7 +288,11 @@ impl DeliveredMessage {
             task,
             priority,
             action_class: parsed.action_class,
-            session_uuid: parsed.session_uuid.clone(),
+            // `DeliveredMessage` is a serde wire-format DTO (`/receive` HTTP
+            // response) — deliberately kept as `String`, not `Arc<str>`, so
+            // this one conversion (crossing a serialization boundary, not a
+            // per-packet hot path) uses `.to_string()` rather than `.clone()`.
+            session_uuid: parsed.session_uuid.to_string(),
         })
     }
 }

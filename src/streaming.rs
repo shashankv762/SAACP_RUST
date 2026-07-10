@@ -187,17 +187,42 @@ impl StreamSession {
 
 // ── StreamRegistry ─────────────────────────────────────────────────────────
 
+/// Number of independent lock shards for process-local `StreamRegistry`
+/// session storage (Phase 3 / P-1 / Part 6.3: sharded on `session_id[0] % 8`,
+/// i.e. the first byte of `stream_id`). Before sharding, every stream's
+/// per-frame `validate_frame` call — the hottest call in this module, invoked
+/// on every CONTINUATION/END frame of every active stream — serialized behind
+/// one process-wide `Mutex`, so two unrelated streams' frames could never be
+/// validated concurrently.
+///
+/// `agent_counts` (the per-agent bookkeeping map used only for the
+/// infrequent `MAX_STREAMS_PER_AGENT` check at `register()` time, not the
+/// per-frame hot path) deliberately stays a single `Mutex` — it is keyed by
+/// `agent_id`, not `stream_id`, so it cannot use the same shard key, and its
+/// low call frequency means sharding it would add complexity without a
+/// measurable contention benefit.
+const STREAM_SHARDS: usize = 8;
+
+/// Maps a `stream_id` to its shard index using the first byte of the string
+/// (falls back to shard 0 for an empty `stream_id`, which the registry never
+/// actually produces itself but a caller-supplied ID is not assumed to avoid).
+fn stream_shard_index(stream_id: &str) -> usize {
+    (stream_id.as_bytes().first().copied().unwrap_or(0) as usize) % STREAM_SHARDS
+}
+
 /// Global registry of active stream sessions.
 ///
-/// Backed by a process-local `HashMap` by default. [`StreamRegistry::with_backend`]
-/// instead routes session state through a shared [`StateBackend`] (e.g.
-/// Redis) so a stream started on one SAACP gateway node can be continued
-/// against another — see `state_backend.rs` for the design. Every mutating
-/// backend-mode operation reuses `StreamSession::validate_continuation`
-/// itself (get → mutate in memory → put) rather than reimplementing its
-/// ordering/byte-cap/duration/gap checks a second time.
+/// Backed by process-local, **sharded** `HashMap`s by default (see
+/// [`STREAM_SHARDS`] above). [`StreamRegistry::with_backend`] instead routes
+/// session state through a shared [`StateBackend`] (e.g. Redis) so a stream
+/// started on one SAACP gateway node can be continued against another — see
+/// `state_backend.rs` for the design; that mode is unaffected by sharding
+/// (Redis handles its own concurrency). Every mutating backend-mode operation
+/// reuses `StreamSession::validate_continuation` itself (get → mutate in
+/// memory → put) rather than reimplementing its ordering/byte-cap/duration/gap
+/// checks a second time.
 pub struct StreamRegistry {
-    streams: Mutex<HashMap<String, StreamSession>>,
+    streams: Vec<Mutex<HashMap<String, StreamSession>>>,
     agent_counts: Mutex<HashMap<String, usize>>,
     backend: Option<Arc<dyn StateBackend>>,
 }
@@ -210,10 +235,14 @@ fn stream_backend_ttl() -> Duration {
 }
 
 impl StreamRegistry {
+    fn new_shards() -> Vec<Mutex<HashMap<String, StreamSession>>> {
+        (0..STREAM_SHARDS).map(|_| Mutex::new(HashMap::new())).collect()
+    }
+
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
-            streams: Mutex::new(HashMap::new()),
+            streams: Self::new_shards(),
             agent_counts: Mutex::new(HashMap::new()),
             backend: None,
         }
@@ -223,10 +252,19 @@ impl StreamRegistry {
     /// Redis) instead of a process-local `HashMap`. See `state_backend.rs`.
     pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
         Self {
-            streams: Mutex::new(HashMap::new()),
+            streams: Self::new_shards(),
             agent_counts: Mutex::new(HashMap::new()),
             backend: Some(backend),
         }
+    }
+
+    /// Lock and return the shard responsible for `stream_id` (process-local
+    /// mode only). Callers that also need `agent_counts` must lock the shard
+    /// first, `agent_counts` second — every call site in this file follows
+    /// that fixed order, so no two call sites can deadlock against each
+    /// other by acquiring the two locks in opposite order.
+    fn shard(&self, stream_id: &str) -> std::sync::MutexGuard<'_, HashMap<String, StreamSession>> {
+        self.streams[stream_shard_index(stream_id)].lock().unwrap()
     }
 
     fn stream_key(stream_id: &str) -> String {
@@ -262,30 +300,58 @@ impl StreamRegistry {
         }
     }
 
+    /// Deliberately never holds `agent_counts`'s lock and a `streams` shard
+    /// lock at the same time (each acquisition below is independent and
+    /// released before the next one starts) — `close`/`abort_stream`/
+    /// `end_stream` acquire a shard lock and then, while still holding it,
+    /// acquire `agent_counts`'s lock; if this function instead held
+    /// `agent_counts` while trying to acquire a shard lock, two threads
+    /// racing this function against one of those could deadlock (classic
+    /// lock-order inversion). Never nesting the two here sidesteps the need
+    /// for a fixed global ordering entirely. The resulting per-agent-limit
+    /// check has a narrow benign race under heavy concurrent registration
+    /// for the *same* agent (it could momentarily admit one more than
+    /// `MAX_STREAMS_PER_AGENT`) — acceptable for this soft cap, consistent
+    /// with this codebase's other best-effort concurrent counters, and no
+    /// worse than the eviction race that already existed for the global cap.
     fn register_local(&self, session: StreamSession) -> Result<(), SAACPHardDrop> {
-        let mut streams = self.streams.lock().unwrap();
-        let mut agent_counts = self.agent_counts.lock().unwrap();
-
-        // Per-agent limit
-        let agent_count = agent_counts.get(&session.agent_id).copied().unwrap_or(0);
-        if agent_count >= MAX_STREAMS_PER_AGENT {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::StreamAbort,
-                format!(
-                    "Agent '{}' already has {} active streams (max {}).",
-                    session.agent_id, agent_count, MAX_STREAMS_PER_AGENT
-                ),
-            ));
+        // Per-agent limit.
+        {
+            let agent_counts = self.agent_counts.lock().unwrap();
+            let agent_count = agent_counts.get(&session.agent_id).copied().unwrap_or(0);
+            if agent_count >= MAX_STREAMS_PER_AGENT {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::StreamAbort,
+                    format!(
+                        "Agent '{}' already has {} active streams (max {}).",
+                        session.agent_id, agent_count, MAX_STREAMS_PER_AGENT
+                    ),
+                ));
+            }
         }
 
-        // Global cap — evict oldest if needed
-        if streams.len() >= MAX_ACTIVE_STREAMS {
-            let oldest_id = streams
-                .iter()
-                .min_by(|a, b| a.1.started_at.partial_cmp(&b.1.started_at).unwrap())
-                .map(|(k, _)| k.clone());
-            if let Some(id) = oldest_id {
-                if let Some(evicted) = streams.remove(&id) {
+        // Global cap — evict oldest if needed. The global cap is a
+        // cross-shard invariant (Part 12 principle 5, "Bounded Everything"
+        // must not be silently loosened by sharding), so this locks every
+        // shard in turn (never more than one at a time) to find the globally
+        // oldest session before deciding whether to evict.
+        let total: usize = self.streams.iter().map(|s| s.lock().unwrap().len()).sum();
+        if total >= MAX_ACTIVE_STREAMS {
+            let mut oldest: Option<(usize, String, f64)> = None;
+            for (idx, shard) in self.streams.iter().enumerate() {
+                let guard = shard.lock().unwrap();
+                if let Some((id, sess)) = guard.iter()
+                    .min_by(|a, b| a.1.started_at.partial_cmp(&b.1.started_at).unwrap())
+                {
+                    if oldest.as_ref().is_none_or(|(_, _, t)| sess.started_at < *t) {
+                        oldest = Some((idx, id.clone(), sess.started_at));
+                    }
+                }
+            }
+            if let Some((idx, id, _)) = oldest {
+                let evicted = self.streams[idx].lock().unwrap().remove(&id);
+                if let Some(evicted) = evicted {
+                    let mut agent_counts = self.agent_counts.lock().unwrap();
                     let cnt = agent_counts.entry(evicted.agent_id.clone()).or_insert(1);
                     *cnt = cnt.saturating_sub(1);
                     if *cnt == 0 {
@@ -295,8 +361,10 @@ impl StreamRegistry {
             }
         }
 
-        *agent_counts.entry(session.agent_id.clone()).or_insert(0) += 1;
-        streams.insert(session.stream_id.clone(), session);
+        let agent_id = session.agent_id.clone();
+        self.shard(&session.stream_id).insert(session.stream_id.clone(), session);
+        let mut agent_counts = self.agent_counts.lock().unwrap();
+        *agent_counts.entry(agent_id).or_insert(0) += 1;
         Ok(())
     }
 
@@ -338,7 +406,7 @@ impl StreamRegistry {
         match &self.backend {
             Some(backend) => self.validate_frame_backend(backend, stream_id, sequence, frame_bytes),
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 let session = streams.get_mut(stream_id).ok_or_else(|| {
                     SAACPHardDrop::new(
                         SAACPBytecodes::StreamAbort,
@@ -443,7 +511,7 @@ impl StreamRegistry {
                 }
             }
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 let mut agent_counts = self.agent_counts.lock().unwrap();
 
                 if let Some(session) = streams.remove(stream_id) {
@@ -470,7 +538,7 @@ impl StreamRegistry {
     pub fn active_count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("stream:").map(|k| k.len()).unwrap_or(0),
-            None => self.streams.lock().unwrap().len(),
+            None => self.streams.iter().map(|s| s.lock().unwrap().len()).sum(),
         }
     }
 
@@ -510,7 +578,7 @@ impl StreamRegistry {
     pub fn get_stream(&self, stream_id: &str) -> Option<StreamSession> {
         match &self.backend {
             Some(backend) => Self::get_session_backend(backend, stream_id),
-            None => self.streams.lock().unwrap().get(stream_id).cloned(),
+            None => self.shard(stream_id).get(stream_id).cloned(),
         }
     }
 
@@ -519,7 +587,7 @@ impl StreamRegistry {
         match &self.backend {
             Some(backend) => { let _ = backend.delete(&Self::stream_key(stream_id)); }
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 let mut agent_counts = self.agent_counts.lock().unwrap();
                 if let Some(session) = streams.remove(stream_id) {
                     let cnt = agent_counts.entry(session.agent_id).or_insert(0);
@@ -547,7 +615,7 @@ impl StreamRegistry {
                 result.map_err(|e| e.message)
             }
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 let session = streams.get_mut(stream_id).ok_or_else(|| {
                     format!("No active stream '{}'.", stream_id)
                 })?;
@@ -568,7 +636,7 @@ impl StreamRegistry {
             Some(backend) => Self::get_session_backend(backend, stream_id)
                 .map(|s| (s.token_exp, s.token_sig_hash, s.last_sequence_id, s.max_action_class, s.source_agent)),
             None => {
-                let streams = self.streams.lock().unwrap();
+                let streams = self.shard(stream_id);
                 streams.get(stream_id).map(|s| {
                     (s.token_exp, s.token_sig_hash.clone(), s.last_sequence_id, s.max_action_class, s.source_agent.clone())
                 })
@@ -601,7 +669,7 @@ impl StreamRegistry {
                 }
             }
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 if let Some(s) = streams.get_mut(stream_id) {
                     s.token_sig_hash = token_sig_hash.to_string();
                     s.token_exp = token_exp;
@@ -622,7 +690,7 @@ impl StreamRegistry {
                 Some(session)
             }
             None => {
-                let mut streams = self.streams.lock().unwrap();
+                let mut streams = self.shard(stream_id);
                 let mut agent_counts = self.agent_counts.lock().unwrap();
                 if let Some(mut session) = streams.remove(stream_id) {
                     session.closed = true;

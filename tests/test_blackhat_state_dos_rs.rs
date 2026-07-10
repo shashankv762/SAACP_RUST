@@ -67,10 +67,10 @@ fn build_measc(
 
 fn make_meta(oaid: &str, cid: &str, rid: &str, ttl_extra: f64) -> AEGFMetadata {
     AEGFMetadata {
-        cid:  cid.to_string(),
+        cid:  Arc::from(cid),
         rid:  rid.to_string(),
         prid: RID_ROOT.to_string(),
-        sid:  "test-session-000000000000000000000000000".to_string(),
+        sid:  Arc::from("test-session-000000000000000000000000000"),
         oaid: oaid.to_string(),
         hc:   1,
         ed:   0,
@@ -214,10 +214,10 @@ fn blackhat_3g_zero_byte_packet_gate0_no_panic() {
 fn blackhat_3h_aegf_expired_ttl_treated_as_terminated() {
     let governor = AEGFGovernor::new(None);
     let meta = AEGFMetadata {
-        cid:  "cid-3h".to_string(),
+        cid:  Arc::from("cid-3h"),
         rid:  "rid-3h-expired".to_string(),
         prid: RID_ROOT.to_string(),
-        sid:  "sid-3h".to_string(),
+        sid:  Arc::from("sid-3h"),
         oaid: "agent-3h".to_string(),
         hc:   1,
         ed:   0,

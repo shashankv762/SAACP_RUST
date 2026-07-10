@@ -102,10 +102,10 @@ fn flip_byte_at(frame: &mut [u8], offset: usize) {
 
 fn make_aegf_meta(oaid: &str, cid: &str, rid: &str, ttl_extra_secs: f64) -> AEGFMetadata {
     AEGFMetadata {
-        cid:  cid.to_string(),
+        cid:  Arc::from(cid),
         rid:  rid.to_string(),
         prid: RID_ROOT.to_string(),
-        sid:  "test-session-00000000000000000000000000000000".to_string(),
+        sid:  Arc::from("test-session-00000000000000000000000000000000"),
         oaid: oaid.to_string(),
         hc:   1,
         ed:   0,

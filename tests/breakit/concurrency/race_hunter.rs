@@ -204,9 +204,9 @@ fn race_c_aegf_graph_cap_overflow() {
         let meta = AEGFMetadata {
             rid: format!("{:032x}", i),
             prid: RID_ROOT.to_string(),
-            sid: format!("{:032x}", i),
+            sid: Arc::from(format!("{:032x}", i)),
             oaid: "agent-fill".to_string(),
-            cid: CID_NONE.to_string(),
+            cid: Arc::from(CID_NONE),
             hc: 0,
             ed: 0,
             ttl: now_ts + 3600.0,
@@ -231,9 +231,9 @@ fn race_c_aegf_graph_cap_overflow() {
             let meta = AEGFMetadata {
                 rid: format!("{:032x}", 100 + i),
                 prid: RID_ROOT.to_string(),
-                sid: format!("{:032x}", 100 + i),
+                sid: Arc::from(format!("{:032x}", 100 + i)),
                 oaid: "agent-race".to_string(),
-                cid: CID_NONE.to_string(),
+                cid: Arc::from(CID_NONE),
                 hc: 0,
                 ed: 0,
                 ttl: ts + 3600.0,
@@ -296,9 +296,9 @@ fn race_e_aegf_repeated_path_toctou() {
     let parent_meta = AEGFMetadata {
         rid: parent_rid.clone(),
         prid: RID_ROOT.to_string(),
-        sid: parent_rid.clone(),
+        sid: Arc::from(parent_rid.as_str()),
         oaid: "agent-parent".to_string(),
-        cid: CID_NONE.to_string(),
+        cid: Arc::from(CID_NONE),
         hc: 0,
         ed: 0,
         ttl: now_ts + 3600.0,
@@ -326,11 +326,11 @@ fn race_e_aegf_repeated_path_toctou() {
             let meta = AEGFMetadata {
                 rid: format!("{:032x}", 0xBBBB_u32 + i as u32),
                 prid,
-                sid: format!("{:032x}", 0xBBBB_u32 + i as u32),
+                sid: Arc::from(format!("{:032x}", 0xBBBB_u32 + i as u32)),
                 // Every racer shares the SAME child oaid, so they all
                 // compete for the SAME (parent_oaid, child_oaid) edge.
                 oaid: "agent-child".to_string(),
-                cid: CID_NONE.to_string(),
+                cid: Arc::from(CID_NONE),
                 hc: 1,
                 ed: 1,
                 ttl: ts + 3600.0,

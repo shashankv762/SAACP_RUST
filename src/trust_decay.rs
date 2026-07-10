@@ -245,10 +245,34 @@ impl TrustEntry {
 // TrustDecayEngine
 // ---------------------------------------------------------------------------
 
+/// Number of independent lock shards for [`TrustDecayEngine`]'s entry map
+/// (Phase 3 / P-1 / Part 6.3: sharded on `agent_fingerprint[0] % 16`, i.e. the
+/// first byte of the (possibly namespaced — `pk:`/`aid:`/`ip:`) map key).
+/// Before sharding, every gate violation across every agent in the entire
+/// fleet serialized behind one process-wide `Mutex` — one busy/compromised
+/// agent's penalty traffic could add lock-contention latency to every other
+/// agent's unrelated packets.
+const TRUST_SHARDS: usize = 16;
+
+/// Per-shard soft capacity, chosen so the aggregate cap across all shards
+/// still matches [`TRUST_MAX_ENTRIES`] under a roughly uniform key
+/// distribution — sharding must not silently multiply the effective capacity
+/// bound (Part 12 principle 5, "Bounded Everything"). H-24's "never evict a
+/// locked entry" protection is preserved because it is enforced identically
+/// within each shard's own eviction sweep.
+const TRUST_PER_SHARD_MAX_ENTRIES: usize = TRUST_MAX_ENTRIES / TRUST_SHARDS;
+
+/// Maps a trust-map key to its shard index using the first byte of the key
+/// string — matching Part 6.3's "first byte of fingerprint" strategy, applied
+/// to whichever namespaced key `trust_key_for`/`ip_trust_key` produced.
+fn trust_shard_index(key: &str) -> usize {
+    (key.as_bytes().first().copied().unwrap_or(0) as usize) % TRUST_SHARDS
+}
+
 /// Process-wide (or per-instance, for tests) continuous behavioral trust
 /// tracker. See module docs for the full model.
 pub struct TrustDecayEngine {
-    entries: Mutex<HashMap<String, TrustEntry>>,
+    shards: Vec<Mutex<HashMap<String, TrustEntry>>>,
     #[allow(clippy::type_complexity)]
     observers: Mutex<Vec<Arc<dyn Fn(TrustSignal) + Send + Sync>>>,
 }
@@ -262,9 +286,14 @@ impl Default for TrustDecayEngine {
 impl TrustDecayEngine {
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            shards: (0..TRUST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             observers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Lock and return the shard responsible for `key`.
+    fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, TrustEntry>> {
+        self.shards[trust_shard_index(key)].lock().unwrap()
     }
 
     /// Process-wide singleton, matching `AgentRateLimiter::global()` /
@@ -290,7 +319,7 @@ impl TrustDecayEngine {
 
     /// Current (recovery-adjusted) score for an agent. Never seen ⇒ `TRUST_SCORE_INITIAL`.
     pub fn score(&self, agent_id: &str) -> f64 {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.shard(agent_id);
         let now = now_secs();
         match entries.get_mut(agent_id) {
             Some(e) => { e.recover_to(now); e.score }
@@ -302,11 +331,12 @@ impl TrustDecayEngine {
     /// (recovery-adjusted, then penalized) score. Fires `Downgraded` /
     /// `ReauthRequired` signals on threshold crossings.
     pub fn penalize(&self, agent_id: &str, kind: PenaltyKind) -> f64 {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.shard(agent_id);
         let now = now_secs();
 
-        // IoT / low-resource fix: sweep stale entries only once the cap is
-        // exceeded — mirrors FederatedMemory. Two passes:
+        // IoT / low-resource fix: sweep stale entries only once this shard's
+        // (aggregate-cap-preserving) per-shard cap is exceeded — mirrors
+        // FederatedMemory. Two passes, scoped to this one shard only:
         //   1. Lazily recover every entry, then drop ones that are fully
         //      recovered (score >= 1.0) and not currently reauth-locked —
         //      those are safe to forget, functionally identical to never
@@ -315,22 +345,22 @@ impl TrustDecayEngine {
         //      exactly once and never touched again — recovery alone can't
         //      reclaim those), evict from the *unlocked* remainder only,
         //      closest-to-`TRUST_SCORE_INITIAL` first (H-24).
-        if entries.len() >= TRUST_MAX_ENTRIES && !entries.contains_key(agent_id) {
+        if entries.len() >= TRUST_PER_SHARD_MAX_ENTRIES && !entries.contains_key(agent_id) {
             for e in entries.values_mut() {
                 e.recover_to(now);
             }
             entries.retain(|_, e| e.score < TRUST_SCORE_INITIAL || e.locked_at.is_some());
 
-            if entries.len() >= TRUST_MAX_ENTRIES {
-                let evict_count = entries.len() + 1 - TRUST_MAX_ENTRIES;
+            if entries.len() >= TRUST_PER_SHARD_MAX_ENTRIES {
+                let evict_count = entries.len() + 1 - TRUST_PER_SHARD_MAX_ENTRIES;
                 // H-24: a reauth-locked entry is precisely the record an
                 // attacker wants purged — flooding the map with fresh
                 // agent_ids to force this sweep must never be able to evict
                 // one, even if that means the map temporarily stays over
-                // TRUST_MAX_ENTRIES until enough locks clear naturally.
-                // Among the unlocked remainder, entries whose score sits
-                // closest to TRUST_SCORE_INITIAL carry the least signal
-                // (nearly/fully recovered, no active penalty) and are
+                // TRUST_PER_SHARD_MAX_ENTRIES until enough locks clear
+                // naturally. Among the unlocked remainder, entries whose
+                // score sits closest to TRUST_SCORE_INITIAL carry the least
+                // signal (nearly/fully recovered, no active penalty) and are
                 // safest to forget first — evict those before anything with
                 // a lower, more diagnostic score.
                 let mut candidates: Vec<(String, f64)> = entries.iter()
@@ -378,7 +408,7 @@ impl TrustDecayEngine {
     /// Requires *both* score recovery above threshold *and* the minimum
     /// cooldown floor to have elapsed since lockout began.
     pub fn requires_reauth(&self, agent_id: &str) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.shard(agent_id);
         let now = now_secs();
         let Some(entry) = entries.get_mut(agent_id) else { return false; };
         entry.recover_to(now);
@@ -405,17 +435,16 @@ impl TrustDecayEngine {
     /// all tracked agents if `None`). Test/ops utility, mirrors
     /// `AgentRateLimiter::reset`.
     pub fn reset(&self, agent_id: Option<&str>) {
-        let mut entries = self.entries.lock().unwrap();
         match agent_id {
-            Some(id) => { entries.remove(id); }
-            None => entries.clear(),
+            Some(id) => { self.shard(id).remove(id); }
+            None => { for shard in &self.shards { shard.lock().unwrap().clear(); } }
         }
     }
 
     /// Number of currently-tracked agents (for the bounded-cardinality
     /// `saacp_trust_agents_tracked` telemetry gauge).
     pub fn tracked_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
     }
 
     /// Snapshot of up to `limit` tracked agents, sorted ascending by score
@@ -432,21 +461,29 @@ impl TrustDecayEngine {
     /// conditions are met, until the next actual packet from that agent
     /// clears it for real.
     pub fn snapshot(&self, limit: usize) -> Vec<AgentTrustSnapshot> {
-        let mut entries = self.entries.lock().unwrap();
         let now = now_secs();
 
-        let mut out: Vec<AgentTrustSnapshot> = entries.iter_mut().map(|(id, e)| {
-            e.recover_to(now);
-            let requires_reauth = match e.locked_at {
-                Some(locked_at) => {
-                    let cooldown_elapsed = (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
-                    let score_recovered = e.score >= TRUST_REAUTH_THRESHOLD;
-                    !(cooldown_elapsed && score_recovered)
-                }
-                None => false,
-            };
-            AgentTrustSnapshot { agent_id: id.clone(), score: e.score, requires_reauth }
-        }).collect();
+        // Each shard's lock is acquired independently and released before
+        // moving to the next — this never holds more than one shard lock at
+        // a time, so a concurrent `penalize()`/`score()` on a different shard
+        // is never blocked by a snapshot in progress (only same-shard callers
+        // briefly contend, same as before sharding).
+        let mut out: Vec<AgentTrustSnapshot> = Vec::new();
+        for shard in &self.shards {
+            let mut entries = shard.lock().unwrap();
+            out.extend(entries.iter_mut().map(|(id, e)| {
+                e.recover_to(now);
+                let requires_reauth = match e.locked_at {
+                    Some(locked_at) => {
+                        let cooldown_elapsed = (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
+                        let score_recovered = e.score >= TRUST_REAUTH_THRESHOLD;
+                        !(cooldown_elapsed && score_recovered)
+                    }
+                    None => false,
+                };
+                AgentTrustSnapshot { agent_id: id.clone(), score: e.score, requires_reauth }
+            }));
+        }
 
         out.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         out.truncate(limit);

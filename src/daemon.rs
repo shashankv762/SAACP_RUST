@@ -497,6 +497,28 @@ where
     // capability token for this connection (`handler.rs`).
 
     // ── Step 2: Persistent connection loop ────────────────────────────────────
+    // Phase 3 / P-6 fix: `payload_buf` used to be freshly allocated
+    // (`vec![0u8; n]`) on every single iteration of this loop — one heap
+    // allocation per packet, for the lifetime of a persistent connection that
+    // may carry thousands of packets. It is now allocated once per connection
+    // and reused: `.clear()` drops the logical length to 0 (capacity is
+    // retained, no deallocation), and the subsequent `.resize(n, 0)` call only
+    // grows the backing allocation if a later packet needs more capacity than
+    // any prior one on this connection — reallocating strictly less often
+    // than "always". `.resize(n, 0)` after `.clear()` explicitly zero-fills
+    // every byte up to the new length, so no stale data from a previous
+    // packet on this connection can ever be read through the reused buffer
+    // (Part 12 principle 9, "Monotonic Security" — no cross-packet
+    // information leak via a dirty buffer).
+    //
+    // `full_packet` is NOT reused the same way: it is moved into
+    // `tokio::task::spawn_blocking`'s `'static` closure below (required since
+    // that closure may run on a different OS thread), so ownership must
+    // transfer out of this loop's scope every iteration — a persistent
+    // outer-scope binding would be moved-from after the first iteration and
+    // fail to compile on the next `.clear()`. It keeps its original
+    // fresh-per-iteration allocation.
+    let mut payload_buf: Vec<u8> = Vec::new();
     loop {
         // 2a. Read 128-byte header with 2s timeout
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -519,7 +541,8 @@ where
         // 2c. MTU chunking assembly with MAX_ASSEMBLY_TIME aggregate timeout
         // payload_length <= MAX_PAYLOAD_SIZE (10 MB); +16 for auth tag is safe.
         let assembly_start = Instant::now();
-        let mut payload_buf = vec![0u8; payload_length.saturating_add(16)];
+        payload_buf.clear();
+        payload_buf.resize(payload_length.saturating_add(16), 0);
         let mut bytes_read  = 0usize;
 
         while bytes_read < payload_buf.len() {
@@ -536,7 +559,7 @@ where
         }
 
         // Assemble full frame: header || auth_tag || ciphertext
-        let mut full_packet = Vec::with_capacity(HEADER_SIZE + payload_buf.len());
+        let mut full_packet = Vec::with_capacity(HEADER_SIZE + bytes_read);
         full_packet.extend_from_slice(&header_buf);
         full_packet.extend_from_slice(&payload_buf[..bytes_read]);
 
