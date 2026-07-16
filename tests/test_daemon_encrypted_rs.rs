@@ -124,7 +124,7 @@ async fn daemon_encrypted_valid_signed_token_accepted_and_decodes() {
                 delivered_cb.lock().unwrap().push(task.clone());
             }
         }));
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -155,7 +155,7 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -178,7 +178,7 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -215,7 +215,7 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     // now fails AES-GCM authentication unconditionally.
     let port = free_port().await;
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -256,7 +256,7 @@ async fn daemon_encrypted_two_independent_sessions() {
         .with_on_delivered(Arc::new(move |_parsed| {
             count_cb.fetch_add(1, Ordering::SeqCst);
         }));
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     for (i, sid_byte) in [0xE0u8, 0xE1u8].into_iter().enumerate() {

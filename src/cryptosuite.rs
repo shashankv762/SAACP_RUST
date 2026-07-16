@@ -240,7 +240,10 @@ pub fn register_suite(
     }
 
     // Step 3: 'ed25519' is the immutable root — allow re-registration (no-op)
-    let mut registry = CRYPTO_SUITES.lock().unwrap();
+    // M-38 fix: recover from poison via `into_inner()` rather than panicking —
+    // this is a process-wide global (`CRYPTO_SUITES`), so a poisoning panic in
+    // one caller must not cascade into every other caller of `register_suite`.
+    let mut registry = CRYPTO_SUITES.lock().unwrap_or_else(|e| e.into_inner());
 
     // Step 4: Log to transparency ledger
     ledger.append(CryptoLedgerEntry {

@@ -63,7 +63,25 @@ use crate::security::ImmutableAuditLog;
 use crate::streaming::StreamRegistry;
 use crate::telemetry::report_gate_rejection;
 use crate::temporal::DeadMansSwitch;
-use crate::trust_decay::{TrustDecayEngine, PenaltyKind, IntentDriftTracker, CHAIN_DRIFT_CEILING, trust_key_for};
+use crate::trust_decay::{TrustDecayEngine, PenaltyKind, RewardKind, IntentDriftTracker, CHAIN_DRIFT_CEILING, trust_key_for};
+
+/// Wrap a gate call expression with latency instrumentation (Phase 5
+/// Observability, O-1). Records the elapsed wall-clock time under `$name`'s
+/// Prometheus histogram (`telemetry::TelemetryCollector::record_gate_latency`)
+/// on BOTH the `Ok` and `Err` path — a gate that always rejects quickly must
+/// not look artificially cheap in the exported metric — then evaluates to
+/// `$call`'s own `Result`, completely unchanged, so every existing
+/// `?`/`if let Err(e) = ...`/`.inspect_err(...)` call site built around a gate
+/// call keeps working with zero control-flow changes; only the call
+/// expression itself is wrapped.
+macro_rules! timed_gate {
+    ($name:expr, $call:expr) => {{
+        let __gate_t0 = std::time::Instant::now();
+        let __gate_result = $call;
+        crate::telemetry::global_telemetry().record_gate_latency($name, __gate_t0.elapsed());
+        __gate_result
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -223,7 +241,11 @@ fn replace_confusable(c: char) -> char {
         '\u{040c}'|'\u{045c}' => 'K',
         '\u{0410}' => 'A', '\u{0430}' => 'a',
         '\u{0412}' => 'B', '\u{0432}' => 'b',
-        '\u{0413}' => 'r',
+        // M-9 fix: U+0413 CYRILLIC CAPITAL LETTER GHE (Г) is a well-known
+        // homoglyph for Latin 'G' (e.g. "Гoogle" typosquatting "Google") — it
+        // was previously mismapped to 'r', which let this exact substitution
+        // slip past exact-match blocklist/allowlist detection undetected.
+        '\u{0413}' => 'G',
         '\u{0415}' => 'E', '\u{0435}' => 'e',
         '\u{041a}' => 'K', '\u{043a}' => 'k',
         '\u{041c}' => 'M', '\u{043c}' => 'm',
@@ -689,7 +711,12 @@ pub struct ParsedPacket {
     /// Whether this was cover traffic.
     pub is_cover_traffic: bool,
     /// Source agent extracted from token.
-    pub source_agent: String,
+    ///
+    /// `Arc<str>`, not `String` — same M-13 rationale as `session_uuid` above:
+    /// this value is cloned several times per packet (AEGF/CSCS metadata
+    /// construction, identity-binding/trust-key lookups), and an `Arc<str>`
+    /// clone is an atomic refcount bump rather than a heap allocation.
+    pub source_agent: Arc<str>,
     /// Whether this packet requires binary stream handling.
     pub is_binary_stream: bool,
     /// Gate 1.0's validated, trust-decay-capped `max_action_class` ceiling for
@@ -698,6 +725,12 @@ pub struct ParsedPacket {
     /// STREAM_START so Gate 2.5 (kinetic firewall) can be re-enforced on every
     /// CONTINUATION/END frame instead of only the first frame of a stream.
     pub max_action_class: u8,
+    /// Part 6.1 (SHA-256 hash caching): the token signature's hash, computed
+    /// once by Gate 1.0 (via `TokenValidationResult::token_sig_hash`) and
+    /// stashed here so `register_stream_start_token` can reuse it for
+    /// STREAM_START auto-registration instead of re-deriving it a third time
+    /// from the raw token bytes. Empty until Gate 1.0 runs.
+    pub token_sig_hash: Arc<str>,
 }
 
 /// Deprecated: cached token result type kept for Python API parity.
@@ -784,9 +817,10 @@ impl SAACPProtocolHandler {
             payload_dict: HashMap::new(),
             gate_tier: tier,
             is_cover_traffic: is_cover,
-            source_agent: String::new(),
+            source_agent: Arc::from(""),
             is_binary_stream: is_binary,
             max_action_class: 0,
+            token_sig_hash: Arc::from(""),
         })
     }
 
@@ -828,9 +862,10 @@ impl SAACPProtocolHandler {
             payload_dict: HashMap::new(),
             gate_tier: tier,
             is_cover_traffic: is_cover,
-            source_agent: String::new(),
+            source_agent: Arc::from(""),
             is_binary_stream: is_binary,
             max_action_class: 0,
+            token_sig_hash: Arc::from(""),
         })
     }
 
@@ -1039,6 +1074,13 @@ impl SAACPProtocolHandler {
     }
 
     /// Gate 1.0: Financial Circuit Breaker.
+    ///
+    /// Pure validation, like every other `gate_*` function in this file — it does
+    /// not itself touch telemetry. The real dispatch site (`intercept_packet_full`'s
+    /// `timed_gate!("gate_0_5_financial", ...)` call) is responsible for reporting a
+    /// rejection via `telemetry::report_financial_rejection`, exactly the same
+    /// convention every other gate's call site already follows with
+    /// `telemetry::report_gate_rejection`.
     pub fn gate_financial_cb(
         status_code: u8,
         payload_dict: &HashMap<String, JsonValue>,
@@ -1078,11 +1120,6 @@ impl SAACPProtocolHandler {
             _ => 0.0,
         };
         if estimated_cost > max_budget {
-            // "Tokens Blocked" accumulator for the Command Center's financial
-            // dashboard — sum of claimed `estimated_cost` across every
-            // BudgetExceeded rejection. `estimated_cost` is already validated
-            // finite/non-negative above, right here at the point of rejection.
-            crate::telemetry::global_telemetry().record_financial_rejection(estimated_cost);
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::BudgetExceeded,
                 format!(
@@ -1095,23 +1132,31 @@ impl SAACPProtocolHandler {
     }
 
     /// Extract intent terms from text for overlap comparison.
+    ///
+    /// M-10 fix: the five sequential `String` allocations previously here
+    /// (NFKC-normalize -> strip zero-width -> replace confusables -> filter
+    /// to ASCII -> filter to alnum + lowercase) are fused into a single
+    /// iterator chain ending in one final `collect::<String>()`, preserving
+    /// the exact same filter/map order and semantics per word. Lowercasing
+    /// is folded into the same chain via `to_ascii_lowercase()` per-char
+    /// (safe here specifically because every char reaching that point has
+    /// already passed the `is_ascii_alphanumeric()` filter, so ASCII
+    /// lowercasing is always the correct 1:1 transform — unlike
+    /// `char::to_lowercase()`, which can be multi-char for some non-ASCII
+    /// scripts and would be wrong to apply mid-chain on mixed input).
     pub fn intent_terms(text: &str) -> HashMap<String, usize> {
         let mut terms: HashMap<String, usize> = HashMap::new();
         // Split by whitespace first, then normalize each word individually
         // so word boundaries are preserved (normalize strips ALL whitespace).
         for word in text.split_whitespace() {
-            let nfkc: String = word.nfkc().collect();
-            let no_zw: String = nfkc.chars()
+            let cleaned: String = word
+                .nfkc()
                 .filter(|c| !ZERO_WIDTH_CHARS.contains(c))
-                .collect();
-            let no_confuse: String = no_zw.chars().map(replace_confusable).collect();
-            let ascii_only: String = no_confuse.chars()
+                .map(replace_confusable)
                 .filter(|c| (*c as u32) < 128)
-                .collect();
-            let cleaned: String = ascii_only.chars()
                 .filter(|c| c.is_ascii_alphanumeric())
-                .collect::<String>()
-                .to_lowercase();
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
             if cleaned.len() >= 3 && !INTENT_STOPWORDS.contains(&cleaned.as_str()) {
                 *terms.entry(cleaned).or_insert(0) += 1;
             }
@@ -1354,17 +1399,28 @@ impl SAACPProtocolHandler {
     /// Runs ALL 12 mandatory security gates in sequence (Authorization Invariance).
     /// Matches Python's `intercept_packet` API exactly.
     ///
-    /// Gate pipeline order (MUST NOT be reordered — §16.3):
-    ///   Gate 0   → crypto integrity (AES-GCM + nonce + Adler32)        [ALL tiers]
-    ///   Cover traffic check → AgentRateLimiter::record_cover_traffic() [ALL tiers]
-    ///   Gate 0.5 → financial circuit breaker                            [ALL tiers]
+    /// Gate pipeline order (MUST NOT be reordered — §16.3). This list reflects the
+    /// TRUE execution order in `run_gates_1_through_12` / the code below it, not an
+    /// idealized one — Gate 0.5 and Gate 2.5 in particular do NOT run where their
+    /// numbering might suggest; see the "Python parity" comments at each gate's
+    /// actual call site for the rationale (opusplan.md Part 1.2):
+    ///   Gate 0   → crypto integrity (AES-GCM + nonce + Adler32)          [ALL tiers]
+    ///   Schema 0 block → raw binary rejected before cover-traffic check  [ALL tiers]
+    ///   Cover traffic check → AgentRateLimiter::record_cover_traffic()   [ALL tiers]
     ///   Context state validation (FederatedMemory + DeadMansSwitch)     [ALL tiers]
     ///   Gate 1.0 → token validation (capability + revocation + expiry)  [ALL tiers]
-    ///   Gate 1.5 → intent envelope (root intent binding when present)   [ALL tiers]
     ///   Gate 2.5 → kinetic firewall (action class escalation guard)     [ALL tiers]
+    ///            (runs BEFORE Gate 1.5 — Python parity, see Gate 2.5 call site)
+    ///   Gate 1.5 → intent envelope (root intent binding when present)   [ALL tiers]
+    ///            (includes Gate 1.5c dangerous-action-term check)
+    ///   Gate 0.5 → financial circuit breaker                            [ALL tiers]
+    ///            (runs AFTER Gate 1.5, concurrent with Gate 4.0/5.0 in the
+    ///             Python reference's async gather — NOT first as the gate
+    ///             number might suggest)
     ///   Gate 3.0 → lateral movement (mutative secondary token)          [ALL tiers]
     ///   Gate 4.0 → injection scan (ALL text frames regardless of tier)  [ALL tiers]
     ///   Gate 5.0 → epistemic circuit breaker (schema_id == 3)           [ALL tiers]
+    ///   Gate 5.0b→ scope-consistency reinforcement (Attack 7.2 fix)     [ALL tiers]
     ///   Gate 6.0 → audit checkpoint (immutable hash-chain entry)        [ALL tiers]
     ///   Gate 9.0 → JSON schema validation + RGC Gate 2                  [ALL tiers]
     ///   Gate 11.0→ AEGF hop-limit + causal graph governance             [ALL tiers]
@@ -1412,9 +1468,20 @@ impl SAACPProtocolHandler {
         let global_rl = AgentRateLimiter::global();
         let effective_rl: &AgentRateLimiter = rate_limiter.unwrap_or(global_rl);
 
+        // opusplan.md 6.4 item 1: one wall-clock read shared by both pre-gate checks
+        // below (`is_locked_at` + `requires_reauth_at`) — a few lines apart with no
+        // state change between them, so sharing one timestamp is behaviorally
+        // identical to each check taking its own while removing a redundant syscall
+        // from every packet's hot path. Mirrors the `pipeline_now_secs` precedent
+        // later in this pipeline (Gate 11.0/12.0's shared TTL read).
+        let pregate_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
         // ── Pre-gate: AgentRateLimiter circuit-breaker lockout check ─────────
         // If the agent is locked out, reject before even decrypting (saves compute).
-        if effective_rl.is_locked(current_agent_name) {
+        if effective_rl.is_locked_at(current_agent_name, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::CircuitBreakerOpen,
                 format!("Agent '{}' is circuit-breaker locked out.", current_agent_name),
@@ -1435,7 +1502,7 @@ impl SAACPProtocolHandler {
         // session_id is read straight off the (still-encrypted) wire header since no
         // `ParsedPacket` exists yet at this pre-Gate-0 checkpoint.
         let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
-        if TrustDecayEngine::global().requires_reauth(&trust_key) {
+        if TrustDecayEngine::global().requires_reauth_at(&trust_key, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -1493,7 +1560,7 @@ impl SAACPProtocolHandler {
                     parsed.payload_dict.get("_capability_token")
                 {
                     Self::register_stream_start_token(
-                        stream_id, cap_tok, source_agent, parsed.max_action_class,
+                        stream_id, cap_tok, &parsed.token_sig_hash, source_agent, parsed.max_action_class,
                     );
                 }
             }
@@ -1543,7 +1610,14 @@ impl SAACPProtocolHandler {
         let global_rl = AgentRateLimiter::global();
         let effective_rl: &AgentRateLimiter = rate_limiter.unwrap_or(global_rl);
 
-        if effective_rl.is_locked(current_agent_name) {
+        // opusplan.md 6.4 item 1: see the identical comment in `intercept_packet_full`
+        // above — one wall-clock read shared by both pre-gate checks below.
+        let pregate_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        if effective_rl.is_locked_at(current_agent_name, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::CircuitBreakerOpen,
                 format!("Agent '{}' is circuit-breaker locked out.", current_agent_name),
@@ -1552,7 +1626,7 @@ impl SAACPProtocolHandler {
 
         // S-2 fix: see the identical comment in `intercept_packet_full` above.
         let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
-        if TrustDecayEngine::global().requires_reauth(&trust_key) {
+        if TrustDecayEngine::global().requires_reauth_at(&trust_key, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -1563,7 +1637,10 @@ impl SAACPProtocolHandler {
             ));
         }
 
-        let result = Self::gate_0_crypto_integrity_encrypted(packet, epoch_manager)
+        let result = timed_gate!(
+            "gate_0_crypto",
+            Self::gate_0_crypto_integrity_encrypted(packet, epoch_manager)
+        )
             .inspect_err(|e| {
                 report_gate_rejection("gate_0_crypto", current_agent_name, e);
             })
@@ -1602,7 +1679,7 @@ impl SAACPProtocolHandler {
                     parsed.payload_dict.get("_capability_token")
                 {
                     Self::register_stream_start_token(
-                        stream_id, cap_tok, source_agent, parsed.max_action_class,
+                        stream_id, cap_tok, &parsed.token_sig_hash, source_agent, parsed.max_action_class,
                     );
                 }
             }
@@ -1632,9 +1709,10 @@ impl SAACPProtocolHandler {
         _cscs: Option<&CSCSLoopDetector>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic Integrity (always runs first — §16.2 Gate 0→All) ──
-        let parsed = Self::gate_0_crypto_integrity(packet, secret_key).inspect_err(|e| {
-            report_gate_rejection("gate_0_crypto", current_agent_name, e);
-        })?;
+        let parsed = timed_gate!("gate_0_crypto", Self::gate_0_crypto_integrity(packet, secret_key))
+            .inspect_err(|e| {
+                report_gate_rejection("gate_0_crypto", current_agent_name, e);
+            })?;
         Self::run_gates_1_through_12(
             parsed, packet, secret_key, current_agent_name, is_pinned,
             gateway, rate_limiter, audit_log, _aegf_governor, _cscs,
@@ -1702,8 +1780,7 @@ impl SAACPProtocolHandler {
             // SECURITY FIX (Gate 6.0 for cover traffic): Write an audit entry so cover
             // traffic cannot be used for unlogged reconnaissance. Without this, an attacker
             // with a valid AES-GCM key could flood cover frames and leave no forensic trace.
-            let traceparent_hex: String = parsed.traceparent.iter()
-                .map(|b| format!("{:02x}", b)).collect();
+            let traceparent_hex: String = hex::encode(&parsed.traceparent);
             if let Some(log) = audit_log {
                 log.append_event(
                     secret_key,
@@ -1768,7 +1845,20 @@ impl SAACPProtocolHandler {
             // On HEARTBEAT_PING, ping the DeadMansSwitch for this context.
             if parsed.status_code == SAACPBytecodes::HeartbeatPing as u8 {
                 let cid_bytes = hex::decode(&parsed.context_state_id).unwrap_or_default();
-                if !DeadMansSwitch::global().ping(&cid_bytes) {
+                let dms = DeadMansSwitch::global();
+                // A heartbeat is how a session signals liveness, so it is also
+                // where the session first becomes tracked. `ping` deliberately
+                // never creates a phantom session (it only refreshes an existing
+                // one), so without registering here the switch would stay empty
+                // forever and `check_timeouts`/`is_active` could never observe a
+                // real session — the tracking half of the dead-man's-switch would
+                // be inert. Register-if-absent (idempotent refresh) keeps the
+                // per-context registration to once per session lifetime rather
+                // than once per packet.
+                if !cid_bytes.is_empty() && !dms.is_active(&cid_bytes) {
+                    dms.register_session(&cid_bytes);
+                }
+                if !dms.ping(&cid_bytes) {
                     return Err(SAACPHardDrop::new(
                         SAACPBytecodes::CircuitBreakerOpen,
                         "Ping-flood detected: context is sending heartbeats at abnormal rate.",
@@ -1829,6 +1919,9 @@ impl SAACPProtocolHandler {
                 root_intent_hash: None,
                 max_action_class: 0, // Safe default: READ_ONLY only when no gateway
                 delegation_depth: 0,
+                // No gateway to compute this via the real revocation-check path —
+                // this is the one remaining call to the hand-rolled parser.
+                token_sig_hash: extract_token_sig_hex(capability_token_b64.as_bytes()),
             }
         };
 
@@ -1898,18 +1991,39 @@ impl SAACPProtocolHandler {
         let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
             .advance(&source_agent, &parsed.session_uuid, "AUTHORIZED");
 
-        parsed.source_agent = token_result.source_agent;
+        parsed.source_agent = Arc::from(token_result.source_agent);
 
-        // Extract token signature hash for audit log + stream session registration.
-        let token_sig_hex = extract_token_sig_hex(capability_token_b64.as_bytes());
+        // Part 6.1 (SHA-256 hash caching): reuse the signature hash `validate_lateral_movement`
+        // already computed for its revocation-set lookup (or, on the no-gateway fallback path,
+        // the one `extract_token_sig_hex` computed there) instead of re-deriving it a second
+        // time from the raw token bytes here.
+        let token_sig_hex = token_result.token_sig_hash;
+        parsed.token_sig_hash = Arc::from(token_sig_hex.as_str());
 
         // ── Gate 2.5: Kinetic Firewall ────────────────────────────────────────
         // Python parity: Gate 2.5 runs BEFORE Gate 1.5 (intent envelope).
         // Use the max_action_class from the VALIDATED token (Gate 1.0 output).
-        Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token, audit_log)
+        timed_gate!(
+            "gate_2_5_kinetic",
+            Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class_from_token, audit_log)
+        )
             .inspect_err(|e| {
                 report_gate_rejection("gate_2_5_kinetic", current_agent_name, e);
             })?;
+
+        // ── ACA: Agent Capability Attestation (Phase 6 / item 6, `aca.rs`, Part 8.4) ──
+        // Gate-2.5-adjacent, not a new numbered gate — see `aca::enforce_attestation`'s
+        // doc comment. A complete no-op unless a deployment has explicitly called
+        // `aca::set_required(true)`, so existing deployments without attestation-issuing
+        // infrastructure are entirely unaffected by this block's presence.
+        if let Err(e) = timed_gate!(
+            "aca_attestation",
+            crate::aca::enforce_attestation(&source_agent, parsed.action_class)
+        ) {
+            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
+            report_gate_rejection("aca_attestation", current_agent_name, &e);
+            return Err(e);
+        }
 
         // ── Gate 1.5: Cognitive Firewall / Intent Envelope ────────────────────
         // Authorization Invariance: runs for ALL tiers when root_intent_hash is present.
@@ -1917,7 +2031,7 @@ impl SAACPProtocolHandler {
         if let Some(ref rint) = root_intent_hash {
             // In the Python, root_intent is fetched from FederatedMemory.
             // Here we use the hash directly as the intent string for structural check.
-            if let Err(e) = Self::enforce_root_intent(rint, &parsed.payload_dict) {
+            if let Err(e) = timed_gate!("gate_1_5_intent", Self::enforce_root_intent(rint, &parsed.payload_dict)) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
@@ -1927,19 +2041,48 @@ impl SAACPProtocolHandler {
             // intent-padding defense) — see gate_1_5c_dangerous_action_consistency's
             // doc comment. Runs before the per-hop/chain-drift reinforcement
             // below since it's the cheaper, more targeted check.
-            if let Err(e) = Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict) {
+            if let Err(e) = timed_gate!(
+                "gate_1_5_intent",
+                Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict)
+            ) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
             }
 
             // ── Reinforcement: per-hop tightening + chain-wide drift ceiling ──
-            if let Err(e) = Self::gate_1_5_reinforcement(
-                rint, &parsed.payload_dict, delegation_depth, &parsed.session_uuid,
+            if let Err(e) = timed_gate!(
+                "gate_1_5_intent",
+                Self::gate_1_5_reinforcement(
+                    rint, &parsed.payload_dict, delegation_depth, &parsed.session_uuid,
+                )
             ) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
+            }
+
+            // ── IEVL registration hook (Phase 6 / item 3, `ievl.rs`, Part 8.1) ──
+            // NOT a gate — a registration hook, matching that module's own doc
+            // comment. Only tracked for IRREVERSIBLE-class actions
+            // (`ievl::RECEIPT_REQUIRED_ACTION_CLASS`); a no-op for every other
+            // action class, so this never touches READ_ONLY/REVERSIBLE
+            // traffic. Uses the same task/action text `enforce_root_intent`
+            // already validated above as the declared intent, and this
+            // packet's own (session_uuid, sequence_id) as the deterministic
+            // declaration ID the client can independently recompute later at
+            // receipt time (see `ievl::declaration_id`'s doc comment).
+            if parsed.action_class >= crate::ievl::RECEIPT_REQUIRED_ACTION_CLASS {
+                if let Some(task_str) = Self::extract_task_str(&parsed.payload_dict) {
+                    crate::ievl::IevlEngine::global().register_declaration(
+                        &parsed.session_uuid,
+                        parsed.sequence_id,
+                        &source_agent,
+                        task_str.to_string(),
+                        parsed.action_class,
+                        crate::ievl::extract_targets(&parsed.payload_dict),
+                    );
+                }
             }
 
             // Python parity: inject _cognitive_constraint for downstream agent binding.
@@ -1972,10 +2115,28 @@ impl SAACPProtocolHandler {
         // ── Gate 0.5: Financial Circuit Breaker ───────────────────────────────
         // Python parity: runs AFTER Gate 1.5 (inside Python's _security_checks),
         // concurrent with Gate 4.0 and Gate 5.0 in async gather.
-        Self::gate_financial_cb(parsed.status_code, &parsed.payload_dict)?;
+        if let Err(e) = timed_gate!("gate_0_5_financial", Self::gate_financial_cb(parsed.status_code, &parsed.payload_dict)) {
+            // Gate 0.5 is the one gate whose rejections carry a real dollar figure
+            // (`estimated_cost`), so it gets its own telemetry helper instead of the
+            // generic `report_gate_rejection` every other gate below uses — see
+            // `telemetry::report_financial_rejection`'s doc comment. Re-reading
+            // `estimated_cost` here (rather than threading it back out of
+            // `gate_financial_cb`) is safe: this is display-only telemetry, not a
+            // second security decision — `gate_financial_cb` above already made the
+            // real accept/reject call, this only labels the alert it just produced.
+            if let Some(JsonValue::Number(cost)) = parsed.payload_dict.get("estimated_cost") {
+                if cost.is_finite() && *cost >= 0.0 {
+                    crate::telemetry::report_financial_rejection(current_agent_name, *cost);
+                }
+            }
+            return Err(e);
+        }
 
         // ── Gate 3.0: Lateral Movement Guard (secondary token for high-risk) ──
-        if let Err(e) = Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict) {
+        if let Err(e) = timed_gate!(
+            "gate_3_0_lateral",
+            Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict)
+        ) {
             let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
             report_gate_rejection("gate_3_0_lateral", current_agent_name, &e);
             return Err(e);
@@ -1988,15 +2149,32 @@ impl SAACPProtocolHandler {
         // json_value_from_map — see PromptInjectionScanner::scan_payload_map's
         // doc comment for the equivalence argument.
         if !parsed.is_binary_stream {
-            if let Err(e) = Self::gate_4_0_injection_scan_map(&parsed.payload_dict) {
+            if let Err(e) = timed_gate!("gate_4_0_inject", Self::gate_4_0_injection_scan_map(&parsed.payload_dict)) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
+                return Err(e);
+            }
+
+            // ── SID: Semantic Injection Defense (Phase 6 / item 7, `sid.rs`, Part 8.3) ──
+            // Runs AFTER Gate 4.0's exact-match automaton: the fast literal scan
+            // rejects known patterns first, and only payloads that already cleared
+            // it pay for this broader structural-heuristic sweep. Text frames only,
+            // same as Gate 4.0. A complete no-op unless a deployment has explicitly
+            // called `sid::set_required(true)`, so existing deployments are entirely
+            // unaffected. Reuses `PenaltyKind::InjectionAttempt` — SID is a semantic
+            // extension of the same threat class, so trust accounting stays coherent.
+            if let Err(e) = timed_gate!("sid_semantic", crate::sid::enforce_semantic_injection(&parsed.payload_dict)) {
+                let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                report_gate_rejection("sid_semantic", current_agent_name, &e);
                 return Err(e);
             }
         }
 
         // ── Gate 5.0: Epistemic Circuit Breaker ───────────────────────────────
-        if let Err(e) = Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict) {
+        if let Err(e) = timed_gate!(
+            "gate_5_0_epistemic",
+            Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict)
+        ) {
             let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
             report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
             return Err(e);
@@ -2005,7 +2183,10 @@ impl SAACPProtocolHandler {
         // ── Gate 5.0b: Scope-Consistency Reinforcement (Attack 7.2 fix) ──────
         // Additive; only engages for schema_id == 3 with a bound root intent.
         if parsed.schema_id == 3 {
-            if let Err(e) = Self::gate_5_0b_scope_consistency(&parsed.payload_dict, root_intent_hash.as_deref()) {
+            if let Err(e) = timed_gate!(
+                "gate_5_0_epistemic",
+                Self::gate_5_0b_scope_consistency(&parsed.payload_dict, root_intent_hash.as_deref())
+            ) {
                 let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
                 report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
                 return Err(e);
@@ -2022,8 +2203,7 @@ impl SAACPProtocolHandler {
                 _ => "Unknown Task",
             }
         );
-        let traceparent_hex: String = parsed.traceparent.iter()
-            .map(|b| format!("{:02x}", b)).collect();
+        let traceparent_hex: String = hex::encode(&parsed.traceparent);
 
         if let Some(log) = audit_log {
             log.append_event(
@@ -2096,7 +2276,10 @@ impl SAACPProtocolHandler {
                     })?
                 }
             };
-            PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val).inspect_err(|e| {
+            timed_gate!(
+                "gate_9_0_schema",
+                PreCompiledSchemas::validate_payload(parsed.schema_id, &json_val)
+            ).inspect_err(|e| {
                 report_gate_rejection("gate_9_0_schema", current_agent_name, e);
             })?;
         }
@@ -2123,9 +2306,23 @@ impl SAACPProtocolHandler {
         // ── Gate 11.0: AEGF Hop-Limit + Causal Graph (DEG) ───────────────────
         // Mandatory for ALL tiers on non-stream frames (Authorization Invariance).
         // Builds AEGFMetadata from authenticated packet fields and submits to the
-        // governor for DEG node-cap + cycle + hop/depth + TTL enforcement.
+        // governor for DEG node-cap + hop/depth + TTL enforcement.
         // Immediately completes the request to avoid unbounded DEG accumulation
         // (packets are synchronously processed; no persistent execution graph needed).
+        //
+        // M-11 (doc-accuracy fix): `aegf_meta.prid` is ALWAYS `RID_ROOT` at this
+        // call site (see the comment on that field below), which means the DEG's
+        // cross-request cycle detection (an A->B->C->A parent-chain cycle) is
+        // structurally INERT here — every node's registered parent is the same
+        // synthetic root, so no two packets can ever form a real graph cycle
+        // through this path, no matter what an attacker sends. This was a
+        // deliberate Phase-3/P-2 simplification (the handler layer processes one
+        // packet at a time with no hop-chain context available to populate a real
+        // `prid`), not an oversight. The node-cap, hop/depth, and TTL enforcement
+        // below ARE fully functional and independent of `prid`. Genuine
+        // delegation-chain cycle/orphan detection is a SEPARATE mechanism —
+        // `factf::DelegationChainValidator::validate_chain` — which validates the
+        // actual signed parent-child delegation chain, not this per-packet DEG.
         if !is_schema_exempt(parsed.status_code) {
             use crate::aegf::{AEGFMetadata, GovernanceDecision, RID_ROOT, GLOBAL_AEGF_GOVERNOR};
             let gov = _aegf_governor.unwrap_or_else(|| &*GLOBAL_AEGF_GOVERNOR);
@@ -2140,6 +2337,9 @@ impl SAACPProtocolHandler {
             let aegf_meta = AEGFMetadata {
                 cid: parsed.session_uuid.clone(),
                 rid: aegf_rid.clone(),
+                // M-11: always RID_ROOT — see the Gate 11.0 doc comment above
+                // for why this makes cross-request DEG cycle detection inert
+                // by design at this call site (not a bug to fix here).
                 prid: RID_ROOT.to_string(),
                 sid: parsed.session_uuid.clone(),
                 oaid: source_agent.clone(),
@@ -2157,7 +2357,7 @@ impl SAACPProtocolHandler {
             // cutting DEG lock acquisitions per packet from 3 down to 1 for
             // the common case. See `AEGFGovernor::submit_and_complete`'s doc
             // comment for the correctness argument.
-            let decision = gov.submit_and_complete(&aegf_meta);
+            let decision = timed_gate!("gate_11_0_aegf", gov.submit_and_complete(&aegf_meta));
 
             match decision {
                 GovernanceDecision::Allow => {} // proceed normally
@@ -2197,6 +2397,20 @@ impl SAACPProtocolHandler {
         // loop scenarios — where a compromised agent re-drives the same session
         // with the same action class at the same sequence position — will be
         // caught because (session, action_class, hc) repeats across frames.
+        //
+        // M-11 (doc-accuracy fix): `cs_detect_loop` below runs two independent
+        // checks. (1) Oscillation fingerprinting hashes (oaid, cid,
+        // action_class) — genuinely functional, keyed on stable per-agent/
+        // per-session identity, not on `prid`. (2) `daeg.detect_cycle(&meta.rid)`
+        // walks `node.prid` in the SAME shared `GLOBAL_DAEG` that Gate 11.0
+        // above submits to — but Gate 11.0's `submit_and_complete` never
+        // actually inserts a persistent node for a root request (`prid ==
+        // RID_ROOT`, always true at this call site — see the Gate 11.0 comment),
+        // so `nodes.get(&meta.rid)` here always misses and `detect_cycle`
+        // always returns `false` immediately. Check (2) is therefore
+        // structurally inert for the same reason Gate 11.0's own cycle check
+        // is: no real cross-packet DEG cycle can ever be represented from this
+        // call site. Only check (1) provides real loop protection here.
         if !is_schema_exempt(parsed.status_code) {
             use crate::cscs::GLOBAL_CSCS;
             use crate::aegf::{AEGFMetadata, RID_ROOT};
@@ -2214,6 +2428,7 @@ impl SAACPProtocolHandler {
             let cscs_meta = AEGFMetadata {
                 cid: parsed.session_uuid.clone(),
                 rid: cscs_rid,
+                // M-11: always RID_ROOT — see the Gate 12.0 doc comment above.
                 prid: RID_ROOT.to_string(),
                 sid: parsed.session_uuid.clone(),
                 oaid: source_agent.clone(),
@@ -2222,10 +2437,23 @@ impl SAACPProtocolHandler {
                 ttl: pipeline_now_secs + 3600.0,
             };
 
-            cscs_det.cs_detect_loop(&parsed.session_uuid, &cscs_meta, parsed.action_class).inspect_err(|e| {
+            timed_gate!(
+                "gate_12_0_cscs",
+                cscs_det.cs_detect_loop(&parsed.session_uuid, &cscs_meta, parsed.action_class)
+            ).inspect_err(|e| {
                 report_gate_rejection("gate_12_0_cscs", current_agent_name, e);
             })?;
         }
+
+        // ── Positive Behavioral Trust Signal (Phase 6 / Part 8.5) ────────────
+        // Reaching this point means every gate from 0 through 12.0 passed cleanly for
+        // this frame — cover traffic and STREAM_CONTINUATION/STREAM_END already returned
+        // earlier (lines above), so this is exactly the "full pipeline pass, no gate
+        // rejection, no cover traffic, no mid-stream continuation frame" case
+        // `RewardKind::CleanPassage` documents. IRREVERSIBLE-class actions (>= 0x02)
+        // earn the doubled reward — clean handling of the riskiest action class is
+        // stronger positive evidence than a READ_ONLY passage.
+        TrustDecayEngine::global().reward(&trust_key, RewardKind::CleanPassage, parsed.action_class >= 0x02);
 
         Ok(parsed)
     }
@@ -2382,8 +2610,7 @@ impl SAACPProtocolHandler {
         // Every accepted continuation frame is now audited, not just STREAM_END —
         // previously a mid-stream attacker with a valid key could push arbitrary
         // authorized-looking activity with zero forensic trail between START and END.
-        let traceparent_hex: String = parsed.traceparent.iter()
-            .map(|b| format!("{:02x}", b)).collect();
+        let traceparent_hex: String = hex::encode(&parsed.traceparent);
         let frame_summary = format!(
             "[STREAM_CONTINUATION seq={}] {} bytes",
             parsed.sequence_id, actual_data_len
@@ -2516,8 +2743,7 @@ impl SAACPProtocolHandler {
         parsed.gate_tier = GateTier::Lightweight;
 
         // Gate 6.0 equivalent: write audit entry for stream finalization
-        let traceparent_hex: String = parsed.traceparent.iter()
-            .map(|b| format!("{:02x}", b)).collect();
+        let traceparent_hex: String = hex::encode(&parsed.traceparent);
         let stream_summary = format!(
             "Stream completed: {} bytes in {} frames",
             total_bytes, frame_count
@@ -2540,21 +2766,24 @@ impl SAACPProtocolHandler {
     /// Register a STREAM_START frame's token metadata for Gate 1.0/2.5 on continuations.
     ///
     /// Call this AFTER a successful `intercept_packet()` on a STREAM_START frame.
-    /// Extracts token_sig_hash and token_exp from the capability token and, together
-    /// with `max_action_class` (Gate 1.0's already-validated, trust-decay-capped
-    /// ceiling — see `run_gates_1_through_12`), registers them on the StreamSession
-    /// for enforcement on all subsequent continuation/end frames (CRIT-2 fix).
+    /// Extracts token_exp from the capability token and, together with the already-
+    /// computed `token_sig_hash` (Part 6.1: reused from Gate 1.0's
+    /// `TokenValidationResult` — see `parsed.token_sig_hash` — instead of re-deriving
+    /// it a third time from the raw token bytes here) and `max_action_class` (Gate
+    /// 1.0's already-validated, trust-decay-capped ceiling — see
+    /// `run_gates_1_through_12`), registers them on the StreamSession for enforcement
+    /// on all subsequent continuation/end frames (CRIT-2 fix).
     pub fn register_stream_start_token(
         stream_id: &str,
         capability_token_b64: &str,
+        token_sig_hash: &str,
         source_agent: &str,
         max_action_class: u8,
     ) {
-        let token_sig_hex = extract_token_sig_hex(capability_token_b64.as_bytes());
         let token_exp = extract_token_exp(capability_token_b64.as_bytes());
         StreamRegistry::global().set_stream_token_info(
             stream_id,
-            &token_sig_hex,
+            token_sig_hash,
             token_exp,
             source_agent,
             max_action_class,
@@ -2675,6 +2904,24 @@ mod tests {
         let text = "Ignore Previous Instructions";
         let norm = PromptInjectionScanner::normalize(text);
         assert_eq!(norm, "ignorepreviousinstructions");
+    }
+
+    /// M-9 regression: U+0413 CYRILLIC CAPITAL LETTER GHE (Г) is a visual
+    /// homoglyph for Latin 'G' (e.g. "Гoogle" typosquatting "Google") and
+    /// must normalize to 'G', not 'r'.
+    #[test]
+    fn test_replace_confusable_cyrillic_ghe_maps_to_latin_g() {
+        assert_eq!(replace_confusable('\u{0413}'), 'G');
+    }
+
+    #[test]
+    fn test_intent_terms_detects_cyrillic_ghe_google_spoof() {
+        // "Гoogle" (Cyrillic Г + Latin "oogle") must normalize to the same
+        // term as legitimate "Google" so exact-match detection catches it.
+        let spoofed = SAACPProtocolHandler::intent_terms("\u{0413}oogle");
+        let legit = SAACPProtocolHandler::intent_terms("Google");
+        assert_eq!(spoofed, legit);
+        assert!(spoofed.contains_key("google"));
     }
 
     #[test]

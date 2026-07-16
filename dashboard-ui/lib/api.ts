@@ -36,6 +36,10 @@ export interface SecurityAlert {
   agent_id: string;
   gate: string;
   bytecode: string;
+  /** Real claimed dollar/token cost blocked — present only on Gate 0.5
+   * (gate_0_5_financial) rejections; `null`/absent for every other gate.
+   * See command_center.rs / telemetry::report_financial_rejection. */
+  estimated_cost?: number | null;
 }
 
 export interface FinancialResponse {
@@ -44,7 +48,31 @@ export interface FinancialResponse {
   dollars_saved: number;
 }
 
-export type TrustEventJson = { Penalized: string } | "Downgraded" | "ReauthRequired" | "Recovered";
+// Mirrors command_center.rs's ReadyzResponse / its nested structs.
+export interface ReadyzResponse {
+  audit_health: {
+    status: "healthy" | "degraded" | "saturated" | "fatal";
+    wal_queue_depth: number;
+    wal_dropped_total: number;
+    wal_write_failures_total: number;
+  };
+  connections: { tcp_active: number; ws_active: number };
+  trust_stats: { agents_tracked: number; agents_requiring_reauth: number };
+  gate_latencies: { gate: string; avg_seconds: number; count: number }[];
+}
+
+export interface ReloadedConfig {
+  dollars_per_token: number;
+  max_recent_alerts: number;
+  max_agents: number;
+}
+
+export type TrustEventJson =
+  | { Penalized: string }
+  | { Rewarded: string }
+  | "Downgraded"
+  | "ReauthRequired"
+  | "Recovered";
 
 export type DashboardEvent =
   | ({ type: "InjectionAlert" } & SecurityAlert)
@@ -64,12 +92,26 @@ async function getJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function postJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`${path} -> HTTP ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
 export const api = {
-  healthz: () => getJson<{ status: string; uptime_secs: number }>("/healthz"),
+  healthz: () => getJson<{ status: string }>("/healthz"),
   agents: () => getJson<AgentTrustSnapshot[]>("/api/agents"),
   trustMesh: () => getJson<TrustMeshResponse>("/api/trust-mesh"),
   alerts: (limit = 200) => getJson<SecurityAlert[]>(`/api/alerts?limit=${limit}`),
   financial: () => getJson<FinancialResponse>("/api/financial"),
+  readyz: () => getJson<ReadyzResponse>("/api/readyz"),
+  reloadConfig: () => postJson<ReloadedConfig>("/api/config/reload"),
 };
 
 /** SSE endpoint URL, token passed as a query param since EventSource can't set headers. */

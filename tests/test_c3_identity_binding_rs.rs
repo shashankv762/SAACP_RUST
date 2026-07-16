@@ -101,7 +101,7 @@ fn test_certificate_body_bytes_not_empty() {
         "agent-body", &hex::encode(avk.as_bytes()),
         &ca_sk, "ca-k", "iss", 60.0, "ed25519",
     );
-    let body = cert.body_bytes();
+    let body = cert.body_bytes().expect("body_bytes must succeed for a freshly-issued certificate");
     assert!(!body.is_empty());
 }
 

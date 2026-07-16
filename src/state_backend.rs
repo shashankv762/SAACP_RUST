@@ -22,9 +22,10 @@
 //! real backend to validate against.
 //!
 //! Two implementations ship here:
-//!   - [`InMemoryBackend`] — the default. A `Mutex<HashMap<...>>`, byte-for-byte
-//!     equivalent in behaviour to what each subsystem already did before this
-//!     module existed.
+//!   - [`InMemoryBackend`] — the default. A `RwLock<HashMap<...>>`, behaviourally
+//!     equivalent to what each subsystem already did before this module existed
+//!     (concurrent reads just no longer serialize against each other — see L-28
+//!     in opusplan.md).
 //!   - [`RedisBackend`] (behind the `redis-backend` Cargo feature) — a thin
 //!     wrapper over the synchronous `redis` crate client.
 //!
@@ -94,6 +95,8 @@
 //!   is out of proportion to the actual requirement.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
+#[cfg(feature = "redis-backend")]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -213,24 +216,48 @@ impl Entry {
     }
 }
 
-/// Default backend — a process-local `Mutex<HashMap<...>>`. Behaviourally
+/// Default backend — a process-local `RwLock<HashMap<...>>`. Behaviourally
 /// equivalent to what every EASY-tier subsystem already did before
 /// `with_backend()` existed; used implicitly whenever a subsystem is
 /// constructed via `::new()` / `::global()` without an explicit backend.
+///
+/// L-28 fix: was a plain `Mutex`, so `get()` — this backend's hottest operation by far
+/// (every rate-limit check, session lookup, ... goes through it) — serialized against
+/// every other concurrent `get()` too, not just against writers. `RwLock` lets
+/// concurrent `get()` calls proceed together via a shared read-lock fast path (below),
+/// only escalating to the exclusive write lock in the rare case an expired entry
+/// actually needs removing. Mutating methods (`set`/`delete`/`incr`/`incr_with_ttl`/
+/// `compare_and_swap`) and `scan_prefix` (which sweeps expired entries as it iterates)
+/// are unconditionally exclusive either way, so they keep the same concurrency
+/// characteristics as before — this fix targets the specific case the finding raised
+/// (reads blocking on other reads), not scan's O(n) sweep, which is a genuine write.
 #[derive(Default)]
 pub struct InMemoryBackend {
-    store: Mutex<HashMap<String, Entry>>,
+    store: RwLock<HashMap<String, Entry>>,
 }
 
 impl InMemoryBackend {
     pub fn new() -> Self {
-        Self { store: Mutex::new(HashMap::new()) }
+        Self { store: RwLock::new(HashMap::new()) }
     }
 }
 
 impl StateBackend for InMemoryBackend {
     fn get(&self, key: &str) -> BackendResult<Option<Vec<u8>>> {
-        let mut store = self.store.lock().expect("lock poisoned");
+        // Fast path: shared read lock, no mutation, for the common case (key absent or
+        // present-and-live). Only the rarer expired-entry case below needs to mutate.
+        {
+            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+            match store.get(key) {
+                Some(e) if !e.is_expired() => return Ok(Some(e.value.clone())),
+                None => return Ok(None),
+                Some(_) => {} // expired — fall through to the write-locked removal path
+            }
+        }
+        // Re-check under the write lock (not just remove blindly): a concurrent `set()`
+        // could have refreshed this exact key between dropping the read lock above and
+        // acquiring the write lock here, in which case there is nothing to remove.
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         match store.get(key) {
             Some(e) if e.is_expired() => {
                 store.remove(key);
@@ -242,7 +269,7 @@ impl StateBackend for InMemoryBackend {
     }
 
     fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> BackendResult<()> {
-        let mut store = self.store.lock().expect("lock poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         store.insert(key.to_string(), Entry {
             value: value.to_vec(),
             expires_at: ttl.map(|d| Instant::now() + d),
@@ -251,28 +278,38 @@ impl StateBackend for InMemoryBackend {
     }
 
     fn delete(&self, key: &str) -> BackendResult<bool> {
-        let mut store = self.store.lock().expect("lock poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         Ok(store.remove(key).is_some())
     }
 
     fn incr(&self, key: &str, by: i64) -> BackendResult<i64> {
-        let mut store = self.store.lock().expect("lock poisoned");
-        let current: i64 = match store.get(key) {
-            Some(e) if !e.is_expired() => {
-                std::str::from_utf8(&e.value).ok().and_then(|s| s.parse().ok()).unwrap_or(0)
-            }
-            _ => 0,
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        // M-24 fix: preserve an existing (non-expired) entry's `expires_at`
+        // instead of unconditionally overwriting it with `None`. Redis's own
+        // `INCR` never touches an existing key's TTL — only a freshly
+        // CREATED key (the `_ => 0` branch below) has no TTL, matching what
+        // `incr_with_ttl` already does correctly a few lines down. Before
+        // this fix, calling `incr` on a key that already had a TTL (e.g. one
+        // set via `set(key, val, Some(ttl))`, then incremented) silently
+        // stripped that TTL, turning a bounded-lifetime counter into an
+        // unbounded one.
+        let (current, existing_ttl): (i64, Option<Instant>) = match store.get(key) {
+            Some(e) if !e.is_expired() => (
+                std::str::from_utf8(&e.value).ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+                e.expires_at,
+            ),
+            _ => (0, None),
         };
         let next = current.saturating_add(by);
         store.insert(key.to_string(), Entry {
             value: next.to_string().into_bytes(),
-            expires_at: None, // INCR-created keys don't inherit a TTL, matching Redis INCR semantics.
+            expires_at: existing_ttl,
         });
         Ok(next)
     }
 
     fn scan_prefix(&self, prefix: &str) -> BackendResult<Vec<String>> {
-        let mut store = self.store.lock().expect("lock poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         // Sweep expired entries opportunistically so scan results (and
         // memory usage) don't accumulate stale keys indefinitely.
         store.retain(|_, e| !e.is_expired());
@@ -280,7 +317,7 @@ impl StateBackend for InMemoryBackend {
     }
 
     fn incr_with_ttl(&self, key: &str, by: i64, ttl: Duration) -> BackendResult<i64> {
-        let mut store = self.store.lock().expect("lock poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         match store.get_mut(key) {
             Some(e) if !e.is_expired() => {
                 let current: i64 =
@@ -314,7 +351,7 @@ impl StateBackend for InMemoryBackend {
     ) -> BackendResult<bool> {
         // Single lock acquisition spanning compare-and-write: atomic with respect to
         // every other `InMemoryBackend` method, which all take this same lock.
-        let mut store = self.store.lock().expect("lock poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let current = match store.get(key) {
             Some(e) if !e.is_expired() => Some(e.value.as_slice()),
             _ => None,
@@ -396,7 +433,7 @@ impl RedisBackend {
 
     /// Take a pooled connection if one is idle, otherwise open a fresh one.
     fn checkout(&self) -> BackendResult<redis::Connection> {
-        if let Some(conn) = self.pool.lock().expect("lock poisoned").pop() {
+        if let Some(conn) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Ok(conn);
         }
         self.client
@@ -407,7 +444,7 @@ impl RedisBackend {
     /// Return a still-healthy connection to the pool for reuse; drop it
     /// (closing the TCP connection) if the pool is already at capacity.
     fn checkin(&self, conn: redis::Connection) {
-        let mut pool = self.pool.lock().expect("lock poisoned");
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < self.max_pool_size {
             pool.push(conn);
         }
@@ -612,6 +649,59 @@ mod tests {
         let b = InMemoryBackend::new();
         b.incr("c", 10).unwrap();
         assert_eq!(b.incr("c", -3).unwrap(), 7);
+    }
+
+    /// M-24 regression: `incr` on a key that already has a live TTL (set via
+    /// `set(key, val, Some(ttl))`) must PRESERVE that TTL, not silently strip
+    /// it — a bounded-lifetime counter must not become unbounded just because
+    /// it was incremented.
+    #[test]
+    fn incr_preserves_existing_ttl_on_existing_key() {
+        let b = InMemoryBackend::new();
+        b.set("c", b"5", Some(Duration::from_millis(60))).unwrap();
+        assert_eq!(b.incr("c", 1).unwrap(), 6);
+        // TTL must still be in effect — the key must expire on schedule.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            b.get("c").unwrap(),
+            None,
+            "M-24: incr must not strip an existing key's TTL, causing it to \
+             survive past its original expiry"
+        );
+    }
+
+    /// M-24: a brand-new key created BY `incr` itself (no prior `set`) must
+    /// still have no TTL — matching Redis's own `INCR` semantics exactly.
+    /// This is the pre-existing, correct behavior for the creation case; the
+    /// fix must not change it.
+    #[test]
+    fn incr_still_creates_key_with_no_ttl() {
+        let b = InMemoryBackend::new();
+        assert_eq!(b.incr("fresh", 1).unwrap(), 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            b.get("fresh").unwrap(),
+            Some(b"1".to_vec()),
+            "a freshly-created-by-incr key must not expire — it never had a TTL"
+        );
+    }
+
+    /// M-24: repeated `incr` calls on a TTL'd key must not RESET the TTL
+    /// clock either — same "measured from first creation" invariant
+    /// `incr_with_ttl_sets_ttl_only_on_creation` proves for `incr_with_ttl`.
+    #[test]
+    fn incr_does_not_reset_ttl_clock_on_repeated_calls() {
+        let b = InMemoryBackend::new();
+        b.set("c", b"0", Some(Duration::from_millis(60))).unwrap();
+        b.incr("c", 1).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        b.incr("c", 1).unwrap(); // must not push expiry further out
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            b.get("c").unwrap(),
+            None,
+            "TTL must expire based on the original set() call, not be renewed by incr()"
+        );
     }
 
     #[test]

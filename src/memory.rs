@@ -142,6 +142,28 @@ impl CheckpointedSession {
         let inner = self.inner.lock().expect("lock poisoned");
         inner.checkpoints.len()
     }
+
+    /// M-26 fix: proactively remove every checkpoint older than
+    /// `CHECKPOINT_TTL_SECONDS`, instead of relying purely on the reactive
+    /// cleanup paths that already exist — `save_checkpoint`'s
+    /// over-capacity retain (only triggers once the map exceeds
+    /// `CHECKPOINT_MAX_ENTRIES`), `resume_checkpoint`'s lazy per-key check
+    /// (only runs if that exact context_state_id is looked up again), and
+    /// `check_pipeline_stalls`'s abort-only eviction (only removes entries
+    /// that have crossed `STALL_ABORT_SECONDS`, a much longer threshold than
+    /// `CHECKPOINT_TTL_SECONDS`). A checkpoint whose agent never reconnects
+    /// and is never looked up again previously sat in memory until either
+    /// threshold was crossed or the map filled up — this gives a
+    /// caller (see `maintenance::MaintenanceCoordinator::with_checkpointed_session`)
+    /// a way to reclaim that memory on a regular cadence instead. Returns the
+    /// number of checkpoints removed.
+    pub fn sweep_expired(&self) -> usize {
+        let now = now_secs();
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        let before = inner.checkpoints.len();
+        inner.checkpoints.retain(|_, v| (now - v.timestamp) < CHECKPOINT_TTL_SECONDS);
+        before - inner.checkpoints.len()
+    }
 }
 
 impl Default for CheckpointedSession {
@@ -160,6 +182,14 @@ pub const FEDERATED_TTL_SECONDS: f64 = 300.0;
 pub const FEDERATED_MAX_ENTRIES: usize = 10_000;
 /// 24 hours max even for intent envelopes.
 pub const INTENT_MAX_LIFETIME: f64 = 86400.0;
+/// opusplan.md 6.5 ("Memory Steady-State Targets": FederatedMemory per-entry budget).
+/// Maximum size, in bytes, of a single record's `data` payload. Without this, one
+/// caller storing an arbitrarily large `massive_context_string`/`data` blob could make
+/// this store's true memory footprint far exceed `FEDERATED_MAX_ENTRIES * <expected
+/// per-entry size>` even while staying under the entry-count cap. Enforced by rejecting
+/// (not truncating) oversized writes — see `put_record`'s doc comment for why silent
+/// truncation is the wrong failure mode here.
+pub const FEDERATED_MAX_VALUE_BYTES: usize = 65_536;
 
 /// Decentralized, shared local memory buffer.
 /// Prevents Context Window Exhaustion by allowing agents to pass data by reference
@@ -265,14 +295,18 @@ impl FederatedMemory {
     /// otherwise `("ab", "cdef")` and `("abcd", "ef")` would hash identically,
     /// the same boundary-ambiguity class already fixed elsewhere in this
     /// crate for `NegotiationTranscript` suite lists (H-9).
-    pub fn store_context(&self, agent_id: &str, massive_context_string: &str, version: u32) -> Vec<u8> {
+    ///
+    /// Returns `Err` (storing nothing) if `massive_context_string` exceeds
+    /// `FEDERATED_MAX_VALUE_BYTES` — see `put_record`'s doc comment for the
+    /// reject-don't-truncate rationale (opusplan.md 6.5).
+    pub fn store_context(&self, agent_id: &str, massive_context_string: &str, version: u32) -> Result<Vec<u8>, String> {
         let mut hasher = Sha256::new();
         hasher.update((agent_id.len() as u64).to_le_bytes());
         hasher.update(agent_id.as_bytes());
         hasher.update(massive_context_string.as_bytes());
         let state_id = hasher.finalize().to_vec();
-        self.put_record(&state_id, massive_context_string.to_string(), version, FEDERATED_TTL_SECONDS);
-        state_id
+        self.put_record(&state_id, massive_context_string.to_string(), version, FEDERATED_TTL_SECONDS)?;
+        Ok(state_id)
     }
 
     /// Fetches context by 32-byte state ID. Checks expiration and version.
@@ -297,8 +331,7 @@ impl FederatedMemory {
         if state_id.len() != 32 {
             return Err("Context-State-ID must be exactly 32 bytes.".into());
         }
-        self.put_record(state_id, data.to_string(), version, FEDERATED_TTL_SECONDS);
-        Ok(())
+        self.put_record(state_id, data.to_string(), version, FEDERATED_TTL_SECONDS)
     }
 
     /// Provenance-tracking sibling of [`Self::save_context`]. `save_context`
@@ -327,8 +360,7 @@ impl FederatedMemory {
             "writer_agent": writer_agent,
             "data": data,
         }).to_string();
-        self.put_record(state_id, tagged, version, FEDERATED_TTL_SECONDS);
-        Ok(())
+        self.put_record(state_id, tagged, version, FEDERATED_TTL_SECONDS)
     }
 
     /// Fetches context by 32-byte state ID, returning the recorded
@@ -362,21 +394,48 @@ impl FederatedMemory {
     // envelopes are both just "a blob behind a hash, with a TTL").
 
     /// Lock and return the shard responsible for `id` (process-local mode only).
+    ///
+    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
+    /// `FederatedMemory::global()` is a process-wide singleton, so one
+    /// poisoning panic must not cascade into every other caller sharing this
+    /// shard losing access to its memory records.
     fn shard(&self, id: &[u8]) -> std::sync::MutexGuard<'_, FederatedInner> {
-        self.shards[shard_index(id)].lock().expect("lock poisoned")
+        self.shards[shard_index(id)].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn put_record(&self, id: &[u8], data: String, version: u32, ttl_secs: f64) {
+    /// opusplan.md 6.5: rejects (returns `Err`, stores nothing) any `data` payload
+    /// exceeding `FEDERATED_MAX_VALUE_BYTES` instead of silently truncating it. A
+    /// truncated context blob, credential-adjacent payload, or signed intent envelope
+    /// is a correctness/integrity hazard — a caller reading back a silently-shortened
+    /// value has no way to detect the corruption, whereas a loud, immediate rejection
+    /// at write time can be handled by the caller (e.g. split into multiple records,
+    /// or reject the originating request). This mirrors how `MAX_PAYLOAD_SIZE` is
+    /// already enforced elsewhere in this crate (reject, never truncate).
+    fn put_record(&self, id: &[u8], data: String, version: u32, ttl_secs: f64) -> Result<(), String> {
+        if data.len() > FEDERATED_MAX_VALUE_BYTES {
+            return Err(format!(
+                "FederatedMemory record exceeds FEDERATED_MAX_VALUE_BYTES ({} > {})",
+                data.len(), FEDERATED_MAX_VALUE_BYTES,
+            ));
+        }
         match &self.backend {
             Some(backend) => {
                 let record = FederatedRecordWire { data, version, expires_at: now_secs() + ttl_secs };
-                if let Ok(bytes) = serde_json::to_vec(&record) {
-                    let _ = backend.set(
+                // Propagate both the serialization and the backend-write failure:
+                // returning `Ok(())` when the record never reached the backend is a
+                // silent data-loss / false-success bug — a caller that got `Ok` would
+                // later read `None` for a record it believes it durably stored. All
+                // callers already surface this `Result` via `?`.
+                let bytes = serde_json::to_vec(&record).map_err(|e| {
+                    format!("FederatedMemory: failed to serialize record: {e}")
+                })?;
+                backend
+                    .set(
                         &Self::backend_key(id),
                         &bytes,
                         Some(Duration::from_secs_f64(ttl_secs.max(0.0))),
-                    );
-                }
+                    )
+                    .map_err(|e| format!("FederatedMemory: backend write failed: {e}"))?;
             }
             None => {
                 let mut inner = self.shard(id);
@@ -392,6 +451,7 @@ impl FederatedMemory {
                 }
             }
         }
+        Ok(())
     }
 
     fn get_record(&self, id: &[u8]) -> Option<(String, u32, f64)> {
@@ -430,12 +490,16 @@ impl FederatedMemory {
     /// byte string passed to HMAC at creation exactly matches the byte string reconstructed
     /// at verification, regardless of serde_json's map iteration order. Separately stored
     /// metadata (root_signature) is never part of the signed payload.
+    ///
+    /// Returns `Err` (storing nothing) if the serialized envelope exceeds
+    /// `FEDERATED_MAX_VALUE_BYTES` — see `put_record`'s doc comment for the
+    /// reject-don't-truncate rationale (opusplan.md 6.5).
     pub fn create_intent_envelope(
         &self,
         root_intent: &str,
         root_issuer: &str,
         secret_key: &[u8],
-    ) -> String {
+    ) -> Result<String, String> {
         // f64→u64: epoch seconds are positive and fractional part is not needed.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ts_u64 = now_secs() as u64;
@@ -458,9 +522,9 @@ impl FederatedMemory {
         let final_json = serde_json::to_string(&final_fields).unwrap_or_default();
         let envelope_hash = Sha256::digest(final_json.as_bytes()).to_vec();
 
-        self.put_record(&envelope_hash, final_json, 1, INTENT_MAX_LIFETIME);
+        self.put_record(&envelope_hash, final_json, 1, INTENT_MAX_LIFETIME)?;
 
-        hex::encode(&envelope_hash)
+        Ok(hex::encode(&envelope_hash))
     }
 
     /// Deletes an intent envelope by hex hash. Returns true if found and deleted.
@@ -492,7 +556,7 @@ impl FederatedMemory {
                 let now = now_secs();
                 let mut evicted = 0usize;
                 for shard in &self.shards {
-                    let mut inner = shard.lock().expect("lock poisoned");
+                    let mut inner = shard.lock().unwrap_or_else(|e| e.into_inner());
                     let before = inner.store.len();
                     inner.store.retain(|_, v| v.expires_at > now);
                     evicted += before - inner.store.len();
@@ -570,7 +634,7 @@ impl FederatedMemory {
     pub fn count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("fedmem:").map(|k| k.len()).unwrap_or(0),
-            None => self.shards.iter().map(|s| s.lock().expect("lock poisoned").store.len()).sum(),
+            None => self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).store.len()).sum(),
         }
     }
 
@@ -664,6 +728,14 @@ struct ScrRecord {
     audience: Vec<String>,
     revoked: bool,
     classification: String,
+    /// M-25 fix: wall-clock time this record was inserted, used by
+    /// `evict_if_needed`'s capacity-forced fallback to evict oldest-first
+    /// instead of by arbitrary `HashMap` key order. Deliberately distinct
+    /// from `expiry` (`now_secs() + ttl_seconds` at creation) — a
+    /// long-TTL record created recently and a short-TTL record created long
+    /// ago can have the same `expiry`, but only `created_at` answers "which
+    /// one is actually older".
+    created_at: f64,
 }
 
 /// Secure Context References (SCR) — AEGF replacement for content-derived
@@ -736,6 +808,7 @@ impl SecureContextStore {
             audience: audience.to_vec(),
             revoked: false,
             classification: classification.to_string(),
+            created_at: now_secs(),
         });
         Ok(scr_hex)
     }
@@ -858,12 +931,18 @@ impl SecureContextStore {
         let now = now_secs();
         inner.store.retain(|_, v| v.expiry > now && !v.revoked);
         // If expiry eviction wasn't enough (all entries still valid), forcibly remove
-        // the oldest half by key order to keep memory bounded.
+        // the oldest half — by actual insertion time (`created_at`), not arbitrary
+        // `HashMap` key order (M-25 fix) — to keep memory bounded.
         if inner.store.len() >= SCR_MAX_ENTRIES {
             let target = SCR_MAX_ENTRIES / 2;
             let excess = inner.store.len().saturating_sub(target);
-            let to_remove: Vec<_> = inner.store.keys().take(excess).cloned().collect();
-            for k in to_remove { inner.store.remove(&k); }
+            let mut by_age: Vec<(String, f64)> = inner.store.iter()
+                .map(|(k, v)| (k.clone(), v.created_at))
+                .collect();
+            by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (k, _) in by_age.into_iter().take(excess) {
+                inner.store.remove(&k);
+            }
         }
     }
 }
@@ -910,6 +989,58 @@ mod tests {
         assert_eq!(cs.count(), 1);
     }
 
+    /// M-26 regression: `sweep_expired` must proactively remove a checkpoint
+    /// past `CHECKPOINT_TTL_SECONDS`, without needing a `resume_checkpoint`
+    /// lookup or an over-capacity `save_checkpoint` call to trigger cleanup.
+    #[test]
+    fn test_sweep_expired_removes_stale_checkpoint() {
+        let cs = CheckpointedSession::new();
+        let state_id = vec![0xCDu8; 32];
+        cs.save_checkpoint(&state_id, "stage_1", serde_json::json!({"k": "v"}));
+        // Directly backdate the entry's timestamp (same-module private-field
+        // access) rather than sleeping CHECKPOINT_TTL_SECONDS (30 minutes)
+        // in a unit test.
+        {
+            let mut inner = cs.inner.lock().unwrap();
+            let entry = inner.checkpoints.get_mut(&state_id).unwrap();
+            entry.timestamp = now_secs() - CHECKPOINT_TTL_SECONDS - 10.0;
+        }
+        assert_eq!(cs.count(), 1, "test setup: entry must still be present before sweep");
+
+        let removed = cs.sweep_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(cs.count(), 0, "M-26: expired checkpoint must be proactively removed");
+    }
+
+    #[test]
+    fn test_sweep_expired_leaves_fresh_checkpoints_alone() {
+        let cs = CheckpointedSession::new();
+        cs.save_checkpoint(&[1u8; 32], "s1", serde_json::json!(null));
+        let removed = cs.sweep_expired();
+        assert_eq!(removed, 0);
+        assert_eq!(cs.count(), 1, "a freshly saved checkpoint must survive a sweep");
+    }
+
+    #[test]
+    fn test_sweep_expired_only_removes_stale_across_mixed_set() {
+        let cs = CheckpointedSession::new();
+        let fresh_id = vec![2u8; 32];
+        let stale_id = vec![3u8; 32];
+        cs.save_checkpoint(&fresh_id, "fresh", serde_json::json!(null));
+        cs.save_checkpoint(&stale_id, "stale", serde_json::json!(null));
+        {
+            let mut inner = cs.inner.lock().unwrap();
+            inner.checkpoints.get_mut(&stale_id).unwrap().timestamp =
+                now_secs() - CHECKPOINT_TTL_SECONDS - 10.0;
+        }
+        assert_eq!(cs.count(), 2);
+
+        let removed = cs.sweep_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(cs.count(), 1);
+        assert!(cs.resume_checkpoint(&fresh_id).is_some(), "fresh checkpoint must survive");
+    }
+
     #[test]
     fn test_pipeline_stall_detection() {
         let cs = CheckpointedSession::new();
@@ -927,7 +1058,7 @@ mod tests {
     fn test_store_and_fetch_context() {
         let fm = FederatedMemory::new();
         let data = "Hello, SAACP world!";
-        let state_id = fm.store_context("agent-alpha", data, 1);
+        let state_id = fm.store_context("agent-alpha", data, 1).unwrap();
         assert_eq!(state_id.len(), 32);
         let fetched = fm.fetch_context(&state_id, 1).unwrap();
         assert_eq!(fetched, data);
@@ -936,7 +1067,7 @@ mod tests {
     #[test]
     fn test_fetch_wrong_version() {
         let fm = FederatedMemory::new();
-        let state_id = fm.store_context("agent-alpha", "data", 1);
+        let state_id = fm.store_context("agent-alpha", "data", 1).unwrap();
         assert!(fm.fetch_context(&state_id, 2).is_err());
     }
 
@@ -965,7 +1096,7 @@ mod tests {
     fn test_intent_envelope_create_and_fetch() {
         let fm = FederatedMemory::new();
         let secret = b"my_secret_key_for_hmac";
-        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret);
+        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret).unwrap();
         assert_eq!(hash_hex.len(), 64); // 32 bytes hex
         let intent = fm.fetch_intent_envelope(&hash_hex, secret).unwrap();
         assert_eq!(intent, "do_something");
@@ -974,7 +1105,7 @@ mod tests {
     #[test]
     fn test_intent_envelope_wrong_secret() {
         let fm = FederatedMemory::new();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1");
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1").unwrap();
         let err = fm.fetch_intent_envelope(&hash_hex, b"secret2").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
     }
@@ -982,7 +1113,7 @@ mod tests {
     #[test]
     fn test_intent_envelope_delete() {
         let fm = FederatedMemory::new();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret");
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret").unwrap();
         assert!(fm.delete_intent_envelope(&hash_hex));
         assert!(!fm.delete_intent_envelope(&hash_hex)); // already gone
     }
@@ -990,10 +1121,41 @@ mod tests {
     #[test]
     fn test_evict_expired() {
         let fm = FederatedMemory::new();
-        fm.store_context("agent-alpha", "data", 1);
+        fm.store_context("agent-alpha", "data", 1).unwrap();
         assert_eq!(fm.count(), 1);
         // Nothing expired yet
         assert_eq!(fm.evict_expired(), 0);
+    }
+
+    /// opusplan.md 6.5: a `store_context` payload over `FEDERATED_MAX_VALUE_BYTES` must
+    /// be rejected outright (`Err`, nothing stored) rather than silently truncated or
+    /// accepted — the whole point of the cap is a hard per-entry memory ceiling.
+    #[test]
+    fn test_store_context_rejects_oversized_value() {
+        let fm = FederatedMemory::new();
+        let oversized = "x".repeat(FEDERATED_MAX_VALUE_BYTES + 1);
+        assert!(fm.store_context("agent-alpha", &oversized, 1).is_err());
+        assert_eq!(fm.count(), 0, "a rejected write must not leave a partial record behind");
+    }
+
+    /// A payload exactly at the cap must still be accepted — the cap is an upper
+    /// bound, not an off-by-one-stricter ceiling.
+    #[test]
+    fn test_store_context_accepts_value_at_exact_cap() {
+        let fm = FederatedMemory::new();
+        let at_cap = "x".repeat(FEDERATED_MAX_VALUE_BYTES);
+        assert!(fm.store_context("agent-alpha", &at_cap, 1).is_ok());
+    }
+
+    /// `save_context` and `create_intent_envelope` funnel through the same
+    /// `put_record` choke point as `store_context` — confirm they enforce the
+    /// identical cap rather than only one call path being protected.
+    #[test]
+    fn test_save_context_and_intent_envelope_reject_oversized_value() {
+        let fm = FederatedMemory::new();
+        let oversized = "x".repeat(FEDERATED_MAX_VALUE_BYTES + 1);
+        assert!(fm.save_context(&[3u8; 32], &oversized, 1).is_err());
+        assert!(fm.create_intent_envelope(&oversized, "issuer", b"secret").is_err());
     }
 
     // -- FederatedMemory::global() / set_global_backend() (H-29) --
@@ -1036,7 +1198,7 @@ mod tests {
     fn test_backend_store_and_fetch_context() {
         let fm = backend_fm();
         let data = "Hello, backend-mode SAACP world!";
-        let state_id = fm.store_context("agent-alpha", data, 1);
+        let state_id = fm.store_context("agent-alpha", data, 1).unwrap();
         assert_eq!(state_id.len(), 32);
         let fetched = fm.fetch_context(&state_id, 1).unwrap();
         assert_eq!(fetched, data);
@@ -1045,7 +1207,7 @@ mod tests {
     #[test]
     fn test_backend_fetch_wrong_version() {
         let fm = backend_fm();
-        let state_id = fm.store_context("agent-alpha", "data", 1);
+        let state_id = fm.store_context("agent-alpha", "data", 1).unwrap();
         assert!(fm.fetch_context(&state_id, 2).is_err());
     }
 
@@ -1068,7 +1230,7 @@ mod tests {
     fn test_backend_intent_envelope_create_and_fetch() {
         let fm = backend_fm();
         let secret = b"my_secret_key_for_hmac";
-        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret);
+        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret).unwrap();
         assert_eq!(hash_hex.len(), 64);
         let intent = fm.fetch_intent_envelope(&hash_hex, secret).unwrap();
         assert_eq!(intent, "do_something");
@@ -1077,7 +1239,7 @@ mod tests {
     #[test]
     fn test_backend_intent_envelope_wrong_secret() {
         let fm = backend_fm();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1");
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1").unwrap();
         let err = fm.fetch_intent_envelope(&hash_hex, b"secret2").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
     }
@@ -1085,7 +1247,7 @@ mod tests {
     #[test]
     fn test_backend_intent_envelope_delete() {
         let fm = backend_fm();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret");
+        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret").unwrap();
         assert!(fm.delete_intent_envelope(&hash_hex));
         assert!(!fm.delete_intent_envelope(&hash_hex)); // already gone
     }
@@ -1094,8 +1256,8 @@ mod tests {
     fn test_backend_count_reflects_scan_prefix() {
         let fm = backend_fm();
         assert_eq!(fm.count(), 0);
-        fm.store_context("agent-alpha", "a", 1);
-        fm.store_context("agent-alpha", "b", 1);
+        fm.store_context("agent-alpha", "a", 1).unwrap();
+        fm.store_context("agent-alpha", "b", 1).unwrap();
         assert_eq!(fm.count(), 2);
     }
 
@@ -1103,7 +1265,7 @@ mod tests {
     fn test_backend_and_local_instances_are_independent() {
         let local = FederatedMemory::new();
         let backend = backend_fm();
-        let state_id = local.store_context("agent-alpha", "only-local", 1);
+        let state_id = local.store_context("agent-alpha", "only-local", 1).unwrap();
         // The backend-mode instance has an entirely separate store — it must
         // not see data written to the local, process-only instance.
         assert!(backend.fetch_context(&state_id, 1).is_err());
@@ -1116,8 +1278,8 @@ mod tests {
     fn test_store_context_cross_agent_no_collision() {
         let fm = FederatedMemory::new();
         let payload = "identical payload submitted by two different agents";
-        let id_a = fm.store_context("agent-alpha", payload, 1);
-        let id_b = fm.store_context("agent-beta", payload, 1);
+        let id_a = fm.store_context("agent-alpha", payload, 1).unwrap();
+        let id_b = fm.store_context("agent-beta", payload, 1).unwrap();
         assert_ne!(id_a, id_b);
         assert_eq!(fm.fetch_context(&id_a, 1).unwrap(), payload);
         assert_eq!(fm.fetch_context(&id_b, 1).unwrap(), payload);
@@ -1129,8 +1291,8 @@ mod tests {
     #[test]
     fn test_store_context_boundary_ambiguity_no_collision() {
         let fm = FederatedMemory::new();
-        let id_1 = fm.store_context("ab", "cdef", 1);
-        let id_2 = fm.store_context("abcd", "ef", 1);
+        let id_1 = fm.store_context("ab", "cdef", 1).unwrap();
+        let id_2 = fm.store_context("abcd", "ef", 1).unwrap();
         assert_ne!(id_1, id_2);
     }
 
@@ -1299,5 +1461,91 @@ mod tests {
         let short_key = vec![0u8; 16];
         let audience: Vec<String> = vec![];
         assert!(scs.store("data", "a", &audience, 300.0, &short_key, "INTERNAL").is_err());
+    }
+
+    // -- M-25: SecureContextStore forced eviction is oldest-created-first --
+
+    /// Builds a minimal, never-expired, never-revoked `ScrRecord` with a
+    /// caller-controlled `created_at`, for directly exercising
+    /// `evict_if_needed`'s forced-eviction fallback without the expense of
+    /// SCR_MAX_ENTRIES real AES-256-GCM `store()` calls. `expiry` is
+    /// anchored far in the future relative to `created_at` (not relative to
+    /// 0) so it always compares greater than the real `now_secs()`
+    /// `evict_if_needed` checks against, regardless of what small offset
+    /// `created_at` itself uses in a given test.
+    fn scr_record_at(created_at: f64) -> ScrRecord {
+        ScrRecord {
+            ciphertext: vec![0u8; 8],
+            salt: vec![0u8; 32],
+            aad: vec![0u8; 8],
+            expiry: now_secs() + 999_999.0, // never expires within the test, regardless of created_at
+            owner: "owner".to_string(),
+            audience: vec![],
+            revoked: false,
+            classification: "INTERNAL".to_string(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn test_evict_if_needed_forced_fallback_removes_oldest_created_first() {
+        let mut inner = ScrInner { store: HashMap::new() };
+        // Populate exactly SCR_MAX_ENTRIES never-expiring records with
+        // DESCENDING created_at (so HashMap key/insertion order is the exact
+        // opposite of age order — if eviction fell back to key order, it
+        // would evict the NEWEST records instead of the oldest).
+        for i in 0..SCR_MAX_ENTRIES {
+            let created_at = (SCR_MAX_ENTRIES - i) as f64; // last-inserted has smallest created_at
+            inner.store.insert(format!("scr-{i:06}"), scr_record_at(created_at));
+        }
+        assert_eq!(inner.store.len(), SCR_MAX_ENTRIES);
+
+        SecureContextStore::evict_if_needed(&mut inner);
+
+        // Exactly SCR_MAX_ENTRIES / 2 should remain (expiry-based retain is a
+        // no-op here since nothing is expired/revoked, so only the forced
+        // oldest-half fallback ran).
+        assert_eq!(inner.store.len(), SCR_MAX_ENTRIES / 2);
+
+        // Every SURVIVING record must have created_at STRICTLY GREATER than
+        // every REMOVED record's created_at — i.e. the newest half survived,
+        // the oldest half was evicted, regardless of HashMap key order.
+        let min_surviving = inner.store.values().map(|v| v.created_at)
+            .fold(f64::INFINITY, f64::min);
+        let max_possible_created_at = SCR_MAX_ENTRIES as f64;
+        assert!(
+            min_surviving > max_possible_created_at / 2.0,
+            "M-25: the oldest half must be evicted first — found a surviving \
+             record with created_at={min_surviving}, expected > {}",
+            max_possible_created_at / 2.0
+        );
+    }
+
+    #[test]
+    fn test_evict_if_needed_below_high_water_is_noop() {
+        let mut inner = ScrInner { store: HashMap::new() };
+        inner.store.insert("only-one".to_string(), scr_record_at(1.0));
+        SecureContextStore::evict_if_needed(&mut inner);
+        assert_eq!(inner.store.len(), 1, "well below HIGH_WATER, eviction must not run");
+    }
+
+    #[test]
+    fn test_evict_if_needed_prefers_expired_over_forced_age_eviction() {
+        let mut inner = ScrInner { store: HashMap::new() };
+        let now = now_secs();
+        // Fill to HIGH_WATER with a mix: half already-expired (should be
+        // swept by the `retain` pass alone, regardless of age), half fresh.
+        const HIGH_WATER: usize = SCR_MAX_ENTRIES - SCR_MAX_ENTRIES / 5;
+        for i in 0..HIGH_WATER {
+            let mut rec = scr_record_at(now - 1000.0 + i as f64);
+            if i % 2 == 0 {
+                rec.expiry = now - 1.0; // already expired
+            }
+            inner.store.insert(format!("scr-{i:06}"), rec);
+        }
+        SecureContextStore::evict_if_needed(&mut inner);
+        // All expired entries must be gone; none of this depends on age-based
+        // forced eviction since expiry-retain alone drops well below SCR_MAX_ENTRIES.
+        assert!(inner.store.values().all(|v| v.expiry > now), "no expired record should survive");
     }
 }

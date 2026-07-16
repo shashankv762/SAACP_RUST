@@ -5,7 +5,8 @@
 
 use saacp::{
     KeyRegistry, KeyLifecycleManager, KeyAlgorithm, KeyCategory, KeyStatus,
-    make_kid, make_descriptor,
+    KeyRotationPolicy,
+    make_kid, make_descriptor, default_key_generator,
     KLMS_DEFAULT_REGISTRY, KLMS_DEFAULT_POLICY,
 };
 
@@ -287,4 +288,190 @@ fn test_klms_default_registry_exists() {
 #[test]
 fn test_klms_default_policy_exists() {
     let _ = KLMS_DEFAULT_POLICY.max_age_seconds;
+}
+
+// ─── Automatic key rotation (Phase 5, item 4) ────────────────────────────────
+
+fn register_with_expiry(registry: &KeyRegistry, expires_at: f64, created_at: f64) -> String {
+    let kid = make_kid();
+    let desc = saacp::KeyDescriptor::new(
+        kid.clone(),
+        1,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0xABu8; 32],
+        created_at,
+        expires_at,
+        None,
+        KeyStatus::Active,
+        std::collections::HashMap::new(),
+    ).unwrap();
+    registry.register(desc).unwrap();
+    kid
+}
+
+#[test]
+fn test_list_expiring_returns_keys_within_lead_window() {
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+    // Expires in 100s — well within a 200s lead window.
+    let due_kid = register_with_expiry(&reg, now + 100.0, now - 1000.0);
+    // Expires in 10,000s — far outside a 200s lead window.
+    let far_kid = register_with_expiry(&reg, now + 10_000.0, now - 1000.0);
+
+    let expiring = reg.list_expiring(200.0, now);
+    let expiring_kids: Vec<&String> = expiring.iter().map(|(k, _)| k).collect();
+
+    assert!(expiring_kids.contains(&&due_kid), "key within the lead window must be listed");
+    assert!(!expiring_kids.contains(&&far_kid), "key far from expiry must not be listed");
+}
+
+#[test]
+fn test_list_expiring_excludes_non_active_keys() {
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+
+    // A Revoked descriptor whose expires_at would otherwise put it well within the lead
+    // window — registered directly with Revoked status (not via rotate_key/revoke_key,
+    // which live on KeyLifecycleManager and take the registry by value) so this test
+    // isolates `KeyRegistry::list_expiring`'s own status filter.
+    let revoked_kid = make_kid();
+    let revoked_desc = saacp::KeyDescriptor::new(
+        revoked_kid.clone(),
+        1,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0xCDu8; 32],
+        now - 1000.0,
+        now + 100.0,
+        None,
+        KeyStatus::Revoked,
+        std::collections::HashMap::new(),
+    ).unwrap();
+    reg.register(revoked_desc).unwrap();
+
+    // A genuinely Active descriptor within the same window, for contrast.
+    let active_kid = register_with_expiry(&reg, now + 100.0, now - 1000.0);
+
+    let expiring = reg.list_expiring(200.0, now);
+    let expiring_kids: Vec<&String> = expiring.iter().map(|(k, _)| k).collect();
+
+    assert!(!expiring_kids.contains(&&revoked_kid), "a Revoked key must never appear in list_expiring");
+    assert!(expiring_kids.contains(&&active_kid), "sanity: the Active key in the same window IS listed");
+}
+
+#[test]
+fn test_sweep_and_rotate_noop_when_auto_rotate_disabled() {
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+    let kid = register_with_expiry(&reg, now + 10.0, now - 1000.0);
+
+    let policy = KeyRotationPolicy {
+        auto_rotate: false,
+        renewal_lead_seconds: 1000.0,
+        ..Default::default()
+    };
+    let mgr = KeyLifecycleManager::new(reg, Some(policy));
+
+    let rotated = mgr.sweep_and_rotate(now, default_key_generator);
+    assert!(rotated.is_empty(), "sweep_and_rotate must be a no-op when auto_rotate is false");
+
+    // The key must still be Active version 1 — untouched.
+    let audit = mgr.audit_key_lifecycle(&kid);
+    assert_eq!(audit.len(), 1, "no rotation should have created a second version");
+    assert_eq!(audit[0].version, 1);
+    assert_eq!(audit[0].status, "ACTIVE");
+}
+
+#[test]
+fn test_sweep_and_rotate_full_cycle_with_injectable_clock() {
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+    // Simulate a key issued long ago whose 24h TTL has almost elapsed (23.9 hours in).
+    let created_at = now - 23.9 * 3600.0;
+    let expires_at = created_at + 24.0 * 3600.0;
+    let kid = register_with_expiry(&reg, expires_at, created_at);
+
+    let policy = KeyRotationPolicy {
+        auto_rotate: true,
+        max_age_seconds: 86_400.0,
+        renewal_lead_seconds: 86_400.0 * 0.1, // default 10% lead (2.4h)
+        ..Default::default()
+    };
+    let mgr = KeyLifecycleManager::new(reg, Some(policy));
+
+    let rotated = mgr.sweep_and_rotate(now, default_key_generator);
+    assert_eq!(rotated, vec![kid.clone()], "the near-expiry key must be rotated");
+
+    let audit = mgr.audit_key_lifecycle(&kid);
+    assert_eq!(audit.len(), 2, "rotation must produce a ROTATED v1 and an ACTIVE v2");
+    assert_eq!(audit[0].status, "ROTATED");
+    assert_eq!(audit[1].status, "ACTIVE");
+    assert_eq!(audit[1].version, 2);
+}
+
+#[test]
+fn test_sweep_and_rotate_never_touches_non_active_keys() {
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+    let kid = register_with_expiry(&reg, now + 10.0, now - 1000.0);
+
+    let policy = KeyRotationPolicy {
+        auto_rotate: true,
+        renewal_lead_seconds: 1000.0,
+        ..Default::default()
+    };
+    let mgr = KeyLifecycleManager::new(reg, Some(policy));
+
+    // Revoke it first — it's now Compromised, not Active, even though it's within the
+    // renewal lead window by expires_at alone.
+    mgr.revoke_key(&kid, "compromised").unwrap();
+
+    let rotated = mgr.sweep_and_rotate(now, default_key_generator);
+    assert!(
+        rotated.is_empty(),
+        "sweep_and_rotate must never rotate a Revoked/Compromised key back to Active"
+    );
+
+    let audit = mgr.audit_key_lifecycle(&kid);
+    assert_eq!(audit.len(), 1, "no new version should have been created");
+    assert_eq!(audit[0].status, "COMPROMISED");
+}
+
+#[test]
+fn test_concurrent_sweep_and_rotate_does_not_double_rotate() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let reg = KeyRegistry::new();
+    let now = 1_000_000.0;
+    let created_at = now - 23.9 * 3600.0;
+    let expires_at = created_at + 24.0 * 3600.0;
+    let kid = register_with_expiry(&reg, expires_at, created_at);
+
+    let policy = KeyRotationPolicy {
+        auto_rotate: true,
+        max_age_seconds: 86_400.0,
+        renewal_lead_seconds: 86_400.0 * 0.1,
+        ..Default::default()
+    };
+    let mgr = Arc::new(KeyLifecycleManager::new(reg, Some(policy)));
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let mgr = Arc::clone(&mgr);
+        handles.push(thread::spawn(move || mgr.sweep_and_rotate(now, default_key_generator)));
+    }
+    let results: Vec<Vec<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let total_rotations: usize = results.iter().map(|r| r.len()).sum();
+    assert_eq!(
+        total_rotations, 1,
+        "exactly one of the concurrent sweep_and_rotate calls must win the (kid, version+1) \
+         registration race — KeyRegistry::register already rejects a duplicate (kid, version) \
+         pair, which this asserts rather than assumes"
+    );
+
+    let audit = mgr.audit_key_lifecycle(&kid);
+    assert_eq!(audit.len(), 2, "only one rotation must have taken effect, not one per thread");
 }

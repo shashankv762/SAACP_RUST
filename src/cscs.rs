@@ -87,7 +87,10 @@ impl OscillationFingerprinter {
 
     /// Records the fingerprint and returns the count of times it has been seen in the current window.
     pub fn record_and_count(&self, session_id: &str, fingerprint: &str) -> usize {
-        let mut hist = self.history.lock().unwrap();
+        // M-38 fix: recover from poison via `into_inner()` — `GLOBAL_CSCS` is a
+        // process-wide singleton, so one poisoning panic must not cascade into
+        // every other session's loop-detection calls.
+        let mut hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_secs();
 
         // IoT / low-resource fix: sweep the least-recently-seen sessions once the
@@ -120,7 +123,7 @@ impl OscillationFingerprinter {
     }
 
     pub fn clear(&self, session_id: &str) {
-        self.history.lock().unwrap().remove(session_id);
+        self.history.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
     }
 }
 

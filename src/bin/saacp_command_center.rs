@@ -2,9 +2,12 @@
 //!
 //! Runs the Command Center's REST+SSE HTTP API. By default it also stands up a bare,
 //! in-process `SAACPNetworkDaemon` (unauthenticated handshake, same shape as running
-//! `saacp-sidecar` with no gateway/encrypted-transport builders) purely so the dashboard
-//! has some live traffic to show out of the box — set `SAACP_DISABLE_DEMO_DAEMON=1` to skip
-//! this and run the dashboard alone against a real gateway process's shared global state
+//! `saacp-sidecar` with no gateway/encrypted-transport builders) AND a synthetic activity
+//! generator (`command_center_demo`) that drives live agents, trust-mesh edges, gate
+//! rejections and Gate 0.5 financial blocks through the same process-wide global engines a
+//! real gateway drives — so the dashboard's panels are populated out of the box instead of
+//! showing (correct but alarming) empty state. Set `SAACP_DISABLE_DEMO_DAEMON=1` to skip
+//! BOTH and run the dashboard alone against a real gateway process's shared global state
 //! instead (see `command_center.rs`'s module doc: this dashboard is designed to run
 //! **in-process** alongside a real gateway, not as a separate observer).
 //!
@@ -22,11 +25,17 @@
 //!   SAACP_DISABLE_DEMO_DAEMON  — set to "1" to skip starting the demo SAACPNetworkDaemon
 //!   SAACP_DEMO_DAEMON_ADDR     — address the demo daemon binds, if not disabled
 //!                                 (default: 127.0.0.1:7444)
+//!   SAACP_DASHBOARD_ALLOWED_ORIGINS — comma-separated exact-match browser Origin CORS
+//!                                 allowlist (default: http://localhost:3000,
+//!                                 http://127.0.0.1:3000). Set to empty to disable all
+//!                                 cross-origin browser access (fail-closed).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use saacp::command_center::{run, CommandCenterConfig};
 use saacp::daemon::SAACPNetworkDaemon;
+use saacp::maintenance::MaintenanceCoordinator;
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -56,7 +65,7 @@ fn read_dashboard_token() -> [u8; 32] {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let dashboard_token = read_dashboard_token();
 
     let listen_addr: SocketAddr = env_or("SAACP_COMMAND_CENTER_ADDR", "127.0.0.1:9090")
@@ -70,14 +79,90 @@ async fn main() {
             .unwrap_or_else(|e| panic!("invalid SAACP_DOLLARS_PER_TOKEN: {e}"));
     }
 
+    // CORS: comma-separated exact-match browser Origin allowlist. Unset ⇒ keep the
+    // built-in localhost:3000 / 127.0.0.1:3000 dev defaults; set-but-empty ⇒ an
+    // explicit, fail-closed "no cross-origin browser access at all". Each entry is
+    // trimmed and empties are dropped, so trailing commas / stray spaces are benign.
+    if let Ok(v) = std::env::var("SAACP_DASHBOARD_ALLOWED_ORIGINS") {
+        config.allowed_origins = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
     if std::env::var("SAACP_DISABLE_DEMO_DAEMON").as_deref() != Ok("1") {
         let demo_addr: SocketAddr = env_or("SAACP_DEMO_DAEMON_ADDR", "127.0.0.1:7444")
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_DEMO_DAEMON_ADDR: {e}"));
         let daemon = SAACPNetworkDaemon::new(&demo_addr.ip().to_string(), demo_addr.port(), None);
-        tokio::spawn(async move { daemon.start().await; });
+        tokio::spawn(async move { let _ = daemon.start().await; });
         eprintln!("[SAACP Command Center] Demo daemon listening on {demo_addr} (set SAACP_DISABLE_DEMO_DAEMON=1 to skip)");
+
+        // A listening daemon with no client connecting to it generates zero packets, so the
+        // gate pipeline never runs and every dashboard panel stays (correctly) empty — which
+        // read as "the dashboard is broken". Drive synthetic activity through the same global
+        // engines a real gateway drives so the panels populate out of the box. This is
+        // demo-only and shares the daemon's opt-out: run against a real gateway with
+        // SAACP_DISABLE_DEMO_DAEMON=1 and no synthetic data is produced.
+        tokio::spawn(saacp::command_center_demo::run());
+        eprintln!("[SAACP Command Center] Demo activity generator started (feeds live agents, mesh, alerts, financial)");
     }
 
-    run(config).await;
+    // R-6 fix: the gate pipeline (`handler.rs`) processes packets through several
+    // process-wide `::global()` singletons (`TrustDecayEngine`, `FederatedMemory`,
+    // `StreamRegistry`, `ievl::IevlEngine`) whose bounded stores were previously only
+    // reclaimed reactively — on the next capacity-triggered eviction inside whatever
+    // packet happened to push a given shard over its cap, per each type's own doc
+    // comment. `MaintenanceCoordinator` (opusplan.md Part 7 / 7.2 R-6) exists precisely
+    // to run their `sweep_*`/`evict_expired` methods proactively on a shared 60s
+    // cadence, but — matching `daemon.rs`'s own "opt-in, caller decides" convention
+    // (see `SAACPNetworkDaemon::with_gossip_engine`'s doc comment) — it is never
+    // auto-started by constructing a daemon, so a caller has to actually do this.
+    // These four are wired via `with_custom` (not `with_trust_decay`/
+    // `with_federated_memory`/`with_stream_registry`/`with_ievl`) because those
+    // builders take an owned `Arc<T>` naming a caller-constructed instance, while the
+    // real, live singletons the packet path actually mutates are `&'static T` behind
+    // each type's own `OnceLock`-backed `::global()` — there is no way to obtain an
+    // `Arc` aliasing that same process-wide instance, so a closure calling
+    // `T::global().sweep_*()` directly is the only way to reach the state that matters.
+    // Multi-Agent Collusion Detection (MACE, Part 8.2) — opt-in via
+    // `SAACP_ENABLE_MACE=1`; see `saacp_sidecar.rs`'s identical wiring comment.
+    let mace_enabled = matches!(
+        std::env::var("SAACP_ENABLE_MACE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    if mace_enabled {
+        saacp::mace::activate();
+    }
+
+    let maintenance = Arc::new({
+        let coordinator = MaintenanceCoordinator::new()
+            .with_custom("trust_decay_global", || {
+                let _ = saacp::trust_decay::TrustDecayEngine::global().sweep_stale();
+            })
+            .with_custom("federated_memory_global", || {
+                let _ = saacp::memory::FederatedMemory::global().evict_expired();
+            })
+            .with_custom("stream_registry_global", || {
+                let _ = saacp::streaming::StreamRegistry::global().sweep_expired();
+            })
+            .with_custom("ievl_global", || {
+                let _ = saacp::ievl::IevlEngine::global().sweep_expired();
+            })
+            .with_custom("dead_mans_switch_global", || {
+                // Reap sessions whose heartbeat lapsed past DEAD_MAN_MAX_TIMEOUT
+                // (opusplan.md Phase 4 "Timeout: DeadMansSwitch triggers session
+                // cleanup"); see saacp_sidecar.rs's identical wiring comment.
+                let _ = saacp::temporal::DeadMansSwitch::global().check_timeouts();
+            });
+        if mace_enabled {
+            coordinator.with_custom("mace_global", saacp::mace::sweep_and_enforce)
+        } else {
+            coordinator
+        }
+    });
+    let _maintenance_handle = Arc::clone(&maintenance).start();
+
+    run(config).await
 }

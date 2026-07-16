@@ -40,8 +40,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::daemon::{
-    CircuitBreakerEntry, PerIpConnectionGuard, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
-    MAX_PAYLOAD_SIZE,
+    PerIpConnectionGuard, SharedCircuitBreakers, MAX_CONNECTIONS,
+    MAX_CONNECTIONS_PER_IP, MAX_PAYLOAD_SIZE, SHUTDOWN_DRAIN_TIMEOUT_SECS,
 };
 use crate::handler::ParsedPacket;
 use crate::measc::SessionEpochManager;
@@ -203,7 +203,7 @@ pub struct SAACPWebSocketDaemon {
     host: String,
     port: u16,
     token_issuer_secret: Option<Vec<u8>>,
-    circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
+    circuit_breakers: SharedCircuitBreakers,
     server_ed25519_seed: Option<[u8; 32]>,
     /// CRIT-9 fix: caps total concurrent connections at `MAX_CONNECTIONS`.
     connection_semaphore: Arc<Semaphore>,
@@ -223,6 +223,8 @@ pub struct SAACPWebSocketDaemon {
     /// H-20 fix: opt-in C-3 identity binding. See `SAACPNetworkDaemon`'s field of the
     /// same name — identical semantics; `None` preserves today's handshake wire format.
     server_agent_id: Option<String>,
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    gossip: Option<Arc<crate::gossip::GossipEngine>>,
 }
 
 impl SAACPWebSocketDaemon {
@@ -231,7 +233,10 @@ impl SAACPWebSocketDaemon {
             host: host.to_string(),
             port,
             token_issuer_secret,
-            circuit_breakers: Arc::new(Mutex::new(HashMap::new())),
+            // L-18 fix: `SharedCircuitBreakers` now wraps `parking_lot::Mutex`, not
+            // `std::sync::Mutex` — use the constructor so this stays in sync with
+            // `daemon.rs`'s own default instead of hand-rolling a mismatched type here.
+            circuit_breakers: crate::daemon::new_shared_circuit_breakers(),
             server_ed25519_seed: None,
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -239,6 +244,7 @@ impl SAACPWebSocketDaemon {
             epoch_manager: None,
             on_delivered: None,
             server_agent_id: None,
+            gossip: None,
         }
     }
 
@@ -276,6 +282,23 @@ impl SAACPWebSocketDaemon {
         self
     }
 
+    /// R-5 / L-12 fix: opt in to a circuit-breaker map shared with other transport
+    /// daemons (e.g. `SAACPNetworkDaemon`, `SAACPTlsDaemon`) so an IP locked out on one
+    /// transport can't bypass the lockout by reconnecting on another. See
+    /// `daemon::SharedCircuitBreakers`. Not calling this preserves today's exact
+    /// behavior: this daemon tracks per-IP lockouts independently of any other daemon.
+    pub fn with_circuit_breakers(mut self, shared: SharedCircuitBreakers) -> Self {
+        self.circuit_breakers = shared;
+        self
+    }
+
+    /// Opt in to the revocation gossip mesh. See
+    /// `SAACPNetworkDaemon::with_gossip_engine` — identical semantics.
+    pub fn with_gossip_engine(mut self, engine: Arc<crate::gossip::GossipEngine>) -> Self {
+        self.gossip = Some(engine);
+        self
+    }
+
     /// H-20 fix: opt in to C-3 identity binding — every connecting client must present an
     /// `AgentIdentityCertificate` signed by one of `ca_keys` and prove possession of the
     /// certified private key during the ECDH handshake, before any packet is processed.
@@ -295,66 +318,118 @@ impl SAACPWebSocketDaemon {
         self
     }
 
-    /// Start listening for WebSocket connections. Runs forever.
-    pub async fn start(&self) {
+    /// Start listening for WebSocket connections. Runs forever (until the process is
+    /// killed) — equivalent to `start_with_shutdown` with a token that's never
+    /// cancelled. M-37 fix: returns `Result` (propagates a bind failure) instead of
+    /// panicking.
+    pub async fn start(&self) -> std::io::Result<()> {
+        self.start_with_shutdown(tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
+    /// `shutdown` is cancelled, then drains in-flight connections (bounded by
+    /// `daemon::SHUTDOWN_DRAIN_TIMEOUT_SECS`) before flushing the audit-log WAL
+    /// (L-10) and returning. See `daemon::SAACPNetworkDaemon::start_with_shutdown` —
+    /// identical shape.
+    pub async fn start_with_shutdown(&self, shutdown: tokio_util::sync::CancellationToken) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).await
-            .unwrap_or_else(|e| panic!("SAACPWebSocketDaemon: bind {} failed: {}", addr, e));
+        let listener = TcpListener::bind(&addr).await?;
 
         let auth_mode = if self.server_ed25519_seed.is_some() { "authenticated" } else { "unauthenticated" };
         eprintln!("[SAACP Daemon/WS] Listening on {} ({} handshake)", addr, auth_mode);
 
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    // CRIT-9 fix: same total + per-IP concurrency bound as the raw-TCP
-                    // daemon — see `daemon::SAACPNetworkDaemon::start`'s doc comment.
-                    let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            eprintln!(
-                                "[SAACP Daemon/WS] Connection limit ({}) reached — rejecting {}",
-                                MAX_CONNECTIONS, peer_addr,
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                    };
-                    let per_ip_guard = match PerIpConnectionGuard::acquire(
-                        &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
-                    ) {
-                        Some(guard) => guard,
-                        None => {
-                            eprintln!(
-                                "[SAACP Daemon/WS] Per-IP connection limit ({}) reached for {} — rejecting",
-                                MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                    };
-
-                    let cbs    = Arc::clone(&self.circuit_breakers);
-                    let secret = self.token_issuer_secret.clone();
-                    let seed   = self.server_ed25519_seed;
-                    let gateway         = self.gateway.clone();
-                    let epoch_manager   = self.epoch_manager.clone();
-                    let on_delivered    = self.on_delivered.clone();
-                    let server_agent_id = self.server_agent_id.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit; // released on drop when this task ends
-                        let _per_ip_guard = per_ip_guard;
-                        serve_ws_connection(
-                            stream, peer_addr, cbs, secret, seed,
-                            gateway, epoch_manager, on_delivered, server_agent_id,
-                        ).await;
-                    });
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    eprintln!("[SAACP Daemon/WS] Shutdown signal received — no longer accepting new connections");
+                    break;
                 }
-                Err(e) => {
-                    eprintln!("[SAACP Daemon/WS] Accept error: {}", e);
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, peer_addr)) => {
+                            // CRIT-9 fix: same total + per-IP concurrency bound as the raw-TCP
+                            // daemon — see `daemon::SAACPNetworkDaemon::start`'s doc comment.
+                            let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    eprintln!(
+                                        "[SAACP Daemon/WS] Connection limit ({}) reached — rejecting {}",
+                                        MAX_CONNECTIONS, peer_addr,
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+                            let per_ip_guard = match PerIpConnectionGuard::acquire(
+                                &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
+                            ) {
+                                Some(guard) => guard,
+                                None => {
+                                    eprintln!(
+                                        "[SAACP Daemon/WS] Per-IP connection limit ({}) reached for {} — rejecting",
+                                        MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+
+                            let cbs    = Arc::clone(&self.circuit_breakers);
+                            let secret = self.token_issuer_secret.clone();
+                            let seed   = self.server_ed25519_seed;
+                            let gateway         = self.gateway.clone();
+                            let epoch_manager   = self.epoch_manager.clone();
+                            let on_delivered    = self.on_delivered.clone();
+                            let server_agent_id = self.server_agent_id.clone();
+                            let gossip          = self.gossip.clone();
+                            tasks.spawn(async move {
+                                let _permit = permit; // released on drop when this task ends
+                                let _per_ip_guard = per_ip_guard;
+                                // O-4 fix: pair this connection's lifetime with the live
+                                // `saacp_active_connections{transport="ws"}` gauge — see
+                                // `daemon::SAACPNetworkDaemon::start_with_shutdown`'s identical
+                                // fix for the TCP transport.
+                                let _conn_count_guard = crate::telemetry::ConnectionCountGuard::ws();
+                                serve_ws_connection(
+                                    stream, peer_addr, cbs, secret, seed,
+                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip,
+                                ).await;
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[SAACP Daemon/WS] Accept error: {}", e);
+                        }
+                    }
                 }
             }
         }
+
+        // Drain: let in-flight connections finish naturally, bounded by
+        // SHUTDOWN_DRAIN_TIMEOUT_SECS, then hard-abort whatever's left.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
+            async { while tasks.join_next().await.is_some() {} },
+        ).await;
+        if drained.is_err() {
+            eprintln!(
+                "[SAACP Daemon/WS] Drain timeout ({}s) exceeded — aborting {} in-flight connection(s)",
+                SHUTDOWN_DRAIN_TIMEOUT_SECS, tasks.len(),
+            );
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+
+        // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
+        let flushed = tokio::task::spawn_blocking(|| {
+            crate::security::ImmutableAuditLog::global()
+                .flush(Duration::from_secs(crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
+        }).await.unwrap_or(false);
+        if !flushed {
+            eprintln!("[SAACP Daemon/WS] WAL flush on shutdown did not confirm in time");
+        }
+
+        Ok(())
     }
 }
 
@@ -367,13 +442,14 @@ impl SAACPWebSocketDaemon {
 async fn serve_ws_connection(
     raw: tokio::net::TcpStream,
     peer_addr: SocketAddr,
-    circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
+    circuit_breakers: SharedCircuitBreakers,
     token_issuer_secret: Option<Vec<u8>>,
     server_ed25519_seed: Option<[u8; 32]>,
     gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
     epoch_manager: Option<Arc<SessionEpochManager>>,
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
     server_agent_id: Option<String>,
+    gossip: Option<Arc<crate::gossip::GossipEngine>>,
 ) {
     // H-19 fix: cap the incoming WebSocket message/frame size at the same
     // `MAX_PAYLOAD_SIZE` the raw-TCP path already enforces for MEASC payloads (+1024
@@ -420,6 +496,7 @@ async fn serve_ws_connection(
         epoch_manager,
         on_delivered,
         server_agent_id,
+        gossip,
     )
     .await;
 }

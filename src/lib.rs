@@ -7,6 +7,7 @@ pub mod acsvaf;
 pub mod aegf;
 pub mod faitf;
 pub mod factf;
+pub mod gossip;
 pub mod pecf;
 pub mod klms;
 pub mod handler;
@@ -41,10 +42,19 @@ pub mod telemetry;
 pub mod transport;
 pub mod state_backend;
 pub mod trust_decay;
+pub mod hrt;
+pub mod type_state;
+pub mod sid;
+pub mod ievl;
+pub mod mace;
+pub mod aca;
+pub mod maintenance;
 #[cfg(feature = "sidecar")]
 pub mod sidecar;
 #[cfg(feature = "command-center")]
 pub mod command_center;
+#[cfg(feature = "command-center")]
+pub mod command_center_demo;
 
 pub use errors::{SAACPBytecodes, SAACPHardDrop};
 pub use schemas::PreCompiledSchemas;
@@ -111,6 +121,7 @@ pub use klms::{
     KeyStatus, KeyAlgorithm, KeyCategory, KeyDescriptor,
     KeyRotationPolicy, KeyRevocationRecord, KeyAuditEntry,
     KeyRegistry, KeyLifecycleManager, make_kid, make_descriptor,
+    default_key_generator,
     default_policy as klms_default_policy,
 };
 /// Alias matching Python's KLMS_DEFAULT_REGISTRY export.
@@ -220,6 +231,20 @@ pub use daemon::{
 };
 pub use easi::EasiEncryptor;
 pub use telemetry::{TelemetryCollector, global_telemetry, GLOBAL_TELEMETRY};
+pub use hrt::{HardwareKeyStore, SoftwareKeyStore, HrtError};
+pub use type_state::PipelineToken;
+pub use sid::{SemanticInjectionDefense, SID_THRESHOLD};
+pub use sid::{
+    set_required as sid_set_required,
+    is_required as sid_is_required,
+    enforce_semantic_injection as sid_enforce_semantic_injection,
+};
+pub use mace::{
+    MultiAgentCollusionEngine, DelegationSignal,
+    activate as mace_activate, is_enabled as mace_is_enabled,
+    sweep_and_enforce as mace_sweep_and_enforce, wire_mace_alert_feed,
+    SYBIL_COSINE_THRESHOLD,
+};
 
 // ─── Protocol Version Constants ───────────────────────────────────────────────
 /// Python parity: `__version__ = "0.1-beta2"`

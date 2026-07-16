@@ -118,7 +118,7 @@ async fn identity_bound_matching_token_accepted() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -137,7 +137,7 @@ async fn identity_bound_matching_token_accepted() {
     // is enforced independently by Gate 1.0's cross-check against the proven agent_id, not
     // by pre-seeding this bootstrap value.
     let token = issue_token(&mesh_secret, "agent-alpha", &["unknown"], 0);
-    let frame = build_task_frame(session_key, session_id, "do the real thing", &token);
+    let frame = build_task_frame(*session_key, session_id, "do the real thing", &token);
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
@@ -162,7 +162,7 @@ async fn identity_bound_token_claiming_different_agent_rejected() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -182,7 +182,7 @@ async fn identity_bound_token_claiming_different_agent_rejected() {
     // impersonation gap S-1 describes: possessing any validly-signed token for an identity
     // was sufficient, regardless of who actually holds that identity's private key.
     let token = issue_token(&mesh_secret, "agent-mallory", &["unknown"], 0);
-    let frame = build_task_frame(session_key, session_id, "steal data", &token);
+    let frame = build_task_frame(*session_key, session_id, "steal data", &token);
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
@@ -209,7 +209,7 @@ async fn identity_bound_untrusted_ca_certificate_rejected() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -251,7 +251,7 @@ async fn identity_bound_forged_proof_of_possession_rejected() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -284,7 +284,7 @@ async fn non_identity_bound_connection_unaffected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { daemon.start().await; });
+    tokio::spawn(async move { let _ = daemon.start().await; });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
@@ -294,7 +294,7 @@ async fn non_identity_bound_connection_unaffected() {
     assert!(session_id.is_none(), "non-identity-bound handshake must not produce a session_id");
 
     let token = issue_token(&mesh_secret, "client-agent", &["unknown"], 0);
-    let frame = build_task_frame(session_key, [0xEEu8; 16], "business as usual", &token);
+    let frame = build_task_frame(*session_key, [0xEEu8; 16], "business as usual", &token);
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;

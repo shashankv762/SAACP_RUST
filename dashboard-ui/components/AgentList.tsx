@@ -1,54 +1,128 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, AgentTrustSnapshot } from "@/lib/api";
-import { useDashboardEvents } from "@/lib/useDashboardEvents";
+import { useMemo, useState } from "react";
+import { useAgents } from "@/lib/store";
 import { trustStatus, trustStatusLabel } from "@/lib/trust";
 
-export function AgentList() {
-  const [agents, setAgents] = useState<AgentTrustSnapshot[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+type SortKey = "id" | "status" | "score";
 
-  useEffect(() => {
-    api.agents().then(setAgents).catch((e) => setError(String(e)));
-  }, []);
+const STATUS_COLOR: Record<string, string> = {
+  good: "var(--safe)",
+  warning: "var(--warn)",
+  serious: "oklch(72% 0.18 45)",
+  critical: "var(--crit)",
+};
 
-  // Live updates: a TrustSignal event means this agent's score just changed.
-  // Re-fetch the snapshot rather than hand-merging partial state client-side —
-  // the endpoint is cheap and this keeps sort order/requires_reauth correct.
-  useDashboardEvents((event) => {
-    if (event.type === "TrustSignal") {
-      api.agents().then(setAgents).catch(() => {});
+interface Props {
+  compact?: boolean;
+}
+
+export function AgentList({ compact = false }: Props) {
+  const agents = useAgents();
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("score");
+  const [sortDir, setSortDir] = useState<number>(-1);
+
+  const rows = useMemo(() => {
+    const q = query.toLowerCase();
+    const filtered = agents.filter((a) => a.agent_id.toLowerCase().includes(q));
+    const sorted = filtered.slice().sort((a, b) => {
+      let av: number | string;
+      let bv: number | string;
+      if (sortKey === "id") {
+        av = a.agent_id.toLowerCase();
+        bv = b.agent_id.toLowerCase();
+      } else {
+        av = a.score;
+        bv = b.score;
+      }
+      return av < bv ? -1 * sortDir : av > bv ? 1 * sortDir : 0;
+    });
+    return compact ? sorted.slice(0, 8) : sorted;
+  }, [agents, query, sortKey, sortDir, compact]);
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDir((d) => d * -1);
+    else {
+      setSortKey(key);
+      setSortDir(key === "score" ? -1 : 1);
     }
-  });
+  };
 
-  if (error) return <p className="empty-state">Failed to load agents: {error}</p>;
-  if (!agents) return <p className="empty-state">Loading…</p>;
-  if (agents.length === 0) return <p className="empty-state">No agents tracked yet — trust scoring begins once traffic flows.</p>;
+  const arrow = (key: SortKey) => (sortKey === key ? (sortDir < 0 ? " ▾" : " ▴") : "");
+
+  if (agents.length === 0) {
+    return (
+      <p className="empty-state">
+        No agents tracked yet — behavioral trust scoring begins once traffic flows.
+      </p>
+    );
+  }
 
   return (
-    <table className="data-table">
-      <thead>
-        <tr>
-          <th>Agent</th>
-          <th>Trust Score</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {agents.map((a) => {
-          const status = trustStatus(a.score, a.requires_reauth);
-          return (
-            <tr key={a.agent_id}>
-              <td>{a.agent_id}</td>
-              <td className="tabular">{a.score.toFixed(3)}</td>
-              <td>
-                <span className={`badge badge-${status}`}>{trustStatusLabel(status)}</span>
-              </td>
+    <>
+      {!compact && (
+        <div className="table-tools">
+          <input
+            className="search"
+            placeholder="Search agents by ID…"
+            autoComplete="off"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <span className="panel-meta">
+            {rows.length} of {agents.length} agents
+          </span>
+        </div>
+      )}
+      <div style={{ overflowX: "auto" }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th onClick={() => toggleSort("id")}>Agent ID{arrow("id")}</th>
+              <th className="no-sort">Reauth</th>
+              <th onClick={() => toggleSort("status")}>Status{arrow("status")}</th>
+              <th onClick={() => toggleSort("score")}>Trust Score{arrow("score")}</th>
             </tr>
-          );
-        })}
-      </tbody>
-    </table>
+          </thead>
+          <tbody>
+            {rows.map((a) => {
+              const status = trustStatus(a.score, a.requires_reauth);
+              const color = STATUS_COLOR[status];
+              return (
+                <tr key={a.agent_id}>
+                  <td>
+                    <span className="agent-id">
+                      <span className="d" style={{ background: color, boxShadow: `0 0 7px ${color}` }} />
+                      {a.agent_id}
+                    </span>
+                  </td>
+                  <td
+                    style={{
+                      fontFamily: "var(--font-jetbrains-mono, monospace)",
+                      fontSize: "0.76rem",
+                      color: a.requires_reauth ? "var(--crit)" : "var(--ink-faint)",
+                    }}
+                  >
+                    {a.requires_reauth ? "REQUIRED" : "—"}
+                  </td>
+                  <td>
+                    <span className={`badge ${status}`}>{trustStatusLabel(status)}</span>
+                  </td>
+                  <td>
+                    <span className="score-cell">
+                      {a.score.toFixed(3)}
+                      <span className="score-bar">
+                        <i style={{ width: `${Math.max(0, Math.min(1, a.score)) * 100}%`, background: color }} />
+                      </span>
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
