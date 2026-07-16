@@ -30,6 +30,12 @@ uuid = { version = "1", features = ["v4"] }
 # without losing any functionality. Left at "full" in [dev-dependencies] below
 # since dev-deps never ship to downstream consumers of this library crate.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+# M-15/R-2 fix: `CancellationToken` for graceful shutdown (`daemon.rs`, `transport/ws.rs`,
+# `transport/tls.rs`, `sidecar.rs`, `command_center.rs`) — a plain (non-optional) dependency
+# since `daemon.rs` is unconditionally compiled. `default-features = false` since none of
+# tokio-util's optional feature-gated modules (`codec`/`io`/`net`/`rt`/`time`) are used here,
+# only `sync::CancellationToken`, which is not behind any of them.
+tokio-util = { version = "0.7", default-features = false }
 base64 = "0.22"
 adler2 = "2"
 unicode-normalization = "0.1"
@@ -37,6 +43,13 @@ rand = "0.8"
 hex = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
+# L-18 fix: `SharedCircuitBreakers` (daemon.rs) used `std::sync::Mutex`, which is fragile
+# in an async context — the lock is only ever held across small synchronous sections today,
+# but nothing stops a future edit from adding an `.await` inside one of those sections and
+# silently reintroducing executor-starvation/deadlock risk with no compiler warning.
+# `parking_lot::Mutex` also never poisons, eliminating the `.unwrap_or_else(|e| e.into_inner())`
+# poison-recovery boilerplate (H-22) this same lock previously needed.
+parking_lot = "0.12"
 aho-corasick = "1"
 flate2 = "1"
 tokio-tungstenite = { version = "0.24", optional = true }
@@ -44,6 +57,15 @@ bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 redis = { version = "0.27", optional = true }
 axum = { version = "0.7", optional = true }
+# TLS-wrapped raw-TCP transport (src/transport/tls.rs) — TLS-terminates an accepted
+# TcpStream, then hands the resulting rustls TlsStream directly to the existing generic
+# `daemon::handle_client` (no adapter needed, unlike `WsByteStream` — `TlsStream` already
+# implements `AsyncRead + AsyncWrite + Unpin + Send`). Both `rustls` (0.23) and
+# `tokio-rustls` (0.26) already resolve in this crate's dependency tree transitively (via
+# `reqwest`'s dev-only `rustls-tls` feature), so pinning the same major versions here as a
+# real, non-dev, optional dependency adds no version conflict.
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [features]
 default = []
@@ -52,6 +74,13 @@ default = []
 # HTTP-only corporate proxies / API gateways / CDNs. Off by default so a
 # plain TCP-only deployment never pulls in tokio-tungstenite.
 transport-ws = ["dep:tokio-tungstenite", "dep:bytes", "dep:futures-util"]
+# TLS-wrapped raw-TCP transport (src/transport/tls.rs) — deliberately raw TCP+TLS only,
+# not WebSocket-over-TLS (wss://); that's a distinct future combination requiring
+# `transport/ws.rs::serve_ws_connection` to be genericized over the stream type. Off by
+# default so a deployment that doesn't need in-protocol TLS termination (e.g. one that
+# already terminates TLS at a reverse proxy in front of the raw MEASC listener) never
+# pulls in rustls.
+transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 # Redis-backed StateBackend (src/state_backend.rs) — lets a horizontally
 # scaled fleet of SAACP gateways share rate-limiter/session/stream state
 # across nodes instead of each node holding an isolated in-memory view. Off
@@ -91,6 +120,18 @@ command-center = ["dep:axum", "dep:futures-util"]
 # structural path was migrated to build genuinely-encrypted frames via
 # `encode_encrypted` instead. See CRIT-1 in opusplan.md.
 unsafe-structural-only = []
+# Hardware Root of Trust (src/hrt.rs, Phase 6 / item 8 / Part 8.8) — trait-abstraction
+# feature gates for hardware-backed `HardwareKeyStore` implementations. The default
+# build stays lightweight: `SoftwareKeyStore` (the default `HardwareKeyStore` impl,
+# delegating to `klms::KeyRegistry`) needs zero additional dependencies. Each of these
+# three flags is a compile-only placeholder for a specific hardware backend's real
+# integration (TPM 2.0, Intel SGX, PKCS#11) — a distinct, multi-week hardware-integration
+# project each, genuinely out of scope for a single pass; the flags exist so the trait
+# seam and Cargo feature wiring are already in place when that work happens, per this
+# item's own "(trait abstraction)" scope note in opusplan.md.
+hrt-tpm = []
+hrt-sgx = []
+hrt-pkcs11 = []
 
 [dev-dependencies]
 serial_test = "3"
@@ -106,6 +147,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Self-signed cert generation for tests/test_transport_tls_rs.rs only — never a runtime
+# dependency of the library itself (SAACPTlsDaemon takes an already-built
+# `rustls::ServerConfig`; see `transport::tls::load_tls_config`/`server_config_from_cert_and_key`).
+rcgen = "0.13"
 
 [[bench]]
 name = "benchmarks"
@@ -115,6 +160,16 @@ harness = false
 name = "test_transport_ws_rs"
 path = "tests/test_transport_ws_rs.rs"
 required-features = ["transport-ws"]
+
+[[test]]
+name = "test_shared_circuit_breaker_rs"
+path = "tests/test_shared_circuit_breaker_rs.rs"
+required-features = ["transport-ws"]
+
+[[test]]
+name = "test_transport_tls_rs"
+path = "tests/test_transport_tls_rs.rs"
+required-features = ["transport-tls"]
 
 [[test]]
 name = "test_sidecar_rs"

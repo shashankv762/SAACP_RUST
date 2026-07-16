@@ -85,7 +85,7 @@ async fn ws_tunnel_cover_traffic_roundtrip() {
     let port = free_port().await;
     let daemon = SAACPWebSocketDaemon::new("127.0.0.1", port, None);
     tokio::spawn(async move {
-        daemon.start().await;
+        let _ = daemon.start().await;
     });
     // Give the daemon a moment to bind before connecting.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -143,7 +143,7 @@ async fn ws_tunnel_two_connections_independent_sessions() {
     let port = free_port().await;
     let daemon = SAACPWebSocketDaemon::new("127.0.0.1", port, None);
     tokio::spawn(async move {
-        daemon.start().await;
+        let _ = daemon.start().await;
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -182,4 +182,25 @@ async fn ws_tunnel_two_connections_independent_sessions() {
 
     let _ = ws_a.close(None).await;
     let _ = ws_b.close(None).await;
+}
+
+/// M-15/R-2 fix: `start_with_shutdown` on `SAACPWebSocketDaemon` must stop accepting
+/// new connections and return once cancelled, mirroring
+/// `tests/test_daemon_shutdown_rs.rs`'s coverage of the raw-TCP daemon.
+#[tokio::test]
+async fn ws_start_with_shutdown_returns_promptly_with_no_connections() {
+    let port = free_port().await;
+    let daemon = SAACPWebSocketDaemon::new("127.0.0.1", port, None);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let shutdown_clone = shutdown.clone();
+    let handle = tokio::spawn(async move { daemon.start_with_shutdown(shutdown_clone).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("start_with_shutdown did not return within 10s")
+        .expect("daemon task panicked");
+    assert!(result.is_ok(), "start_with_shutdown returned an error: {:?}", result);
 }

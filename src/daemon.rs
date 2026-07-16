@@ -16,9 +16,10 @@ use tokio::time::timeout;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey};
+use zeroize::Zeroizing;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
-use crate::handler::{ParsedPacket, SAACPProtocolHandler};
+use crate::handler::{JsonValue, ParsedPacket, SAACPProtocolHandler};
 use crate::measc::SessionEpochManager;
 use crate::pecf::{generate_correlation_id, internal_to_external_raw, SREL};
 
@@ -51,17 +52,52 @@ pub const MAX_CONNECTIONS: usize = 10_000;
 /// Bounds a single attacker from consuming the entire `MAX_CONNECTIONS` budget alone.
 pub const MAX_CONNECTIONS_PER_IP: usize = 100;
 
+/// M-15/R-2 fix: how long graceful shutdown waits for in-flight connections to finish
+/// their current packet/loop iteration naturally before hard-aborting them.
+/// `handle_client`'s per-connection loop is persistent (exits only on EOF, a 2s header
+/// read timeout, or a fatal bytecode) — an unbounded drain could otherwise hang the
+/// whole shutdown on a single idle-but-still-open client.
+pub const SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 30;
+
 /// Number of consecutive errors before an IP is locked out.
 const CIRCUIT_BREAKER_ERROR_THRESHOLD: u32 = 5;
 
-/// Lockout duration in seconds after threshold breached.
+/// Base lockout duration in seconds after threshold breached — this exact value is what a
+/// fresh IP's first-ever lockout still gets; see `CIRCUIT_BREAKER_MAX_LOCKOUT_SECS` for the
+/// L-20 escalation applied to repeat offenders.
 const CIRCUIT_BREAKER_LOCKOUT_SECS: f64 = 30.0;
+
+/// L-20 fix, opusplan.md 6.6: ceiling on the exponentially-escalating lockout duration
+/// (`CircuitBreakerEntry::record_error`) — grows with `consecutive_lockouts` so a
+/// persistent attacker can't just wait out the same flat 30s window forever, but is still
+/// capped so it never becomes a de facto permanent ban stemming from a transient issue far
+/// in the past. 4 hours.
+const CIRCUIT_BREAKER_MAX_LOCKOUT_SECS: f64 = 14400.0;
+
+/// L-20 fix: how long a `CircuitBreakerEntry` must go completely error-free before its
+/// `consecutive_lockouts` escalation counter resets to 0 — genuine passive recovery, not
+/// merely surviving out its own most recent lockout window (which is much shorter). Chosen
+/// as a multiple of the base lockout so "quiet long enough to be trusted again" is clearly
+/// distinguishable from "just reconnected right after the lockout expired".
+const CIRCUIT_BREAKER_RECOVERY_PERIOD_SECS: f64 = 300.0;
 
 /// Token re-validation interval for pinned connections (VULN-04).
 const TOKEN_REVALIDATION_INTERVAL_SECS: f64 = 30.0;
 
 /// Maximum payload size (10 MB).
 pub(crate) const MAX_PAYLOAD_SIZE: usize = 10_000_000;
+
+/// opusplan.md 6.6 ("Per-connection memory": ~16KB steady-state target). `payload_buf`'s
+/// P-6 reuse (below) never *shrinks* on its own — `.clear()` + `.resize()` only grows the
+/// backing allocation when a later packet needs more room than any prior one on the same
+/// connection. Without a ceiling, a single legitimately large packet (up to
+/// `MAX_PAYLOAD_SIZE`, 10MB) permanently pins that allocation for the connection's entire
+/// remaining lifetime, even if every subsequent packet is tiny — across `MAX_CONNECTIONS`
+/// that is a real memory-amplification vector, not just a missed micro-optimization.
+/// Chosen with headroom above the spec's literal 16KB (most legitimate payloads comfortably
+/// fit under 64KB) so ordinary size variation within normal traffic never triggers a
+/// reallocation — only a genuine outlier does.
+const CONNECTION_BUFFER_STEADY_STATE_CAP: usize = 65_536;
 
 /// MEASC header size in bytes.
 const HEADER_SIZE: usize = 128;
@@ -74,31 +110,88 @@ const WIRE_YIELD_ASYNC: &[u8]    = b"YIELD_ASYNC";
 
 // ─── CircuitBreakerEntry ─────────────────────────────────────────────────────
 
+/// R-5 / L-12 fix: `pub` (not `pub(crate)`) so [`SharedCircuitBreakers`] below can be a
+/// fully public type alias. Only the struct's *nameability* changes here — `record_error`/
+/// `is_locked` stay module-private, so this is not a new capability for external callers,
+/// just lets them hold and pass an opaque handle (exactly as `transport/ws.rs` already
+/// does today by importing this type).
 #[derive(Debug, Clone)]
-pub(crate) struct CircuitBreakerEntry {
+pub struct CircuitBreakerEntry {
     error_count: u32,
     lockout_until: Option<Instant>,
+    /// M-16 fix: last time this entry was touched by `record_error`. Lets
+    /// `record_error`'s eviction step sort candidates oldest-first instead of
+    /// relying on `HashMap`'s arbitrary iteration order.
+    last_activity: Instant,
+    /// L-20 fix: number of times this entry has entered a NEW lockout (i.e.
+    /// transitioned from not-locked to locked), used to exponentially escalate the
+    /// lockout duration for repeat offenders. Reset to 0 after a full
+    /// `CIRCUIT_BREAKER_RECOVERY_PERIOD_SECS` with zero errors — see `record_error`.
+    consecutive_lockouts: u32,
 }
 
 impl CircuitBreakerEntry {
     fn new() -> Self {
-        Self { error_count: 0, lockout_until: None }
+        Self {
+            error_count: 0,
+            lockout_until: None,
+            last_activity: Instant::now(),
+            consecutive_lockouts: 0,
+        }
     }
 
     fn is_locked(&self) -> bool {
         self.lockout_until.is_some_and(|t| Instant::now() < t)
     }
 
+    /// M-16: does this entry's lockout (if any) currently protect anything?
+    /// An entry with no lockout, or an expired one, has zero remaining
+    /// protective value and is always safe to evict ahead of one still
+    /// actively blocking a misbehaving IP.
+    fn lockout_expired_or_absent(&self) -> bool {
+        match self.lockout_until {
+            None => true,
+            Some(t) => Instant::now() >= t,
+        }
+    }
+
     fn record_error(&mut self) {
+        let now = Instant::now();
+
+        // L-20 fix: genuine passive recovery — this entry has gone a full recovery
+        // period with zero activity (of any kind, not just while locked out), so
+        // whatever escalation streak it had built up no longer reflects an ongoing
+        // problem. Checked BEFORE `last_activity` is overwritten below, using the
+        // still-stale timestamp from the last call.
+        if now.duration_since(self.last_activity).as_secs_f64() >= CIRCUIT_BREAKER_RECOVERY_PERIOD_SECS {
+            self.consecutive_lockouts = 0;
+        }
+
+        // Captured before this call's mutations so the eventual "did a NEW lockout
+        // just begin" check below can't be fooled by an already-locked entry simply
+        // getting its lockout extended.
+        let was_locked = self.is_locked();
+
+        self.last_activity = now;
         // Reset if previous lockout has expired
-        if self.lockout_until.is_some_and(|t| Instant::now() >= t) {
+        if self.lockout_until.is_some_and(|t| now >= t) {
             self.error_count = 0;
             self.lockout_until = None;
         }
         self.error_count += 1;
         if self.error_count >= CIRCUIT_BREAKER_ERROR_THRESHOLD {
-            self.lockout_until = Some(Instant::now()
-                + Duration::from_secs_f64(CIRCUIT_BREAKER_LOCKOUT_SECS));
+            // L-20 fix: escalate the lockout duration using the PRE-increment
+            // `consecutive_lockouts` value, so a fresh IP's first-ever lockout is
+            // exactly `CIRCUIT_BREAKER_LOCKOUT_SECS` (today's unescalated behavior,
+            // unchanged) — only the SECOND and later lockouts of the same IP grow.
+            let lockout_secs = (CIRCUIT_BREAKER_LOCKOUT_SECS
+                * 2f64.powi(self.consecutive_lockouts.min(20) as i32))
+                .min(CIRCUIT_BREAKER_MAX_LOCKOUT_SECS);
+            self.lockout_until = Some(now + Duration::from_secs_f64(lockout_secs));
+        }
+
+        if !was_locked && self.is_locked() {
+            self.consecutive_lockouts = self.consecutive_lockouts.saturating_add(1);
         }
     }
 }
@@ -108,7 +201,11 @@ impl CircuitBreakerEntry {
 /// CRIT-9 fix: RAII guard enforcing `MAX_CONNECTIONS_PER_IP`. `acquire` increments the
 /// caller's IP's live-connection count (rejecting once at the per-IP cap); the count is
 /// decremented automatically when the guard is dropped (connection closes or errors),
-/// mirroring how `CircuitBreakerEntry` state is keyed per-IP.
+/// mirroring how `CircuitBreakerEntry` state is keyed per-IP. Deliberately still
+/// `std::sync::Mutex` (not `parking_lot`, unlike [`SharedCircuitBreakers`] below) — L-18's
+/// finding is scoped to the circuit-breaker map specifically; this guard's own critical
+/// sections are equally short/non-`.await`-holding today, but widening the parking_lot
+/// swap to every lock in this file is out of scope for that finding.
 pub(crate) struct PerIpConnectionGuard {
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
@@ -144,6 +241,32 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
+// ─── Shared circuit-breaker state (R-5 / L-12) ───────────────────────────────
+
+/// A per-IP circuit-breaker map that can be handed to more than one transport daemon
+/// (TCP, WebSocket, TLS) so an IP address locked out on one transport cannot bypass the
+/// lockout simply by reconnecting on another. Each daemon defaults to its own
+/// independent map (today's exact behavior) unless a caller opts in via
+/// `with_circuit_breakers(shared)`.
+///
+/// L-18 fix: backed by `parking_lot::Mutex`, not `std::sync::Mutex`. The lock is only
+/// ever held across small, synchronous, non-`.await`-containing critical sections today
+/// (verified at every call site: here, `record_error`, and the Step 0 check in
+/// `handle_client`), so this was never a live deadlock/executor-starvation bug — but a
+/// future edit that added an `.await` inside one of those sections would silently
+/// reintroduce exactly that hazard with `std::sync::Mutex` (whose guard is `Send`-permissive
+/// across `.await` points in a way that just compiles and then misbehaves under
+/// contention). `parking_lot::Mutex` also never poisons, which is strictly better than
+/// this codebase's own H-22 `.unwrap_or_else(|e| e.into_inner())` poison-recovery pattern
+/// (that boilerplate is gone from every call site below, not just papered over).
+pub type SharedCircuitBreakers = Arc<parking_lot::Mutex<HashMap<String, CircuitBreakerEntry>>>;
+
+/// Construct a fresh, empty [`SharedCircuitBreakers`] map suitable for handing to
+/// multiple daemons' `with_circuit_breakers(...)`.
+pub fn new_shared_circuit_breakers() -> SharedCircuitBreakers {
+    Arc::new(parking_lot::Mutex::new(HashMap::new()))
+}
+
 // ─── SAACPNetworkDaemon ──────────────────────────────────────────────────────
 
 /// Async TCP server implementing the full SAACP network daemon.
@@ -163,7 +286,7 @@ pub struct SAACPNetworkDaemon {
     host: String,
     port: u16,
     token_issuer_secret: Option<Vec<u8>>,
-    circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
+    circuit_breakers: SharedCircuitBreakers,
     /// DAEMON-MTLS: optional Ed25519 signing key seed (32 bytes) for server auth.
     server_ed25519_seed: Option<[u8; 32]>,
     /// Opt-in real Gate 1.0 token verification (DAEMON-NO-TOKEN-VERIFY fix). `None`
@@ -181,8 +304,16 @@ pub struct SAACPNetworkDaemon {
     epoch_manager: Option<Arc<SessionEpochManager>>,
     /// Opt-in hook invoked with every successfully-verified `ParsedPacket` right before the
     /// ack is written back — lets a caller (e.g. `sidecar.rs`) observe decrypted, gate-passed
-    /// payloads without forking `handle_client`'s dispatch logic. Called from inside
-    /// `spawn_blocking`, so implementations must not `.await` (use `try_send`/`blocking_send`).
+    /// payloads without forking `handle_client`'s dispatch logic.
+    ///
+    /// M-18 fix: genuinely called from INSIDE the `tokio::task::spawn_blocking`
+    /// closure that runs the gate pipeline (immediately after a successful
+    /// intercept, still on the blocking-pool thread) — not merely documented
+    /// as such while actually running after `.await` back on the async
+    /// executor, which was the case before this fix. Implementations must
+    /// still not `.await` (use `try_send`/`blocking_send`); that contract is
+    /// now enforced by where the call actually happens, not just by this
+    /// comment.
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
     /// Opt-in C-3 identity binding (see `identity_binding.rs` and `with_identity_binding`).
     /// `None` preserves today's exact handshake wire format and behavior. `Some` requires
@@ -194,6 +325,17 @@ pub struct SAACPNetworkDaemon {
     connection_semaphore: Arc<Semaphore>,
     /// CRIT-9 fix: caps concurrent connections per source IP at `MAX_CONNECTIONS_PER_IP`.
     per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    /// Opt-in revocation gossip mesh (Phase 6 / item 4, `gossip.rs`, Part 8.6). `None`
+    /// preserves today's exact behavior: a schema_id=11 `Gossip Envelope` packet still
+    /// passes Gate 0 through Gate 12.0 like any other packet (schema 11 is a real,
+    /// already-registered schema — see `schemas.rs`), but nothing ever acts on its
+    /// contents. `Some` (via `with_gossip_engine`) additionally decodes the envelope and
+    /// calls `gossip::GossipEngine::receive` once the packet has cleared the full gate
+    /// pipeline — reusing the exact same "observe a successfully-verified `ParsedPacket`"
+    /// point the `on_delivered` hook already taps (see that field's doc comment), rather
+    /// than adding a gossip-specific gate or special-casing schema 11 inside `handler.rs`'s
+    /// gate pipeline itself.
+    gossip: Option<Arc<crate::gossip::GossipEngine>>,
 }
 
 impl SAACPNetworkDaemon {
@@ -202,7 +344,7 @@ impl SAACPNetworkDaemon {
             host: host.to_string(),
             port,
             token_issuer_secret,
-            circuit_breakers: Arc::new(Mutex::new(HashMap::new())),
+            circuit_breakers: new_shared_circuit_breakers(),
             server_ed25519_seed: None,
             gateway: None,
             epoch_manager: None,
@@ -210,6 +352,7 @@ impl SAACPNetworkDaemon {
             server_agent_id: None,
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
+            gossip: None,
         }
     }
 
@@ -286,68 +429,143 @@ impl SAACPNetworkDaemon {
         self
     }
 
-    /// Start listening for connections. Runs forever.
-    pub async fn start(&self) {
+    /// R-5 / L-12 fix: opt in to a circuit-breaker map shared with other transport
+    /// daemons (e.g. `SAACPWebSocketDaemon`, `SAACPTlsDaemon`) — see
+    /// [`SharedCircuitBreakers`]. Not calling this preserves today's exact behavior:
+    /// each daemon tracks per-IP lockouts independently.
+    pub fn with_circuit_breakers(mut self, shared: SharedCircuitBreakers) -> Self {
+        self.circuit_breakers = shared;
+        self
+    }
+
+    /// Opt in to the revocation gossip mesh (Phase 6 / item 4, see the `gossip` field doc
+    /// comment). The caller constructs the `GossipEngine` itself (wiring its own
+    /// `GossipTransport`, `DistributedRevocationInfrastructure`, and `TrustStore` — see
+    /// `gossip.rs`'s module docs) since those are deployment-specific; this daemon only
+    /// needs to know where to hand off an inbound schema_id=11 envelope once it clears the
+    /// gate pipeline. Does not itself start `GossipEngine::start_sweep` — call that
+    /// separately on the same `Arc<GossipEngine>` if periodic `SeenSet` maintenance is
+    /// wanted (mirrors `klms::KeyLifecycleManager::start_auto_rotation` being a distinct
+    /// opt-in call from the engine's construction).
+    pub fn with_gossip_engine(mut self, engine: Arc<crate::gossip::GossipEngine>) -> Self {
+        self.gossip = Some(engine);
+        self
+    }
+
+    /// Start listening for connections. Runs forever (until the process is killed) —
+    /// equivalent to `start_with_shutdown` with a token that's never cancelled. M-37
+    /// fix: returns `Result` (propagates a bind failure) instead of panicking.
+    pub async fn start(&self) -> std::io::Result<()> {
+        self.start_with_shutdown(tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
+    /// `shutdown` is cancelled, then drains in-flight connections (bounded by
+    /// `SHUTDOWN_DRAIN_TIMEOUT_SECS`, after which any still-open connections are
+    /// hard-aborted) before flushing the audit-log WAL (L-10) and returning.
+    pub async fn start_with_shutdown(&self, shutdown: tokio_util::sync::CancellationToken) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).await
-            .unwrap_or_else(|e| panic!("SAACPNetworkDaemon: bind {} failed: {}", addr, e));
+        let listener = TcpListener::bind(&addr).await?;
 
         let auth_mode = if self.server_ed25519_seed.is_some() { "authenticated" } else { "unauthenticated" };
         eprintln!("[SAACP Daemon] Listening on {} ({} handshake)", addr, auth_mode);
 
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    // CRIT-9 fix: bound total and per-IP concurrent connections before
-                    // spawning a handler task, so an unbounded flood of slow-feed
-                    // connections cannot exhaust memory (each connection can be forced
-                    // to hold up to MAX_PAYLOAD_SIZE via a crafted header).
-                    let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            eprintln!(
-                                "[SAACP Daemon] Connection limit ({}) reached — rejecting {}",
-                                MAX_CONNECTIONS, peer_addr,
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                    };
-                    let per_ip_guard = match PerIpConnectionGuard::acquire(
-                        &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
-                    ) {
-                        Some(guard) => guard,
-                        None => {
-                            eprintln!(
-                                "[SAACP Daemon] Per-IP connection limit ({}) reached for {} — rejecting",
-                                MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                    };
-
-                    let cbs    = Arc::clone(&self.circuit_breakers);
-                    let secret = self.token_issuer_secret.clone();
-                    let seed   = self.server_ed25519_seed;
-                    let gateway       = self.gateway.clone();
-                    let epoch_manager = self.epoch_manager.clone();
-                    let on_delivered  = self.on_delivered.clone();
-                    let server_agent_id = self.server_agent_id.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit; // released on drop when this task ends
-                        let _per_ip_guard = per_ip_guard;
-                        handle_client(
-                            stream, peer_addr, cbs, secret, seed,
-                            gateway, epoch_manager, on_delivered, server_agent_id,
-                        ).await;
-                    });
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    eprintln!("[SAACP Daemon] Shutdown signal received — no longer accepting new connections");
+                    break;
                 }
-                Err(e) => {
-                    eprintln!("[SAACP Daemon] Accept error: {}", e);
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, peer_addr)) => {
+                            // CRIT-9 fix: bound total and per-IP concurrent connections before
+                            // spawning a handler task, so an unbounded flood of slow-feed
+                            // connections cannot exhaust memory (each connection can be forced
+                            // to hold up to MAX_PAYLOAD_SIZE via a crafted header).
+                            let permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    eprintln!(
+                                        "[SAACP Daemon] Connection limit ({}) reached — rejecting {}",
+                                        MAX_CONNECTIONS, peer_addr,
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+                            let per_ip_guard = match PerIpConnectionGuard::acquire(
+                                &self.per_ip_connections, peer_addr.ip(), MAX_CONNECTIONS_PER_IP,
+                            ) {
+                                Some(guard) => guard,
+                                None => {
+                                    eprintln!(
+                                        "[SAACP Daemon] Per-IP connection limit ({}) reached for {} — rejecting",
+                                        MAX_CONNECTIONS_PER_IP, peer_addr.ip(),
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+
+                            let cbs    = Arc::clone(&self.circuit_breakers);
+                            let secret = self.token_issuer_secret.clone();
+                            let seed   = self.server_ed25519_seed;
+                            let gateway       = self.gateway.clone();
+                            let epoch_manager = self.epoch_manager.clone();
+                            let on_delivered  = self.on_delivered.clone();
+                            let server_agent_id = self.server_agent_id.clone();
+                            let gossip        = self.gossip.clone();
+                            tasks.spawn(async move {
+                                let _permit = permit; // released on drop when this task ends
+                                let _per_ip_guard = per_ip_guard;
+                                // O-4 fix: pair this connection's lifetime with the live
+                                // `saacp_active_connections{transport="tcp"}` gauge, mirroring
+                                // the `_permit`/`_per_ip_guard` RAII idiom above — dropped on
+                                // every exit path (normal return, early return, or
+                                // `JoinSet::abort_all()` during shutdown drain-timeout).
+                                let _conn_count_guard = crate::telemetry::ConnectionCountGuard::tcp();
+                                handle_client(
+                                    stream, peer_addr, cbs, secret, seed,
+                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip,
+                                ).await;
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[SAACP Daemon] Accept error: {}", e);
+                        }
+                    }
                 }
             }
         }
+
+        // Drain: let in-flight connections finish naturally, bounded by
+        // SHUTDOWN_DRAIN_TIMEOUT_SECS, then hard-abort whatever's left.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
+            async { while tasks.join_next().await.is_some() {} },
+        ).await;
+        if drained.is_err() {
+            eprintln!(
+                "[SAACP Daemon] Drain timeout ({}s) exceeded — aborting {} in-flight connection(s)",
+                SHUTDOWN_DRAIN_TIMEOUT_SECS, tasks.len(),
+            );
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+
+        // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
+        // `ImmutableAuditLog::flush` is a std blocking call — run it off the async executor.
+        let flushed = tokio::task::spawn_blocking(|| {
+            crate::security::ImmutableAuditLog::global()
+                .flush(Duration::from_secs(crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
+        }).await.unwrap_or(false);
+        if !flushed {
+            eprintln!("[SAACP Daemon] WAL flush on shutdown did not confirm in time");
+        }
+
+        Ok(())
     }
 
     /// Derive the server's Ed25519 verifying key from the seed (32 bytes → 32-byte VK).
@@ -373,7 +591,7 @@ impl SAACPNetworkDaemon {
 pub(crate) async fn handle_client<S>(
     mut stream: S,
     peer_addr: SocketAddr,
-    circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>,
+    circuit_breakers: SharedCircuitBreakers,
     // DAEMON-NO-TOKEN-VERIFY fix: previously received but never read (hence the leading
     // underscore) — the structural default path still ignores it (matching today's exact
     // behavior), but the `gateway`-opted-in branches below now use it as the stable,
@@ -390,6 +608,8 @@ pub(crate) async fn handle_client<S>(
     // `SAACPNetworkDaemon::with_identity_binding`). `None` preserves today's exact
     // handshake wire format and behavior.
     server_agent_id: Option<String>,
+    // Phase 6 / item 4: see the `gossip` field doc comment on `SAACPNetworkDaemon`.
+    gossip: Option<Arc<crate::gossip::GossipEngine>>,
 )
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -399,11 +619,11 @@ where
 
     // ── Step 0: Circuit breaker check ────────────────────────────────────────
     {
-        // H-22 fix: recover from a poisoned mutex instead of propagating the panic —
-        // a poisoned `circuit_breakers` lock would otherwise cascade into every future
-        // connection's Step 0 check panicking too, DoSing the whole daemon from one
-        // unrelated panic. Matches `PerIpConnectionGuard`'s existing recovery pattern.
-        let cbs = circuit_breakers.lock().unwrap_or_else(|e| e.into_inner());
+        // L-18 fix: `parking_lot::Mutex` never poisons, so the H-22 poison-recovery
+        // dance this call site used to need (`.unwrap_or_else(|e| e.into_inner())`) is
+        // gone — a panic elsewhere while holding this lock can no longer cascade into
+        // every future connection's Step 0 check panicking too.
+        let cbs = circuit_breakers.lock();
         if let Some(entry) = cbs.get(&ip_key) {
             if entry.is_locked() {
                 // Silent drop — no response, no logging (DDoS defence)
@@ -542,7 +762,17 @@ where
         // payload_length <= MAX_PAYLOAD_SIZE (10 MB); +16 for auth tag is safe.
         let assembly_start = Instant::now();
         payload_buf.clear();
-        payload_buf.resize(payload_length.saturating_add(16), 0);
+        // opusplan.md 6.6 fix: release an oversized allocation left behind by a prior
+        // outlier-large packet on this connection, but only when the buffer is already
+        // over the steady-state ceiling AND this packet doesn't need that much room —
+        // so ordinary traffic never reallocates and P-6's buffer-reuse win is preserved.
+        let needed_len = payload_length.saturating_add(16);
+        if payload_buf.capacity() > CONNECTION_BUFFER_STEADY_STATE_CAP
+            && needed_len <= CONNECTION_BUFFER_STEADY_STATE_CAP
+        {
+            payload_buf.shrink_to(CONNECTION_BUFFER_STEADY_STATE_CAP);
+        }
+        payload_buf.resize(needed_len, 0);
         let mut bytes_read  = 0usize;
 
         while bytes_read < payload_buf.len() {
@@ -632,7 +862,29 @@ where
         let gate_secret: Vec<u8> = token_issuer_secret
             .clone()
             .unwrap_or_else(|| session_key.to_vec());
+        // L-16 fix: `session_key` itself is `Zeroizing<[u8; 32]>` and lives for the whole
+        // connection, so it must never be moved into a per-iteration `move` closure (that
+        // would drop-and-zeroize it after the first packet, breaking every later packet on
+        // this same connection). Take a plain `Copy` snapshot of the raw bytes instead —
+        // ephemeral per-packet copies handed to the short-lived gate pipeline below are the
+        // same exposure this codebase already accepts for e.g. `KeyEvolutionEngine`'s
+        // per-epoch derived keys; what L-16 protects is the long-lived top-level binding.
+        let session_key_bytes: [u8; 32] = *session_key;
 
+        // M-18 fix: `on_delivered` is invoked from INSIDE the `spawn_blocking`
+        // closures below (immediately after a successful intercept, still on
+        // the blocking-pool thread), not after `.await` back on the async
+        // executor as it was previously. The field doc comment on
+        // `SAACPNetworkDaemon::on_delivered` has always documented "called
+        // from inside spawn_blocking, so implementations must not .await" —
+        // this makes that contract true instead of aspirational. Previously,
+        // any `on_delivered` implementation that did even a small blocking
+        // operation (the doc comment's own stated allowance) would have
+        // stalled a tokio worker thread rather than a dedicated blocking-pool
+        // thread. `sidecar.rs`'s implementation (`tx.try_send(msg)`) already
+        // relied on exactly this non-blocking guarantee; this fix makes the
+        // guarantee real for any future implementation too.
+        let on_delivered_for_task = on_delivered.clone();
         let intercept_result = if let Some(epoch_mgr) = epoch_manager.clone() {
             let session_id: [u8; 16] = full_packet.get(16..32)
                 .and_then(|s| <[u8; 16]>::try_from(s).ok())
@@ -643,7 +895,7 @@ where
                 // winner's session.
                 let _ = epoch_mgr.create_session(
                     session_id,
-                    session_key,
+                    session_key_bytes,
                     crate::measc::MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
                     crate::measc::MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
                     None,
@@ -651,7 +903,7 @@ where
             }
             let gw_for_task = gateway.clone();
             tokio::task::spawn_blocking(move || {
-                SAACPProtocolHandler::intercept_packet_encrypted(
+                let result = SAACPProtocolHandler::intercept_packet_encrypted(
                     &full_packet,
                     &epoch_mgr,
                     &gate_secret,
@@ -660,20 +912,32 @@ where
                     gw_for_task.as_deref(),
                     None,
                     None,
-                )
+                );
+                if let Ok(parsed) = &result {
+                    if let Some(cb) = on_delivered_for_task.as_ref() {
+                        cb(parsed.clone());
+                    }
+                }
+                result
             }).await
         } else {
             let gw_for_task = gateway.clone();
             tokio::task::spawn_blocking(move || {
-                match gw_for_task.as_deref() {
+                let result = match gw_for_task.as_deref() {
                     Some(gw) => SAACPProtocolHandler::intercept_packet_full(
                         &full_packet, &gate_secret, &agent_name, is_pinned,
                         Some(gw), None, None, None, None,
                     ),
                     None => SAACPProtocolHandler::intercept_packet(
-                        &full_packet, &session_key, &agent_name, is_pinned,
+                        &full_packet, &session_key_bytes, &agent_name, is_pinned,
                     ),
+                };
+                if let Ok(parsed) = &result {
+                    if let Some(cb) = on_delivered_for_task.as_ref() {
+                        cb(parsed.clone());
+                    }
                 }
+                result
             }).await
         };
         // Flatten JoinError (panic in gate pipeline) into SAACPHardDrop
@@ -686,15 +950,39 @@ where
         };
         match intercept_result {
             Ok(parsed) => {
-                // Opt-in observer hook (sidecar.rs's Inbox) — invoked synchronously, same
-                // as any other post-gate bookkeeping here; implementations must not block
-                // (see the `on_delivered` field doc comment on `SAACPNetworkDaemon`).
-                if let Some(cb) = on_delivered.as_ref() {
-                    cb(parsed.clone());
+                // Phase 6 / item 4: a schema_id=11 packet that cleared the full gate
+                // pipeline (so it's a genuinely authenticated, non-cover-traffic frame) is
+                // a Gossip Envelope — hand it to the configured `GossipEngine` instead of
+                // (there is no further "application" handling for this schema; it carries
+                // no task/action for an agent to execute). See the `gossip` field doc
+                // comment for why this dispatches here rather than inside `handler.rs`.
+                if let Some(engine) = gossip.as_ref() {
+                    if parsed.schema_id == 11 {
+                        if let Some(envelope) = decode_gossip_envelope(&parsed.payload_dict) {
+                            engine.receive(envelope);
+                        }
+                    }
+                }
+                // Phase 6 / item 3 (IEVL, `ievl.rs`, Part 8.1): a schema_id=10 packet
+                // that cleared the full gate pipeline is an `ExecutionReceipt` — hand
+                // it to IEVL for verification against its matching `IntentDeclaration`
+                // instead of further "application" handling (this schema carries no
+                // task/action for an agent to execute). Mirrors the schema_id=11
+                // gossip dispatch immediately above for the same reason: the
+                // verification/enforcement decision needs the fully-authenticated
+                // `ParsedPacket`, which only exists after Gate 0 through Gate 12.0
+                // have all already passed. Unlike gossip, always active (no opt-in
+                // engine to configure) — see `ievl::handle_execution_receipt`'s doc
+                // comment.
+                if parsed.schema_id == 10 {
+                    crate::ievl::handle_execution_receipt(&parsed);
                 }
                 // Update pinning state
                 if pinned_agent.is_none() && !parsed.source_agent.is_empty() {
-                    pinned_agent    = Some(parsed.source_agent.clone());
+                    // `parsed.source_agent` is `Arc<str>` (Phase 3 / M-13-style fix); this
+                    // event fires at most once per connection (guarded by `pinned_agent.is_none()`),
+                    // so a `.to_string()` here is a one-time allocation, not a per-packet cost.
+                    pinned_agent    = Some(parsed.source_agent.to_string());
                     last_validated_at = Some(Instant::now());
                     // Snapshot the current revocation epoch so future revocations
                     // trigger disconnect (C1 fix).
@@ -738,7 +1026,7 @@ where
             }
             Err(drop) => {
                 // PECF error translation + SREL timing equalization
-                SREL::equalize_timing(start);
+                SREL::equalize_timing(start).await;
                 let ext  = internal_to_external_raw(drop.bytecode as u8);
                 // Wire format requires a real 32-hex-char correlation ID (spec §9.3);
                 // an empty string both violates that contract and previously produced
@@ -814,7 +1102,7 @@ async fn ecdh_handshake<S>(
     stream: &mut S,
     server_ed25519_seed: Option<[u8; 32]>,
     identity_binding_server_agent_id: Option<&str>,
-) -> Result<([u8; 32], Option<VerifiedClientIdentity>), SAACPHardDrop>
+) -> Result<(Zeroizing<[u8; 32]>, Option<VerifiedClientIdentity>), SAACPHardDrop>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -980,7 +1268,11 @@ where
         None
     };
 
-    Ok((session_key, verified_identity))
+    // L-16 fix: wrap the raw handshake session key in `Zeroizing` so it's wiped from
+    // memory the moment the caller's binding drops out of scope, instead of the 32
+    // live key bytes lingering in freed heap/stack memory (recoverable via a core
+    // dump, swap, or an unrelated use-after-free elsewhere in the process).
+    Ok((Zeroizing::new(session_key), verified_identity))
 }
 
 /// Result of a successful C-3 identity-bound handshake (see `ecdh_handshake`'s doc
@@ -1024,7 +1316,7 @@ pub(crate) struct VerifiedClientIdentity {
 pub async fn client_handshake<S>(
     stream: &mut S,
     identity: Option<&ClientIdentityConfig>,
-) -> Result<([u8; 32], Option<[u8; 16]>), SAACPHardDrop>
+) -> Result<(Zeroizing<[u8; 32]>, Option<[u8; 16]>), SAACPHardDrop>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1115,7 +1407,9 @@ where
     hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
         .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "HKDF expand failed"))?;
 
-    Ok((session_key, session_id))
+    // L-16 fix: see `ecdh_handshake`'s matching doc comment — same rationale applies to
+    // the client-initiator side of the handshake.
+    Ok((Zeroizing::new(session_key), session_id))
 }
 
 /// Client-side configuration for C-3 identity binding (see `client_handshake`'s doc
@@ -1143,17 +1437,73 @@ fn ip_trust_key(ip: &str) -> String {
     format!("ip:{ip}")
 }
 
-fn record_error(cbs: &Arc<Mutex<HashMap<String, CircuitBreakerEntry>>>, ip: &str) {
-    // H-22 fix: same poison-recovery as the Step 0 check above — this is the other
-    // call site sharing the same process-wide `Arc<Mutex<...>>`.
-    let mut map = cbs.lock().unwrap_or_else(|e| e.into_inner());
-    // OOM guard: drop oldest 10% when at capacity
+fn record_error(cbs: &SharedCircuitBreakers, ip: &str) {
+    // L-18 fix: `parking_lot::Mutex::lock()` returns the guard directly (no poison
+    // `Result` to unwrap) — see the matching Step 0 check's doc comment above.
+    let mut map = cbs.lock();
+    // OOM guard: drop oldest 10% when at capacity.
+    //
+    // M-16 fix: candidates are chosen by (1) lockout-expired-or-absent first —
+    // an entry with no active lockout provides zero remaining protective
+    // value, so it is always safe to drop ahead of one still actively
+    // blocking a misbehaving IP — then (2) oldest-`last_activity`-first
+    // within each group, instead of relying on `HashMap::keys()`'s arbitrary
+    // hash-bucket iteration order (which could just as easily drop an IP
+    // that's actively mid-lockout while leaving long-idle, already-expired
+    // entries in place).
     if map.len() >= MAX_CIRCUIT_BREAKER_IPS && !map.contains_key(ip) {
         let drop_count = MAX_CIRCUIT_BREAKER_IPS / 10;
-        let to_drop: Vec<String> = map.keys().take(drop_count).cloned().collect();
-        for k in to_drop { map.remove(&k); }
+        let mut candidates: Vec<(String, bool, Instant)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.lockout_expired_or_absent(), v.last_activity))
+            .collect();
+        candidates.sort_by(|a, b| {
+            // Expired-or-absent-lockout entries (true) sort before still-locked
+            // ones (false) — Rust's bool ordering is false < true, so reverse it.
+            b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2))
+        });
+        for (k, _, _) in candidates.into_iter().take(drop_count) {
+            map.remove(&k);
+        }
     }
     map.entry(ip.to_string()).or_insert_with(CircuitBreakerEntry::new).record_error();
+}
+
+/// Decode a schema_id=11 (`Gossip Envelope`, `schemas.rs`) packet's already-validated
+/// `payload_dict` into a `gossip::GossipEnvelope`. `PreCompiledSchemas::validate_payload`
+/// has already confirmed `gossip_record`/`hop_count`/`origin_id`/`revocation_id` are all
+/// present by the time this runs (schema validation happens inside `handler.rs`'s gate
+/// pipeline, before `Ok(parsed)` is ever returned) — this only handles the type coercion
+/// from loosely-typed `JsonValue`s to the envelope's concrete field types, and the
+/// base64 + `SignedRevocationRecord::from_wire` decode of `gossip_record`. Returns `None`
+/// (silently dropped, matching `GossipTransport::send_to_peer`'s "drop and log" philosophy
+/// for malformed/adversarial peer traffic) on any decode failure rather than propagating an
+/// error — a malformed gossip envelope from a misbehaving or malicious peer must never be
+/// able to disrupt this connection's otherwise-successful packet delivery.
+fn decode_gossip_envelope(payload_dict: &HashMap<String, JsonValue>) -> Option<crate::gossip::GossipEnvelope> {
+    use base64::Engine;
+
+    let gossip_record_b64 = match payload_dict.get("gossip_record") {
+        Some(JsonValue::String(s)) => s,
+        _ => return None,
+    };
+    let hop_count = match payload_dict.get("hop_count") {
+        Some(JsonValue::Number(n)) if *n >= 0.0 && *n <= u8::MAX as f64 => *n as u8,
+        _ => return None,
+    };
+    let origin_id = match payload_dict.get("origin_id") {
+        Some(JsonValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+    let revocation_id = match payload_dict.get("revocation_id") {
+        Some(JsonValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+
+    let wire = base64::engine::general_purpose::STANDARD.decode(gossip_record_b64).ok()?;
+    let record = crate::faitf::SignedRevocationRecord::from_wire(&wire).ok()?;
+
+    Some(crate::gossip::GossipEnvelope { record, hop_count, origin_id, revocation_id })
 }
 
 async fn send_hard_drop<S>(stream: &mut S, bc: SAACPBytecodes, _msg: &str)
@@ -1185,20 +1535,58 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_oom_guard() {
-        let cbs: Arc<Mutex<HashMap<String, CircuitBreakerEntry>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let cbs: SharedCircuitBreakers = new_shared_circuit_breakers();
         // Fill to capacity
         {
-            let mut map = cbs.lock().unwrap();
+            let mut map = cbs.lock();
             for i in 0..MAX_CIRCUIT_BREAKER_IPS {
                 map.insert(format!("10.0.{}.{}", i / 256, i % 256), CircuitBreakerEntry::new());
             }
         }
-        assert_eq!(cbs.lock().unwrap().len(), MAX_CIRCUIT_BREAKER_IPS);
+        assert_eq!(cbs.lock().len(), MAX_CIRCUIT_BREAKER_IPS);
         // Adding a new IP should trigger eviction
         record_error(&cbs, "192.168.1.1");
-        assert!(cbs.lock().unwrap().len() < MAX_CIRCUIT_BREAKER_IPS + 1,
+        assert!(cbs.lock().len() < MAX_CIRCUIT_BREAKER_IPS + 1,
             "OOM guard must prevent unbounded growth");
+    }
+
+    /// M-16 regression: an entry with an ACTIVE (not-yet-expired) lockout
+    /// must survive eviction as long as an entry with no lockout at all is
+    /// available to drop instead — proving eviction no longer relies on
+    /// arbitrary `HashMap` iteration order, which could just as easily have
+    /// dropped the actively-locked entry.
+    #[test]
+    fn test_circuit_breaker_eviction_prefers_unlocked_over_actively_locked() {
+        let cbs: SharedCircuitBreakers = new_shared_circuit_breakers();
+        const LOCKED_IP: &str = "203.0.113.42"; // TEST-NET-3 (RFC 5737) — never generated by the fill loop below
+        {
+            let mut map = cbs.lock();
+            // One entry with an ACTIVE lockout — must be protected from eviction.
+            let mut locked_entry = CircuitBreakerEntry::new();
+            for _ in 0..CIRCUIT_BREAKER_ERROR_THRESHOLD {
+                locked_entry.record_error();
+            }
+            assert!(locked_entry.is_locked(), "test setup: entry must actually be locked");
+            map.insert(LOCKED_IP.to_string(), locked_entry);
+
+            // Fill the rest of capacity with plain, never-errored (no lockout)
+            // entries — all strictly safer to evict than the locked one above.
+            for i in 1..MAX_CIRCUIT_BREAKER_IPS {
+                map.insert(format!("10.0.{}.{}", i / 256, i % 256), CircuitBreakerEntry::new());
+            }
+        }
+        assert_eq!(cbs.lock().len(), MAX_CIRCUIT_BREAKER_IPS);
+
+        // Trigger eviction by recording an error for a brand-new IP.
+        record_error(&cbs, "192.168.1.1");
+
+        let map = cbs.lock();
+        assert!(
+            map.contains_key(LOCKED_IP),
+            "M-16: the actively-locked entry must survive eviction while \
+             unlocked entries are still available to drop"
+        );
+        assert!(map.len() < MAX_CIRCUIT_BREAKER_IPS + 1, "OOM guard must still bound growth");
     }
 
     #[test]

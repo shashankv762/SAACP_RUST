@@ -372,8 +372,14 @@ impl ExecutionStateMachine {
 
     /// Register a new request in CREATED state.
     /// Returns `Err` if the RID is already registered.
+    ///
+    /// M-38 fix: every `self.states.lock()` in this impl block recovers via
+    /// `into_inner()` on poison rather than panicking — `ExecutionStateMachine`
+    /// is embedded in `AEGFGovernor`, reachable via the process-wide
+    /// `GLOBAL_AEGF_GOVERNOR` singleton, so one poisoning panic must not
+    /// cascade into every other request's execution-state tracking.
     pub fn create(&self, rid: &str, reason: &str) -> Result<ExecutionState, String> {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         if states.contains_key(rid) {
             return Err(format!("RID {}… already registered in ESM.", &rid[..8.min(rid.len())]));
         }
@@ -398,7 +404,7 @@ impl ExecutionStateMachine {
         new_state: ExecutionState,
         reason: &str,
     ) -> Result<ExecutionState, SAACPHardDrop> {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let rec = states.get_mut(rid).ok_or_else(|| {
             SAACPHardDrop::new(
                 SAACPBytecodes::AegfInvalidTransition,
@@ -431,26 +437,26 @@ impl ExecutionStateMachine {
 
     /// Return current state, or `None` if not found.
     pub fn get_state(&self, rid: &str) -> Option<ExecutionState> {
-        let states = self.states.lock().unwrap();
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states.get(rid).map(|r| r.state)
     }
 
     /// Return full record, or `None` if not found.
     pub fn get_record(&self, rid: &str) -> Option<StateRecord> {
-        let states = self.states.lock().unwrap();
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states.get(rid).cloned()
     }
 
     /// Remove a request from the registry. Returns true if found.
     pub fn remove(&self, rid: &str) -> bool {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states.remove(rid).is_some()
     }
 
     /// Evict terminal states older than `max_age_seconds`. Returns eviction count.
     pub fn expire_old(&self, max_age_seconds: f64) -> usize {
         let cutoff = now_epoch_f64() - max_age_seconds;
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let to_remove: Vec<String> = states
             .iter()
             .filter(|(_, rec)| rec.state.is_terminal() && rec.updated_at < cutoff)
@@ -465,7 +471,7 @@ impl ExecutionStateMachine {
 
     /// Current entry count.
     pub fn count(&self) -> usize {
-        self.states.lock().unwrap().len()
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Must be called with the lock held (via mutable ref to HashMap).
@@ -694,8 +700,17 @@ impl DistributedExecutionGraph {
     ) -> GovernanceDecision {
         // 0. Graph node cap — cheap early-exit pre-check (not authoritative;
         // see the re-check below held under the same lock as the insert).
-        {
-            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        //
+        // O-6 / deadlock fix: this pre-check uses `try_lock`, not a blocking
+        // `lock()`. It is deliberately best-effort — if the state lock is
+        // currently held elsewhere, we simply skip the early-exit and fall
+        // through to the authoritative acquisition below (which re-checks the
+        // cap at FINDING-7 under the real lock, so nothing is lost). A blocking
+        // acquisition here would (a) absorb the very lock contention the O-6
+        // probe at the authoritative acquisition is meant to observe, defeating
+        // the instrumentation, and (b) make this cheap pre-check able to block
+        // the whole call on a lock it doesn't even need to hold.
+        if let Ok(guard) = self.state.try_lock() {
             if guard.nodes.len() >= policy.max_graph_nodes as usize {
                 return GovernanceDecision::Pause;
             }
@@ -737,7 +752,20 @@ impl DistributedExecutionGraph {
         // without the other mid-critical-section. They are now one
         // `Mutex<DegState>`, acquired once, so the ordering invariant is
         // structural rather than a convention to remember.
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        //
+        // O-6: non-blocking probe first — on contention, record the
+        // observation then fall through to the normal blocking lock() below.
+        // Instrumentation only; this is the authoritative acquisition for
+        // the whole check-and-insert critical section, so it's probed once
+        // per call rather than also probing the cheap step-0 pre-check above.
+        let mut guard = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::telemetry::global_telemetry().record_mutex_contention("deg_state");
+                self.state.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         let DegState { nodes, path_counts } = &mut *guard;
 
         // SECURITY FIX (FINDING-7): the step-0 cap check above releases the
@@ -965,12 +993,15 @@ impl AEGFGovernor {
         &self.esm
     }
 
+    /// M-38 fix: every `self.policy.lock()` in this impl block recovers via
+    /// `into_inner()` on poison rather than panicking — `AEGFGovernor` is a
+    /// process-wide singleton (`GLOBAL_AEGF_GOVERNOR`).
     pub fn set_policy(&self, policy: AEGFPolicy) {
-        *self.policy.lock().unwrap() = policy;
+        *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
     }
 
     pub fn get_policy(&self) -> AEGFPolicy {
-        self.policy.lock().unwrap().clone()
+        self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Validate metadata, run DEG governance, update ESM.
@@ -982,7 +1013,7 @@ impl AEGFGovernor {
     /// 3. DEG cycle + repeated-path detection
     /// 4. ESM registration + transition
     pub fn submit_request(&self, meta: &AEGFMetadata) -> GovernanceDecision {
-        let policy = self.policy.lock().unwrap().clone();
+        let policy = self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         // Step 1: TTL
         if meta.is_expired() {
@@ -1072,7 +1103,7 @@ impl AEGFGovernor {
     /// step 7 ("DEG fast-path... eliminate 3 lock acquisitions"); ESM's own
     /// lock traffic is a separate concern not in this pass's scope.
     pub fn submit_and_complete(&self, meta: &AEGFMetadata) -> GovernanceDecision {
-        let policy = self.policy.lock().unwrap().clone();
+        let policy = self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let is_root = meta.prid == RID_ROOT;
 
         // Step 1: TTL — identical to submit_request's early-return path.
@@ -1184,7 +1215,7 @@ impl AEGFGovernor {
 
     /// GC terminal ESM states + expired DEG nodes. Returns total evicted.
     pub fn expire_stale_requests(&self) -> usize {
-        let gc_age = self.policy.lock().unwrap().esm_gc_age_seconds;
+        let gc_age = self.policy.lock().unwrap_or_else(|e| e.into_inner()).esm_gc_age_seconds;
         let esm_evicted = self.esm.expire_old(gc_age);
         let deg_evicted = self.deg.evict_expired();
         esm_evicted + deg_evicted
@@ -1492,6 +1523,56 @@ mod tests {
             ttl: now_epoch_f64() + 3600.0,
         };
         let _ = deg.validate_transient_root(&non_root, &policy);
+    }
+
+    #[test]
+    fn o6_validate_and_add_records_contention_when_lock_is_held_elsewhere() {
+        // O-6: hold the DEG's combined-state lock from another thread so
+        // `validate_and_add`'s `try_lock()` observes `WouldBlock`, then
+        // assert the contention probe actually incremented — proving the
+        // instrumentation fires under real contention, not just that it
+        // compiles.
+        //
+        // The holder releases the lock after a brief, bounded hold rather than
+        // waiting for `validate_and_add` to return. That ordering is required,
+        // not incidental: for a non-root-cap call, `validate_and_add`'s
+        // authoritative acquisition is a *blocking* `lock()` that only completes
+        // once this holder releases — so if the holder waited for the call to
+        // finish before releasing, and the call waited for the holder to release
+        // before finishing, the two would deadlock. Instead the holder holds
+        // just long enough for the main thread to reach the contention probe
+        // (microseconds after `held` is signalled), observe `WouldBlock`, and
+        // record the probe, then releases so the authoritative acquisition can
+        // proceed. The hold duration comfortably exceeds the probe-reaching time
+        // while staying short, matching this crate's established sleep-based
+        // timing-test convention.
+        let deg = Arc::new(DistributedExecutionGraph::new());
+        let policy = AEGFPolicy::default();
+        let meta = root_meta("o6-contention-check");
+
+        let before = crate::telemetry::global_telemetry().mutex_contention_count("deg_state");
+
+        let deg_holder = Arc::clone(&deg);
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = deg_holder.state.lock().unwrap_or_else(|e| e.into_inner());
+            held_tx.send(()).unwrap();
+            // Hold long enough for the main thread to reach the probe and block
+            // on the authoritative acquisition, then release so it can proceed.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(guard);
+        });
+
+        held_rx.recv().expect("holder thread must signal lock acquisition");
+        // The lock is held by `holder` at this instant; this call's probe must
+        // observe WouldBlock, then block on the authoritative acquisition until
+        // the holder's brief hold elapses.
+        let _ = deg.validate_and_add(&meta, &policy);
+
+        holder.join().unwrap();
+
+        let after = crate::telemetry::global_telemetry().mutex_contention_count("deg_state");
+        assert!(after > before, "expected deg_state contention probe to increment: before={before}, after={after}");
     }
 
     #[test]

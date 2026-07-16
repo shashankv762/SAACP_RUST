@@ -35,6 +35,7 @@
 
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 // ─── EasiEncryptor ────────────────────────────────────────────────────────────
 
@@ -68,17 +69,23 @@ impl EasiEncryptor {
     ///
     /// Returns the 32-byte EASI-encrypted form that goes into the MEASC header
     /// at `MEASC_CONTEXT_REF_ID_OFFSET` (offset 44).
+    ///
+    /// M-6 fix: the keystream `pad` is derived from `traffic_key` (a session
+    /// secret) — it is explicitly zeroized after the XOR so it doesn't linger
+    /// in stack memory (which can be paged to swap or captured in a core
+    /// dump) past its single use here.
     pub fn encrypt(
         ctx_ref_id: &[u8; 32],
         traffic_key: &[u8; 32],
         epoch_id: u32,
         psn: u64,
     ) -> [u8; 32] {
-        let pad = Self::derive_pad(traffic_key, epoch_id, psn);
+        let mut pad = Self::derive_pad(traffic_key, epoch_id, psn);
         let mut out = [0u8; 32];
         for i in 0..32 {
             out[i] = ctx_ref_id[i] ^ pad[i];
         }
+        pad.zeroize();
         out
     }
 

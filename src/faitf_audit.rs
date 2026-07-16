@@ -11,10 +11,57 @@
 
 
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
 use crate::security::ImmutableAuditLog;
 
-/// Sentinel key used when no PSK is available in FAITF-only deployments.
-const FAITF_AUDIT_KEY: &[u8] = b"FAITF_AUDIT_LOG_SENTINEL_KEY_v1";
+/// L-14/L-24 fix: fallback HMAC key used when no PSK is available in FAITF-only
+/// deployments (every `log_*` function below accepts an optional `session_key`; this is
+/// only ever used when the caller passes `None`). Previously a fixed compile-time
+/// constant shared byte-for-byte by every deployment of this crate — a real weakness,
+/// since anyone who has read this source (it's open source) could forge/verify
+/// sentinel-keyed audit entries for any deployment that never configures an explicit
+/// session key. Resolution order, computed once and cached for this process's lifetime:
+/// 1. `SAACP_FAITF_AUDIT_KEY` env var, hex-encoded, if present and decodes to >= 32
+///    bytes — lets an operator pin a real deployment-specific secret (L-24).
+/// 2. Otherwise, a securely-random 32-byte value generated via `OsRng` at first use
+///    (L-14) — unpredictable and unique per process, so two instances (or the same
+///    instance across restarts without an explicit secret configured) never share a
+///    guessable key.
+///
+/// Cached in a `LazyLock` (not regenerated per call) because every event logged within
+/// one process's lifetime must use the same fallback key for the audit chain's HMAC to
+/// be internally self-consistent.
+static FAITF_AUDIT_KEY: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    if let Ok(hex_key) = std::env::var("SAACP_FAITF_AUDIT_KEY") {
+        if let Ok(bytes) = hex::decode(hex_key.trim()) {
+            if bytes.len() >= 32 {
+                return bytes;
+            }
+        }
+    }
+    use rand::RngCore;
+    let mut key = vec![0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    key
+});
+
+/// L-27 fix: strip ASCII control characters (C0 range `0x00-0x1F` plus `0x7F`) from a
+/// caller-supplied string before it is interpolated into an `intent` line that becomes
+/// an audit log entry. Every `log_*` function below formats free-form,
+/// potentially-attacker-influenced strings (agent IDs, domains, reasons, ...) directly
+/// into a line of a line-oriented JSONL log; an embedded newline/carriage-return could
+/// otherwise inject fake-looking extra "log lines" or corrupt downstream log
+/// parsing/SIEM ingestion. Only allocates (`Cow::Owned`) when a control character is
+/// actually present, so the common clean-input path stays zero-copy.
+fn sanitize_for_audit(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_control()) {
+        Cow::Owned(s.chars().filter(|c| !c.is_ascii_control()).collect())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 /// Structured FAITF event logger that writes to ImmutableAuditLog.
 pub struct FAITFAuditLog;
@@ -33,16 +80,19 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let agent_id_s = sanitize_for_audit(agent_id);
+        let issuer_id_s = sanitize_for_audit(issuer_id);
+        let trust_model_s = sanitize_for_audit(trust_model);
         let intent = format!(
             "[FAITF:ISSUANCE] agent={} issuer={} version={} key={}... valid_until={:.0} model={}",
-            agent_id,
-            issuer_id,
+            agent_id_s,
+            issuer_id_s,
             credential_version,
             &key_fingerprint[..16.min(key_fingerprint.len())],
             valid_until,
-            trust_model
+            trust_model_s
         );
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             issuer_id,
@@ -67,20 +117,27 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let agent_id_s = sanitize_for_audit(agent_id);
+        let trust_anchor_used_s = sanitize_for_audit(trust_anchor_used);
+        let trust_model_s = sanitize_for_audit(trust_model);
         let domain_info = if cross_domain {
-            format!(" cross_domain={}->{}", source_domain, target_domain)
+            format!(
+                " cross_domain={}->{}",
+                sanitize_for_audit(source_domain),
+                sanitize_for_audit(target_domain)
+            )
         } else {
             String::new()
         };
         let intent = format!(
             "[FAITF:AUTH] agent={} session={}... anchor={} model={}{}",
-            agent_id,
+            agent_id_s,
             &session_id[..16.min(session_id.len())],
-            trust_anchor_used,
-            trust_model,
+            trust_anchor_used_s,
+            trust_model_s,
             domain_info
         );
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             agent_id,
@@ -101,6 +158,9 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let agent_id_s = sanitize_for_audit(agent_id);
+        let revoker_id_s = sanitize_for_audit(revoker_id);
+        let reason_s = sanitize_for_audit(reason);
         let scope = if !credential_fingerprint.is_empty() {
             format!("cred={}...", &credential_fingerprint[..16.min(credential_fingerprint.len())])
         } else {
@@ -108,14 +168,14 @@ impl FAITFAuditLog {
         };
         let intent = format!(
             "[FAITF:REVOCATION] agent={} revoker={} scope={} reason={}",
-            agent_id, revoker_id, scope, reason
+            agent_id_s, revoker_id_s, scope, reason_s
         );
         let token_sig = if !credential_fingerprint.is_empty() {
             credential_fingerprint
         } else {
             "agent-wide"
         };
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             revoker_id,
@@ -140,18 +200,20 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let agent_id_s = sanitize_for_audit(agent_id);
+        let issuer_id_s = sanitize_for_audit(issuer_id);
         let mode = if emergency { "EMERGENCY" } else { "SCHEDULED" };
         let intent = format!(
             "[FAITF:ROTATION:{}] agent={} issuer={} old_key={}... new_key={}... v{}->v{}",
             mode,
-            agent_id,
-            issuer_id,
+            agent_id_s,
+            issuer_id_s,
             &old_key_fingerprint[..16.min(old_key_fingerprint.len())],
             &new_key_fingerprint[..16.min(new_key_fingerprint.len())],
             old_version,
             new_version
         );
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             issuer_id,
@@ -174,20 +236,25 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let event_type_s = sanitize_for_audit(event_type);
+        let source_domain_s = sanitize_for_audit(source_domain);
+        let target_domain_s = sanitize_for_audit(target_domain);
+        let result_s = sanitize_for_audit(result);
+        let agreement_id_s = sanitize_for_audit(agreement_id);
         let intent = format!(
             "[FAITF:FEDERATION:{}] {}->{} agreement={} result={}",
-            event_type,
-            source_domain,
-            target_domain,
-            if agreement_id.is_empty() { "no_agreement" } else { agreement_id },
-            result
+            event_type_s,
+            source_domain_s,
+            target_domain_s,
+            if agreement_id.is_empty() { "no_agreement" } else { agreement_id_s.as_ref() },
+            result_s
         );
         let token_sig = if agreement_id.is_empty() {
             "no_agreement"
         } else {
             agreement_id
         };
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             source_domain,
@@ -208,12 +275,15 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let parent_agent_id_s = sanitize_for_audit(parent_agent_id);
+        let child_agent_id_s = sanitize_for_audit(child_agent_id);
+        let constraints_summary_s = sanitize_for_audit(constraints_summary);
         let intent = format!(
             "[FAITF:DELEGATION] parent={} child={} depth={} constraints={}",
-            parent_agent_id, child_agent_id, depth, constraints_summary
+            parent_agent_id_s, child_agent_id_s, depth, constraints_summary_s
         );
         let token_sig = format!("depth:{}", depth);
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             parent_agent_id,
@@ -234,14 +304,17 @@ impl FAITFAuditLog {
         session_key: Option<&[u8]>,
         traceparent: &str,
     ) {
+        let event_type_s = sanitize_for_audit(event_type);
+        let anchor_id_s = sanitize_for_audit(anchor_id);
+        let trust_model_s = sanitize_for_audit(trust_model);
         let intent = format!(
             "[FAITF:ANCHOR:{}] anchor={} key={}... model={}",
-            event_type,
-            anchor_id,
+            event_type_s,
+            anchor_id_s,
             &key_fingerprint[..16.min(key_fingerprint.len())],
-            trust_model
+            trust_model_s
         );
-        let key = session_key.unwrap_or(FAITF_AUDIT_KEY);
+        let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
         audit_log.append_signed(
             key,
             "TrustStore",
@@ -422,5 +495,17 @@ mod tests {
             &"0".repeat(48),
         );
         assert!(log.entry_count() > 0);
+    }
+
+    #[test]
+    fn test_sanitize_for_audit_strips_control_chars() {
+        assert_eq!(sanitize_for_audit("clean"), "clean");
+        assert_eq!(sanitize_for_audit("line1\nline2\r\nline3"), "line1line2line3");
+        assert_eq!(sanitize_for_audit("tab\tbell\x07end"), "tabbellend");
+    }
+
+    #[test]
+    fn test_faitf_audit_key_is_at_least_32_bytes() {
+        assert!(FAITF_AUDIT_KEY.len() >= 32);
     }
 }

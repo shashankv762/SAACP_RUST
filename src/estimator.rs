@@ -22,9 +22,15 @@ impl AutonomousTokenEstimator {
     /// account for structured / nested payloads that inflate token counts
     /// beyond their raw byte length.
     pub fn estimate_cost(payload: &JsonValue, complexity_multiplier: f64) -> usize {
+        // L-31 fix: clamp to the documented `>= 1.0` contract (upper-bounded too) so a
+        // negative or huge caller-supplied multiplier can neither zero out this estimate
+        // (a negative multiplier would otherwise saturate the cast to 0, silently
+        // bypassing any downstream spend/budget gate keyed on this value) nor inflate it
+        // into a nonsensical overestimate.
+        let complexity_multiplier = complexity_multiplier.clamp(1.0, 100.0);
         let serialized = serde_json::to_string(payload).unwrap_or_default();
         let byte_len = serialized.len() as f64;
-        
+
         (byte_len / 4.0 * complexity_multiplier) as usize + 50
     }
 

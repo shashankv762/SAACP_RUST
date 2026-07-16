@@ -88,6 +88,37 @@ pub enum SAACPBytecodes {
     /// the "small, individually-plausible scope creep at every hop" failure
     /// mode. *New in Rust* — no Python parity.
     IntentChainDriftExceeded = 0x43,
+    /// IEVL (`ievl.rs`, Phase 6 / Part 8.1) rejection: a submitted
+    /// `ExecutionReceipt`'s `actual_action`/`actual_targets` exceeded the
+    /// action_class the matching `IntentDeclaration` declared at Gate 1.5
+    /// registration time — the agent executed something more dangerous than
+    /// it promised. Triggers immediate revocation, not just a trust penalty
+    /// (Monotonic Security — Part 12 principle 9). *New in Rust* — no Python
+    /// parity (IEVL has no Python-reference analog).
+    IntentClassEscalationDetected = 0x44,
+    /// SID Layer 1 (`sid.rs`, Phase 6 / Part 8.3) rejection: structural
+    /// heuristic score (role-override phrasing, context-break markers,
+    /// authority claims, exfiltration patterns, instruction density,
+    /// intent/payload contradiction) met or exceeded the 0.75 threshold —
+    /// catches semantically-novel prompt injection that Gate 4.0's
+    /// Aho-Corasick keyword scan cannot see. Runs strictly after Gate 4.0.
+    /// *New in Rust* — no Python parity.
+    SemanticInjectionDetected = 0x45,
+    /// ACA (`aca.rs`, Phase 6 / Part 8.4) rejection: the session's
+    /// `AttestationClaim` safety level is below the minimum required for the
+    /// packet's resolved action_class (default policy: IRREVERSIBLE requires
+    /// at least `AlignedModel`). Only enforced when ACA is explicitly
+    /// configured on for the deployment (fail-closed only once enabled — Part
+    /// 12 principle 3). *New in Rust* — no Python parity.
+    InsufficientAttestation = 0x46,
+    /// MACE (`mace.rs`, Phase 6 / Part 8.2) rejection: the Multi-Agent
+    /// Collusion Detection Engine confirmed a circular-delegation cycle or a
+    /// Sybil-cluster match (cosine similarity >= 0.92 across per-agent
+    /// gate-outcome behavioral fingerprints) implicating this agent —
+    /// triggers simultaneous trust penalty and revocation (Part A.10: "MACE
+    /// -> Trust + DRI: Collusion detection simultaneously penalizes trust AND
+    /// revokes credentials"). *New in Rust* — no Python parity.
+    CollusionDetected = 0x47,
 }
 
 impl fmt::Display for SAACPBytecodes {

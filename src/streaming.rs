@@ -263,8 +263,13 @@ impl StreamRegistry {
     /// first, `agent_counts` second — every call site in this file follows
     /// that fixed order, so no two call sites can deadlock against each
     /// other by acquiring the two locks in opposite order.
+    ///
+    /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
+    /// poison rather than panicking — `StreamRegistry::global()` is a
+    /// process-wide singleton, so one poisoning panic must not cascade into
+    /// every other agent's streaming sessions.
     fn shard(&self, stream_id: &str) -> std::sync::MutexGuard<'_, HashMap<String, StreamSession>> {
-        self.streams[stream_shard_index(stream_id)].lock().unwrap()
+        self.streams[stream_shard_index(stream_id)].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn stream_key(stream_id: &str) -> String {
@@ -317,7 +322,7 @@ impl StreamRegistry {
     fn register_local(&self, session: StreamSession) -> Result<(), SAACPHardDrop> {
         // Per-agent limit.
         {
-            let agent_counts = self.agent_counts.lock().unwrap();
+            let agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
             let agent_count = agent_counts.get(&session.agent_id).copied().unwrap_or(0);
             if agent_count >= MAX_STREAMS_PER_AGENT {
                 return Err(SAACPHardDrop::new(
@@ -335,11 +340,11 @@ impl StreamRegistry {
         // must not be silently loosened by sharding), so this locks every
         // shard in turn (never more than one at a time) to find the globally
         // oldest session before deciding whether to evict.
-        let total: usize = self.streams.iter().map(|s| s.lock().unwrap().len()).sum();
+        let total: usize = self.streams.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len()).sum();
         if total >= MAX_ACTIVE_STREAMS {
             let mut oldest: Option<(usize, String, f64)> = None;
             for (idx, shard) in self.streams.iter().enumerate() {
-                let guard = shard.lock().unwrap();
+                let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((id, sess)) = guard.iter()
                     .min_by(|a, b| a.1.started_at.partial_cmp(&b.1.started_at).unwrap())
                 {
@@ -349,9 +354,9 @@ impl StreamRegistry {
                 }
             }
             if let Some((idx, id, _)) = oldest {
-                let evicted = self.streams[idx].lock().unwrap().remove(&id);
+                let evicted = self.streams[idx].lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 if let Some(evicted) = evicted {
-                    let mut agent_counts = self.agent_counts.lock().unwrap();
+                    let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
                     let cnt = agent_counts.entry(evicted.agent_id.clone()).or_insert(1);
                     *cnt = cnt.saturating_sub(1);
                     if *cnt == 0 {
@@ -363,7 +368,7 @@ impl StreamRegistry {
 
         let agent_id = session.agent_id.clone();
         self.shard(&session.stream_id).insert(session.stream_id.clone(), session);
-        let mut agent_counts = self.agent_counts.lock().unwrap();
+        let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
         *agent_counts.entry(agent_id).or_insert(0) += 1;
         Ok(())
     }
@@ -512,7 +517,7 @@ impl StreamRegistry {
             }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
 
                 if let Some(session) = streams.remove(stream_id) {
                     let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
@@ -531,6 +536,56 @@ impl StreamRegistry {
         }
     }
 
+    /// M-21 fix: proactively remove stream sessions that have exceeded
+    /// `STREAM_MAX_DURATION_SECONDS` or gone `STREAM_MAX_FRAME_GAP_SECONDS`
+    /// without a frame, instead of relying purely on the next
+    /// `validate_frame` call (which never comes for an abandoned stream —
+    /// e.g. a client that opens a stream and then disappears) or on
+    /// `register`'s indirect, capacity-triggered "evict oldest when at cap"
+    /// fallback. Intended to be called periodically (see
+    /// `maintenance::MaintenanceCoordinator`, which already consolidates
+    /// several other subsystems' periodic sweeps into one background
+    /// thread) — safe to call directly from a test too. Returns the number
+    /// of sessions removed.
+    ///
+    /// Backend mode needs no explicit sweep: every backend-stored session
+    /// already carries a TTL (`stream_backend_ttl()`, applied in
+    /// `put_session_backend`) comfortably beyond both staleness thresholds,
+    /// so an abandoned stream there self-expires without this method's help.
+    pub fn sweep_expired(&self) -> usize {
+        if self.backend.is_some() {
+            return 0;
+        }
+        let now = now_epoch_secs();
+        let mut removed = 0usize;
+        for shard in &self.streams {
+            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let stale_ids: Vec<String> = guard
+                .iter()
+                .filter(|(_, s)| {
+                    (now - s.started_at) > STREAM_MAX_DURATION_SECONDS
+                        || (now - s.last_frame_at) > STREAM_MAX_FRAME_GAP_SECONDS
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if stale_ids.is_empty() {
+                continue;
+            }
+            let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+            for id in stale_ids {
+                if let Some(session) = guard.remove(&id) {
+                    let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        agent_counts.remove(&session.agent_id);
+                    }
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// Number of currently active streams.
     ///
     /// In backend mode this is a `scan_prefix` over the `stream:` namespace —
@@ -538,7 +593,7 @@ impl StreamRegistry {
     pub fn active_count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("stream:").map(|k| k.len()).unwrap_or(0),
-            None => self.streams.iter().map(|s| s.lock().unwrap().len()).sum(),
+            None => self.streams.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len()).sum(),
         }
     }
 
@@ -547,7 +602,7 @@ impl StreamRegistry {
         match &self.backend {
             Some(backend) => Self::all_sessions_backend(backend).iter()
                 .filter(|s| s.agent_id == agent_id).count(),
-            None => self.agent_counts.lock().unwrap().get(agent_id).copied().unwrap_or(0),
+            None => self.agent_counts.lock().unwrap_or_else(|e| e.into_inner()).get(agent_id).copied().unwrap_or(0),
         }
     }
 
@@ -588,7 +643,7 @@ impl StreamRegistry {
             Some(backend) => { let _ = backend.delete(&Self::stream_key(stream_id)); }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(session) = streams.remove(stream_id) {
                     let cnt = agent_counts.entry(session.agent_id).or_insert(0);
                     *cnt = cnt.saturating_sub(1);
@@ -691,7 +746,7 @@ impl StreamRegistry {
             }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap();
+                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(mut session) = streams.remove(stream_id) {
                     session.closed = true;
                     let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
@@ -808,6 +863,82 @@ mod tests {
     fn test_registry_close_nonexistent() {
         let reg = StreamRegistry::new();
         assert!(reg.close("no-such-stream").is_err());
+    }
+
+    // -- M-21: StreamRegistry::sweep_expired --
+
+    #[test]
+    fn test_sweep_expired_removes_stale_duration_session() {
+        let reg = StreamRegistry::new();
+        let mut s = make_session("s-stale-duration", "agent-a");
+        // Backdate started_at well past STREAM_MAX_DURATION_SECONDS.
+        s.started_at = now_epoch_secs() - STREAM_MAX_DURATION_SECONDS - 10.0;
+        s.last_frame_at = now_epoch_secs(); // frame gap itself is fine
+        reg.register(s).unwrap();
+        assert_eq!(reg.active_count(), 1);
+
+        let removed = reg.sweep_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.agent_stream_count("agent-a"), 0);
+    }
+
+    #[test]
+    fn test_sweep_expired_removes_stale_frame_gap_session() {
+        let reg = StreamRegistry::new();
+        let mut s = make_session("s-stale-gap", "agent-a");
+        s.started_at = now_epoch_secs(); // duration itself is fine
+        // Backdate last_frame_at well past STREAM_MAX_FRAME_GAP_SECONDS.
+        s.last_frame_at = now_epoch_secs() - STREAM_MAX_FRAME_GAP_SECONDS - 5.0;
+        reg.register(s).unwrap();
+        assert_eq!(reg.active_count(), 1);
+
+        let removed = reg.sweep_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    #[test]
+    fn test_sweep_expired_leaves_fresh_sessions_alone() {
+        let reg = StreamRegistry::new();
+        let s = make_session("s-fresh", "agent-a"); // started_at/last_frame_at == now
+        reg.register(s).unwrap();
+
+        let removed = reg.sweep_expired();
+        assert_eq!(removed, 0);
+        assert_eq!(reg.active_count(), 1, "a freshly registered session must survive a sweep");
+    }
+
+    #[test]
+    fn test_sweep_expired_only_removes_stale_across_mixed_set() {
+        let reg = StreamRegistry::new();
+        let fresh = make_session("s-fresh-2", "agent-a");
+        let mut stale = make_session("s-stale-2", "agent-b");
+        stale.started_at = now_epoch_secs() - STREAM_MAX_DURATION_SECONDS - 1.0;
+        reg.register(fresh).unwrap();
+        reg.register(stale).unwrap();
+        assert_eq!(reg.active_count(), 2);
+
+        let removed = reg.sweep_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(reg.active_count(), 1);
+        assert!(reg.agent_stream_count("agent-a") == 1, "fresh session's agent must be untouched");
+        assert_eq!(reg.agent_stream_count("agent-b"), 0, "stale session's agent count must be decremented");
+    }
+
+    #[test]
+    fn test_sweep_expired_is_noop_in_backend_mode() {
+        use crate::state_backend::InMemoryBackend;
+        let backend = Arc::new(InMemoryBackend::new());
+        let reg = StreamRegistry::with_backend(backend);
+        let mut s = make_session("s-backend-stale", "agent-a");
+        s.started_at = now_epoch_secs() - STREAM_MAX_DURATION_SECONDS - 10.0;
+        reg.register(s).unwrap();
+
+        // Backend mode relies on the backend's own TTL, not sweep_expired —
+        // this must be a documented no-op, not silently misbehave.
+        let removed = reg.sweep_expired();
+        assert_eq!(removed, 0);
     }
 
     #[test]

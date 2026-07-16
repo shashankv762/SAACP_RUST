@@ -505,7 +505,7 @@ fn hijack_4_context_provenance_capability_demonstrated() {
 #[test]
 fn hijack_4b_non_provenance_entries_still_readable() {
     let fm = FederatedMemory::new();
-    let state_id = fm.store_context("legacy-agent", "plain legacy context, no provenance tag", 1);
+    let state_id = fm.store_context("legacy-agent", "plain legacy context, no provenance tag", 1).unwrap();
     let (data, writer) = fm.fetch_context_with_provenance(&state_id, 1).unwrap();
     assert_eq!(data, "plain legacy context, no provenance tag");
     assert_eq!(writer, None);

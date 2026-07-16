@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
+use crate::acsvaf::ACSVAF_MAX_DELEGATION_DEPTH;
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,9 @@ pub struct AuthorityPolicy {
     pub is_federation_root: bool,
     /// Explicit whitelist of action strings. Empty = unrestricted.
     pub allowed_actions: HashSet<String>,
-    /// Override for max delegation depth (defaults to 8).
+    /// Override for max delegation depth (defaults to [`ACSVAF_MAX_DELEGATION_DEPTH`], the
+    /// protocol-layer hard ceiling already enforced in `acsvaf.rs`/`gateway.rs`/`factf.rs`,
+    /// so a fresh policy never advertises a laxer limit than what's actually enforced).
     pub max_delegation_depth: u32,
     /// Arbitrary protocol-level annotations.
     pub metadata: HashMap<String, String>,
@@ -125,7 +128,9 @@ impl AuthorityPolicy {
             authority_class,
             is_federation_root: false,
             allowed_actions: HashSet::new(),
-            max_delegation_depth: 8,
+            // L-15 fix: default to the protocol's actual enforced ceiling instead of a
+            // laxer hardcoded literal (was 8; the hard limit enforced elsewhere is 3).
+            max_delegation_depth: ACSVAF_MAX_DELEGATION_DEPTH,
             metadata: HashMap::new(),
         }
     }
@@ -165,62 +170,71 @@ impl AuthorityRegistry {
     }
 
     /// Register or replace an authority policy for issuer_id.
+    ///
+    /// M-38 fix: every `self.inner.lock()` in this impl block recovers via
+    /// `into_inner()` on poison rather than panicking (`.expect(...)`) —
+    /// `DEFAULT_AUTHORITY_REGISTRY` is a process-wide singleton, so one
+    /// poisoning panic must not cascade into every other caller losing
+    /// access to the whole authority registry.
     pub fn register(&self, policy: AuthorityPolicy) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.insert(policy.issuer_id.clone(), policy);
     }
 
     /// Remove a policy. Returns true if it existed.
     pub fn deregister(&self, issuer_id: &str) -> bool {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.remove(issuer_id).is_some()
     }
 
     /// Check if an issuer is registered.
     pub fn contains(&self, issuer_id: &str) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.contains_key(issuer_id)
     }
 
     /// Get the authority class for an issuer, if registered.
+    ///
+    /// M-38 fix: recovers via `into_inner()` on poison instead of `.ok()?`-mapping
+    /// poison to `None` (indistinguishable from "issuer not registered").
     pub fn get_authority_class(&self, issuer_id: &str) -> Option<AuthorityClass> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.get(issuer_id).map(|p| p.authority_class)
     }
 
     /// Get whether an issuer may self-issue.
     pub fn may_self_issue(&self, issuer_id: &str) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.get(issuer_id).is_some_and(|p| p.may_self_issue())
     }
 
     /// Check if an issuer may issue to a given subject class.
     pub fn may_issue_to(&self, issuer_id: &str, sub_class: AuthorityClass) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.get(issuer_id).is_some_and(|p| p.may_issue_to(sub_class))
     }
 
     /// Check if an issuer is a terminal class.
     pub fn is_terminal(&self, issuer_id: &str) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.get(issuer_id).is_some_and(|p| terminal_classes().contains(&p.authority_class))
     }
 
     /// List all registered issuer IDs.
     pub fn list_issuers(&self) -> Vec<String> {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.keys().cloned().collect()
     }
 
     /// Return the number of registered policies.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.policies.len()
     }
 
     /// Promote or demote a ROOT_AUTHORITY issuer's federation-root flag.
     pub fn set_federation_root(&self, issuer_id: &str, is_root: bool) -> Result<(), SAACPHardDrop> {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let policy = inner.policies.get_mut(issuer_id).ok_or_else(|| {
             SAACPHardDrop::new(
                 SAACPBytecodes::FederationRootRequired,

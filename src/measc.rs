@@ -364,15 +364,22 @@ pub struct PacketSequencer {
 impl PacketSequencer {
     pub fn new(start: u64) -> Self { Self { next_psn: AtomicU64::new(start) } }
 
+    /// L-2 fix: was `fetch_add` then a compensating `fetch_sub` on overflow — safe with
+    /// respect to *uniqueness* (each caller still gets a distinct reserved PSN, since
+    /// `fetch_add` is a single atomic RMW), but not with respect to *visibility*: between
+    /// the `fetch_add` and the rollback, the counter briefly held a value strictly
+    /// greater than `MEASC_PSN_MAX`, observable by a concurrent `current()` call as an
+    /// invariant violation even if only for a moment. `fetch_update` performs the bounds
+    /// check and the increment as a single atomic compare-exchange loop, so the stored
+    /// value never exceeds `MEASC_PSN_MAX`, not even transiently.
     pub fn next_psn(&self) -> Result<u64, SAACPHardDrop> {
-        let psn = self.next_psn.fetch_add(1, Ordering::SeqCst);
-        if psn >= MEASC_PSN_MAX {
-            self.next_psn.fetch_sub(1, Ordering::SeqCst);
-            return Err(SAACPHardDrop::new(
+        self.next_psn
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |psn| {
+                if psn >= MEASC_PSN_MAX { None } else { Some(psn + 1) }
+            })
+            .map_err(|_| SAACPHardDrop::new(
                 SAACPBytecodes::SequenceOverflow, "PSN would exceed MEASC_PSN_MAX",
-            ));
-        }
-        Ok(psn)
+            ))
     }
 
     pub fn next(&self) -> Result<u64, SAACPHardDrop> { self.next_psn() }
@@ -535,6 +542,18 @@ struct SessionMeta {
     suite_transcript_hash_hex: String,
 }
 
+/// L-11 fix: lock ordering. This type holds three independent locks (`sessions`,
+/// `meta`, `grace`). Every method in `impl SessionEpochManager` (verified by reading
+/// each one directly) acquires at most ONE of these three at a time — each acquisition
+/// is scoped to a single statement or a tightly-bounded block, and the guard is always
+/// dropped before the next lock (of any of the three) is taken. No method ever holds
+/// two of these locks simultaneously, so there is no fixed cross-lock ordering to
+/// document or violate: two threads racing any combination of these methods can never
+/// deadlock against each other on this type, regardless of which lock each happens to
+/// reach for first. Any future addition to this `impl` block that needs to hold two of
+/// these locks at once must establish and follow a fixed acquisition order
+/// (`sessions` → `meta` → `grace`, matching their declaration order below) to preserve
+/// this invariant.
 pub struct SessionEpochManager {
     pub(crate) sessions: Mutex<HashMap<[u8; 16], HashMap<u32, SessionEpoch>>>,
     meta: Mutex<HashMap<[u8; 16], SessionMeta>>,
@@ -576,6 +595,7 @@ impl SessionEpochManager {
         let epoch = SessionEpoch::new(session_id, 0, initial_key, packet_threshold, time_threshold_secs);
 
         {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut sessions = self.sessions.lock().unwrap();
             if sessions.contains_key(&session_id) {
                 return Err(SAACPHardDrop::new(
@@ -588,6 +608,7 @@ impl SessionEpochManager {
             sessions.insert(session_id, ep_map);
         }
 
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.meta.lock().unwrap().insert(session_id, SessionMeta {
             secret: bound_secret,
             current_epoch: 0,
@@ -595,26 +616,32 @@ impl SessionEpochManager {
             time_threshold_secs,
             suite_transcript_hash_hex: suite_hex,
         });
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.grace.lock().unwrap().insert(session_id, HashMap::new());
         Ok(0)
     }
 
     pub fn with_epoch<F, R>(&self, session_id: &[u8; 16], epoch_id: u32, f: F) -> Option<R>
     where F: FnOnce(&SessionEpoch) -> R {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.sessions.lock().unwrap().get(session_id)?.get(&epoch_id).map(f)
     }
 
     pub fn with_epoch_mut<F, R>(&self, session_id: &[u8; 16], epoch_id: u32, f: F) -> Option<R>
     where F: FnOnce(&mut SessionEpoch) -> R {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.sessions.lock().unwrap().get_mut(session_id)?.get_mut(&epoch_id).map(f)
     }
 
     pub fn get_current_epoch_id(&self, session_id: &[u8; 16]) -> Option<u32> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.meta.lock().unwrap().get(session_id).map(|m| m.current_epoch)
     }
 
+    // R-1: read-only observability enumeration — not a security gate; safe to
+    // recover from a poisoned lock rather than panic.
     pub fn list_epoch_ids(&self, session_id: &[u8; 16]) -> Vec<u32> {
-        match self.sessions.lock().unwrap().get(session_id) {
+        match self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(session_id) {
             Some(m) => { let mut v: Vec<u32> = m.keys().copied().collect(); v.sort(); v }
             None => vec![],
         }
@@ -622,6 +649,7 @@ impl SessionEpochManager {
 
     pub fn rotate_epoch(&self, session_id: &[u8; 16]) -> Result<u32, SAACPHardDrop> {
         let (current_id, secret, packet_threshold, time_threshold_secs) = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let meta = self.meta.lock().unwrap();
             let m = meta.get(session_id).ok_or_else(|| SAACPHardDrop::new(
                 SAACPBytecodes::EpochExpired,
@@ -631,6 +659,7 @@ impl SessionEpochManager {
         };
 
         let prev_key = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let sessions = self.sessions.lock().unwrap();
             let ep_map = sessions.get(session_id).ok_or_else(|| SAACPHardDrop::new(
                 SAACPBytecodes::EpochExpired, "Session not found",
@@ -651,6 +680,7 @@ impl SessionEpochManager {
         );
 
         {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut sessions = self.sessions.lock().unwrap();
             let ep_map = sessions.get_mut(session_id).ok_or_else(|| SAACPHardDrop::new(
                 SAACPBytecodes::EpochExpired, "Session disappeared during rotation",
@@ -658,14 +688,17 @@ impl SessionEpochManager {
             ep_map.insert(new_epoch_id, new_epoch);
         }
 
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         if let Some(m) = self.meta.lock().unwrap().get_mut(session_id) {
             m.current_epoch = new_epoch_id;
         }
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.grace.lock().unwrap()
             .entry(*session_id).or_default()
             .insert(current_id, Instant::now());
 
         {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(ep_map) = sessions.get_mut(session_id) {
                 if let Some(old) = ep_map.get_mut(&current_id) {
@@ -685,8 +718,11 @@ impl SessionEpochManager {
     }
 
     pub fn destroy_session(&self, session_id: &[u8; 16]) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let epochs = self.sessions.lock().unwrap().remove(session_id);
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.meta.lock().unwrap().remove(session_id);
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.grace.lock().unwrap().remove(session_id);
         if let Some(mut ep_map) = epochs {
             for e in ep_map.values_mut() { e.destroy(); }
@@ -698,6 +734,7 @@ impl SessionEpochManager {
             grace_seconds.unwrap_or(MEASC_EPOCH_GRACE_PERIOD_SECONDS as f64)
         );
         let to_remove: Vec<([u8; 16], u32)> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let g = self.grace.lock().unwrap();
             g.iter().flat_map(|(sid, eid_map)| {
                 eid_map.iter()
@@ -708,20 +745,25 @@ impl SessionEpochManager {
         };
         let mut collected = 0;
         for (sid, eid) in to_remove {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let ep = self.sessions.lock().unwrap().get_mut(&sid).and_then(|m| m.remove(&eid));
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             self.grace.lock().unwrap().get_mut(&sid).map(|m| m.remove(&eid));
             if let Some(mut e) = ep { e.destroy(); collected += 1; }
         }
         collected
     }
 
-    pub fn session_count(&self) -> usize { self.sessions.lock().unwrap().len() }
+    // R-1: pure observability counter — safe to recover from a poisoned lock
+    // rather than panic.
+    pub fn session_count(&self) -> usize { self.sessions.lock().unwrap_or_else(|e| e.into_inner()).len() }
 
     // ── Python parity: get_epoch() and get_current_epoch() ──────────────────
 
     /// Return a clone of the SessionEpoch state for the given (session_id, epoch_id).
     /// Python parity: `SessionEpochManager.get_epoch(session_id, epoch_id)`.
     pub fn get_epoch(&self, session_id: &[u8; 16], epoch_id: u32) -> Option<EpochSnapshot> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let sessions = self.sessions.lock().unwrap();
         let ep = sessions.get(session_id)?.get(&epoch_id)?;
         Some(EpochSnapshot {
@@ -1129,7 +1171,7 @@ impl PSKCompromiseRecovery {
         let gateway_revocation_ok = match &self.gateway_callback {
             None => true,
             Some(cb) => matches!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
                 Ok(Ok(()))
             ),
         };
@@ -1149,6 +1191,7 @@ impl PSKCompromiseRecovery {
 
         // ── Step 2: Destroy ALL active MEASC sessions ──────────────────────
         let session_ids: Vec<[u8; 16]> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             self.manager.sessions.lock().unwrap().keys().copied().collect()
         };
         let mut destroyed     = 0usize;
@@ -1164,21 +1207,21 @@ impl PSKCompromiseRecovery {
         // remain observable even though they don't gate `recovery_complete`.
         let capability_revocation_ok = self.capability_revoke_callback.as_ref().map(|cb| {
             matches!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
                 Ok(Ok(()))
             )
         });
 
         let key_rotation_ok = self.key_rotation_callback.as_ref().map(|cb| {
             matches!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
                 Ok(Ok(()))
             )
         });
 
         let audit_ok = self.audit_callback.as_ref().map(|cb| {
             matches!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb())),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
                 Ok(Ok(()))
             )
         });

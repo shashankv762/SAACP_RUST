@@ -1,33 +1,33 @@
-import { FinancialSummary } from "@/components/FinancialSummary";
-import { AgentList } from "@/components/AgentList";
-import { AlertFeed } from "@/components/AlertFeed";
-import Link from "next/link";
+import { TrustMeshGraph } from "@/components/TrustMeshGraph";
+import { Terminal } from "@/components/Terminal";
+import { RoiPanel } from "@/components/RoiPanel";
 
 export default function OverviewPage() {
   return (
-    <main className="page">
-      <p className="page-title">
-        <span className="live-dot" />
-        Live Overview
-      </p>
-
-      <FinancialSummary />
-
-      <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 16, marginTop: 8 }}>
-        <div className="card">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12 }}>
-            <p className="page-title" style={{ margin: 0 }}>Agent Trust</p>
-            <Link href="/agents" className="nav-link" style={{ fontSize: 12 }}>View all →</Link>
+    <main className="stage">
+      <div className="grid-overview">
+        <div className="panel" id="overview-graph">
+          <div className="panel-head">
+            <span className="panel-title">
+              <span className="dot" />
+              Trust Mesh
+            </span>
           </div>
-          <AgentList />
+          <TrustMeshGraph compact />
         </div>
-        <div className="card">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12 }}>
-            <p className="page-title" style={{ margin: 0 }}>Security Alerts</p>
-            <Link href="/alerts" className="nav-link" style={{ fontSize: 12 }}>View all →</Link>
+
+        <div className="panel" id="term-panel">
+          <div className="panel-head">
+            <span className="panel-title">
+              <span className="dot" style={{ background: "var(--crit)", boxShadow: "0 0 8px var(--crit-glow)" }} />
+              Live Attack Feed
+            </span>
+            <span className="panel-meta">streaming</span>
           </div>
-          <AlertFeed />
+          <Terminal />
         </div>
+
+        <RoiPanel />
       </div>
     </main>
   );

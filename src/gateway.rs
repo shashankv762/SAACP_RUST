@@ -38,6 +38,12 @@ pub const COVER_TRAFFIC_WINDOW_SECONDS: f64 = 1.0;
 pub const TOKEN_CACHE_MAX: usize = 10_000;
 /// Token cache TTL cap (seconds).
 pub const TOKEN_CACHE_TTL: f64 = 30.0;
+/// L-9 fix: hard cap on distinct issuers `ZeroTrustGateway::register_issuer_key` will
+/// track. Previously unbounded — a caller (or attacker) able to reach this method
+/// repeatedly with distinct `issuer_agent` strings could grow `trusted_issuer_keys`
+/// without limit, an OOM vector. Matches this codebase's established bound for other
+/// unbounded-cardinality maps (`TOKEN_CACHE_MAX`, `RATE_LIMITER_MAX_ENTRIES`).
+pub const MAX_TRUSTED_ISSUERS: usize = 10_000;
 /// Maximum tracked agent_ids in each `AgentRateLimiter` map before a stale-entry
 /// sweep runs. IoT / low-resource fix: these maps previously grew unbounded for
 /// the process lifetime — one permanent entry per distinct agent_id ever seen,
@@ -45,11 +51,41 @@ pub const TOKEN_CACHE_TTL: f64 = 30.0;
 /// idiom: only swept when the cap is exceeded, so well-behaved fleets (fewer than
 /// this many concurrently-active agents) never pay the sweep cost at all.
 pub const RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
+/// Phase 7 / item 2 / Part 6.3: number of independent lock shards for
+/// `AgentRateLimiter`'s `records`/`cover_records` maps (sharded on
+/// `agent_id.as_bytes()[0] % N`, mirroring `trust_decay::TRUST_SHARDS`). Before
+/// sharding, every agent's rate-limit check across the entire process serialized on
+/// one process-wide `Mutex` each — under load, an unrelated agent's `record_error`/
+/// `record_cover_traffic` call could stall behind a completely different agent's.
+const RATE_LIMITER_SHARDS: usize = 16;
+/// Per-shard soft capacity, chosen so the aggregate cap across all shards still
+/// equals `RATE_LIMITER_MAX_ENTRIES` — sharding must not silently multiply the
+/// effective capacity of these bounded maps.
+const RATE_LIMITER_PER_SHARD_MAX_ENTRIES: usize = RATE_LIMITER_MAX_ENTRIES / RATE_LIMITER_SHARDS;
 /// Default interval at which `AgentRateLimiter::with_backend`'s background
 /// poller mirrors fleet-wide lockouts (tripped on another node) into this
 /// node's local map. Bounds the "already-known-here" staleness window —
 /// see `state_backend.rs`'s module doc for the full design rationale.
 pub const RATE_LIMITER_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Part 6.2 P-1 (broadened scope) / Part 6.3: number of independent lock shards for
+/// `ZeroTrustGateway::revoked_tokens`, mirroring `trust_decay::TRUST_SHARDS`'s
+/// convention. This set is read on every Gate 1.0 pass (both the direct
+/// `is_token_revoked` check used by stream continuation/end frames, and the
+/// inline check inside `validate_lateral_movement`) and written on every
+/// `revoke_token` call — before sharding it was a single process-wide `Mutex`
+/// serializing every packet's revocation check behind every other packet's,
+/// regardless of which token each one actually concerned.
+const REVOKED_TOKENS_SHARDS: usize = 16;
+
+/// Maps a token signature hash to its shard index using the first byte of the
+/// hash itself. Unlike `trust_decay::trust_shard_index`'s key space, a
+/// signature hash is never namespace-prefixed (it's always a raw SHA-256 hex
+/// digest — see `sha256_hex`), so there is no prefix to skip: the first byte
+/// is already uniformly distributed.
+fn revoked_token_shard_index(sig_hash: &str) -> usize {
+    (sig_hash.as_bytes().first().copied().unwrap_or(0) as usize) % REVOKED_TOKENS_SHARDS
+}
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -62,28 +98,63 @@ fn now_epoch_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// Maps an `AgentRateLimiter` map key (an `agent_id`) to its shard index using the
+/// first byte of the key, matching `trust_decay::trust_shard_index`'s convention.
+fn ratelimit_shard_index(key: &str) -> usize {
+    (key.as_bytes().first().copied().unwrap_or(0) as usize) % RATE_LIMITER_SHARDS
+}
+
+fn new_ratelimit_shards<V>() -> Vec<Mutex<HashMap<String, V>>> {
+    (0..RATE_LIMITER_SHARDS).map(|_| Mutex::new(HashMap::new())).collect()
+}
+
+/// Lock and return the shard responsible for `key`.
+///
+/// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
+/// `AgentRateLimiter::global()` is a process-wide singleton, so one poisoning
+/// panic must not cascade into every other agent's rate-limit checks.
+fn ratelimit_shard<'a, V>(
+    shards: &'a [Mutex<HashMap<String, V>>],
+    key: &str,
+) -> std::sync::MutexGuard<'a, HashMap<String, V>> {
+    shards[ratelimit_shard_index(key)].lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
+/// L-7 fix: HMAC's spec (RFC 2104) accepts any key length — short keys are
+/// zero-padded, long keys are pre-hashed — so `Hmac::new_from_slice(key).unwrap()`
+/// was not actually reachable as a panic. But a short (or empty) key is a genuine
+/// *cryptographic weakness* regardless: a trivially guessable/brute-forceable MAC key.
+/// Rather than thread a new `Result` through this function's ~7 call sites across this
+/// file (a large blast radius for what the underlying weakness needs), any key shorter
+/// than 32 bytes is strengthened here by hashing it with SHA-256 first — every caller
+/// keeps compiling unchanged, but the *effective* key HMAC actually signs/verifies with
+/// is always full-entropy-width-derived, never a short raw value.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    let strengthened;
+    let key = if key.len() < 32 {
+        strengthened = Sha256::digest(key);
+        strengthened.as_slice()
+    } else {
+        key
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+/// M-1 fix: re-export the crate's single canonical constant-time comparison
+/// (see `security::constant_time_eq`'s doc comment) instead of carrying a
+/// separate byte-identical copy here. `gateway.rs` no longer defines its own —
+/// this alias exists purely so existing callers spelled as
+/// `crate::gateway::constant_time_eq` (e.g. `sidecar.rs`'s bearer-token auth,
+/// M-22) keep compiling unchanged.
+pub(crate) use crate::security::constant_time_eq;
 
 fn serialize_sorted_json(data: &HashMap<String, serde_json::Value>) -> Vec<u8> {
     let sorted: BTreeMap<&String, &serde_json::Value> = data.iter().collect();
@@ -146,6 +217,14 @@ pub struct TokenValidationResult {
     /// exactly as before. Feeds Gate 1.5's per-hop intent-drift tightening
     /// (`handler.rs`) — deeper delegation chains get a stricter overlap bar.
     pub delegation_depth: u32,
+    /// Part 6.1 (SHA-256 hash caching): the token signature's SHA-256 hex
+    /// digest, computed once here (the revocation-set lookup already needs
+    /// it) and carried out so callers (Gate 1.0's audit log, `StreamRegistry`
+    /// registration) don't independently re-derive it from the raw token
+    /// bytes a second and third time for the same packet. Cached inside
+    /// `CacheEntry` along with the rest of this struct, so a `token_cache`
+    /// hit costs zero extra hashing, exactly as it does today.
+    pub token_sig_hash: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,8 +251,8 @@ struct CoverRecord {
 /// backend (`::new()`/`::global()`), behavior is byte-for-byte identical to
 /// before this was added — purely in-process, no thread spawned.
 pub struct AgentRateLimiter {
-    records: Arc<Mutex<HashMap<String, RateRecord>>>,
-    cover_records: Arc<Mutex<HashMap<String, CoverRecord>>>,
+    records: Arc<Vec<Mutex<HashMap<String, RateRecord>>>>,
+    cover_records: Arc<Vec<Mutex<HashMap<String, CoverRecord>>>>,
     backend: Option<Arc<dyn StateBackend>>,
     poller_stop: Option<Arc<AtomicBool>>,
 }
@@ -189,8 +268,8 @@ fn ratelimit_lock_key(agent_id: &str) -> String {
 impl AgentRateLimiter {
     pub fn new() -> Self {
         Self {
-            records: Arc::new(Mutex::new(HashMap::new())),
-            cover_records: Arc::new(Mutex::new(HashMap::new())),
+            records: Arc::new(new_ratelimit_shards()),
+            cover_records: Arc::new(new_ratelimit_shards()),
             backend: None,
             poller_stop: None,
         }
@@ -207,7 +286,7 @@ impl AgentRateLimiter {
     /// Same as [`Self::with_backend`], with a configurable poll interval for
     /// the background lockout-mirroring thread.
     pub fn with_backend_and_poll_interval(backend: Arc<dyn StateBackend>, poll_interval: Duration) -> Self {
-        let records = Arc::new(Mutex::new(HashMap::new()));
+        let records = Arc::new(new_ratelimit_shards());
         let stop = Arc::new(AtomicBool::new(false));
 
         let poll_records = Arc::clone(&records);
@@ -224,7 +303,7 @@ impl AgentRateLimiter {
 
         Self {
             records,
-            cover_records: Arc::new(Mutex::new(HashMap::new())),
+            cover_records: Arc::new(new_ratelimit_shards()),
             backend: Some(backend),
             poller_stop: Some(stop),
         }
@@ -240,7 +319,7 @@ impl AgentRateLimiter {
         }
     }
 
-    fn poll_once(records: &Mutex<HashMap<String, RateRecord>>, backend: &dyn StateBackend) {
+    fn poll_once(records: &[Mutex<HashMap<String, RateRecord>>], backend: &dyn StateBackend) {
         // The `ratelimit:lock:` keyspace is small and self-cleaning (only
         // currently-locked-out agents, TTL-bounded at
         // RATE_LIMITER_LOCKOUT_SECONDS), so a SCAN here is cheap — this is
@@ -252,7 +331,7 @@ impl AgentRateLimiter {
             let Ok(text) = std::str::from_utf8(&bytes) else { continue };
             let Ok(locked_until) = text.parse::<f64>() else { continue };
 
-            let mut r = records.lock().unwrap();
+            let mut r = ratelimit_shard(records, agent_id);
             let rec = r.entry(agent_id.to_string()).or_insert(RateRecord {
                 errors: 0,
                 window_start: now_epoch_secs(),
@@ -277,7 +356,7 @@ impl AgentRateLimiter {
             // hammering the backend with every subsequent bad packet during
             // an active lockout.
             {
-                let records = self.records.lock().unwrap();
+                let records = ratelimit_shard(&self.records, agent_id);
                 if let Some(rec) = records.get(agent_id) {
                     if now < rec.locked_until {
                         return Err(SAACPHardDrop::new(
@@ -297,7 +376,7 @@ impl AgentRateLimiter {
                     if shared_count >= RATE_LIMITER_THRESHOLD as i64 {
                         let locked_until = now + RATE_LIMITER_LOCKOUT_SECONDS;
                         {
-                            let mut records = self.records.lock().unwrap();
+                            let mut records = ratelimit_shard(&self.records, agent_id);
                             let rec = records.entry(agent_id.to_string()).or_insert(RateRecord {
                                 errors: 0,
                                 window_start: now,
@@ -319,7 +398,7 @@ impl AgentRateLimiter {
                             ),
                         ));
                     }
-                    let mut records = self.records.lock().unwrap();
+                    let mut records = ratelimit_shard(&self.records, agent_id);
                     let rec = records.entry(agent_id.to_string()).or_insert(RateRecord {
                         errors: 0,
                         window_start: now,
@@ -335,14 +414,15 @@ impl AgentRateLimiter {
             }
         }
 
-        let mut records = self.records.lock().unwrap();
+        let mut records = ratelimit_shard(&self.records, agent_id);
 
         // IoT / low-resource fix: this map previously grew unbounded — one permanent
         // entry per distinct agent_id ever seen. Sweep stale entries (not currently
         // locked out AND window already elapsed — i.e. functionally identical to
-        // never having existed) only once the cap is exceeded, mirroring
-        // `memory::FederatedMemory`'s sweep-on-overflow idiom.
-        if records.len() >= RATE_LIMITER_MAX_ENTRIES {
+        // never having existed) only once this shard's (aggregate-cap-preserving)
+        // per-shard cap is exceeded, mirroring `memory::FederatedMemory`'s
+        // sweep-on-overflow idiom.
+        if records.len() >= RATE_LIMITER_PER_SHARD_MAX_ENTRIES {
             records.retain(|_, r| {
                 now < r.locked_until || (now - r.window_start) <= RATE_LIMITER_WINDOW_SECONDS
             });
@@ -389,11 +469,11 @@ impl AgentRateLimiter {
     /// signal) — a per-packet backend round trip here would reintroduce
     /// exactly the regression the hybrid design avoids for `record_error`.
     pub fn record_cover_traffic(&self, agent_id: &str) -> Result<(), SAACPHardDrop> {
-        let mut records = self.cover_records.lock().unwrap();
+        let mut records = ratelimit_shard(&self.cover_records, agent_id);
         let now = now_epoch_secs();
 
         // IoT / low-resource fix: same unbounded-growth issue as `record_error`'s map.
-        if records.len() >= RATE_LIMITER_MAX_ENTRIES {
+        if records.len() >= RATE_LIMITER_PER_SHARD_MAX_ENTRIES {
             records.retain(|_, r| (now - r.window_start) <= COVER_TRAFFIC_WINDOW_SECONDS);
         }
 
@@ -428,9 +508,21 @@ impl AgentRateLimiter {
     /// via `record_error`'s immediate local write (same node) or the
     /// background poller (other nodes, bounded by the poll interval).
     pub fn is_locked(&self, agent_id: &str) -> bool {
-        let records = self.records.lock().unwrap();
+        self.is_locked_at(agent_id, now_epoch_secs())
+    }
+
+    /// opusplan.md 6.4 item 1: same as [`Self::is_locked`], but takes an
+    /// already-captured wall-clock reading instead of calling `now_epoch_secs()`
+    /// internally — lets a caller that's about to make several near-simultaneous
+    /// time-sensitive checks (e.g. `intercept_packet_full`'s pre-gate circuit-breaker
+    /// and trust-decay reauth checks, a few lines apart with no state change between
+    /// them) share one syscall instead of each check taking its own. `is_locked`
+    /// itself is untouched and remains the right choice for any caller that doesn't
+    /// already have a `now` in hand.
+    pub fn is_locked_at(&self, agent_id: &str, now: f64) -> bool {
+        let records = ratelimit_shard(&self.records, agent_id);
         if let Some(rec) = records.get(agent_id) {
-            return now_epoch_secs() < rec.locked_until;
+            return now < rec.locked_until;
         }
         false
     }
@@ -449,15 +541,19 @@ impl AgentRateLimiter {
     /// Reset records for an agent (or all agents if None).
     pub fn reset(&self, agent_id: Option<&str>) {
         if let Some(id) = agent_id {
-            self.records.lock().unwrap().remove(id);
-            self.cover_records.lock().unwrap().remove(id);
+            ratelimit_shard(&self.records, id).remove(id);
+            ratelimit_shard(&self.cover_records, id).remove(id);
             if let Some(backend) = &self.backend {
                 let _ = backend.delete(&ratelimit_err_key(id));
                 let _ = backend.delete(&ratelimit_lock_key(id));
             }
         } else {
-            self.records.lock().unwrap().clear();
-            self.cover_records.lock().unwrap().clear();
+            for s in self.records.iter() {
+                s.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+            for s in self.cover_records.iter() {
+                s.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
             if let Some(backend) = &self.backend {
                 if let Ok(keys) = backend.scan_prefix("ratelimit:") {
                     for key in keys {
@@ -496,7 +592,10 @@ struct CacheEntry {
 
 /// Zero-Trust Tokenized Micro-Gateway.
 pub struct ZeroTrustGateway {
-    revoked_tokens: Mutex<HashSet<String>>,
+    /// Part 6.3: sharded 16-way on the signature hash's first byte (see
+    /// `revoked_token_shard_index`) — access via `revoked_shard()`, never
+    /// directly.
+    revoked_tokens: Vec<Mutex<HashSet<String>>>,
     token_cache: Mutex<HashMap<String, CacheEntry>>,
     // S-3 fix: issuer secrets are long-term key material held for the life of the
     // process — wrapped in `Zeroizing` so a value is cleared from heap memory
@@ -525,7 +624,7 @@ pub struct ZeroTrustGateway {
 impl ZeroTrustGateway {
     pub fn new() -> Self {
         Self {
-            revoked_tokens: Mutex::new(HashSet::new()),
+            revoked_tokens: (0..REVOKED_TOKENS_SHARDS).map(|_| Mutex::new(HashSet::new())).collect(),
             token_cache: Mutex::new(HashMap::new()),
             trusted_issuer_keys: Mutex::new(HashMap::new()),
             strict_asymmetric_mode: Mutex::new(false),
@@ -548,21 +647,27 @@ impl ZeroTrustGateway {
     }
 
     /// When true, HMAC-PSK tokens are rejected outright.
+    ///
+    /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
+    /// poison rather than panicking (`.unwrap()`) — `ZeroTrustGateway::global()`
+    /// is a process-wide singleton, so one poisoning panic must not cascade
+    /// into every other in-flight packet losing token validation/revocation
+    /// entirely.
     pub fn set_strict_asymmetric_mode(&self, enabled: bool) {
-        *self.strict_asymmetric_mode.lock().unwrap() = enabled;
-        self.token_cache.lock().unwrap().clear();
+        *self.strict_asymmetric_mode.lock().unwrap_or_else(|e| e.into_inner()) = enabled;
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// T3.1 — Register a FAITF TrustStore for identity verification.
     pub fn register_trust_store(&self, ts: Arc<TrustStore>) {
-        *self.trust_store.lock().unwrap() = Some(ts);
-        self.token_cache.lock().unwrap().clear();
+        *self.trust_store.lock().unwrap_or_else(|e| e.into_inner()) = Some(ts);
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// T3.2 — Register an ACSVAF CapabilityVerificationAuthority.
     pub fn register_capability_authority(&self, ca: Arc<CapabilityVerificationAuthority>) {
-        *self.capability_authority.lock().unwrap() = Some(ca);
-        self.token_cache.lock().unwrap().clear();
+        *self.capability_authority.lock().unwrap_or_else(|e| e.into_inner()) = Some(ca);
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Register the canonical token-signing key for a trusted issuer.
@@ -588,20 +693,31 @@ impl ZeroTrustGateway {
                 format!("register_issuer_key: secret must be exactly 32 bytes, got {}", issuer_secret.len()),
             ));
         }
-        self.trusted_issuer_keys
-            .lock()
-            .unwrap()
-            .insert(issuer_agent.to_string(), Zeroizing::new(issuer_secret.to_vec()));
-        self.token_cache.lock().unwrap().clear();
-        *self.issuer_registry_epoch.lock().unwrap() += 1;
+        {
+            let mut keys = self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner());
+            // L-9 fix: reject growing past the cap for a genuinely NEW issuer — but
+            // always allow re-registering (rotating the key of) an issuer already
+            // tracked, since that never grows the map.
+            if keys.len() >= MAX_TRUSTED_ISSUERS && !keys.contains_key(issuer_agent) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::RgcResourceLimitExceeded,
+                    format!(
+                        "register_issuer_key: at capacity ({MAX_TRUSTED_ISSUERS} trusted issuers); rejecting new issuer '{issuer_agent}'"
+                    ),
+                ));
+            }
+            keys.insert(issuer_agent.to_string(), Zeroizing::new(issuer_secret.to_vec()));
+        }
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         Ok(())
     }
 
     /// Clear trusted issuer registry.
     pub fn clear_trusted_issuers(&self) {
-        self.trusted_issuer_keys.lock().unwrap().clear();
-        self.token_cache.lock().unwrap().clear();
-        *self.issuer_registry_epoch.lock().unwrap() += 1;
+        self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     /// Issue a capability token (HMAC-SHA256 path).
@@ -655,6 +771,16 @@ impl ZeroTrustGateway {
         base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
     }
 
+    /// Lock and return the shard responsible for `sig_hash`.
+    ///
+    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
+    /// `ZeroTrustGateway::global()` is a process-wide singleton, so one
+    /// poisoning panic must not cascade into every other in-flight packet
+    /// losing revocation enforcement entirely.
+    fn revoked_shard(&self, sig_hash: &str) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.revoked_tokens[revoked_token_shard_index(sig_hash)].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Revoke a token by adding its signature hash to the revocation set.
     pub fn revoke_token(&self, token_b64: &[u8]) -> Result<(), String> {
         let (_token_json, signature) = parse_token_wire(token_b64)
@@ -663,20 +789,20 @@ impl ZeroTrustGateway {
             return Err("Token has no signature to revoke.".into());
         }
         let sig_hash = sha256_hex(&signature);
-        self.revoked_tokens.lock().unwrap().insert(sig_hash);
-        self.token_cache.lock().unwrap().clear();
-        *self.revocation_epoch.lock().unwrap() += 1;
+        self.revoked_shard(&sig_hash).insert(sig_hash);
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         Ok(())
     }
 
     /// Returns the current revocation epoch.
     pub fn get_revocation_epoch(&self) -> u64 {
-        *self.revocation_epoch.lock().unwrap()
+        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Check if a token signature hash is in the revocation set.
     pub fn is_token_revoked(&self, token_sig_hash: &str) -> bool {
-        self.revoked_tokens.lock().unwrap().contains(token_sig_hash)
+        self.revoked_shard(token_sig_hash).contains(token_sig_hash)
     }
 
     /// PSK Compromise Recovery: revoke ALL tokens, flush ALL caches (M-6 fix).
@@ -692,12 +818,12 @@ impl ZeroTrustGateway {
         // `iat` as a `u64`) — comparing a fractional timestamp against a
         // floored one could spuriously reject a token issued in the same
         // wall-clock second as this call, after it.
-        *self.blanket_revoked_before.lock().unwrap() = now_epoch_secs().floor();
-        self.token_cache.lock().unwrap().clear();
-        self.trusted_issuer_keys.lock().unwrap().clear();
-        let mut rev_epoch = self.revocation_epoch.lock().unwrap();
+        *self.blanket_revoked_before.lock().unwrap_or_else(|e| e.into_inner()) = now_epoch_secs().floor();
+        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut rev_epoch = self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner());
         *rev_epoch += 1;
-        let mut iss_epoch = self.issuer_registry_epoch.lock().unwrap();
+        let mut iss_epoch = self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner());
         *iss_epoch += 1;
         *rev_epoch
     }
@@ -713,8 +839,8 @@ impl ZeroTrustGateway {
     ) -> Result<TokenValidationResult, SAACPHardDrop> {
         let now = now_epoch_secs();
         let fallback_key_hash = sha256_hex(issuer_secret);
-        let registry_epoch = *self.issuer_registry_epoch.lock().unwrap();
-        let revocation_epoch = *self.revocation_epoch.lock().unwrap();
+        let registry_epoch = *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        let revocation_epoch = *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner());
 
         // Hash the token before using it as a cache key — never store the plaintext
         // capability token in a data structure that could be heap-dumped or logged.
@@ -730,7 +856,7 @@ impl ZeroTrustGateway {
 
         // Check cache
         {
-            let cache = self.token_cache.lock().unwrap();
+            let cache = self.token_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = cache.get(&cache_key) {
                 if now < entry.expiry {
                     return Ok(entry.result.clone());
@@ -757,7 +883,7 @@ impl ZeroTrustGateway {
 
         // Check revocation
         let sig_hash = sha256_hex(&signature);
-        if self.revoked_tokens.lock().unwrap().contains(&sig_hash) {
+        if self.revoked_shard(&sig_hash).contains(&sig_hash) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::LateralMovementBlocked,
                 "Capability Token has been REVOKED.",
@@ -776,7 +902,7 @@ impl ZeroTrustGateway {
             .unwrap_or("hmac-sha256");
 
         // Reject HMAC in strict mode
-        if *self.strict_asymmetric_mode.lock().unwrap() && sig_alg != "ed25519" {
+        if *self.strict_asymmetric_mode.lock().unwrap_or_else(|e| e.into_inner()) && sig_alg != "ed25519" {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "HMAC-PSK tokens are rejected in strict asymmetric mode.",
@@ -785,7 +911,7 @@ impl ZeroTrustGateway {
 
         // HMAC-SHA256 verification
         if sig_alg != "ed25519" {
-            let trusted_keys = self.trusted_issuer_keys.lock().unwrap();
+            let trusted_keys = self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner());
             let has_registry = !trusted_keys.is_empty();
             let trusted_secret = trusted_keys.get(&source_agent).cloned();
             drop(trusted_keys);
@@ -820,6 +946,50 @@ impl ZeroTrustGateway {
                     "Capability Token has been tampered with!",
                 ));
             }
+        } else {
+            // Ed25519 (asymmetric) verification path. SECURITY (I-1/I-10 fail-closed):
+            // previously this branch did NOTHING — a token declaring
+            // `_sig_alg: "ed25519"` skipped the HMAC block above and reached the
+            // authorization checks with its signature never verified, so any
+            // attacker-supplied signature was accepted. Worse, `strict_asymmetric_mode`
+            // *forces* every token onto this branch, so enabling "strict" security
+            // actually disabled signature verification entirely. The token's
+            // `kid` claim selects the issuer's registered verifying key from the
+            // `CapabilityVerificationAuthority` wired via `register_capability_authority`;
+            // as a fallback, the issuer's identity-pinned key in a registered FAITF
+            // `TrustStore` (wired via `register_trust_store`, T3.1) is accepted too.
+            // Absence of both key sources, an unknown kid/issuer, a missing kid, or a
+            // bad signature all reject.
+            let kid = obj.get("kid").and_then(|v| v.as_str()).ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "Ed25519 capability token is missing its 'kid' claim.",
+                )
+            })?;
+            let ca = self.capability_authority.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let ca_key = ca.and_then(|ca| ca.get_verification_key(kid));
+            let vk = match ca_key {
+                Some(vk) => vk,
+                None => {
+                    // Fallback: FAITF TrustStore identity-pinned key for this issuer.
+                    let ts = self.trust_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    match ts.and_then(|ts| ts.get_pinned_key(&source_agent)) {
+                        Some(vk) => vk,
+                        None => {
+                            return Err(SAACPHardDrop::new(
+                                SAACPBytecodes::AcsvafKeyNotTrusted,
+                                format!(
+                                    "Ed25519 capability token kid '{kid}' (issuer '{source_agent}') \
+                                     is not a trusted key in either the CapabilityVerificationAuthority \
+                                     or the FAITF TrustStore. Register one via \
+                                     register_capability_authority / register_trust_store (fail-closed).",
+                                ),
+                            ));
+                        }
+                    }
+                }
+            };
+            verify_ed25519_signature_inner(&token_json, &signature, vk.as_bytes())?;
         }
 
         // H-2 fix: blanket, epoch-based rejection for PSK compromise recovery.
@@ -831,7 +1001,7 @@ impl ZeroTrustGateway {
         // `revoked_tokens`. A token missing `iat` (pre-fix wire format) is
         // treated as issued at time 0 — fail-closed once any blanket
         // revocation has occurred.
-        let blanket_revoked_before = *self.blanket_revoked_before.lock().unwrap();
+        let blanket_revoked_before = *self.blanket_revoked_before.lock().unwrap_or_else(|e| e.into_inner());
         if blanket_revoked_before > 0.0 {
             let iat = obj.get("iat").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
             if iat < blanket_revoked_before {
@@ -956,6 +1126,7 @@ impl ZeroTrustGateway {
             root_intent_hash,
             max_action_class,
             delegation_depth,
+            token_sig_hash: sig_hash,
         };
 
         // T3.7: eviction — drop expired first, then soonest-expiring 20% if still full.
@@ -966,7 +1137,7 @@ impl ZeroTrustGateway {
         // entries is deterministic (based on content, not iteration order) and correct:
         // entries closest to natural expiry provide the least residual value anyway.
         let cache_expiry = (now_epoch_secs() + TOKEN_CACHE_TTL).min(exp);
-        let mut cache = self.token_cache.lock().unwrap();
+        let mut cache = self.token_cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= TOKEN_CACHE_MAX {
             let current_time = now_epoch_secs();
             // First pass: drop already-expired entries (free, no ordering needed).
@@ -991,16 +1162,6 @@ impl ZeroTrustGateway {
         });
 
         Ok(result)
-    }
-
-    // T3.3 — Ed25519 signature verification path (delegates to module-level fn)
-    #[allow(dead_code)]
-    fn verify_ed25519_signature(
-        token_json: &[u8],
-        signature: &[u8],
-        pub_key_bytes: &[u8],
-    ) -> Result<(), SAACPHardDrop> {
-        verify_ed25519_signature_inner(token_json, signature, pub_key_bytes)
     }
 }
 
@@ -1241,6 +1402,7 @@ impl RRBCGateway {
 
         // Register token
         let data: serde_json::Value = serde_json::from_slice(&token_json).unwrap_or(serde_json::Value::Null);
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.tokens.lock().unwrap().insert(jti, RRBCTokenRecord {
             data,
             remaining: max_use,
@@ -1328,6 +1490,7 @@ impl RRBCGateway {
         let jti = obj.get("jti").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         // Revocation check
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         if self.revoked_jtis.lock().unwrap().contains(&jti) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::LateralMovementBlocked,
@@ -1383,6 +1546,7 @@ impl RRBCGateway {
         // Replay protection
         let replay_key = (jti.clone(), rnonce.to_string(), presenting_sid.to_string());
         {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut registry = self.replay_registry.lock().unwrap();
 
             // TTL-based eviction: prune entries whose bound token has expired.
@@ -1413,6 +1577,7 @@ impl RRBCGateway {
 
         // Usage counter
         let remaining = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut tokens = self.tokens.lock().unwrap();
             if let Some(rec) = tokens.get_mut(&jti) {
                 if rec.remaining <= 0 {
@@ -1501,8 +1666,10 @@ impl RRBCGateway {
 
     /// Revoke a token by JTI.
     pub fn revoke_token(&self, jti: &str) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut revoked = self.revoked_jtis.lock().unwrap();
         revoked.insert(jti.to_string());
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut tokens = self.tokens.lock().unwrap();
         if let Some(rec) = tokens.get_mut(jti) {
             rec.revoked = true;
@@ -1512,17 +1679,20 @@ impl RRBCGateway {
 
     /// Check if a JTI has been revoked.
     pub fn is_jti_revoked(&self, jti: &str) -> bool {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.revoked_jtis.lock().unwrap().contains(jti)
     }
 
     /// Return remaining uses for a JTI, or None if not in registry.
     pub fn get_remaining_uses(&self, jti: &str) -> Option<i64> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let tokens = self.tokens.lock().unwrap();
         tokens.get(jti).map(|rec| rec.remaining)
     }
 
     /// Clear all replay state. Returns count of cleared entries.
     pub fn clear_replay_registry(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut registry = self.replay_registry.lock().unwrap();
         let n = registry.len();
         registry.clear();
@@ -1532,6 +1702,7 @@ impl RRBCGateway {
     /// Prune expired replay-registry entries (entries whose token_exp < now).
     /// Returns the count of pruned entries. Call periodically from a maintenance task.
     pub fn prune_expired_replay_entries(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut registry = self.replay_registry.lock().unwrap();
         let before = registry.len();
         let now = now_epoch_secs();
@@ -1541,6 +1712,7 @@ impl RRBCGateway {
 
     /// Return the current size of the replay registry (for monitoring).
     pub fn replay_registry_size(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.replay_registry.lock().unwrap().len()
     }
 }
@@ -1579,6 +1751,24 @@ mod tests {
         assert!(rl.is_locked("agent1"));
         rl.reset(Some("agent1"));
         assert!(!rl.is_locked("agent1"));
+    }
+
+    /// opusplan.md 6.4 item 1: `is_locked_at` must agree with `is_locked` — same
+    /// answer whether the caller supplies `now` explicitly or lets `is_locked` capture
+    /// it internally, since they're the same comparison against `locked_until`.
+    #[test]
+    fn is_locked_at_agrees_with_is_locked() {
+        let rl = AgentRateLimiter::new();
+        for _ in 0..5 {
+            let _ = rl.record_error("agent1");
+        }
+        assert!(rl.is_locked("agent1"));
+
+        let now = now_epoch_secs();
+        assert!(rl.is_locked_at("agent1", now), "a `now` at the current instant must still read as locked");
+        assert!(!rl.is_locked_at("agent1", now + RATE_LIMITER_LOCKOUT_SECONDS + 1.0),
+            "a `now` far past the lockout window must read as unlocked");
+        assert!(!rl.is_locked_at("never-locked-agent", now));
     }
 
     #[test]
@@ -1885,6 +2075,124 @@ mod tests {
         );
         let result = gw.validate_lateral_movement("agent-b", &token, untrusted_secret);
         assert!(result.is_err(), "an issuer absent from a non-empty registry must be rejected");
+    }
+
+    /// Build an Ed25519-signed capability token wire blob: sorted-JSON claims
+    /// (including `_sig_alg:"ed25519"` and `kid`) with a real Ed25519 signature
+    /// over those exact bytes, or — when `tamper` is true — a bogus signature.
+    #[cfg(test)]
+    fn build_ed25519_token(
+        sk: &ed25519_dalek::SigningKey,
+        kid: &str,
+        issuer: &str,
+        allow: &[&str],
+        tamper: bool,
+    ) -> Vec<u8> {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let iat = now_epoch_secs() as u64;
+        let mut token_data: HashMap<String, serde_json::Value> = HashMap::new();
+        token_data.insert("iss".into(), serde_json::Value::String(issuer.into()));
+        token_data.insert("kid".into(), serde_json::Value::String(kid.into()));
+        token_data.insert("_sig_alg".into(), serde_json::Value::String("ed25519".into()));
+        token_data.insert("iat".into(), serde_json::Value::Number(iat.into()));
+        token_data.insert("exp".into(), serde_json::Value::Number((iat + 3600).into()));
+        token_data.insert("allow".into(), sorted_str_array(allow));
+        token_data.insert("forbid".into(), sorted_str_array(&[]));
+        token_data.insert("max_action_class".into(), serde_json::Value::Number(1u8.into()));
+        let token_json = serialize_sorted_json(&token_data);
+        let signature = if tamper {
+            [0x7u8; 64]
+        } else {
+            sk.sign(&token_json).to_bytes()
+        };
+        let json_len = u32::try_from(token_json.len()).unwrap_or(u32::MAX);
+        let mut packed = Vec::with_capacity(4 + token_json.len() + 64);
+        packed.extend_from_slice(&json_len.to_be_bytes());
+        packed.extend_from_slice(&token_json);
+        packed.extend_from_slice(&signature);
+        base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+    }
+
+    /// SECURITY regression (ed25519 fail-open): a token declaring
+    /// `_sig_alg:"ed25519"` must have its signature verified. Before the fix the
+    /// ed25519 branch did nothing, so ANY signature — including an all-0x07
+    /// forgery — was accepted. Now: no CVA registered ⇒ reject; unknown kid ⇒
+    /// reject; forged signature ⇒ reject; genuine signature over the claims ⇒ ok.
+    #[test]
+    fn test_ed25519_token_signature_is_verified_fail_closed() {
+        use ed25519_dalek::SigningKey;
+        let mut csprng = rand::thread_rng();
+        let sk = SigningKey::generate(&mut csprng);
+        let vk = sk.verifying_key();
+        let kid = "ed25519-test-kid";
+
+        // 1. No CapabilityVerificationAuthority registered ⇒ fail closed.
+        let gw = ZeroTrustGateway::new();
+        let genuine = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], false);
+        assert!(
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret").is_err(),
+            "ed25519 token with no registered authority must be rejected (fail-closed)"
+        );
+
+        // 2. Authority registered but for a DIFFERENT kid ⇒ unknown kid ⇒ reject.
+        let gw = ZeroTrustGateway::new();
+        let ca = Arc::new(CapabilityVerificationAuthority::new());
+        ca.register_key("some-other-kid", vk);
+        gw.register_capability_authority(Arc::clone(&ca));
+        assert!(
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret").is_err(),
+            "ed25519 token whose kid has no registered key must be rejected"
+        );
+
+        // 3. Correct kid registered but signature is forged ⇒ reject.
+        let gw = ZeroTrustGateway::new();
+        let ca = Arc::new(CapabilityVerificationAuthority::new());
+        ca.register_key(kid, vk);
+        gw.register_capability_authority(Arc::clone(&ca));
+        let forged = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], true);
+        assert!(
+            gw.validate_lateral_movement("agent-b", &forged, b"unused-secret").is_err(),
+            "ed25519 token with a forged signature must be rejected"
+        );
+
+        // 4. Correct kid + genuine signature over the claims ⇒ accepted.
+        let result = gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret");
+        assert!(
+            result.is_ok(),
+            "ed25519 token with a valid signature over its claims must be accepted: {result:?}"
+        );
+        assert_eq!(result.unwrap().source_agent, "agent-a");
+    }
+
+    /// SECURITY regression: `strict_asymmetric_mode` forces every token onto the
+    /// ed25519 branch. That branch must actually verify signatures — a forged
+    /// ed25519 token must not sail through just because strict mode is on.
+    #[test]
+    fn test_strict_asymmetric_mode_still_verifies_ed25519_signature() {
+        use ed25519_dalek::SigningKey;
+        let mut csprng = rand::thread_rng();
+        let sk = SigningKey::generate(&mut csprng);
+        let vk = sk.verifying_key();
+        let kid = "ed25519-strict-kid";
+
+        let gw = ZeroTrustGateway::new();
+        gw.set_strict_asymmetric_mode(true);
+        let ca = Arc::new(CapabilityVerificationAuthority::new());
+        ca.register_key(kid, vk);
+        gw.register_capability_authority(Arc::clone(&ca));
+
+        let forged = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], true);
+        assert!(
+            gw.validate_lateral_movement("agent-b", &forged, b"unused").is_err(),
+            "strict mode must not accept a forged ed25519 signature"
+        );
+
+        let genuine = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], false);
+        assert!(
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused").is_ok(),
+            "strict mode must accept a genuine ed25519 signature"
+        );
     }
 
     #[test]

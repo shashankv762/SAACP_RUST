@@ -4,7 +4,7 @@
 //! within the MAX_TIMEOUT limit, the session is terminated.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 use std::thread;
 
@@ -161,7 +161,11 @@ impl DeadMansSwitch {
                 );
             }
             None => {
-                let mut inner = self.inner.lock().expect("lock poisoned");
+                // M-38 fix: every `self.inner.lock()` in this impl block recovers via
+                // `into_inner()` on poison rather than panicking — `GLOBAL_DEAD_MANS_SWITCH`
+                // is a process-wide singleton, so one poisoning panic must not cascade
+                // into every other session's ping-tracking/timeout checks.
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if inner.active_sessions.len() >= self.max_sessions {
                     // Evict the oldest session to stay under the cap
                     if let Some(oldest_key) = inner.active_sessions.iter()
@@ -190,7 +194,7 @@ impl DeadMansSwitch {
     }
 
     fn ping_local(&self, context_state_id: &[u8], now: f64) -> bool {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // ── Ping-flood detection (DMS-PINGFLOOD fix) ─────────────────────────
         // A compromised context can call ping at maximum rate to stay alive forever.
@@ -252,10 +256,26 @@ impl DeadMansSwitch {
     }
 
     /// Remove the session from tracking.
+    ///
+    /// M-19 fix: the local-mode branch also removes `context_state_id`'s
+    /// entry from `ping_flood_records`. That map has no TTL/expiry mechanism
+    /// of its own — it is only ever pruned opportunistically inside `ping()`
+    /// (see `ping_local`'s window-reset logic), which never runs again once a
+    /// session stops pinging (e.g. because it was just unregistered). Without
+    /// this, every session that is ever unregistered leaks one
+    /// `ping_flood_records` entry permanently, growing unbounded under normal
+    /// session churn. Backend mode is unaffected: its flood-key already
+    /// carries its own TTL (`DEAD_MAN_PING_FLOOD_WINDOW_SECS * 2.0`, set in
+    /// `ping_backend`), so it self-expires without needing an explicit
+    /// delete here.
     pub fn unregister_session(&self, context_state_id: &[u8]) {
         match &self.backend {
             Some(backend) => { let _ = backend.delete(&Self::session_key(context_state_id)); }
-            None => { self.inner.lock().expect("lock poisoned").active_sessions.remove(context_state_id); }
+            None => {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.active_sessions.remove(context_state_id);
+                inner.ping_flood_records.remove(context_state_id);
+            }
         }
     }
 
@@ -281,7 +301,7 @@ impl DeadMansSwitch {
                 stale
             }
             None => {
-                let mut inner = self.inner.lock().expect("lock poisoned");
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let stale: Vec<Vec<u8>> = inner.active_sessions.iter()
                     .filter(|(_, &last_ping)| (now - last_ping) > self.max_timeout)
                     .map(|(k, _)| k.clone())
@@ -302,7 +322,7 @@ impl DeadMansSwitch {
     pub fn session_count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("dms:session:").map(|k| k.len()).unwrap_or(0),
-            None => self.inner.lock().expect("lock poisoned").active_sessions.len(),
+            None => self.inner.lock().unwrap_or_else(|e| e.into_inner()).active_sessions.len(),
         }
     }
 
@@ -310,7 +330,7 @@ impl DeadMansSwitch {
     pub fn is_active(&self, context_state_id: &[u8]) -> bool {
         match &self.backend {
             Some(backend) => backend.get(&Self::session_key(context_state_id)).ok().flatten().is_some(),
-            None => self.inner.lock().expect("lock poisoned").active_sessions.contains_key(context_state_id),
+            None => self.inner.lock().unwrap_or_else(|e| e.into_inner()).active_sessions.contains_key(context_state_id),
         }
     }
 
@@ -331,8 +351,35 @@ impl Default for DeadMansSwitch {
 // ===========================================================================
 
 /// Background heartbeat that periodically pings a DeadMansSwitch.
+///
+/// M-20 analysis (OS thread is deliberate here, not a stopgap): this type
+/// spawns a dedicated `std::thread` per instance rather than a `tokio::spawn`
+/// task. `TemporalHeartbeat` is public library API (exported from `lib.rs`
+/// with a `TemporalHeartbeatThread` Python-parity alias) with no documented
+/// requirement that a Tokio runtime be active — its own test coverage
+/// (`test_heartbeat_starts_and_stops`) constructs and drives it from a plain
+/// synchronous `#[test]`, not `#[tokio::test]`, and no call site anywhere in
+/// this crate (`daemon.rs`, `sidecar.rs`, `command_center.rs`) references it
+/// at all today. Switching to `tokio::spawn` would panic ("there is no
+/// reactor running") for any synchronous caller or embedder — exactly the
+/// same reasoning `maintenance.rs`'s module doc comment gives for why its own
+/// coordinator thread is deliberately not built on `tokio::spawn` either. The
+/// per-instance thread stack cost (2-8MB, OS-dependent) this finding flags is
+/// real but bounded by however many concurrent `TemporalHeartbeat` instances
+/// a caller chooses to run — if a future caller needs many concurrent
+/// heartbeats from an async context specifically, that call site should
+/// route through `tokio::spawn` + `tokio::time::interval` itself (or drive
+/// `DeadMansSwitch::ping` from `MaintenanceCoordinator`, which already
+/// consolidates several other per-subsystem background threads into one),
+/// rather than this type's general-purpose, runtime-agnostic implementation
+/// changing underneath every existing (synchronous) caller.
 pub struct TemporalHeartbeat {
-    stop_flag: Arc<Mutex<bool>>,
+    // L-19 fix: `Condvar` paired with the stop flag lets `stop()` wake the
+    // background thread immediately (`notify_one`) instead of it only
+    // noticing the flag after `thread::sleep(interval)` returns on its own —
+    // previously `.stop()` -> `.join()` could block the caller for up to one
+    // full `interval_secs` even though the thread was idle the whole time.
+    stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -343,27 +390,34 @@ impl TemporalHeartbeat {
         session_id: Vec<u8>,
         interval_secs: f64,
     ) -> Self {
-        let stop_flag = Arc::new(Mutex::new(false));
-        let stop_clone = stop_flag.clone();
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_clone = stop.clone();
 
         let handle = thread::Builder::new()
             .name("heartbeat".to_string())
             .spawn(move || {
                 let interval = Duration::from_millis((interval_secs * 1000.0) as u64);
+                let (lock, condvar) = &*stop_clone;
                 loop {
-                    thread::sleep(interval);
-                    if let Ok(stopped) = stop_clone.lock() {
-                        if *stopped {
-                            break;
-                        }
+                    let guard = match lock.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let (stopped, _timeout_result) = match condvar.wait_timeout(guard, interval) {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    if *stopped {
+                        break;
                     }
+                    drop(stopped);
                     let _ = switch.ping(&session_id);
                 }
             })
             .expect("failed to spawn heartbeat thread");
 
         Self {
-            stop_flag,
+            stop,
             handle: Some(handle),
         }
     }
@@ -373,11 +427,14 @@ impl TemporalHeartbeat {
         Self::start(switch, session_id, HEARTBEAT_INTERVAL_SECONDS)
     }
 
-    /// Stop the heartbeat thread.
+    /// Stop the heartbeat thread. Wakes it immediately via `Condvar::notify_one`
+    /// rather than waiting for its current sleep window to elapse on its own.
     pub fn stop(&mut self) {
-        if let Ok(mut stopped) = self.stop_flag.lock() {
+        let (lock, condvar) = &*self.stop;
+        if let Ok(mut stopped) = lock.lock() {
             *stopped = true;
         }
+        condvar.notify_one();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -437,6 +494,57 @@ mod tests {
         dms.unregister_session(&sid);
         assert!(!dms.is_active(&sid));
         assert_eq!(dms.session_count(), 0);
+    }
+
+    /// M-19 regression: `unregister_session` (local mode) must also clean up
+    /// `ping_flood_records`, not just `active_sessions`. Before the fix, this
+    /// entry would remain forever — `ping_flood_records` has no independent
+    /// TTL/expiry, only opportunistic pruning inside `ping()` itself, which
+    /// never runs again for an unregistered session.
+    #[test]
+    fn test_unregister_also_clears_ping_flood_record() {
+        let dms = DeadMansSwitch::new();
+        let sid = vec![6u8; 32];
+        dms.register_session(&sid);
+        // Ping at least once so a ping_flood_records entry actually exists.
+        dms.ping(&sid);
+        {
+            let inner = dms.inner.lock().expect("lock poisoned");
+            assert!(
+                inner.ping_flood_records.contains_key(&sid),
+                "test setup: a ping_flood_records entry must exist after ping()"
+            );
+        }
+
+        dms.unregister_session(&sid);
+
+        let inner = dms.inner.lock().expect("lock poisoned");
+        assert!(
+            !inner.ping_flood_records.contains_key(&sid),
+            "M-19: ping_flood_records entry must be removed on unregister_session, \
+             not leaked forever"
+        );
+    }
+
+    /// M-19: repeated register -> ping -> unregister cycles for DIFFERENT
+    /// session IDs must not leave `ping_flood_records` growing unbounded —
+    /// proves the fix holds under session churn, not just a single instance.
+    #[test]
+    fn test_ping_flood_records_bounded_under_session_churn() {
+        let dms = DeadMansSwitch::new();
+        for i in 0..50u8 {
+            let sid = vec![i; 32];
+            dms.register_session(&sid);
+            dms.ping(&sid);
+            dms.unregister_session(&sid);
+        }
+        let inner = dms.inner.lock().expect("lock poisoned");
+        assert_eq!(
+            inner.ping_flood_records.len(),
+            0,
+            "M-19: ping_flood_records must not accumulate entries across \
+             register/ping/unregister churn"
+        );
     }
 
     #[test]

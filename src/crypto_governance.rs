@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sha2::{Sha256, Digest};
 
+use crate::security::constant_time_eq_hex;
+
 fn now_epoch_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -146,6 +148,18 @@ fn canonical_json(entry: &CryptoLedgerEntry) -> String {
 }
 
 /// Append-only, hash-chained ledger of all cryptographic governance events.
+///
+/// R-1: `log`/`last_hash` hold the *audit trail* of governance events, not the
+/// governance decision state itself — suite accept/reject/deprecate decisions
+/// are made by `ApprovedSuitePolicy` (no mutex, evaluated independently of
+/// this ledger) before or alongside any `append()` call. A poisoned lock here
+/// therefore cannot flip an accept/reject outcome; it would only risk this
+/// audit log becoming unusable for every future caller (every `negotiate()`,
+/// `get_suite()`, `register_suite()` call appends to a shared ledger), which
+/// is a needless availability cascade, not a security bypass. So — matching
+/// the established `CRYPTO_SUITES` idiom (see `cryptosuite.rs` M-38 fix) —
+/// lock methods here recover from poisoning via `into_inner()` instead of
+/// propagating the panic to every subsequent caller.
 pub struct CryptoTransparencyLedger {
     log: Mutex<Vec<CryptoLedgerEntry>>,
     last_hash: Mutex<String>,
@@ -162,28 +176,33 @@ impl CryptoTransparencyLedger {
     /// Append an entry with hash-chaining.
     pub fn append(&self, mut entry: CryptoLedgerEntry) {
         let canonical = canonical_json(&entry);
-        let prev = self.last_hash.lock().unwrap().clone();
+        let prev = self.last_hash.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let chain_input = format!("{}{}", prev, canonical);
         let hash = sha256_hex(chain_input.as_bytes());
         entry.entry_hash = hash.clone();
-        *self.last_hash.lock().unwrap() = hash;
-        self.log.lock().unwrap().push(entry);
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
     }
 
     /// Return all entries.
     pub fn entries(&self) -> Vec<CryptoLedgerEntry> {
-        self.log.lock().unwrap().clone()
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Verify the hash chain integrity.
+    ///
+    /// M-2 fix: compares `entry_hash` against the recomputed expected digest
+    /// using a constant-time hex comparison (`constant_time_eq_hex`) instead
+    /// of `!=`, so a local timing side-channel can't help an attacker narrow
+    /// down a forged ledger entry's hash byte-by-byte.
     pub fn verify_chain(&self) -> bool {
-        let log = self.log.lock().unwrap();
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         let mut prev_hash = "0".repeat(64);
         for entry in log.iter() {
             let canonical = canonical_json(entry);
             let chain_input = format!("{}{}", prev_hash, canonical);
             let expected = sha256_hex(chain_input.as_bytes());
-            if entry.entry_hash != expected {
+            if !constant_time_eq_hex(&entry.entry_hash, &expected) {
                 return false;
             }
             prev_hash = entry.entry_hash.clone();
@@ -193,8 +212,8 @@ impl CryptoTransparencyLedger {
 
     /// Reset the ledger (for tests only).
     pub fn reset(&self) {
-        self.log.lock().unwrap().clear();
-        *self.last_hash.lock().unwrap() = "0".repeat(64);
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = "0".repeat(64);
     }
 }
 

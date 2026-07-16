@@ -152,11 +152,18 @@ impl SignedCapabilityToken {
         // Guard against integer overflow in the addition and against DoS via a
         // giant json_len field. 10 MB is the protocol MTU; legitimate tokens are
         // measured in hundreds of bytes.
+        //
+        // M-12 fix: exact-length check (`!=`, not `<`). `to_wire()` always
+        // produces exactly `WIRE_JSON_LEN_SIZE + json_len + 64` bytes with no
+        // trailing padding, so any extra bytes beyond that are either
+        // corruption or an attacker-appended payload smuggled past whatever
+        // validated the token's length — previously silently ignored (`< `
+        // let `decoded.len() > required` through), now rejected fail-closed.
         let required = WIRE_JSON_LEN_SIZE.saturating_add(json_len).saturating_add(64);
-        if json_len > 10_000_000 || decoded.len() < required {
+        if json_len > 10_000_000 || decoded.len() != required {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
-                "Wire token length invalid or exceeds protocol MTU",
+                "Wire token length invalid, exceeds protocol MTU, or has trailing data",
             ));
         }
 
@@ -743,6 +750,56 @@ mod tests {
         );
         let token = cia.issue(claims).expect("issue must succeed");
         assert!(cva.verify(&token).is_ok(), "depth=max must be accepted");
+    }
+
+    // -- M-12: SignedCapabilityToken::from_wire trailing-data rejection --
+
+    #[test]
+    fn test_wire_roundtrip_succeeds() {
+        let (cia, _cva) = make_authority_pair("issuer-wire");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire", 0, now + 300.0);
+        let token = cia.issue(claims).expect("issue must succeed");
+
+        let wire = token.to_wire();
+        let recovered = SignedCapabilityToken::from_wire(&wire).expect("exact wire bytes must roundtrip");
+        assert_eq!(recovered.claims, token.claims);
+        assert_eq!(recovered.signature, token.signature);
+    }
+
+    #[test]
+    fn test_from_wire_rejects_trailing_data() {
+        let (cia, _cva) = make_authority_pair("issuer-wire-trailer");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire-2", 0, now + 300.0);
+        let token = cia.issue(claims).expect("issue must succeed");
+
+        // Decode the legitimate wire bytes, append attacker-controlled trailing
+        // bytes to the pre-base64 payload, then re-encode — simulating a
+        // smuggled payload appended after a valid signature.
+        let wire = token.to_wire();
+        let mut decoded = BASE64.decode(&wire).expect("valid base64");
+        decoded.extend_from_slice(b"SMUGGLED-TRAILING-BYTES");
+        let tampered = BASE64.encode(&decoded).into_bytes();
+
+        let result = SignedCapabilityToken::from_wire(&tampered);
+        assert!(result.is_err(), "M-12: trailing bytes after a valid signature must be rejected, not silently ignored");
+    }
+
+    #[test]
+    fn test_from_wire_rejects_truncated_data() {
+        let (cia, _cva) = make_authority_pair("issuer-wire-trunc");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire-3", 0, now + 300.0);
+        let token = cia.issue(claims).expect("issue must succeed");
+
+        let wire = token.to_wire();
+        let mut decoded = BASE64.decode(&wire).expect("valid base64");
+        decoded.truncate(decoded.len() - 1); // drop the last byte of the signature
+        let tampered = BASE64.encode(&decoded).into_bytes();
+
+        let result = SignedCapabilityToken::from_wire(&tampered);
+        assert!(result.is_err(), "truncated wire data (short by 1 byte) must be rejected");
     }
 
     #[test]

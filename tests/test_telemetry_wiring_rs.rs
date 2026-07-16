@@ -5,9 +5,13 @@
 //! or `sidecar` feature required, since these counters/feeds must work for any deployment,
 //! not just ones running the dashboard.
 
+use std::time::Duration;
+
+use tokio::net::TcpStream;
+
 use saacp::framing::MEASCFrame as StructuralFrame;
 use saacp::telemetry::global_telemetry;
-use saacp::{AgentRateLimiter, SAACPBytecodes, SAACPProtocolHandler};
+use saacp::{AgentRateLimiter, SAACPBytecodes, SAACPNetworkDaemon, SAACPProtocolHandler};
 
 /// Builds a genuinely AES-256-GCM-encrypted `framing::MEASCFrame` wire packet
 /// via `encode_encrypted`, using the same `secret_key` the caller then passes
@@ -77,15 +81,28 @@ fn budget_exceeded_rejection_increments_financial_accumulator() {
     let frame = build_frame(session, &secret, payload.as_bytes(), 1, SAACPBytecodes::CostEstimate as u8, 0);
 
     let before = global_telemetry().snapshot()["financial_tokens_rejected"];
+    let alerts_before = saacp::telemetry::global_alert_feed().len();
+    let agent_id = "wiring-test-agent-financial";
 
     let rl = AgentRateLimiter::new();
     let r = SAACPProtocolHandler::intercept_packet_full(
-        &frame, &secret, "wiring-test-agent-financial", false, None, Some(&rl), None, None, None,
+        &frame, &secret, agent_id, false, None, Some(&rl), None, None, None,
     );
     assert!(r.is_err(), "estimated_cost exceeding max_token_budget must be rejected");
 
     let after = global_telemetry().snapshot()["financial_tokens_rejected"];
     assert!(after >= before + 250, "expected +250 financial_tokens_rejected, before={before} after={after}");
+
+    // Command Center dashboard: a real Gate 0.5 rejection must also produce a live
+    // SecurityAlert carrying the actual estimated_cost (not just move the aggregate
+    // counter) — see telemetry::report_financial_rejection.
+    let alerts = saacp::telemetry::global_alert_feed().recent(alerts_before + 10);
+    assert!(
+        alerts.iter().any(|a| a.agent_id == agent_id
+            && a.gate == "gate_0_5_financial"
+            && a.estimated_cost == Some(250.0)),
+        "expected a real gate_0_5_financial SecurityAlert with estimated_cost=250.0 for '{agent_id}'"
+    );
 }
 
 #[test]
@@ -127,4 +144,66 @@ fn overall_packet_accept_reject_counters_increment() {
     let rejected_after = global_telemetry().snapshot()["packets_rejected"];
     assert_eq!(accepted_after, accepted_before + 1, "packets_accepted must increment on the accepted packet");
     assert!(rejected_after > rejected_before, "packets_rejected must increment on the rejected packet");
+}
+
+async fn free_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// O-4 fix: `saacp_active_connections{transport="tcp"}` must actually track live
+/// connections through a real `SAACPNetworkDaemon` accept loop, not just prove the
+/// `ConnectionCountGuard` RAII type's own increment/decrement semantics in isolation
+/// (see `telemetry.rs`'s own `test_connection_count_guard_raii_pairs_on_global`, which
+/// constructs the guard directly and never touches `daemon.rs`'s accept loop at all).
+/// Before the fix, `daemon::SAACPNetworkDaemon::start_with_shutdown` never constructed a
+/// `ConnectionCountGuard` at its per-connection spawn site, so this gauge silently read
+/// zero under real production traffic despite existing and being exported.
+#[tokio::test]
+async fn tcp_daemon_accept_loop_updates_live_connection_gauge() {
+    let port = free_port().await;
+    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let before = global_telemetry().active_tcp_connections();
+
+    let client = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("client connect failed");
+
+    // Poll (rather than a single fixed sleep) for the accept loop's spawned task to run
+    // past the `ConnectionCountGuard::tcp()` construction point — robust against
+    // scheduling jitter when this integration binary's other `#[tokio::test]`s are
+    // running concurrently on the same process.
+    let mut during = before;
+    for _ in 0..50 {
+        during = global_telemetry().active_tcp_connections();
+        if during > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        during > before,
+        "expected the TCP connection gauge to increment while a client is connected: before={before} during={during}"
+    );
+
+    drop(client);
+    // The connection never completes the handshake, so `handle_client`'s own read
+    // timeout ends the spawned task on its own; poll for its Drop to run.
+    let mut after = during;
+    for _ in 0..50 {
+        after = global_telemetry().active_tcp_connections();
+        if after <= during.saturating_sub(1) || after < during {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        after <= during,
+        "expected the TCP connection gauge to decrement after the connection closed: during={during} after={after}"
+    );
 }

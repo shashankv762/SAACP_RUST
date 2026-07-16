@@ -46,9 +46,30 @@ impl DeploymentProfile {
 }
 
 
+/// Backing state for the global active profile: the profile itself plus
+/// whether it was ever set programmatically via `set_active_profile`.
+///
+/// M-34 fix: previously this was a bare `Mutex<DeploymentProfile>`, and
+/// `get_active_profile()` decided whether to re-apply the env var by
+/// checking `*profile == DeploymentProfile::Production` — indistinguishable
+/// from "never explicitly set". An explicit `set_active_profile(Production)`
+/// (e.g. a test resetting state, or admin tooling pinning PRODUCTION) left
+/// that same value in the Mutex, so the very next `get_active_profile()`
+/// call would re-read the env var and silently overwrite the explicit
+/// choice if `SAACP_DEPLOYMENT_PROFILE` was set to STAGING/DEVELOPMENT.
+/// `manually_set` makes "was explicitly set" its own bit of state, so an
+/// explicit set always sticks regardless of which profile value it set.
+struct ProfileState {
+    profile: DeploymentProfile,
+    manually_set: bool,
+}
+
 /// Global active profile (protected by a Mutex for thread safety).
 /// Initialized from `SAACP_DEPLOYMENT_PROFILE` env var at first access.
-static ACTIVE_PROFILE: Mutex<DeploymentProfile> = Mutex::new(DeploymentProfile::Production);
+static ACTIVE_PROFILE: Mutex<ProfileState> = Mutex::new(ProfileState {
+    profile: DeploymentProfile::Production,
+    manually_set: false,
+});
 
 /// Env var name for deployment profile (Appendix A).
 pub const ENV_DEPLOYMENT_PROFILE: &str = "SAACP_DEPLOYMENT_PROFILE";
@@ -67,29 +88,37 @@ fn profile_from_env() -> DeploymentProfile {
 ///
 /// On first call, initializes from `SAACP_DEPLOYMENT_PROFILE` env var
 /// if it has not already been set programmatically via `set_active_profile`.
+///
+/// M-38 fix: recovers the lock via `into_inner()` on poison rather than
+/// panicking — this Mutex backs a process-wide singleton read on every
+/// hard-drop response, so one poisoning panic must not cascade into every
+/// other in-flight connection losing the ability to read the deployment
+/// profile at all.
 pub fn get_active_profile() -> DeploymentProfile {
-    let mut profile = ACTIVE_PROFILE.lock().unwrap();
-    // If still at the static default (Production) and env var is set, apply it.
-    // Tests that call set_active_profile() directly take priority over the env var.
-    if *profile == DeploymentProfile::Production {
-        let env_profile = profile_from_env();
-        if env_profile != DeploymentProfile::Production {
-            *profile = env_profile;
-        }
+    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    // M-34: only ever consult the env var before the profile has been set
+    // programmatically — once `manually_set` is true, the explicit choice
+    // always wins, no matter which profile value it was set to.
+    if !state.manually_set {
+        state.profile = profile_from_env();
     }
-    *profile
+    state.profile
 }
 
 /// Override the active profile (used in tests and admin tooling).
 pub fn set_active_profile(profile: DeploymentProfile) {
-    *ACTIVE_PROFILE.lock().unwrap() = profile;
+    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    state.profile = profile;
+    state.manually_set = true;
 }
 
 /// Initialize the global deployment profile from the environment variable.
 /// Call this once at process startup before handling any requests.
 /// Calling this after `set_active_profile()` overwrites the programmatic value.
 pub fn init_profile_from_env() {
-    *ACTIVE_PROFILE.lock().unwrap() = profile_from_env();
+    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    state.profile = profile_from_env();
+    state.manually_set = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +385,22 @@ impl SdlEntry {
     }
 
     /// Serialise to a JSON string.
+    ///
+    /// M-35 fix: previously built the JSON text by hand with a
+    /// `.replace('\\', ..).replace('"', ..)` pass over each value — that
+    /// escapes backslashes and quotes but not the other characters JSON
+    /// requires escaping in a string (control characters like `\n`, `\t`,
+    /// `\r`, or bare `\x00`-`\x1F` bytes), any of which appearing in
+    /// `internal_message` (attacker-influenced free text from a rejected
+    /// packet) would have produced invalid, unparseable JSON. Routes through
+    /// `serde_json::Value` instead, whose `Display`/`to_string()` escaping is
+    /// complete and spec-compliant.
     pub fn to_json(&self) -> String {
-        let pairs: Vec<String> = self.to_map().iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v.replace('\\', "\\\\").replace('"', "\\\"")))
+        let map: serde_json::Map<String, serde_json::Value> = self.to_map()
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        format!("{{{}}}", pairs.join(","))
+        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
     }
 }
 
@@ -385,7 +425,7 @@ impl SecureDiagnosticLedger {
 
     /// Append one diagnostic entry to the ledger (thread-safe).
     pub fn record(&self, entry: SdlEntry) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= SDL_MAX_ENTRIES {
             entries.pop_front(); // evict oldest; preserve most-recent window
         }
@@ -397,7 +437,7 @@ impl SecureDiagnosticLedger {
     /// IMPORTANT: This method must only be called by authorised admin tooling.
     /// It must NEVER be wired to any network-accessible endpoint.
     pub fn query(&self, correlation_id: Option<&str>, limit: usize) -> Vec<SdlEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let filtered: Vec<SdlEntry> = if let Some(cid) = correlation_id {
             entries.iter().filter(|e| e.correlation_id == cid).cloned().collect()
         } else {
@@ -409,12 +449,12 @@ impl SecureDiagnosticLedger {
 
     /// Wipe the ledger (used in tests).
     pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Return the current number of entries.
     pub fn entry_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -450,14 +490,29 @@ impl SREL {
     /// Sleep until at least SREL_FLOOR_SECONDS have elapsed since `start`.
     ///
     /// Does nothing in DEVELOPMENT mode.
-    pub fn equalize_timing(start: Instant) {
+    ///
+    /// M-33 fix: uses `tokio::time::sleep` (async), not `std::thread::sleep`.
+    /// `tokio` is a mandatory (non-optional) dependency of this crate
+    /// already including the `time` feature, and this function's only
+    /// caller (`daemon.rs`'s `handle_client`, in the hard-drop response
+    /// path) runs on the async executor — specifically AFTER the gate
+    /// pipeline's own `spawn_blocking` call has already completed and been
+    /// `.await`ed, not inside it. The previous `std::thread::sleep` blocked
+    /// a tokio worker thread for up to `SREL_FLOOR_SECONDS` (50ms) on every
+    /// single hard-drop response; under load, enough concurrent hard-drops
+    /// could exhaust the whole worker pool and stall unrelated in-flight
+    /// connections, not just the one being timing-equalized. There are no
+    /// synchronous callers of this function anywhere in this crate (grepped
+    /// call sites and tests) to preserve compatibility for, so this is a
+    /// pure behavior fix, not an API compromise.
+    pub async fn equalize_timing(start: Instant) {
         if get_active_profile() == DeploymentProfile::Development {
             return;
         }
         let elapsed = start.elapsed().as_secs_f64();
         let remaining = SREL_FLOOR_SECONDS - elapsed;
         if remaining > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(remaining));
+            tokio::time::sleep(std::time::Duration::from_secs_f64(remaining)).await;
         }
     }
 

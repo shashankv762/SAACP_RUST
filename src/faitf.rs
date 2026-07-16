@@ -12,8 +12,8 @@
 //! 9. `CredentialRenewal` — Key rotation with overlap periods.
 //! 10. `HardwareAttestationStub` — Interface for TPM/HSM/TEE integration.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -29,13 +29,12 @@ pub const FAITF_VERSION: &str = "1.0";
 pub const FAITF_MAX_DELEGATION_DEPTH: usize = 3;
 pub const IDENTITY_PROOF_TTL: f64 = 30.0;
 pub const MAX_CLOCK_SKEW: f64 = 5.0;
-/// (H-28) Maximum distinct challenges tracked in `IdentityProver::used_challenges`
-/// before oldest-first eviction runs, bounding memory even if a caller floods
-/// `verify_proof` with fresh, never-reused challenges faster than
-/// `IDENTITY_PROOF_TTL` ages them out. Same order of magnitude as
-/// `trust_decay::DRIFT_MAX_TRACKED_SESSIONS`, which bounds a structurally
-/// similar per-key map.
-pub const IDENTITY_PROVER_MAX_CHALLENGES: usize = 50_000;
+/// (H-28, opusplan.md 6.5) Maximum distinct challenges tracked in
+/// `IdentityProver::used_challenges` before oldest-first eviction runs, bounding memory
+/// even if a caller floods `verify_proof` with fresh, never-reused challenges faster than
+/// `IDENTITY_PROOF_TTL` ages them out. Matches the ~128B-per-entry / 10K-entry (~1.28MB)
+/// memory steady-state budget in opusplan.md's Memory Steady-State Targets table.
+pub const IDENTITY_PROVER_MAX_CHALLENGES: usize = 10_000;
 pub const CREDENTIAL_SIG_MARKER: &str = "ed25519";
 pub const PSK_SIG_MARKER: &str = "hmac-sha256";
 
@@ -64,9 +63,27 @@ fn verify_data(verifying_key: &VerifyingKey, message: &[u8], signature: &[u8]) -
     verifying_key.verify(message, &sig).is_ok()
 }
 
+/// M-7/M-8 fix: explicitly convert a top-level JSON object to a
+/// `BTreeMap<&String, &Value>` before serializing, instead of relying on
+/// `serde_json::Value`'s internal `Map` happening to iterate in sorted order.
+/// Today `serde_json::Map` IS backed by `BTreeMap` (this crate enables no
+/// `preserve_order` feature anywhere in its dependency tree — verified via
+/// `Cargo.lock`), so this is not an active bug, but it is an implicit,
+/// fragile invariant: a future dependency bump that transitively enables
+/// `serde_json/preserve_order` would silently swap `Map`'s backing store to
+/// an insertion-ordered `IndexMap`, breaking every signature verification
+/// that depends on this function's output being byte-stable, with no compile
+/// error. Mirrors the same explicit-`BTreeMap` pattern already used by
+/// `acsvaf.rs::serialize_sorted_json`. Non-`Object` values (arrays, scalars)
+/// have no key-ordering ambiguity and serialize directly.
 fn sorted_json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    // serde_json with BTreeMap produces sorted keys by default
-    serde_json::to_vec(value).unwrap_or_default()
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: BTreeMap<&String, &serde_json::Value> = map.iter().collect();
+            serde_json::to_vec(&sorted).unwrap_or_default()
+        }
+        other => serde_json::to_vec(other).unwrap_or_default(),
+    }
 }
 
 // ─── Enumerations ───────────────────────────────────────────────────────────────
@@ -116,6 +133,18 @@ impl AttestationType {
 // ─── AgentIdentity ──────────────────────────────────────────────────────────────
 
 /// A provisioned cryptographic identity for a single agent.
+///
+/// M-5 analysis (no `Zeroize`/`ZeroizeOnDrop` derive needed): the only field
+/// here that holds secret material is `signing_key`. `ed25519_dalek::SigningKey`
+/// (v2) already implements `Drop` + `ZeroizeOnDrop` internally — its private
+/// key bytes are wiped on drop with no action required from this struct.
+/// Every other field is non-secret metadata: `agent_id`/`issuer_id` are
+/// identifiers (not secrets), `revocation_info`/`supported_protocols` are
+/// descriptive strings, and `trust_policy`/`capability_constraints` are
+/// public-facing policy JSON. Adding a `Zeroize` derive across all string
+/// fields would zero non-secret data for no security benefit while doing
+/// nothing for `signing_key` (which is already handled) — so this struct
+/// deliberately does not derive `Zeroize`/`ZeroizeOnDrop`.
 pub struct AgentIdentity {
     pub agent_id: String,
     pub signing_key: SigningKey,
@@ -361,6 +390,19 @@ impl TrustAnchor {
 // ─── TrustStore ─────────────────────────────────────────────────────────────────
 
 /// Thread-safe registry of TrustAnchors and manually pinned identities.
+/// M-23 fix (documented lock ordering, no behavior change): every method on
+/// this type that acquires more than one of the four `Mutex`es below always
+/// acquires `verification_epoch` LAST, after `anchors`/`pinned_keys`/
+/// `keys_by_fp` (whichever of those it needs) have already been locked and
+/// (for the two that are only ever briefly held) released. No method acquires
+/// `verification_epoch` first and then tries to acquire one of the other
+/// three while still holding it. This ordering is verified-consistent across
+/// every call site in this file today, so there is no live deadlock — but it
+/// was previously an implicit convention rather than a stated invariant, so a
+/// future method added without checking existing call sites could easily
+/// invert it (e.g. lock `verification_epoch` first "just to bump the
+/// counter early", then lock `anchors`) and introduce a real one. Any new
+/// method taking more than one of these locks MUST preserve this ordering.
 pub struct TrustStore {
     anchors: Mutex<HashMap<String, TrustAnchor>>,
     pinned_keys: Mutex<HashMap<String, VerifyingKey>>,
@@ -379,22 +421,25 @@ impl TrustStore {
     }
 
     pub fn register_anchor(&self, anchor: TrustAnchor) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut anchors = self.anchors.lock().unwrap();
-        let mut epoch = self.verification_epoch.lock().unwrap();
+        let mut epoch = self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner());
         anchors.insert(anchor.anchor_id.clone(), anchor);
         *epoch += 1;
     }
 
     pub fn remove_anchor(&self, anchor_id: &str) -> bool {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut anchors = self.anchors.lock().unwrap();
         let existed = anchors.remove(anchor_id).is_some();
         if existed {
-            *self.verification_epoch.lock().unwrap() += 1;
+            *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         }
         existed
     }
 
     pub fn get_anchor(&self, anchor_id: &str) -> Option<TrustAnchorEntry> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let anchors = self.anchors.lock().unwrap();
         anchors.get(anchor_id).map(|a| TrustAnchorEntry {
             anchor_id: a.anchor_id.clone(),
@@ -408,29 +453,35 @@ impl TrustStore {
     }
 
     pub fn list_anchors(&self) -> Vec<String> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.anchors.lock().unwrap().keys().cloned().collect()
     }
 
     pub fn pin_identity(&self, agent_id: &str, public_key: VerifyingKey) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut pinned = self.pinned_keys.lock().unwrap();
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut by_fp = self.keys_by_fp.lock().unwrap();
         let fp = pub_key_fingerprint(&public_key);
         pinned.insert(agent_id.to_string(), public_key);
         by_fp.insert(fp, public_key);
-        *self.verification_epoch.lock().unwrap() += 1;
+        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     pub fn register_key_by_fingerprint(&self, fingerprint: &str, public_key: VerifyingKey) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut by_fp = self.keys_by_fp.lock().unwrap();
         by_fp.insert(fingerprint.to_string(), public_key);
-        *self.verification_epoch.lock().unwrap() += 1;
+        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     pub fn get_pinned_key(&self, agent_id: &str) -> Option<VerifyingKey> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.pinned_keys.lock().unwrap().get(agent_id).copied()
     }
 
     pub fn get_key_by_fingerprint(&self, fingerprint: &str) -> Option<VerifyingKey> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.keys_by_fp.lock().unwrap().get(fingerprint).copied()
     }
 
@@ -445,6 +496,7 @@ impl TrustStore {
         }
 
         let anchors_snapshot: Vec<(String, TrustAnchorSnapshot)> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let anchors = self.anchors.lock().unwrap();
             anchors
                 .iter()
@@ -462,6 +514,7 @@ impl TrustStore {
                 .collect()
         };
         let pinned_snapshot: HashMap<String, VerifyingKey> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             self.pinned_keys.lock().unwrap().clone()
         };
 
@@ -491,7 +544,7 @@ impl TrustStore {
     }
 
     pub fn epoch(&self) -> u64 {
-        *self.verification_epoch.lock().unwrap()
+        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -643,6 +696,13 @@ pub struct DistributedRevocationInfrastructure {
     revoked_agents: Mutex<HashMap<String, SignedRevocationRecord>>,
     revoked_credentials: Mutex<HashMap<String, SignedRevocationRecord>>,
     revocation_epoch: Mutex<u64>,
+    /// Optional gossip engine (Phase 5, item 3) — when set via
+    /// [`Self::set_gossip_engine`], every successful local [`Self::revoke`] automatically
+    /// calls [`crate::gossip::GossipEngine::broadcast`] after storing the record, so
+    /// revocation propagation is automatic rather than something every caller must
+    /// remember to trigger by hand. Defaults to `None` (no-op) so existing callers/tests
+    /// are unaffected.
+    gossip: Mutex<Option<std::sync::Arc<crate::gossip::GossipEngine>>>,
 }
 
 const DRI_MAX_RECORDS: usize = 100_000;
@@ -707,7 +767,28 @@ impl DistributedRevocationInfrastructure {
             revoked_agents: Mutex::new(HashMap::new()),
             revoked_credentials: Mutex::new(HashMap::new()),
             revocation_epoch: Mutex::new(0),
+            gossip: Mutex::new(None),
         }
+    }
+
+    /// Process-wide singleton, matching `TrustDecayEngine::global()`'s
+    /// established pattern. Added for Phase 6 / item 3 (IEVL, `ievl.rs`) — its
+    /// `ClassEscalation` enforcement path is the first production (non-test)
+    /// caller of [`Self::revoke`], and needs a `DistributedRevocationInfrastructure`
+    /// reachable from a bare module function with no daemon-constructed state
+    /// threaded through. Callers that construct and manage their own instance
+    /// (e.g. via `Arc::new(..)` for gossip-mesh wiring, as every existing test
+    /// does) are unaffected — this is purely additive.
+    pub fn global() -> &'static DistributedRevocationInfrastructure {
+        static GLOBAL: OnceLock<DistributedRevocationInfrastructure> = OnceLock::new();
+        GLOBAL.get_or_init(DistributedRevocationInfrastructure::new)
+    }
+
+    /// Wire a [`crate::gossip::GossipEngine`] so every successful local [`Self::revoke`]
+    /// automatically broadcasts to the gossip mesh. Defaults to unset (no-op) — existing
+    /// callers/tests that never call this are completely unaffected.
+    pub fn set_gossip_engine(&self, engine: std::sync::Arc<crate::gossip::GossipEngine>) {
+        *self.gossip.lock().unwrap_or_else(|e| e.into_inner()) = Some(engine);
     }
 
     /// Revoke an agent or a specific credential. Returns the signed record.
@@ -736,6 +817,11 @@ impl DistributedRevocationInfrastructure {
         };
         record.revoker_signature = sign_data(&revoker_identity.signing_key, &record.body_bytes());
         self.store_record(record.clone())?;
+
+        if let Some(engine) = self.gossip.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            engine.broadcast(record.clone());
+        }
+
         Ok(record)
     }
 
@@ -856,13 +942,39 @@ impl DistributedRevocationInfrastructure {
     }
 
     /// Check if an agent or specific credential is revoked.
+    /// M-28 analysis (accepted, bounded, self-healing race — no lock merge):
+    /// `revoked_agents` and `revoked_credentials` are checked under two
+    /// SEPARATE lock acquisitions, not one atomic critical section. In
+    /// principle a revocation landing in the second map between this
+    /// method's two checks is invisible to this particular call. In
+    /// practice the risk is narrow: both maps are strictly monotonic — the
+    /// only writer is `revoke()`/`store_record()`, which only ever ADDS
+    /// entries (eviction under capacity is severity/age-protected per
+    /// CRIT-5/CRIT-6, never a mechanism for un-revoking anything) — so a
+    /// caller that observes `false` here due to the race sees a state that
+    /// is merely STALE, not one that has been made permanently wrong: the
+    /// very next `is_revoked` call (e.g. on the next packet from the same
+    /// agent) will observe the revocation correctly, since nothing here ever
+    /// un-does a revocation once it has landed in either map. Merging the
+    /// two `Mutex`es into one would touch every read/write call site of
+    /// both maps across this file for a race whose worst case is "one
+    /// packet's gate decision made against state that was already stale by
+    /// microseconds" — disproportionate to the actual risk. This is the
+    /// finding's own stated fallback ("...or accept documented race
+    /// window").
+    /// M-38 fix: every lock in this method (and `get_revocation_record`/`epoch`/
+    /// `clear` below) recovers via `into_inner()` on poison rather than
+    /// panicking, matching `store_record`'s existing fix above — DRI is reachable
+    /// through the process-wide `DistributedRevocationInfrastructure::global()`
+    /// singleton, so one poisoning panic must not cascade into every other
+    /// caller losing the ability to check revocation status.
     pub fn is_revoked(&self, agent_id: &str, credential_fingerprint: &str) -> bool {
-        let agents = self.revoked_agents.lock().unwrap();
+        let agents = self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner());
         if agents.contains_key(agent_id) {
             return true;
         }
         if !credential_fingerprint.is_empty() {
-            let creds = self.revoked_credentials.lock().unwrap();
+            let creds = self.revoked_credentials.lock().unwrap_or_else(|e| e.into_inner());
             if creds.contains_key(credential_fingerprint) {
                 return true;
             }
@@ -871,17 +983,17 @@ impl DistributedRevocationInfrastructure {
     }
 
     pub fn get_revocation_record(&self, agent_id: &str) -> Option<SignedRevocationRecord> {
-        self.revoked_agents.lock().unwrap().get(agent_id).cloned()
+        self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner()).get(agent_id).cloned()
     }
 
     pub fn epoch(&self) -> u64 {
-        *self.revocation_epoch.lock().unwrap()
+        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn clear(&self) {
-        self.revoked_agents.lock().unwrap().clear();
-        self.revoked_credentials.lock().unwrap().clear();
-        *self.revocation_epoch.lock().unwrap() = 0;
+        self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.revoked_credentials.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 }
 
@@ -962,6 +1074,7 @@ impl TrustMeshFederation {
     }
 
     pub fn register_member(&self, domain: &str, anchor: &TrustAnchor) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut members = self.members.lock().unwrap();
         members.insert(
             domain.to_string(),
@@ -986,6 +1099,7 @@ impl TrustMeshFederation {
         if !verify_data(&issuer_anchor.verifying_key, &body, &agreement.signature) {
             return false;
         }
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut agreements = self.agreements.lock().unwrap();
         agreements.insert(agreement.agreement_id.clone(), agreement);
         true
@@ -1000,7 +1114,9 @@ impl TrustMeshFederation {
         target_domain: &str,
         requested_scope: &str,
     ) -> (bool, String) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let members = self.members.lock().unwrap();
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let agreements = self.agreements.lock().unwrap();
 
         let source_anchor = match members.get(source_domain) {
@@ -1027,6 +1143,7 @@ impl TrustMeshFederation {
     }
 
     pub fn list_members(&self) -> Vec<String> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.members.lock().unwrap().keys().cloned().collect()
     }
 
@@ -1040,6 +1157,7 @@ impl TrustMeshFederation {
         &self,
         record: &crate::faitf::SignedRevocationRecord,
     ) -> Vec<String> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let members = self.members.lock().unwrap();
         let mut notified = Vec::new();
         for (domain, member) in members.iter() {
@@ -1107,6 +1225,7 @@ impl IdentityProver {
 
         // 2. Challenge replay prevention
         {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             let mut challenges = self.used_challenges.lock().unwrap();
             Self::evict_expired_challenges(&mut challenges);
             if challenges.contains_key(challenge) {
@@ -1169,6 +1288,7 @@ impl IdentityProver {
     /// `memory::SecureContextStore::evict_expired`. Returns the number of
     /// entries removed.
     pub fn sweep_expired_challenges(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut challenges = self.used_challenges.lock().unwrap();
         let before = challenges.len();
         Self::evict_expired_challenges(&mut challenges);
@@ -1177,10 +1297,12 @@ impl IdentityProver {
 
     /// Number of challenges currently tracked (for observability/tests).
     pub fn tracked_challenge_count(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.used_challenges.lock().unwrap().len()
     }
 
     pub fn clear(&self) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.used_challenges.lock().unwrap().clear();
     }
 }
@@ -1302,6 +1424,14 @@ impl DelegationChain {
         if !ok {
             return (false, format!("root_credential_invalid:{reason}"));
         }
+        // `verify_credential` checks expiry/validity-window but not DRI
+        // revocation — apply it here so a revoked root anchor credential can't
+        // still root a chain.
+        if DistributedRevocationInfrastructure::global()
+            .is_revoked(&chain[0].agent_id(), &chain[0].fingerprint())
+        {
+            return (false, "root_credential_revoked".to_string());
+        }
 
         // Verify each subsequent credential
         for i in 1..chain.len() {
@@ -1335,6 +1465,26 @@ impl DelegationChain {
                 return (false, format!("invalid_signature_at_chain_index_{i}"));
             }
 
+            // SECURITY: a delegated credential must be checked for expiry,
+            // validity window, AND revocation — not just a valid parent
+            // signature. Previously only chain[0] went through
+            // `verify_credential` (which checks is_expired/is_active), so an
+            // expired, not-yet-valid, or DRI-revoked *delegated* credential
+            // deeper in the chain still returned (true, "") as long as its
+            // parent's signature was intact. A revoked sub-agent could keep
+            // acting on a still-signed delegation.
+            if child_cred.is_expired() {
+                return (false, format!("delegated_credential_expired_at_index_{i}"));
+            }
+            if !child_cred.is_active() {
+                return (false, format!("delegated_credential_not_active_at_index_{i}"));
+            }
+            if DistributedRevocationInfrastructure::global()
+                .is_revoked(&child_cred.agent_id(), &child_cred.fingerprint())
+            {
+                return (false, format!("delegated_credential_revoked_at_index_{i}"));
+            }
+
             let parent_constraints = parent_cred
                 .payload
                 .get("capability_constraints")
@@ -1357,14 +1507,18 @@ impl DelegationChain {
         parent_constraints: &serde_json::Value,
         child_constraints: &serde_json::Value,
     ) -> Result<(), String> {
+        // L-30 fix: a missing `max_action_class` must fail closed (treated as the most
+        // restrictive class, 0) not fail open (0xFF/"unrestricted") — the prior default
+        // silently granted maximal privilege to any credential that simply omitted the
+        // field, exactly backwards for a privilege-amplification guard.
         let parent_max = parent_constraints
             .get("max_action_class")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0xFF);
+            .unwrap_or(0);
         let child_max = child_constraints
             .get("max_action_class")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0xFF);
+            .unwrap_or(0);
         if child_max > parent_max {
             return Err(format!(
                 "Privilege amplification detected: child max_action_class ({child_max}) > parent ({parent_max})."
@@ -1682,8 +1836,56 @@ mod tests {
         );
     }
 
-    // ─── CRIT-5 / CRIT-6: DRI eviction hardening ─────────────────────────────
-    //
+    /// SECURITY regression: `verify_chain` must reject a delegated (non-root)
+    /// credential that has been revoked in the DRI, even when its parent
+    /// signature and the whole chain are otherwise valid. Before the fix only
+    /// chain[0] was checked for validity and NOTHING checked revocation, so a
+    /// revoked sub-agent kept passing on a still-signed delegation.
+    #[test]
+    fn delegation_chain_rejects_revoked_delegated_credential() {
+        let (issuer_identity, issuer_cred, anchor) = make_issuer("issuer-revoke-child");
+        let store = TrustStore::new();
+        store.register_anchor(anchor);
+        store.pin_identity(&issuer_identity.agent_id, issuer_identity.verifying_key);
+
+        // Unique child agent_id so the process-wide DRI singleton can't collide
+        // with any other test's revocations.
+        let child_agent_id = "delegated-child-revoke-unique-xyz";
+        let child_identity = AgentIdentity::generate(
+            child_agent_id, &issuer_identity.agent_id,
+            3600, None, None, "", AttestationType::None,
+        );
+        let constraints = serde_json::json!({"max_action_class": 0});
+        let delegated = DelegationChain::issue_delegated(
+            &issuer_identity,
+            &issuer_cred,
+            &child_identity.agent_id,
+            &child_identity.verifying_key,
+            constraints,
+            3600,
+            1,
+        ).expect("depth-1 delegation must succeed");
+
+        let chain = vec![issuer_cred.clone(), delegated.credential.clone()];
+
+        // Sanity: the intact chain verifies before revocation.
+        let (ok, reason) = DelegationChain::verify_chain(&chain, &store);
+        assert!(ok, "intact delegation chain must verify: {reason}");
+
+        // Revoke the delegated child agent in the global DRI.
+        DistributedRevocationInfrastructure::global()
+            .revoke(child_agent_id, "compromised", &issuer_identity, "")
+            .expect("revoke must succeed");
+
+        let (ok, reason) = DelegationChain::verify_chain(&chain, &store);
+        assert!(!ok, "chain with a revoked delegated credential must be rejected");
+        assert!(
+            reason.contains("revoked"),
+            "reason must indicate revocation: got '{reason}'"
+        );
+    }
+
+    // ─── CRIT-5 / CRIT-6: DRI eviction hardening ─────────────────────────────    //
     // White-box tests: they populate `revoked_agents` / `revoked_credentials`
     // directly and call the private `store_record` so the fix can be
     // exercised at the real `DRI_MAX_RECORDS` boundary without paying for
@@ -1792,6 +1994,73 @@ mod tests {
             !dri.is_revoked("agent-overflow", ""),
             "a record rejected with AtCapacity must never be reported as revoked"
         );
+    }
+
+    /// Phase 5, item 3: a wired `GossipEngine` must automatically receive a broadcast on
+    /// every successful local `revoke()` — no caller should have to remember to trigger
+    /// propagation by hand.
+    #[test]
+    fn revoke_broadcasts_to_wired_gossip_engine() {
+        use crate::gossip::{GossipEngine, GossipTransport};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        struct RecordingTransport {
+            peers: Vec<String>,
+            sends: StdMutex<usize>,
+        }
+        impl GossipTransport for RecordingTransport {
+            fn known_peers(&self) -> Vec<String> {
+                self.peers.clone()
+            }
+            fn send_to_peer(&self, _peer_id: &str, _bytes: &[u8]) {
+                *self.sends.lock().unwrap() += 1;
+            }
+        }
+
+        let anchor = AgentIdentity::generate(
+            "anchor-gossip-wire", "iss-gw", 86_400, None, None, "", AttestationType::None,
+        );
+        let trust_store = Arc::new(TrustStore::new());
+        trust_store.register_anchor(TrustAnchor::new(&anchor.agent_id, anchor.verifying_key));
+
+        let dri = Arc::new(DistributedRevocationInfrastructure::new());
+        let transport = Arc::new(RecordingTransport {
+            peers: vec!["peer-1".to_string(), "peer-2".to_string(), "peer-3".to_string()],
+            sends: StdMutex::new(0),
+        });
+        let engine = Arc::new(GossipEngine::new(
+            transport.clone(),
+            dri.clone(),
+            trust_store,
+            "node-under-test",
+        ));
+        dri.set_gossip_engine(engine);
+
+        let revoker = AgentIdentity::generate(
+            "revoker-gw", "iss-gw", 3600, None, None, "", AttestationType::None,
+        );
+        dri.revoke("agent-gossip-target", "test-broadcast", &revoker, "fp-gw")
+            .expect("revoke must succeed under normal capacity");
+
+        assert_eq!(
+            *transport.sends.lock().unwrap(),
+            3,
+            "revoke() must have broadcast to all 3 known peers via the wired GossipEngine"
+        );
+    }
+
+    /// A `DistributedRevocationInfrastructure` with no gossip engine wired must behave
+    /// exactly as before this feature was added — `revoke()` must not panic or error
+    /// merely because gossip was never configured.
+    #[test]
+    fn revoke_without_wired_gossip_engine_is_unaffected() {
+        let dri = DistributedRevocationInfrastructure::new();
+        let revoker = AgentIdentity::generate(
+            "revoker-no-gossip", "iss-ng", 3600, None, None, "", AttestationType::None,
+        );
+        let result = dri.revoke("agent-no-gossip", "test", &revoker, "fp-ng");
+        assert!(result.is_ok());
+        assert!(dri.is_revoked("agent-no-gossip", "fp-ng"));
     }
 
     /// CRIT-6: capacity is checked against the sum of both maps, but eviction

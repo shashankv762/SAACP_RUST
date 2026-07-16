@@ -65,6 +65,19 @@ impl KeyAlgorithm {
             Self::HkdfSha256 => "HKDF-SHA-256",
         }
     }
+
+    /// L-4 fix: the exact key-material length this algorithm requires, in bytes. Single
+    /// source of truth shared by [`KeyDescriptor::new`]'s validation and
+    /// [`default_key_generator`], so the two can never silently drift out of sync with
+    /// each other.
+    pub fn key_len(&self) -> usize {
+        match self {
+            Self::Aes256Gcm => 32,
+            Self::Ed25519 => 32,
+            Self::HmacSha256 => 32,
+            Self::HkdfSha256 => 32,
+        }
+    }
 }
 
 /// Semantic role of a key within the SAACP security architecture.
@@ -197,6 +210,19 @@ impl KeyDescriptor {
         if expires_at <= created_at {
             return Err("expires_at must be strictly after created_at".into());
         }
+        // L-4 fix: reject key material whose length doesn't match what `algorithm`
+        // requires — previously any length was silently accepted, so a truncated or
+        // malformed key (e.g. a 16-byte value where AES-256-GCM needs 32) would only
+        // surface as a confusing failure much later, at first actual use.
+        let expected_len = algorithm.key_len();
+        if key_material.len() != expected_len {
+            return Err(format!(
+                "key_material length {} does not match {} bytes required by {}",
+                key_material.len(),
+                expected_len,
+                algorithm.value()
+            ));
+        }
         Ok(Self {
             kid,
             version,
@@ -223,15 +249,22 @@ pub struct KeyRotationPolicy {
     pub auto_rotate: bool,
     /// Propagation deadline (seconds) for emergency revocations. 0.0 = immediate.
     pub emergency_revocation_ttl: f64,
+    /// Pre-expiry renewal window (seconds): a key becomes eligible for automatic rotation
+    /// once `expires_at - now <= renewal_lead_seconds`, i.e. rotation happens ahead of
+    /// expiry rather than exactly at it. Defaults to 10% of `max_age_seconds` (a 24h-TTL
+    /// key rotates ~2.4h before expiry) via [`Self::default`].
+    pub renewal_lead_seconds: f64,
 }
 
 impl Default for KeyRotationPolicy {
     fn default() -> Self {
+        let max_age_seconds = 86_400.0;
         Self {
-            max_age_seconds: 86_400.0,
+            max_age_seconds,
             overlap_seconds: 3_600.0,
             auto_rotate: true,
             emergency_revocation_ttl: 0.0,
+            renewal_lead_seconds: max_age_seconds * 0.1,
         }
     }
 }
@@ -286,9 +319,14 @@ impl KeyRegistry {
     /// Register a KeyDescriptor in the store.
     ///
     /// Returns Err if a descriptor with the same (kid, version) already exists.
+    ///
+    /// M-38 fix: every `self.registry.lock()` in this impl block recovers via
+    /// `into_inner()` on poison rather than panicking — `klms::DEFAULT_REGISTRY`
+    /// is a process-wide singleton, so one poisoning panic must not cascade
+    /// into every other caller losing the ability to look up/rotate keys.
     pub fn register(&self, descriptor: KeyDescriptor) -> Result<(), String> {
         let key = (descriptor.kid.clone(), descriptor.version);
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         if reg.contains_key(&key) {
             return Err(format!(
                 "Key (kid={:?}, version={}) is already registered. Use rotate_key to create a new version.",
@@ -303,7 +341,7 @@ impl KeyRegistry {
     ///
     /// Returns SAACPHardDrop with KEY_REVOKED if all versions are revoked/compromised.
     pub fn get_active(&self, kid: &str) -> Result<KeyDescriptor, SAACPHardDrop> {
-        let reg = self.registry.lock().unwrap();
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let versions: Vec<&KeyDescriptor> = reg
             .iter()
             .filter(|((k, _), _)| k == kid)
@@ -337,7 +375,7 @@ impl KeyRegistry {
 
     /// Return the exact (kid, version) descriptor.
     pub fn get_version(&self, kid: &str, version: u64) -> Result<KeyDescriptor, String> {
-        let reg = self.registry.lock().unwrap();
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let key = (kid.to_string(), version);
         reg.get(&key)
             .cloned()
@@ -346,7 +384,7 @@ impl KeyRegistry {
 
     /// Return a deduplicated sorted list of key ids with at least one ACTIVE version.
     pub fn list_active_kids(&self) -> Vec<String> {
-        let reg = self.registry.lock().unwrap();
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let mut kids: Vec<String> = reg
             .iter()
             .filter(|(_, desc)| desc.status == KeyStatus::Active)
@@ -359,7 +397,7 @@ impl KeyRegistry {
 
     /// Return all descriptors for kid, sorted by version ascending.
     pub fn all_for_kid(&self, kid: &str) -> Vec<KeyDescriptor> {
-        let reg = self.registry.lock().unwrap();
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let mut descriptors: Vec<KeyDescriptor> = reg
             .iter()
             .filter(|((k, _), _)| k == kid)
@@ -369,13 +407,163 @@ impl KeyRegistry {
         descriptors
     }
 
+    /// Return `(kid, version)` pairs for every `Active` descriptor whose
+    /// `expires_at - now <= within_seconds` — a "pre-expiry renewal window" query used by
+    /// [`KeyLifecycleManager::sweep_and_rotate`] (Phase 5, item 4: automatic key rotation).
+    /// Only `Active` descriptors are ever considered (never `Rotated`/`Revoked`/
+    /// `Compromised`) — Monotonic Security: automatic rotation must never touch a key that
+    /// isn't currently the live version.
+    pub fn list_expiring(&self, within_seconds: f64, now: f64) -> Vec<(String, u64)> {
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .filter(|(_, desc)| {
+                desc.status == KeyStatus::Active && desc.expires_at - now <= within_seconds
+            })
+            .map(|((kid, version), _)| (kid.clone(), *version))
+            .collect()
+    }
+
     /// Internal: update a descriptor's status and rotated_at in-place.
     fn update_status(&self, kid: &str, version: u64, status: KeyStatus, rotated_at: Option<f64>) {
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let key = (kid.to_string(), version);
         if let Some(desc) = reg.get_mut(&key) {
             desc.status = status;
             desc.rotated_at = rotated_at;
+        }
+    }
+
+    /// Atomically rotate `kid`'s current ACTIVE version to a freshly-built next version,
+    /// entirely under one lock acquisition.
+    ///
+    /// This exists to close a TOCTOU race that a naive "get_active, then update_status,
+    /// then register" sequence (three separate lock acquisitions) leaves open: two
+    /// concurrent callers can both read the same ACTIVE descriptor before either writes
+    /// back, both compute the same `version + 1`, and — worse — a caller acting on a stale
+    /// "this kid is due for rotation" snapshot can still successfully rotate a kid that a
+    /// *different* concurrent caller already rotated moments earlier, since a plain
+    /// `get_active` check only confirms *some* version is Active, not that it's still the
+    /// specific version the caller believed was due. Holding the registry lock across the
+    /// read-current, build-new, and write-both steps makes the whole operation atomic: at
+    /// most one concurrent caller can ever observe and act on a given ACTIVE version.
+    ///
+    /// `build_new` receives the current ACTIVE descriptor (lock held) and must return its
+    /// replacement; whatever `version` it sets is overwritten with `current.version + 1`
+    /// before insertion, so a caller cannot target the wrong slot even by mistake.
+    fn atomic_rotate<F>(
+        &self,
+        kid: &str,
+        rotated_at: f64,
+        build_new: F,
+    ) -> Result<KeyDescriptor, KlmsRotateError>
+    where
+        F: FnOnce(&KeyDescriptor) -> Result<KeyDescriptor, String>,
+    {
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+
+        let current_version = reg
+            .iter()
+            .filter(|((k, _), d)| k == kid && d.status == KeyStatus::Active)
+            .map(|((_, v), _)| *v)
+            .max()
+            .ok_or_else(|| KlmsRotateError::NoActiveVersion(format!("Unknown kid: {:?}", kid)))?;
+
+        let current = reg
+            .get(&(kid.to_string(), current_version))
+            .expect("current_version was just derived from this same map")
+            .clone();
+
+        let mut new_descriptor = build_new(&current).map_err(KlmsRotateError::Invalid)?;
+        new_descriptor.version = current_version + 1;
+
+        let new_key = (kid.to_string(), new_descriptor.version);
+        if reg.contains_key(&new_key) {
+            return Err(KlmsRotateError::Conflict(format!(
+                "Key (kid={:?}, version={}) is already registered. Use rotate_key to create a new version.",
+                kid, new_descriptor.version
+            )));
+        }
+
+        if let Some(desc) = reg.get_mut(&(kid.to_string(), current_version)) {
+            desc.status = KeyStatus::Rotated;
+            desc.rotated_at = Some(rotated_at);
+        }
+        reg.insert(new_key, new_descriptor.clone());
+        Ok(new_descriptor)
+    }
+
+    /// Same single-lock atomicity as [`Self::atomic_rotate`], but conditional: rotates only
+    /// if `kid`'s current ACTIVE version is still exactly `expected_version`, returning
+    /// `Ok(None)` as a no-op otherwise.
+    ///
+    /// [`Self::atomic_rotate`] alone is not sufficient for
+    /// [`KeyLifecycleManager::sweep_and_rotate`]'s concurrent use: it always rotates
+    /// *whatever* is currently ACTIVE, so if two threads both believe (from their own
+    /// `list_expiring` snapshot) that `kid` is due for rotation, the first thread's
+    /// atomic_rotate call succeeds, and the second thread's call would then happily rotate
+    /// the *first thread's brand-new, nowhere-near-expiry* replacement — silently
+    /// double-rotating a key far ahead of schedule. Gating on `expected_version` means the
+    /// second thread's call sees the active version has already moved past what it
+    /// snapshotted as due and skips, exactly once per genuinely-due version.
+    fn atomic_rotate_if_current<F>(
+        &self,
+        kid: &str,
+        expected_version: u64,
+        rotated_at: f64,
+        build_new: F,
+    ) -> Result<Option<KeyDescriptor>, KlmsRotateError>
+    where
+        F: FnOnce(&KeyDescriptor) -> Result<KeyDescriptor, String>,
+    {
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (kid.to_string(), expected_version);
+
+        let current = match reg.get(&key) {
+            Some(d) if d.status == KeyStatus::Active => d.clone(),
+            // Either never existed, or exists but is no longer Active (already rotated,
+            // revoked, or expired by a concurrent caller) — both are a safe no-op, not an
+            // error, since "someone else already handled this due key" is the expected
+            // outcome of losing the race, not a failure.
+            _ => return Ok(None),
+        };
+
+        let mut new_descriptor = build_new(&current).map_err(KlmsRotateError::Invalid)?;
+        new_descriptor.version = current.version + 1;
+
+        let new_key = (kid.to_string(), new_descriptor.version);
+        if reg.contains_key(&new_key) {
+            return Err(KlmsRotateError::Conflict(format!(
+                "Key (kid={:?}, version={}) is already registered. Use rotate_key to create a new version.",
+                kid, new_descriptor.version
+            )));
+        }
+
+        if let Some(desc) = reg.get_mut(&key) {
+            desc.status = KeyStatus::Rotated;
+            desc.rotated_at = Some(rotated_at);
+        }
+        reg.insert(new_key, new_descriptor.clone());
+        Ok(Some(new_descriptor))
+    }
+}
+
+/// Error from [`KeyRegistry::atomic_rotate`] — kept distinct from a bare `String` so
+/// [`KeyLifecycleManager::rotate_key`] can map each variant to the right
+/// [`SAACPBytecodes`] instead of guessing from message text.
+enum KlmsRotateError {
+    /// `kid` has no ACTIVE version at all (already fully revoked/rotated away).
+    NoActiveVersion(String),
+    /// The computed next-version slot is already occupied (should be unreachable given the
+    /// single-lock atomicity above, but kept as a defensive check rather than an `unwrap`).
+    Conflict(String),
+    /// `build_new` itself rejected the new descriptor (e.g. `KeyDescriptor::new` validation).
+    Invalid(String),
+}
+
+impl KlmsRotateError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NoActiveVersion(m) | Self::Conflict(m) | Self::Invalid(m) => m,
         }
     }
 }
@@ -418,40 +606,40 @@ impl KeyLifecycleManager {
         algorithm: KeyAlgorithm,
     ) -> Result<KeyDescriptor, SAACPHardDrop> {
         let now = now_epoch_secs();
+        let policy = &self.policy;
 
-        // Fetch the current active descriptor (may raise SAACPHardDrop)
-        let current = self.registry.get_active(kid)?;
+        // Read-current, build-new, and write-both all happen under one lock inside
+        // atomic_rotate — see its doc comment for the concurrent-rotation race this closes.
+        let result = self.registry.atomic_rotate(kid, now, move |current| {
+            let mut metadata = HashMap::new();
+            metadata.insert("rotated_from_version".into(), current.version.to_string());
+            metadata.insert("overlap_expires_at".into(), (now + policy.overlap_seconds).to_string());
 
-        // Stamp the old descriptor as ROTATED
-        self.registry.update_status(
-            kid,
-            current.version,
-            KeyStatus::Rotated,
-            Some(now),
-        );
+            KeyDescriptor::new(
+                kid.to_string(),
+                current.version + 1,
+                algorithm,
+                current.category,
+                new_key_material,
+                now,
+                now + policy.max_age_seconds,
+                None,
+                KeyStatus::Active,
+                metadata,
+            )
+        });
 
-        // Build the new descriptor
-        let mut metadata = HashMap::new();
-        metadata.insert("rotated_from_version".into(), current.version.to_string());
-        metadata.insert("overlap_expires_at".into(), (now + self.policy.overlap_seconds).to_string());
+        let new_descriptor = match result {
+            Ok(desc) => desc,
+            Err(e @ KlmsRotateError::NoActiveVersion(_)) => {
+                return Err(SAACPHardDrop::new(SAACPBytecodes::KeyRevoked, e.into_message()));
+            }
+            Err(e) => {
+                return Err(SAACPHardDrop::new(SAACPBytecodes::KeyVersionMismatch, e.into_message()));
+            }
+        };
 
-        let new_descriptor = KeyDescriptor::new(
-            kid.to_string(),
-            current.version + 1,
-            algorithm,
-            current.category,
-            new_key_material,
-            now,
-            now + self.policy.max_age_seconds,
-            None,
-            KeyStatus::Active,
-            metadata,
-        )
-        .map_err(|e| SAACPHardDrop::new(SAACPBytecodes::KeyVersionMismatch, e))?;
-
-        self.registry
-            .register(new_descriptor.clone())
-            .map_err(|e| SAACPHardDrop::new(SAACPBytecodes::KeyVersionMismatch, e))?;
+        crate::telemetry::global_telemetry().record_key_rotation();
 
         Ok(new_descriptor)
     }
@@ -489,7 +677,7 @@ impl KeyLifecycleManager {
             propagated: false,
         };
 
-        self.revocation_log.lock().unwrap().push(record.clone());
+        self.revocation_log.lock().unwrap_or_else(|e| e.into_inner()).push(record.clone());
         Ok(record)
     }
 
@@ -501,8 +689,12 @@ impl KeyLifecycleManager {
         let now = now.unwrap_or_else(now_epoch_secs);
         let mut count = 0;
 
-        // Get all registered keys via the registry's internal map
-        let reg = self.registry.registry.lock().unwrap();
+        // Get all registered keys via the registry's internal map. Matches the
+        // M-38 idiom already used by every other `self.registry.lock()` call
+        // in `KeyRegistry`'s own impl block (see its doc comment): this is the
+        // same process-wide-singleton-backing Mutex, so recovering on poison
+        // here keeps this direct field access consistent with its siblings.
+        let reg = self.registry.registry.lock().unwrap_or_else(|e| e.into_inner());
         let stale: Vec<(String, u64)> = reg
             .iter()
             .filter(|(_, desc)| desc.status == KeyStatus::Active && desc.expires_at < now)
@@ -517,6 +709,90 @@ impl KeyLifecycleManager {
         }
 
         count
+    }
+
+    /// Automatically rotate every key within its pre-expiry renewal window (Phase 5, item
+    /// 4: automatic key rotation). A no-op if `self.policy.auto_rotate` is `false`.
+    ///
+    /// `generate_key` supplies fresh CSPRNG key material per algorithm — `klms.rs` itself
+    /// never hard-codes or duplicates an RNG choice for every [`KeyAlgorithm`] variant; see
+    /// [`default_key_generator`] for a sane default. Returns the `kid`s that were
+    /// successfully rotated (a `kid` whose current version has since become non-`Active`,
+    /// e.g. concurrently revoked, is silently skipped rather than erroring — Monotonic
+    /// Security: automatic rotation must never resurrect a `Revoked`/`Compromised` key, and
+    /// [`KeyRegistry::get_active`] — which only [`KeyRegistry::list_expiring`] feeds —
+    /// already filters to `Active`, so a skip here means the key changed state between the
+    /// `list_expiring` snapshot and this call, not that rotation logic is unsound).
+    pub fn sweep_and_rotate<F>(&self, now: f64, generate_key: F) -> Vec<String>
+    where
+        F: Fn(KeyAlgorithm) -> Vec<u8>,
+    {
+        if !self.policy.auto_rotate {
+            return Vec::new();
+        }
+
+        let due = self.registry.list_expiring(self.policy.renewal_lead_seconds, now);
+        let mut rotated = Vec::new();
+        for (kid, version) in due {
+            // `version` is the exact snapshotted descriptor `list_expiring` found due —
+            // versions are retained (never deleted) on rotation, so `get_version` still
+            // resolves it even if a concurrent sweep already rotated `kid` past it.
+            let algorithm = match self.registry.get_version(&kid, version) {
+                Ok(desc) => desc.algorithm,
+                Err(_) => continue,
+            };
+            let policy = &self.policy;
+            // `atomic_rotate_if_current` only performs the rotation if `version` is still
+            // the live ACTIVE version at the moment the lock is acquired — see its doc
+            // comment for the concurrent double-rotation race this closes. A concurrent
+            // sweep that already rotated `kid` past `version` makes this call a safe no-op
+            // (`Ok(None)`) rather than a second, spurious rotation.
+            let result = self.registry.atomic_rotate_if_current(&kid, version, now, |current| {
+                let mut metadata = HashMap::new();
+                metadata.insert("rotated_from_version".into(), current.version.to_string());
+                metadata.insert(
+                    "overlap_expires_at".into(),
+                    (now + policy.overlap_seconds).to_string(),
+                );
+                KeyDescriptor::new(
+                    kid.clone(),
+                    current.version + 1,
+                    algorithm,
+                    current.category,
+                    generate_key(algorithm),
+                    now,
+                    now + policy.max_age_seconds,
+                    None,
+                    KeyStatus::Active,
+                    metadata,
+                )
+            });
+            if matches!(result, Ok(Some(_))) {
+                rotated.push(kid);
+            }
+        }
+        rotated
+    }
+
+    /// Spawn a background OS thread (matching `security.rs`'s WAL-worker idiom, and the
+    /// Phase-7 "background maintenance sweep" 60s cadence used elsewhere) that calls
+    /// [`Self::sweep_and_rotate`] every 60 seconds using `generate_key` for fresh key
+    /// material. Returns the thread's `JoinHandle` — the thread runs for the lifetime of
+    /// the process (or until the handle is dropped and the process exits); there is no
+    /// explicit stop signal since `KeyLifecycleManager` instances are expected to live for
+    /// the daemon's lifetime, matching `TrustDecayEngine`/other global background workers.
+    pub fn start_auto_rotation(
+        self: std::sync::Arc<Self>,
+        generate_key: impl Fn(KeyAlgorithm) -> Vec<u8> + Send + Sync + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("klms-auto-rotation".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let now = now_epoch_secs();
+                self.sweep_and_rotate(now, &generate_key);
+            })
+            .expect("failed to spawn klms-auto-rotation thread")
     }
 
     /// Return an ordered audit trail for all versions of kid.
@@ -539,7 +815,7 @@ impl KeyLifecycleManager {
 
     /// Return a copy of the internal revocation log.
     pub fn get_revocation_log(&self) -> Vec<KeyRevocationRecord> {
-        self.revocation_log.lock().unwrap().clone()
+        self.revocation_log.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Propagate all un-propagated revocation records to federation peers.
@@ -551,7 +827,7 @@ impl KeyLifecycleManager {
         F: FnMut(&KeyRevocationRecord),
     {
         let unpropagated: Vec<usize> = {
-            let log = self.revocation_log.lock().unwrap();
+            let log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
             log.iter()
                 .enumerate()
                 .filter(|(_, r)| !r.propagated)
@@ -562,7 +838,7 @@ impl KeyLifecycleManager {
         let mut count = 0;
         for idx in unpropagated {
             let record = {
-                let log = self.revocation_log.lock().unwrap();
+                let log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
                 log[idx].clone()
             };
 
@@ -571,7 +847,7 @@ impl KeyLifecycleManager {
                 cb(&record);
             }
 
-            let mut log = self.revocation_log.lock().unwrap();
+            let mut log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
             log[idx].propagated = true;
             count += 1;
         }
@@ -621,6 +897,21 @@ fn now_epoch_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Sane default CSPRNG-backed key-material generator for
+/// [`KeyLifecycleManager::sweep_and_rotate`]/[`KeyLifecycleManager::start_auto_rotation`],
+/// using `rand::rngs::OsRng` (already available via `ed25519-dalek`'s `rand_core` feature /
+/// the plain `rand = "0.8"` dependency). Sized correctly per algorithm — 32 bytes
+/// (256 bits) for every current [`KeyAlgorithm`] variant (AES-256-GCM, Ed25519,
+/// HMAC-SHA-256, HKDF-SHA-256). Most deployments can pass this directly and need zero
+/// extra wiring; a deployment with its own HSM-backed key generation should supply its own
+/// `generate_key` closure instead.
+pub fn default_key_generator(alg: KeyAlgorithm) -> Vec<u8> {
+    use rand::RngCore;
+    let mut buf = vec![0u8; alg.key_len()];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
 }
 
 // ---------------------------------------------------------------------------

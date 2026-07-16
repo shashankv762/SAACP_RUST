@@ -129,8 +129,18 @@ impl HandshakeTranscript {
     ///
     /// # Errors
     /// Returns `Err` if the transcript has already been finalized.
+    ///
+    /// M-39 fix: recovers the lock via `into_inner()` on poison, matching
+    /// every other method on this type (see this type's module-level M-39
+    /// note). Previously this was the only method that surfaced poisoning as
+    /// an `Err` here — inconsistent with `element_count`/`is_finalized`/the
+    /// `Debug` impl, which `.expect()`-panicked on poison, and with
+    /// `hth`/`hth_hex`, which silently mapped poison to `None` (indistinguishable
+    /// from "not yet finalized"). None of the critical sections below can
+    /// itself panic under normal operation (`Vec::push`, simple field writes),
+    /// so recovering rather than treating poison as fatal is safe.
     pub fn append(&self, element_type: TranscriptElementType, data: &[u8]) -> Result<(), String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.finalized {
             return Err("Cannot append to a finalized HandshakeTranscript".into());
         }
@@ -162,8 +172,11 @@ impl HandshakeTranscript {
     ///
     /// # Errors
     /// Returns `Err` if the transcript has already been finalized.
+    ///
+    /// M-39 fix: recovers the lock via `into_inner()` on poison — see `append`'s
+    /// doc comment for why this is consistent and safe across every method here.
     pub fn finalize(&self) -> Result<Vec<u8>, String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.finalized {
             return Err("HandshakeTranscript has already been finalized".into());
         }
@@ -193,26 +206,39 @@ impl HandshakeTranscript {
     }
 
     /// The 32-byte HTH digest, or `None` if not yet finalized.
+    ///
+    /// M-39 fix: recovers the lock via `into_inner()` on poison instead of
+    /// `.ok()?`-mapping poison to `None` — the prior behavior was
+    /// indistinguishable from "not yet finalized", silently hiding a
+    /// poisoned lock behind a normal-looking `None` return. See `append`'s
+    /// doc comment for why recovery is safe here.
     pub fn hth(&self) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.hth.clone()
     }
 
     /// Hex-encoded HTH digest string, or `None` if not yet finalized.
+    ///
+    /// M-39 fix: see `hth`'s doc comment — same poison-recovery fix.
     pub fn hth_hex(&self) -> Option<String> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.hth.as_ref().map(hex::encode)
     }
 
     /// Return the number of elements currently in the transcript.
+    ///
+    /// M-39 fix: recovers the lock via `into_inner()` on poison instead of
+    /// `.expect("lock poisoned")`-panicking — see `append`'s doc comment.
     pub fn element_count(&self) -> u64 {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.elements.len() as u64
     }
 
     /// Return `true` if `finalize()` has been successfully called.
+    ///
+    /// M-39 fix: see `element_count`'s doc comment — same poison-recovery fix.
     pub fn is_finalized(&self) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.finalized
     }
 
@@ -224,7 +250,9 @@ impl HandshakeTranscript {
 
 impl std::fmt::Debug for HandshakeTranscript {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock poisoned");
+        // M-39 fix: recovers via `into_inner()` on poison, consistent with every
+        // other method on this type — see `append`'s doc comment.
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("HandshakeTranscript")
             .field("session_id", &hex::encode(&self.session_id))
             .field("elements", &inner.elements.len())
@@ -341,6 +369,12 @@ pub fn verify_capability_binding(
 // TranscriptRegistry
 // ---------------------------------------------------------------------------
 
+/// Maximum number of sessions held by a `TranscriptRegistry` before oldest-first
+/// eviction kicks in (M-36). Matches the scale of the other process-wide
+/// per-session registries (`identity_binding::SESSION_IDENTITY_REGISTRY_MAX_ENTRIES`,
+/// `memory::SCR_MAX_ENTRIES`'s sibling bound).
+pub const TRANSCRIPT_REGISTRY_MAX_SESSIONS: usize = 10_000;
+
 /// Thread-safe global registry mapping session IDs to TranscriptSessions.
 pub struct TranscriptRegistry {
     sessions: Mutex<HashMap<Vec<u8>, TranscriptSession>>,
@@ -356,8 +390,38 @@ impl TranscriptRegistry {
 
     /// Add a `TranscriptSession` to the registry.
     /// Silently replaces any existing session with the same ID.
+    ///
+    /// M-36 fix: previously unbounded — every established handshake session
+    /// stayed in the registry forever with no cap, letting a client that
+    /// completes (or is driven through) many handshakes without the
+    /// corresponding sessions ever being explicitly `remove()`-d grow this
+    /// map without limit (unbounded memory growth / OOM DoS). Forces
+    /// oldest-`established_at`-first eviction once at capacity and the
+    /// incoming session ID is new, mirroring
+    /// `identity_binding::SessionIdentityRegistry::register`'s established
+    /// pattern for the same class of registry. An evicted session simply
+    /// requires the client to re-run its handshake — fail-closed, not
+    /// fail-open.
+    ///
+    /// M-38 fix: every lock in this impl block (and the `Debug` impl below)
+    /// recovers via `into_inner()` on poison rather than panicking/silently
+    /// returning `None` — `DEFAULT_REGISTRY` is a process-wide singleton, so
+    /// one poisoning panic must not cascade into every other session's
+    /// handshake-transcript lookups.
     pub fn register(&self, session: TranscriptSession) {
-        let mut sessions = self.sessions.lock().expect("lock poisoned");
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.len() >= TRANSCRIPT_REGISTRY_MAX_SESSIONS
+            && !sessions.contains_key(&session.session_id)
+        {
+            let evict_count = sessions.len() + 1 - TRANSCRIPT_REGISTRY_MAX_SESSIONS;
+            let mut by_age: Vec<(Vec<u8>, f64)> = sessions.iter()
+                .map(|(k, v)| (k.clone(), v.established_at))
+                .collect();
+            by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (k, _) in by_age.into_iter().take(evict_count) {
+                sessions.remove(&k);
+            }
+        }
         sessions.insert(session.session_id.clone(), session);
     }
 
@@ -367,25 +431,25 @@ impl TranscriptRegistry {
     where
         F: FnOnce(&TranscriptSession) -> R,
     {
-        let sessions = self.sessions.lock().ok()?;
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_id).map(f)
     }
 
     /// Check if a session exists.
     pub fn contains(&self, session_id: &[u8]) -> bool {
-        let sessions = self.sessions.lock().expect("lock poisoned");
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.contains_key(session_id)
     }
 
     /// Remove a session from the registry. No-op if not present.
     pub fn remove(&self, session_id: &[u8]) {
-        let mut sessions = self.sessions.lock().expect("lock poisoned");
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.remove(session_id);
     }
 
     /// Return the number of currently registered sessions.
     pub fn count(&self) -> usize {
-        let sessions = self.sessions.lock().expect("lock poisoned");
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.len()
     }
 }
@@ -398,7 +462,7 @@ impl Default for TranscriptRegistry {
 
 impl std::fmt::Debug for TranscriptRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sessions = self.sessions.lock().expect("lock poisoned");
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         write!(f, "TranscriptRegistry(sessions={})", sessions.len())
     }
 }
@@ -575,6 +639,52 @@ mod tests {
         let reg = TranscriptRegistry::new();
         reg.remove(&[0u8; 16]); // should not panic
         assert_eq!(reg.count(), 0);
+    }
+
+    /// Build a finalized, registerable `TranscriptSession` with a unique
+    /// 16-byte session ID derived from `id` and an explicit `established_at`
+    /// (overwritten directly post-construction — `established_at` is a
+    /// `pub` field — for deterministic, non-flaky age control instead of
+    /// relying on real wall-clock deltas in a tight loop).
+    fn test_session_at(id: u32, established_at: f64) -> TranscriptSession {
+        let mut sid = vec![0u8; 12];
+        sid.extend_from_slice(&id.to_be_bytes());
+        let ht = HandshakeTranscript::new(&sid).unwrap();
+        let mut session = TranscriptSession::create(&sid, 1, "cid", ht).unwrap();
+        session.established_at = established_at;
+        session
+    }
+
+    /// M-36 regression: `TranscriptRegistry` must evict the oldest-by-`established_at`
+    /// session (not oldest-by-insertion / arbitrary `HashMap` order) once at capacity,
+    /// mirroring `identity_binding::SessionIdentityRegistry`'s established pattern.
+    #[test]
+    fn test_registry_evicts_oldest_first_at_capacity() {
+        let reg = TranscriptRegistry::new();
+        {
+            let mut sessions = reg.sessions.lock().unwrap();
+            for i in 0..TRANSCRIPT_REGISTRY_MAX_SESSIONS {
+                // Descending established_at (opposite of insertion/key order)
+                // so eviction-by-key-order would evict the WRONG entries.
+                let established_at = (TRANSCRIPT_REGISTRY_MAX_SESSIONS - i) as f64;
+                let session = test_session_at(i as u32, established_at);
+                sessions.insert(session.session_id.clone(), session);
+            }
+        }
+        assert_eq!(reg.count(), TRANSCRIPT_REGISTRY_MAX_SESSIONS);
+
+        let newest = test_session_at(u32::MAX, 999_999.0);
+        let newest_id = newest.session_id.clone();
+        reg.register(newest);
+
+        assert!(
+            reg.count() <= TRANSCRIPT_REGISTRY_MAX_SESSIONS,
+            "M-36: TranscriptRegistry must not grow past its cap"
+        );
+        assert!(
+            reg.contains(&newest_id),
+            "the just-registered newest session must survive"
+        );
     }
 
     #[test]

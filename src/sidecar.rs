@@ -62,10 +62,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -146,6 +148,16 @@ pub struct SidecarConfig {
     /// network and every peer is already trusted at the network layer. Defaults to
     /// `false` — the safe, fail-closed setting.
     pub allow_private_targets: bool,
+    /// M-22 fix: opt-in bearer-token auth for the local plain-HTTP/JSON API — every
+    /// `/send`/`/receive` request must carry a matching `Authorization: Bearer <token>`
+    /// header, checked with a constant-time comparison (`gateway::constant_time_eq`).
+    /// `/healthz` is never gated (matches `command_center.rs`'s existing precedent).
+    /// `None` (default, set by `SidecarConfig::new`) preserves today's exact
+    /// unauthenticated behavior — opt-in, matching this module's other security opt-ins
+    /// (`peer_secrets`, `target_allowlist`). This guards only the local co-located-agent
+    /// API, not the SAACP wire protocol itself (already authenticated via
+    /// `token_issuer_secret`/`peer_secrets`).
+    pub http_bearer_token: Option<String>,
 }
 
 impl SidecarConfig {
@@ -170,6 +182,7 @@ impl SidecarConfig {
             send_retry_attempts: SIDECAR_DEFAULT_SEND_RETRY_ATTEMPTS,
             target_allowlist: Vec::new(),
             allow_private_targets: false,
+            http_bearer_token: None,
         }
     }
 }
@@ -284,25 +297,50 @@ impl DeliveredMessage {
             _ => 1,
         };
         Some(Self {
-            from_agent: parsed.source_agent.clone(),
+            // `DeliveredMessage` is a serde wire-format DTO (`/receive` HTTP
+            // response) — deliberately kept as `String`, not `Arc<str>`, so
+            // these conversions (crossing a serialization boundary, not a
+            // per-packet hot path) use `.to_string()` rather than `.clone()`.
+            from_agent: parsed.source_agent.to_string(),
             task,
             priority,
             action_class: parsed.action_class,
-            // `DeliveredMessage` is a serde wire-format DTO (`/receive` HTTP
-            // response) — deliberately kept as `String`, not `Arc<str>`, so
-            // this one conversion (crossing a serialization boundary, not a
-            // per-packet hot path) uses `.to_string()` rather than `.clone()`.
             session_uuid: parsed.session_uuid.to_string(),
         })
     }
 }
 
 /// Bounded, single-consumer inbox fed by `SAACPNetworkDaemon`'s `on_delivered` hook.
+///
+/// M-17 fix: `recv_permit` is a single-permit semaphore dedicated to
+/// enforcing "only one in-flight `/receive` call at a time". Before this fix,
+/// a second concurrent `/receive` call blocked behind `rx`'s `tokio::sync::
+/// Mutex` for up to the FIRST call's entire `wait_secs` timeout (as long as
+/// `SIDECAR_MAX_RECEIVE_WAIT_SECS`) instead of failing fast — a caller
+/// issuing overlapping polls (a bug on the agent side, but one this API
+/// should surface immediately rather than silently queue behind) would see
+/// unexplained multi-second latency instead of an actionable error.
+/// `try_recv_permit` lets `handle_receive` fail fast with 409 CONFLICT
+/// instead, preserving the existing single-consumer design intent (this
+/// inbox was never meant to fan out to multiple concurrent readers) without
+/// changing delivery semantics the way a broadcast channel would.
 struct Inbox {
     rx: Mutex<mpsc::Receiver<DeliveredMessage>>,
+    recv_permit: tokio::sync::Semaphore,
 }
 
 impl Inbox {
+    fn new(rx: mpsc::Receiver<DeliveredMessage>) -> Self {
+        Self { rx: Mutex::new(rx), recv_permit: tokio::sync::Semaphore::new(1) }
+    }
+
+    /// Attempt to reserve the single `/receive` slot. Returns `None`
+    /// immediately (no waiting) if another `/receive` call already holds it —
+    /// the caller should respond 409 CONFLICT rather than queue.
+    fn try_recv_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.recv_permit.try_acquire().ok()
+    }
+
     async fn recv_timeout(&self, wait: Duration) -> Option<DeliveredMessage> {
         let mut rx = self.rx.lock().await;
         tokio::time::timeout(wait, rx.recv()).await.ok().flatten()
@@ -438,7 +476,10 @@ pub async fn send_message(
     epoch_mgr
         .create_session(
             session_id,
-            session_key,
+            // L-16 fix: `client_handshake` now returns `Zeroizing<[u8; 32]>` so the raw
+            // key is wiped on drop; `*session_key` takes a `Copy` snapshot of the bytes
+            // for this one-shot `create_session` call without disturbing that guarantee.
+            *session_key,
             MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
             MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
             None,
@@ -533,6 +574,13 @@ struct SidecarState {
     target_allowlist: Vec<(IpAddr, u8)>,
     /// H-21 (SSRF) fix — see `SidecarConfig::allow_private_targets`.
     allow_private_targets: bool,
+    /// M-22 fix — see `SidecarConfig::http_bearer_token`.
+    http_bearer_token: Option<String>,
+    /// Set `false` if the inner SAACP protocol listener (`daemon.rs`) exits with an
+    /// error (e.g. its TCP bind failed). Without this, a dead protocol listener left
+    /// the sidecar serving HTTP while silently unable to receive any peer traffic, and
+    /// `/healthz` still reported `"ok"` — a half-dead sidecar that looked healthy.
+    protocol_listener_healthy: Arc<AtomicBool>,
 }
 
 impl SidecarState {
@@ -626,6 +674,14 @@ async fn handle_receive(
     State(state): State<Arc<SidecarState>>,
     Query(q): Query<ReceiveQuery>,
 ) -> Response {
+    // M-17 fix: fail fast with 409 if another /receive call is already
+    // in-flight, instead of queueing behind `Inbox::rx`'s Mutex for up to
+    // this request's own `wait_secs`. The permit is held for the duration of
+    // this handler (dropped at the end of this function, releasing the slot
+    // for the next caller).
+    let Some(_permit) = state.inbox.try_recv_permit() else {
+        return StatusCode::CONFLICT.into_response();
+    };
     let wait = Duration::from_secs_f64(q.wait_secs.clamp(0.0, SIDECAR_MAX_RECEIVE_WAIT_SECS));
     match state.inbox.recv_timeout(wait).await {
         Some(msg) => (StatusCode::OK, Json(msg)).into_response(),
@@ -633,19 +689,81 @@ async fn handle_receive(
     }
 }
 
-async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
+async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Response {
+    // A dead inner protocol listener means the sidecar can serve HTTP but cannot receive
+    // any peer traffic — report it as unhealthy (503) rather than a misleading "ok".
+    let protocol_healthy = state.protocol_listener_healthy.load(Ordering::Relaxed);
+    let body = serde_json::json!({
+        "status": if protocol_healthy { "ok" } else { "degraded" },
+        "protocol_listener": if protocol_healthy { "up" } else { "down" },
         "agent_id": state.agent_id,
         "inbox_depth": state.inbox.len().await,
         "inbox_capacity": state.inbox_capacity,
         "peers_configured": state.peer_secrets.len(),
-    }))
+    });
+    let code = if protocol_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body)).into_response()
+}
+
+// ─── M-22: bearer-token auth for the local HTTP API ───────────────────────────
+
+/// Mirrors `command_center.rs::bearer_token` exactly.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+fn unauthorized_response() -> Response {
+    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
+}
+
+/// M-22 fix: applied via `route_layer` to `/send`/`/receive` only — never `/healthz`,
+/// matching `command_center.rs::require_auth`'s precedent. When
+/// `SidecarConfig::http_bearer_token` is `None` (the default), every request passes
+/// through unauthenticated — today's exact existing behavior, opt-in only.
+async fn require_bearer_auth(
+    State(state): State<Arc<SidecarState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.http_bearer_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let authorized = bearer_token(request.headers())
+        .map(|tok| crate::gateway::constant_time_eq(tok.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false);
+    if authorized {
+        next.run(request).await
+    } else {
+        unauthorized_response()
+    }
 }
 
 /// Start the sidecar: the real SAACP protocol listener (peer sidecars dial in) plus the
-/// local plain-HTTP/JSON API (the co-located agent talks to this). Runs forever.
+/// local plain-HTTP/JSON API (the co-located agent talks to this). Runs forever (until the
+/// process is killed) — equivalent to `run_with_shutdown` with a token that's never
+/// cancelled.
 pub async fn run(config: SidecarConfig) {
+    run_with_shutdown(config, tokio_util::sync::CancellationToken::new()).await
+}
+
+/// M-15 fix: same as `run`, but both the inner SAACP protocol listener
+/// (`daemon.rs`) and the outer plain-HTTP/JSON API (`axum::serve`) stop
+/// accepting new work as soon as `shutdown` is cancelled, mirroring the same
+/// `CancellationToken` idiom already used by `daemon::SAACPNetworkDaemon::
+/// start_with_shutdown` / `transport::ws`/`transport::tls`'s equivalents — the
+/// sidecar was previously the one network-facing entry point in this crate
+/// with no graceful-shutdown path at all (bare `tokio::spawn` for the inner
+/// daemon with a token that's never propagated, and a bare `axum::serve(...)
+/// .await` with no `.with_graceful_shutdown(...)`).
+pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync::CancellationToken) {
     let (tx, rx) = mpsc::channel::<DeliveredMessage>(SIDECAR_INBOX_CAPACITY);
 
     let gateway = Arc::new(ZeroTrustGateway::new());
@@ -679,7 +797,19 @@ pub async fn run(config: SidecarConfig) {
             }
         }));
 
-    tokio::spawn(async move { daemon.start().await; });
+    let daemon_shutdown = shutdown.clone();
+    let protocol_listener_healthy = Arc::new(AtomicBool::new(true));
+    let daemon_health = Arc::clone(&protocol_listener_healthy);
+    tokio::spawn(async move {
+        if let Err(e) = daemon.start_with_shutdown(daemon_shutdown).await {
+            // The inner SAACP protocol listener failed (typically a bind error). Mark the
+            // sidecar unhealthy so `/healthz` reports the degradation instead of a false
+            // "ok" — the process keeps its HTTP surface up so orchestration can observe the
+            // failure and restart, rather than the listener dying silently.
+            daemon_health.store(false, Ordering::Relaxed);
+            eprintln!("[SAACP Sidecar] protocol listener exited with error: {e}");
+        }
+    });
 
     let state = Arc::new(SidecarState {
         agent_id: config.agent_id,
@@ -687,16 +817,25 @@ pub async fn run(config: SidecarConfig) {
         peer_secrets: config.peer_secrets,
         send_retry_attempts: config.send_retry_attempts,
         send_semaphore: tokio::sync::Semaphore::new(config.max_concurrent_sends.max(1)),
-        inbox: Inbox { rx: Mutex::new(rx) },
+        inbox: Inbox::new(rx),
         inbox_capacity: SIDECAR_INBOX_CAPACITY,
         target_allowlist: config.target_allowlist,
         allow_private_targets: config.allow_private_targets,
+        http_bearer_token: config.http_bearer_token,
+        protocol_listener_healthy,
     });
 
-    let app = Router::new()
+    // M-22 fix: `/send`/`/receive` sit behind bearer-token auth (opt-in, see
+    // `require_bearer_auth`); `/healthz` is never gated, matching
+    // `command_center.rs`'s existing split-router precedent.
+    let protected = Router::new()
         .route("/send", post(handle_send))
         .route("/receive", get(handle_receive))
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_bearer_auth));
+
+    let app = Router::new()
         .route("/healthz", get(handle_healthz))
+        .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_PAYLOAD_SIZE))
         .with_state(state);
 
@@ -706,6 +845,7 @@ pub async fn run(config: SidecarConfig) {
 
     eprintln!("[SAACP Sidecar] HTTP API listening on {}", config.http_listen_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .unwrap_or_else(|e| panic!("saacp-sidecar: HTTP server failed: {}", e));
 }

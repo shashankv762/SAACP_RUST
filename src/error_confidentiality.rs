@@ -185,12 +185,14 @@ impl ErrorConfidentialityFilter {
             None
         };
 
-        WireErrorResponse {
-            category,
-            correlation_id,
-            retry_after_seconds,
-            protocol_version: DEFAULT_PROTOCOL_VERSION.to_string(),
-        }
+        // L-33 fix: route through `WireErrorResponse::new()`'s validation instead of a
+        // raw struct literal, so this hot path and `new()`'s own invariant can never
+        // silently diverge. `.expect()` is safe here (not a caller-facing fallibility
+        // this function needs to propagate): `correlation_id` is always exactly
+        // `hex::encode` of a 16-byte buffer, i.e. always exactly 32 hex chars, so
+        // `new()`'s length check can never actually fail from this call site.
+        WireErrorResponse::new(category, correlation_id, retry_after_seconds)
+            .expect("sanitize(): correlation_id is always hex::encode of a 16-byte buffer (32 chars)")
     }
 
     /// Serialize a WireErrorResponse to the fixed 44-byte wire format.

@@ -200,8 +200,12 @@ impl CoverTraffic {
     /// Tracks wall-clock time; caller must actually build and send the
     /// FLAG_COVER_TRAFFIC packet using the MEASC framing layer.
     pub fn should_emit(&mut self) -> bool {
-        let interval_ms = (1000.0 / self.rate_hz) as u64;
-        let interval = Duration::from_millis(interval_ms);
+        // L-34 fix: `Duration::from_secs_f64` keeps full `f64` precision, instead of
+        // truncating to whole milliseconds — for any `rate_hz` that doesn't evenly
+        // divide 1000 (e.g. 7.0 Hz), the old computation drifted the emitted cadence
+        // away from the configured rate, a detectable periodicity that weakens exactly
+        // the traffic-analysis resistance this module exists to provide.
+        let interval = Duration::from_secs_f64(1.0 / self.rate_hz);
         match self.last_issued {
             None => {
                 self.last_issued = Some(Instant::now());
@@ -557,7 +561,7 @@ mod tests {
         let seq_b: Vec<u64> = (0..20).map(|_| b.jitter_ms()).collect();
         assert_ne!(seq_a, seq_b, "jitter sequences must not be deterministic across instances");
         for &j in seq_a.iter().chain(seq_b.iter()) {
-            assert!(j >= MPF_TIMING_JITTER_MIN_MS && j <= MPF_TIMING_JITTER_MS);
+            assert!((MPF_TIMING_JITTER_MIN_MS..=MPF_TIMING_JITTER_MS).contains(&j));
         }
     }
 

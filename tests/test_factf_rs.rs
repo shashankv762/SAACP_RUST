@@ -12,7 +12,22 @@ use saacp::{
     CapabilityTransparencyLog,
     RiskAwareAuthorizationEvaluator, AuthorizationContext,
     PostCompromiseRecovery, CompromiseRecoveryReport,
+    FilesystemBackend, TransparencyLogBackend,
 };
+
+/// Unique scratch file path under the OS temp dir for `FilesystemBackend` tests —
+/// avoids collisions between parallel test threads without adding a `tempfile` dev-dependency.
+fn scratch_path(tag: &str) -> String {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    dir.join(format!("saacp_test_tlog_{tag}_{pid}_{nonce}.jsonl"))
+        .to_string_lossy()
+        .into_owned()
+}
 
 fn make_ca_pair(iss: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
     let sk = CapabilitySigningKey::generate(iss, 3600);
@@ -356,8 +371,80 @@ fn test_crit3_verify_rejects_when_below_real_threshold_even_if_token_claims_enou
     );
 }
 
-// ─── CapabilityTransparencyLog ───────────────────────────────────────────────
+// ─── submit_partial_approval: opt-in cryptographic verification ──────────────
+//
+// When a CapabilityVerificationAuthority is registered on the issuer,
+// submit_partial_approval must reject any approval whose signature is not a
+// valid Ed25519 signature over the proposal's base_claims — closing the hole
+// where the only prior check was "signature is not all-zero".
 
+/// Build a `SignedCapabilityToken` carrying `kid` in its claims and a signature
+/// (by `sk`) over `sign_over` — decoupled from the token's own claims so a test
+/// can produce a signature over the proposal base_claims OR over unrelated bytes.
+fn threshold_approval_token(
+    sk: &CapabilitySigningKey,
+    kid: &str,
+    sign_over: &[u8],
+) -> saacp::SignedCapabilityToken {
+    let mut claims = Map::new();
+    claims.insert("kid".into(), Value::String(kid.into()));
+    let sig = sk.sign(sign_over);
+    saacp::SignedCapabilityToken { claims, signature: sig.to_bytes() }
+}
+
+#[test]
+fn test_submit_rejects_forged_approval_when_cva_registered() {
+    let auths = vec!["A".to_string(), "B".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(2, auths, 300.0).unwrap();
+    let cva = std::sync::Arc::new(CapabilityVerificationAuthority::new());
+    issuer.register_verification_authority(std::sync::Arc::clone(&cva));
+
+    let base_claims = serde_json::json!({"action": "wire_transfer", "amount": 100000});
+    let req = issuer.create_request(base_claims.clone());
+    let base_bytes = serde_json::to_vec(&base_claims).unwrap();
+
+    // Authority A registers its key but signs SOMETHING ELSE (not base_claims).
+    let sk = CapabilitySigningKey::generate("A", 3600);
+    let kid = sk.kid.clone();
+    cva.register_key(&kid, sk.verifying_key);
+    let forged = threshold_approval_token(&sk, &kid, br#"{"unrelated":"payload"}"#);
+
+    assert!(
+        issuer.submit_partial_approval(&req, "A", &forged).is_err(),
+        "a non-zero but wrong-payload signature must be rejected once a CVA is registered"
+    );
+
+    // And a signature over the correct base_claims is accepted.
+    let genuine = threshold_approval_token(&sk, &kid, &base_bytes);
+    assert!(
+        issuer.submit_partial_approval(&req, "A", &genuine).is_ok(),
+        "a valid signature over base_claims must be accepted"
+    );
+}
+
+#[test]
+fn test_submit_rejects_unknown_kid_when_cva_registered() {
+    let auths = vec!["A".to_string()];
+    let issuer = ThresholdAuthorityIssuer::new(1, auths, 300.0).unwrap();
+    let cva = std::sync::Arc::new(CapabilityVerificationAuthority::new());
+    issuer.register_verification_authority(std::sync::Arc::clone(&cva));
+
+    let base_claims = serde_json::json!({"op": "release"});
+    let req = issuer.create_request(base_claims.clone());
+    let base_bytes = serde_json::to_vec(&base_claims).unwrap();
+
+    // Key is NEVER registered with the CVA — fail closed.
+    let sk = CapabilitySigningKey::generate("A", 3600);
+    let kid = sk.kid.clone();
+    let token = threshold_approval_token(&sk, &kid, &base_bytes);
+
+    assert!(
+        issuer.submit_partial_approval(&req, "A", &token).is_err(),
+        "an approval whose kid has no registered verification key must be rejected"
+    );
+}
+
+// ─── CapabilityTransparencyLog ───────────────────────────────────────────────
 #[test]
 fn test_transparency_log_new_empty_integrity() {
     let log = CapabilityTransparencyLog::new();
@@ -384,6 +471,70 @@ fn test_transparency_log_chain_integrity_after_appends() {
     }
     assert_eq!(log.count(), 5);
     assert!(log.verify_chain_integrity(), "Chain must be intact after sequential appends");
+}
+
+/// M-30 regression: `verify_chain_integrity` caches its result, invalidated
+/// only by `append()`. Calling it repeatedly WITHOUT an intervening append
+/// must keep returning the correct (unchanged) answer (exercising the
+/// cache-hit path), and calling it again immediately AFTER each append must
+/// correctly reflect the newly-appended entry (exercising cache
+/// invalidation) — interleaved across many appends, not just checked once
+/// at the end, so a caching bug that only shows up on the Nth cache
+/// hit/invalidation cycle would be caught.
+#[test]
+fn m30_verify_chain_integrity_cache_tracks_current_state_across_interleaved_calls() {
+    let log = CapabilityTransparencyLog::new();
+
+    // Empty log: first call computes and caches; second call (no append in
+    // between) must hit the cache and still return the same correct answer.
+    assert!(log.verify_chain_integrity());
+    assert!(log.verify_chain_integrity(), "repeated call with no append must stay consistent");
+
+    for i in 0..20u32 {
+        let jti = format!("jti-interleaved-{}", i);
+        log.append(
+            "ISSUED", "iss-tl-interleaved", Some(jti.as_str()), None,
+            "sub", &[], &["read"], 0, None, None,
+        );
+        // Immediately after append: cache must be invalidated by the
+        // generation bump and recomputed against the new entry.
+        assert!(
+            log.verify_chain_integrity(),
+            "must reflect the just-appended entry (iteration {i}), not a stale cached result"
+        );
+        // A second call right after, with no further append: must hit the
+        // now-fresh cache and return the same correct answer again.
+        assert!(
+            log.verify_chain_integrity(),
+            "repeated call immediately after append must stay consistent (iteration {i})"
+        );
+    }
+    assert_eq!(log.count(), 20);
+}
+
+/// M-30: the cache must also invalidate correctly across the H-26
+/// capacity-eviction path (which mutates `chain_floor_hash`, not just
+/// `last_hash`/backend content) — every append while at capacity still
+/// goes through the same single `generation` bump, so this must behave
+/// identically to the below-capacity case above.
+#[test]
+fn m30_verify_chain_integrity_cache_correct_across_capacity_eviction() {
+    let log = CapabilityTransparencyLog::with_capacity(5);
+    for i in 0..15u32 {
+        let jti = format!("jti-cap-{}", i);
+        log.append(
+            "ISSUED", "iss-tl-cap", Some(jti.as_str()), None,
+            "sub", &[], &["read"], 0, None, None,
+        );
+        assert!(
+            log.verify_chain_integrity(),
+            "must verify correctly immediately after append {i}, including once eviction begins"
+        );
+    }
+    assert_eq!(log.count(), 5, "must stay at capacity throughout");
+    assert_eq!(log.pruned_count(), 10);
+    // Final steady-state check with no intervening append (cache-hit path).
+    assert!(log.verify_chain_integrity());
 }
 
 /// H-26: the backend must be capacity-bounded (not grow forever), must evict
@@ -674,4 +825,155 @@ fn test_post_compromise_revokes_key_in_cva() {
 
     PostCompromiseRecovery::declare_key_compromise(cia.kid(), "new-kid", "iss-rev", &cva, &log);
     assert!(cva.verify(&tok).is_err(), "Token must be invalid after key compromise declared");
+}
+
+// ─── FilesystemBackend persistence (Phase 5, item 2) ───────────────────────────
+
+#[test]
+fn test_filesystem_backend_round_trip_write_reopen_verify() {
+    let path = scratch_path("roundtrip");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let log = CapabilityTransparencyLog::with_backend(Box::new(
+            FilesystemBackend::open(&path).unwrap(),
+        ));
+        log.append("ISSUED", "iss-fs", Some("jti-1"), Some("kid-1"), "sub", &[], &["read"], 0, None, None);
+        log.append("DELEGATED", "iss-fs", Some("jti-2"), Some("kid-1"), "sub", &[], &["write"], 1, Some("jti-1"), None);
+        log.append("REVOKED", "iss-fs", Some("jti-2"), Some("kid-1"), "sub", &[], &[], 1, None, None);
+        assert!(log.verify_chain_integrity());
+        assert_eq!(log.count(), 3);
+    } // log (and its FilesystemBackend's file handle) dropped here
+
+    // Reopen against the same path — must replay all 3 entries and verify the chain.
+    let reopened_backend = FilesystemBackend::open(&path).unwrap();
+    assert_eq!(reopened_backend.count(), 3);
+    let log2 = CapabilityTransparencyLog::with_backend(Box::new(reopened_backend));
+    assert_eq!(log2.count(), 3);
+    assert!(log2.verify_chain_integrity());
+    assert_eq!(log2.get_entries_by_jti("jti-1").len(), 1);
+    assert_eq!(log2.get_entries_by_jti("jti-2").len(), 2);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_filesystem_backend_truncated_file_rejected() {
+    let path = scratch_path("truncated");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let log = CapabilityTransparencyLog::with_backend(Box::new(
+            FilesystemBackend::open(&path).unwrap(),
+        ));
+        log.append("ISSUED", "iss-trunc", Some("jti-a"), Some("kid-a"), "sub", &[], &["read"], 0, None, None);
+        log.append("ISSUED", "iss-trunc", Some("jti-b"), Some("kid-a"), "sub", &[], &["read"], 0, None, None);
+    }
+
+    // Corrupt the file: flip a byte inside the JSON so it still parses as a
+    // line but the hash-chain no longer recomputes correctly.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let corrupted = contents.replacen("jti-a", "jti-X", 1);
+    std::fs::write(&path, corrupted).unwrap();
+
+    let result = FilesystemBackend::open(&path);
+    assert!(result.is_err(), "Tampered transparency log file must fail to open, not silently reset to empty");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_filesystem_backend_truncated_last_line_rejected() {
+    let path = scratch_path("truncated_line");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let log = CapabilityTransparencyLog::with_backend(Box::new(
+            FilesystemBackend::open(&path).unwrap(),
+        ));
+        log.append("ISSUED", "iss-tl", Some("jti-c"), Some("kid-c"), "sub", &[], &["read"], 0, None, None);
+        log.append("ISSUED", "iss-tl", Some("jti-d"), Some("kid-c"), "sub", &[], &["read"], 0, None, None);
+    }
+
+    // Truncate mid-way through the last line so it's no longer valid JSON.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let cut = contents.len() - 5;
+    std::fs::write(&path, &contents[..cut]).unwrap();
+
+    let result = FilesystemBackend::open(&path);
+    assert!(result.is_err(), "A truncated final line must fail to open, not silently drop the partial entry");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_filesystem_backend_fresh_file_starts_empty_and_verifies() {
+    let path = scratch_path("fresh");
+    let _ = std::fs::remove_file(&path);
+
+    let backend = FilesystemBackend::open(&path).unwrap();
+    assert_eq!(backend.count(), 0);
+    assert_eq!(backend.path(), path);
+
+    let log = CapabilityTransparencyLog::with_backend(Box::new(backend));
+    assert!(log.verify_chain_integrity());
+    assert_eq!(log.count(), 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_filesystem_backend_persists_across_multiple_reopens() {
+    let path = scratch_path("multi_reopen");
+    let _ = std::fs::remove_file(&path);
+
+    for i in 0..5 {
+        let backend = FilesystemBackend::open(&path).unwrap();
+        let log = CapabilityTransparencyLog::with_backend(Box::new(backend));
+        assert_eq!(log.count(), i);
+        log.append("ISSUED", "iss-multi", Some(&format!("jti-{i}")), Some("kid-multi"), "sub", &[], &["read"], 0, None, None);
+        assert!(log.verify_chain_integrity());
+    }
+
+    let final_backend = FilesystemBackend::open(&path).unwrap();
+    assert_eq!(final_backend.count(), 5);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_filesystem_backend_rotation_produces_bak_file() {
+    let path = scratch_path("rotation");
+    let _ = std::fs::remove_file(&path);
+
+    // A tiny threshold (256 bytes) forces rotation after just a couple of entries.
+    let backend = FilesystemBackend::open_with_max_file_size(&path, 256).unwrap();
+    let log = CapabilityTransparencyLog::with_backend(Box::new(backend));
+    for i in 0..20 {
+        log.append("ISSUED", "iss-rot", Some(&format!("jti-rot-{i}")), Some("kid-rot"), "sub", &[], &["read"], 0, None, None);
+    }
+    assert_eq!(log.count(), 20, "in-memory mirror must retain all entries regardless of on-disk rotation");
+    assert!(log.verify_chain_integrity());
+
+    // At least one rotated `.bak` file must have been produced given the tiny threshold
+    // (same rotation contract as `security::WalWriter` — rotated-out entries live in the
+    // `.bak` sibling, not the active file; only the active file is replayed on reopen).
+    let dir = std::path::Path::new(&path).parent().unwrap();
+    let file_name = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+    let bak_files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with(&file_name) && name.ends_with(".bak")
+        })
+        .collect();
+    assert!(!bak_files.is_empty(), "expected at least one rotated .bak file given a 256-byte threshold and 20 entries");
+
+    // Clean up the primary file, its .floor sidecar, and any .bak siblings it produced.
+    for e in bak_files {
+        let _ = std::fs::remove_file(e.path());
+    }
+    let _ = std::fs::remove_file(format!("{path}.floor"));
+    let _ = std::fs::remove_file(&path);
 }

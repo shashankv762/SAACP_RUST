@@ -14,3 +14,22 @@ __pycache__/
 *.pyc
 *.egg-info/
 opusplan.md
+
+# Append-only manifest written by scripts/prune_test_results.py — a log of
+# pruned/trimmed test-result files, not a build artifact, but regenerated
+# indefinitely so it doesn't belong in version control.
+/.test-manifest.jsonl
+
+# Local agent/dev tooling and machine-specific config — not part of the project.
+# .cargo/config.toml pins a machine-specific RAM-disk target dir (R:/...), and
+# .claude/.agents hold local assistant settings; none belong in the public repo.
+/.claude/
+/.agents/
+/.cargo/
+/scripts/
+/.tmp-target-build/
+
+# Benchmark run artifacts (regenerable from `cargo bench`) — the curated,
+# human-readable results live in benchmark_results.md instead.
+/bench_raw_output.txt
+/bench_parsed.txt

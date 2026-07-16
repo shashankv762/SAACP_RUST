@@ -17,6 +17,11 @@
 //!   - `transport-ws`   → [`ws`] — WebSocket binary-message tunnel. Natural
 //!     fit for SAACP's persistent, ordered stream sessions
 //!     (STREAM_START/CONTINUATION/END — see `streaming.rs`).
+//!   - `transport-tls`  → [`tls`] — TLS-terminated raw TCP (`tokio-rustls`).
+//!     Raw TCP+TLS only, not WebSocket-over-TLS (`wss://`) — see [`tls`]'s
+//!     module doc for why.
 
 #[cfg(feature = "transport-ws")]
 pub mod ws;
+#[cfg(feature = "transport-tls")]
+pub mod tls;

@@ -33,7 +33,11 @@ async fn free_addr() -> SocketAddr {
 async fn spawn_command_center(token: [u8; 32]) -> SocketAddr {
     let addr = free_addr().await;
     let config = CommandCenterConfig::new(addr, token);
-    tokio::spawn(async move { run(config).await; });
+    tokio::spawn(async move {
+        if let Err(e) = run(config).await {
+            eprintln!("test command center instance exited: {e}");
+        }
+    });
     tokio::time::sleep(Duration::from_millis(200)).await;
     addr
 }
@@ -81,7 +85,7 @@ async fn command_center_protected_routes_require_correct_bearer_token() {
     let addr = spawn_command_center(token).await;
     let client = reqwest::Client::new();
 
-    for path in ["/api/agents", "/api/trust-mesh", "/api/alerts", "/api/financial", "/api/metrics"] {
+    for path in ["/api/agents", "/api/trust-mesh", "/api/alerts", "/api/financial", "/api/metrics", "/api/readyz"] {
         // No token at all.
         let resp = client.get(format!("http://{addr}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 401, "path {path} should reject with no token");
@@ -235,6 +239,130 @@ async fn command_center_financial_reflects_real_budget_exceeded_rejection() {
     assert!(after["dollars_saved"].as_f64().unwrap() > 0.0);
 }
 
+/// R-3 (opusplan.md Part 7 / 7.2): `/api/readyz` bundles audit_health + connections +
+/// trust_stats + gate_latencies into one authenticated JSON response.
+#[tokio::test]
+async fn command_center_readyz_bundles_audit_connections_trust_and_latency() {
+    let token = [0x08u8; 32];
+    let addr = spawn_command_center(token).await;
+    let bearer = hex_token(&token);
+    let client = reqwest::Client::new();
+
+    // Drive one real packet through the gate pipeline first, so `gate_latencies` has
+    // at least one non-empty entry to assert on (a brand-new process might otherwise
+    // have an empty `gate_latencies` array before any packet is ever processed).
+    let secret = [0xEEu8; 32];
+    let session = [0xEFu8; 16];
+    let payload = serde_json::json!({
+        "task": "summarize the quarterly report",
+        "priority": 1,
+        "_capability_token": "structural-test-token",
+    }).to_string();
+    let frame = build_frame(session, &secret, payload.as_bytes(), 1, 0x10, 0);
+    let rl = AgentRateLimiter::new();
+    let _ = SAACPProtocolHandler::intercept_packet_full(
+        &frame, &secret, "cc-test-agent-readyz", false, None, Some(&rl), None, None, None,
+    );
+
+    let resp = client.get(format!("http://{addr}/api/readyz"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // audit_health
+    let audit_health = &body["audit_health"];
+    assert!(audit_health["status"].is_string(), "audit_health.status must be present: {body}");
+    assert!(audit_health["wal_queue_depth"].is_u64(), "audit_health.wal_queue_depth must be present: {body}");
+    assert!(audit_health["wal_dropped_total"].is_u64());
+    assert!(audit_health["wal_write_failures_total"].is_u64());
+
+    // connections
+    let connections = &body["connections"];
+    assert!(connections["tcp_active"].is_u64(), "connections.tcp_active must be present: {body}");
+    assert!(connections["ws_active"].is_u64(), "connections.ws_active must be present: {body}");
+
+    // trust_stats
+    let trust_stats = &body["trust_stats"];
+    assert!(trust_stats["agents_tracked"].is_u64(), "trust_stats.agents_tracked must be present: {body}");
+    assert!(trust_stats["agents_requiring_reauth"].is_u64());
+
+    // gate_latencies — must be a non-empty array with real gate names/counts after
+    // driving a packet through the pipeline above.
+    let gate_latencies = body["gate_latencies"].as_array().expect("gate_latencies must be an array");
+    assert!(!gate_latencies.is_empty(), "expected at least one gate latency entry after processing a packet: {body}");
+    assert!(
+        gate_latencies.iter().any(|g| g["gate"].as_str().map(|s| s.starts_with("gate_")).unwrap_or(false)),
+        "expected at least one entry with a gate_* name: {body}"
+    );
+}
+
+/// R-4 (opusplan.md Part 7 / 7.2): `POST /api/config/reload` re-reads
+/// `SAACP_DOLLARS_PER_TOKEN`/`SAACP_MAX_RECENT_ALERTS`/`SAACP_MAX_AGENTS` from the
+/// process environment and swaps them in without a restart, reflected immediately in
+/// subsequent `/api/financial`, `/api/alerts`, `/api/agents` responses.
+///
+/// Uses a dedicated instance/token (not shared with any other test) since the env vars
+/// this test sets are process-global; no other test in this file reads them.
+#[tokio::test]
+async fn command_center_config_reload_applies_env_overrides() {
+    let token = [0x09u8; 32];
+    let addr = spawn_command_center(token).await;
+    let bearer = hex_token(&token);
+    let client = reqwest::Client::new();
+
+    // Before reload: still the built-in default.
+    let before = client.get(format!("http://{addr}/api/financial"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send().await.unwrap()
+        .json::<serde_json::Value>().await.unwrap();
+    assert_eq!(before["dollars_per_token"].as_f64().unwrap(), 0.00002);
+
+    // SAFETY: test process, no other test in this file reads these env vars, and
+    // `tokio::test` bodies each get their own async task but share the process
+    // environment — fine here since nothing else races on these specific keys.
+    unsafe {
+        std::env::set_var("SAACP_DOLLARS_PER_TOKEN", "0.05");
+        std::env::set_var("SAACP_MAX_RECENT_ALERTS", "3");
+        std::env::set_var("SAACP_MAX_AGENTS", "2");
+    }
+
+    let reload_resp = client.post(format!("http://{addr}/api/config/reload"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send().await.unwrap();
+    assert_eq!(reload_resp.status(), 200);
+    let reloaded: serde_json::Value = reload_resp.json().await.unwrap();
+    assert_eq!(reloaded["dollars_per_token"].as_f64().unwrap(), 0.05);
+    assert_eq!(reloaded["max_recent_alerts"].as_u64().unwrap(), 3);
+    assert_eq!(reloaded["max_agents"].as_u64().unwrap(), 2);
+
+    // The reload_from_env response IS the effect (no shared global to re-query), but
+    // confirm downstream routes also observe the new value through `hot_config`.
+    let after = client.get(format!("http://{addr}/api/financial"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send().await.unwrap()
+        .json::<serde_json::Value>().await.unwrap();
+    assert_eq!(after["dollars_per_token"].as_f64().unwrap(), 0.05);
+
+    unsafe {
+        std::env::remove_var("SAACP_DOLLARS_PER_TOKEN");
+        std::env::remove_var("SAACP_MAX_RECENT_ALERTS");
+        std::env::remove_var("SAACP_MAX_AGENTS");
+    }
+}
+
+/// `POST /api/config/reload` must be behind the same bearer-auth gate as every other
+/// `/api/*` route.
+#[tokio::test]
+async fn command_center_config_reload_requires_auth() {
+    let token = [0x0Au8; 32];
+    let addr = spawn_command_center(token).await;
+    let client = reqwest::Client::new();
+
+    let resp = client.post(format!("http://{addr}/api/config/reload")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
 #[tokio::test]
 async fn command_center_events_sse_delivers_all_event_types() {
     use futures_util::StreamExt;
@@ -306,4 +434,137 @@ async fn command_center_events_sse_delivers_all_event_types() {
 fn tail(s: &str) -> &str {
     let n = s.len();
     &s[n.saturating_sub(2000)..]
+}
+
+// ---------------------------------------------------------------------------
+// CORS — the dashboard-ui frontend is a genuine cross-origin browser client
+// (different port than this backend), so the backend must answer preflights and
+// reflect an allowlisted Origin, or the browser blocks every fetch/EventSource.
+// These drive the exact request shapes a browser emits.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DEV_ORIGIN: &str = "http://localhost:3000";
+
+/// A browser CORS preflight (`OPTIONS` + `Access-Control-Request-*`, and crucially
+/// NO `Authorization` header) for an allowlisted origin must succeed and grant the
+/// bearer header — proving the CORS layer runs ahead of `require_auth`.
+#[tokio::test]
+async fn command_center_cors_preflight_allowed_origin_succeeds_without_auth() {
+    let addr = spawn_command_center([0x0Bu8; 32]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/api/agents"))
+        .header("Origin", DEFAULT_DEV_ORIGIN)
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+
+    // Preflight is answered directly (204), never 401'd, even though it carries no bearer.
+    assert_eq!(resp.status(), 204, "preflight for an allowlisted origin must not require auth");
+    let headers = resp.headers();
+    assert_eq!(
+        headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+        Some(DEFAULT_DEV_ORIGIN),
+        "the specific matched origin must be reflected (never '*')"
+    );
+    let allow_headers = headers
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        allow_headers.to_ascii_lowercase().contains("authorization"),
+        "Authorization must be an allowed request header, got: {allow_headers:?}"
+    );
+    let allow_methods = headers
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(allow_methods.contains("GET") && allow_methods.contains("POST"));
+    // A caches-safe grant must vary on Origin.
+    assert_eq!(
+        headers.get("vary").and_then(|v| v.to_str().ok()),
+        Some("Origin"),
+    );
+}
+
+/// An actual authenticated GET from an allowlisted origin must carry the reflected
+/// `Access-Control-Allow-Origin` on the real 200 response (not just the preflight),
+/// or the browser discards the body.
+#[tokio::test]
+async fn command_center_cors_actual_request_reflects_allowed_origin() {
+    let token = [0x0Cu8; 32];
+    let addr = spawn_command_center(token).await;
+    let bearer = hex_token(&token);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/api/agents"))
+        .header("Origin", DEFAULT_DEV_ORIGIN)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+        Some(DEFAULT_DEV_ORIGIN),
+        "the 200 response itself must carry the CORS grant"
+    );
+}
+
+/// A disallowed origin gets NO `Access-Control-Allow-Origin` (fail-closed) — the
+/// request still executes server-side (CORS is a browser control, not server authz),
+/// but the browser will block the caller from reading the response.
+#[tokio::test]
+async fn command_center_cors_disallowed_origin_gets_no_grant() {
+    let token = [0x0Du8; 32];
+    let addr = spawn_command_center(token).await;
+    let bearer = hex_token(&token);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/api/agents"))
+        .header("Origin", "http://evil.example.com")
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "a non-allowlisted origin must receive no Access-Control-Allow-Origin header"
+    );
+}
+
+/// A near-miss on the allowlist (extra path/port/scheme, or a substring of an
+/// allowed origin) must NOT match — guards against prefix/substring bypasses.
+#[tokio::test]
+async fn command_center_cors_rejects_near_miss_origins() {
+    let token = [0x0Eu8; 32];
+    let addr = spawn_command_center(token).await;
+    let bearer = hex_token(&token);
+    let client = reqwest::Client::new();
+
+    for bad in [
+        "http://localhost:3000.evil.com", // allowed origin as a prefix
+        "http://localhost:30001",          // port superstring
+        "https://localhost:3000",          // scheme mismatch
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/api/agents"))
+            .header("Origin", bad)
+            .header("Authorization", format!("Bearer {bearer}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "near-miss origin {bad:?} must not receive a CORS grant"
+        );
+    }
 }

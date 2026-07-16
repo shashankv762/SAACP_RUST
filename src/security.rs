@@ -3,6 +3,14 @@
 //! Implements:
 //! - `NonceTracker`: Tracks nonces to defeat Replay Attacks
 //! - `ImmutableAuditLog`: Append-only cryptographic hash chain with WAL worker thread
+//!
+//! C-4: rotated audit logs (`<path>.<timestamp>.bak`, written by `WalWriter::maybe_rotate`
+//! once the active log exceeds `AUDIT_MAX_LOG_SIZE`) are gzip-compressed to `.bak.gz` on a
+//! dedicated `saacp-audit-archival` background thread — never the `saacp-wal-worker` thread
+//! that services live writes, so compression never adds latency to audit-log appends. What
+//! happens to the compressed file afterward is pluggable via the [`ArchivalSink`] trait —
+//! see its doc comment, [`NoopArchivalSink`] (default), and [`FilesystemArchivalSink`]
+//! (opt in via [`ENV_AUDIT_ARCHIVE_DIR`] or [`ImmutableAuditLog::with_paths_and_archival_sink`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -13,7 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use sha2::Sha256;
+use sha2::{Sha256, Digest};
 use hmac::{Hmac, Mac};
 use hkdf::Hkdf;
 use aes_gcm::aead::Aead;
@@ -27,21 +35,36 @@ type HmacSha256 = Hmac<Sha256>;
 /// Constant-time comparison of two byte slices.
 /// Returns true iff a.len() == b.len() AND all bytes are equal,
 /// without short-circuiting on the first differing byte.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// M-1 fix: this is the SINGLE canonical implementation for the whole crate.
+/// `gateway.rs`, `command_center.rs`, and `identity_binding.rs` previously each
+/// carried a byte-identical private copy of this function (and of
+/// `constant_time_eq_hex` below) — harmless on its own, but a maintenance trap:
+/// a future correctness fix applied to one copy silently would not propagate to
+/// the other three. `pub(crate)` so every module in this crate can call this one
+/// instead of redefining it.
+/// L-5 fix: delegates to `subtle::ConstantTimeEq` (already a declared dependency,
+/// already used elsewhere in this crate — nothing new pulled in) instead of a
+/// hand-rolled `diff |= x ^ y` loop. LLVM is legally permitted to prove `diff == 0`
+/// early and short-circuit a hand-written loop like the old one under aggressive
+/// inlining/optimization, defeating the constant-time intent; `subtle::ConstantTimeEq`
+/// is specifically engineered to resist that. The `a.len() != b.len()` short-circuit is
+/// kept as-is — length isn't secret, so comparing it in variable time is fine; only the
+/// byte-content comparison needs the constant-time guarantee.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
     if a.len() != b.len() {
         return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.ct_eq(b).into()
 }
 
 /// Constant-time comparison of two hex-encoded HMAC digests (as strings).
 /// Decodes both to raw bytes before comparing so no timing information
 /// about the first differing hex character leaks.
-fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+///
+/// M-1 fix: canonical implementation — see `constant_time_eq`'s doc comment.
+pub(crate) fn constant_time_eq_hex(a: &str, b: &str) -> bool {
     match (hex::decode(a), hex::decode(b)) {
         (Ok(ab), Ok(bb)) => constant_time_eq(&ab, &bb),
         _ => false,
@@ -83,10 +106,18 @@ fn now_secs() -> f64 {
 /// the existing chain-integrity guarantee.
 const AUDIT_INTENT_HKDF_INFO: &[u8] = b"SAACP-audit-intent-confidentiality-v1";
 
+/// L-1 fix: HKDF-Extract salt for audit-intent key derivation. `AUDIT_INTENT_HKDF_INFO`
+/// (above) already domain-separates the *expand* step, but a `None` salt at the
+/// *extract* step falls back to a zero-filled salt per RFC 5869 — fine per-spec, but it
+/// gives up free domain separation between this extraction and any other unsalted HKDF
+/// extraction elsewhere that might reuse the same `issuer_secret` as IKM. A fixed,
+/// purpose-specific salt closes that gap even though no such collision is known today.
+const AUDIT_INTENT_HKDF_SALT: &[u8] = b"SAACP-audit-intent-hkdf-salt-v1";
+
 /// Derive a 32-byte AES-256-GCM key for audit-intent encryption from the same
 /// `issuer_secret` already used for chain-hash HMACs, via HKDF-SHA256.
 fn derive_intent_key(issuer_secret: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, issuer_secret);
+    let hk = Hkdf::<Sha256>::new(Some(AUDIT_INTENT_HKDF_SALT), issuer_secret);
     let mut key = [0u8; 32];
     hk.expand(AUDIT_INTENT_HKDF_INFO, &mut key)
         .expect("HKDF-SHA256 expand: output length 32 is always valid");
@@ -144,6 +175,10 @@ pub fn decrypt_intent(issuer_secret: &[u8], encrypted_hex: &str) -> Result<Strin
 pub const ENV_AUDIT_LOG: &str = "SAACP_AUDIT_LOG";
 /// Env var that overrides the audit event-count sentinel file path.
 pub const ENV_COUNT_FILE: &str = "SAACP_COUNT_FILE";
+/// C-4: optional directory that rotated-and-gzip-compressed audit logs are moved into
+/// after compression. Unset (the default) leaves compressed `.bak.gz` files beside the
+/// live WAL — see [`FilesystemArchivalSink`] / [`ArchivalSink`].
+pub const ENV_AUDIT_ARCHIVE_DIR: &str = "SAACP_AUDIT_ARCHIVE_DIR";
 
 // ===========================================================================
 // NonceTracker
@@ -190,18 +225,57 @@ impl NonceTracker {
 
     /// Track a nonce. Returns `Err` if the nonce was already used (replay attack).
     pub fn track(&self, nonce: u64) -> Result<(), SAACPHardDrop> {
+        self.track_key(nonce)
+    }
+
+    /// M-4 fix: track a nonce scoped to `session_id`, so the same raw nonce
+    /// value reused by two different sessions is not treated as a replay of
+    /// itself. `NonceTracker` as originally written has no per-session
+    /// scoping baked into `track()` — every caller shares one flat `u64`
+    /// keyspace. That is a real hazard for any *future* caller that tracks
+    /// nonces across multiple concurrent sessions from one shared
+    /// `NonceTracker` (today, `NonceTracker` is only exercised by this
+    /// module's own unit tests; production replay protection for MEASC
+    /// traffic is `ReplayWindow`/`PacketSequencer` in `measc.rs`, which is
+    /// already correctly scoped per `SessionEpochManager` entry). Composes
+    /// `(session_id, nonce)` into a single derived key via SHA-256 (truncated
+    /// to the first 8 bytes) before delegating to the same atomic
+    /// check-and-insert logic `track()` uses — a different `session_id` with
+    /// the same `nonce` value hashes to a different key, so no cross-session
+    /// collision is possible.
+    pub fn track_scoped(&self, session_id: &str, nonce: u64) -> Result<(), SAACPHardDrop> {
+        self.track_key(Self::composite_key(session_id, nonce))
+    }
+
+    /// Derive a session-scoped `u64` key from `(session_id, nonce)` via
+    /// SHA-256 truncated to its first 8 bytes (big-endian). Collision
+    /// probability is cryptographically negligible for any realistic number
+    /// of tracked (session, nonce) pairs.
+    fn composite_key(session_id: &str, nonce: u64) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(session_id.as_bytes());
+        hasher.update(nonce.to_be_bytes());
+        let digest = hasher.finalize();
+        u64::from_be_bytes(digest[0..8].try_into().expect("SHA-256 digest is >= 8 bytes"))
+    }
+
+    /// Shared atomic check-and-insert-with-pruning logic backing both
+    /// `track()` (raw nonce as key) and `track_scoped()` (session-composited
+    /// key) — the only difference between the two public entry points is
+    /// which `u64` they pass in here.
+    fn track_key(&self, key: u64) -> Result<(), SAACPHardDrop> {
         let current_time = now_secs();
         let mut inner = self.inner.lock().expect("lock poisoned");
 
         // Atomic check-and-insert (fixes TOCTOU race condition)
-        if inner.seen_nonces.contains_key(&nonce) {
+        if inner.seen_nonces.contains_key(&key) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "REPLAY ATTACK DETECTED: Nonce already used.",
             ));
         }
 
-        inner.seen_nonces.insert(nonce, current_time);
+        inner.seen_nonces.insert(key, current_time);
 
         // Prune expired nonces to prevent OOM memory leaks
         if inner.seen_nonces.len() > inner.max_entries {
@@ -265,6 +339,12 @@ pub const AUDIT_WAL_QUEUE_CAPACITY: usize = 100_000;
 pub const AUDIT_WAL_FLUSH_EVERY_N_ENTRIES: u64 = 200;
 /// See `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`.
 pub const AUDIT_WAL_FLUSH_INTERVAL_MS: u64 = 50;
+
+/// L-10 fix: default timeout for [`ImmutableAuditLog::flush`]'s ack wait — used by
+/// every graceful-shutdown call site (`daemon.rs`, `transport/ws.rs`,
+/// `transport/tls.rs`, `sidecar.rs`) as the bound on how long shutdown waits for the
+/// WAL worker to confirm a final flush+sync before the process exits.
+pub const AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
 const AUDIT_WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(AUDIT_WAL_FLUSH_INTERVAL_MS);
 
@@ -379,9 +459,17 @@ struct CanonicalAuditRecord<'a> {
 // WAL worker message
 // ---------------------------------------------------------------------------
 
-struct WalMessage {
-    entry_json: String,
-    event_count: u64,
+enum WalMessage {
+    Entry {
+        entry_json: String,
+        event_count: u64,
+    },
+    /// L-10 fix: sent by [`ImmutableAuditLog::flush`]; the worker acks on the enclosed
+    /// `Sender<()>` only after performing a real flush+`sync_data()` (and sentinel
+    /// write) at this exact point in the FIFO queue — i.e. after every `Entry` message
+    /// enqueued before it, so a caller that observes the ack knows every
+    /// happened-before `append_event` is durable.
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 // ---------------------------------------------------------------------------
@@ -459,8 +547,51 @@ impl ImmutableAuditLog {
         Self::with_paths(log_file, &count_file)
     }
 
-    /// Create with both log file and sentinel file paths.
+    /// Create with both log file and sentinel file paths. Rotated audit logs are
+    /// gzip-compressed in the background (C-4) but the compressed `.bak.gz` file is
+    /// left in place (`NoopArchivalSink`) — use
+    /// [`with_paths_and_archival_sink`](Self::with_paths_and_archival_sink) to plug in
+    /// a real archival destination.
     pub fn with_paths(log_file: &str, count_file: &str) -> Self {
+        Self::with_paths_and_archival_sink(log_file, count_file, Arc::new(NoopArchivalSink))
+    }
+
+    /// Create with both log file and sentinel file paths, plus a pluggable
+    /// [`ArchivalSink`] (C-4) that receives every rotated-and-gzip-compressed audit
+    /// log (`<log_file>.<timestamp>.bak.gz`). Compression itself always happens (on a
+    /// dedicated background thread, never delaying the WAL worker) — the sink only
+    /// decides what happens to the compressed file afterward.
+    pub fn with_paths_and_archival_sink(
+        log_file: &str,
+        count_file: &str,
+        archival_sink: Arc<dyn ArchivalSink>,
+    ) -> Self {
+        let resolved_log_file = if log_file.is_empty() {
+            String::new()
+        } else if let Ok(test_log_dir) = std::env::var("SAACP_TEST_LOG_DIR") {
+            let path = Path::new(&log_file);
+            if path.is_relative() {
+                Path::new(&test_log_dir).join(path).to_string_lossy().to_string()
+            } else {
+                log_file.to_string()
+            }
+        } else {
+            log_file.to_string()
+        };
+
+        let resolved_count_file = if count_file.is_empty() {
+            String::new()
+        } else if let Ok(test_log_dir) = std::env::var("SAACP_TEST_LOG_DIR") {
+            let path = Path::new(&count_file);
+            if path.is_relative() {
+                Path::new(&test_log_dir).join(path).to_string_lossy().to_string()
+            } else {
+                count_file.to_string()
+            }
+        } else {
+            count_file.to_string()
+        };
+
         let (wal_tx, wal_rx) = mpsc::sync_channel::<WalMessage>(AUDIT_WAL_QUEUE_CAPACITY);
 
         let health: Arc<AtomicU8> = Arc::new(AtomicU8::new(AuditHealth::Healthy as u8));
@@ -474,8 +605,8 @@ impl ImmutableAuditLog {
         let worker_health = Arc::clone(&health);
         let worker_wal_write_failures = Arc::clone(&wal_write_failures);
         let worker_queue_len = Arc::clone(&queue_len);
-        let worker_log_file = log_file.to_string();
-        let worker_count_file = count_file.to_string();
+        let worker_log_file = resolved_log_file.clone();
+        let worker_count_file = resolved_count_file.clone();
         thread::Builder::new()
             .name("saacp-wal-worker".into())
             .spawn(move || {
@@ -486,6 +617,7 @@ impl ImmutableAuditLog {
                     &worker_health,
                     &worker_wal_write_failures,
                     &worker_queue_len,
+                    archival_sink,
                 );
             })
             .expect("WAL worker thread spawn failed");
@@ -494,8 +626,8 @@ impl ImmutableAuditLog {
             inner: Mutex::new(AuditInner {
                 last_hash: GENESIS_HASH.to_string(),
                 event_count: 0,
-                log_file: log_file.to_string(),
-                count_file: count_file.to_string(),
+                log_file: resolved_log_file,
+                count_file: resolved_count_file,
                 entries: Vec::new(),
             }),
             wal_tx: Some(wal_tx),
@@ -513,17 +645,29 @@ impl ImmutableAuditLog {
     /// hash-chain lock is released). Keep callbacks fast and non-blocking —
     /// they run inline on the packet-processing path that triggered the
     /// append. Mirrors `TrustDecayEngine::subscribe`'s established pattern.
+    /// M-38 fix: every `self.inner.lock()`/`self.subscribers.lock()` in this
+    /// impl block recovers via `into_inner()` on poison rather than panicking
+    /// — `ImmutableAuditLog::global()` is a process-wide singleton, so one
+    /// poisoning panic must not cascade into every other in-flight packet
+    /// losing the ability to append/verify the audit chain.
     pub fn subscribe(&self, cb: Arc<dyn Fn(&AuditRecord) + Send + Sync>) {
-        self.subscribers.lock().expect("lock poisoned").push(cb);
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(cb);
     }
 
-    /// Create a new audit log with default file path (reads from env vars).
+    /// Create a new audit log with default file path (reads from env vars). C-4: also
+    /// honors [`ENV_AUDIT_ARCHIVE_DIR`] — when set, rotated-and-compressed audit logs
+    /// are moved into that directory via [`FilesystemArchivalSink`]; when unset, the
+    /// compressed `.bak.gz` is simply left beside the live WAL ([`NoopArchivalSink`]).
     pub fn with_default_path() -> Self {
         let log_file = std::env::var(ENV_AUDIT_LOG)
             .unwrap_or_else(|_| AUDIT_LOG_FILE.to_string());
         let count_file = std::env::var(ENV_COUNT_FILE)
             .unwrap_or_else(|_| AUDIT_COUNT_FILE.to_string());
-        Self::with_paths(&log_file, &count_file)
+        let archival_sink: Arc<dyn ArchivalSink> = match std::env::var(ENV_AUDIT_ARCHIVE_DIR) {
+            Ok(dir) if !dir.is_empty() => Arc::new(FilesystemArchivalSink::new(dir)),
+            _ => Arc::new(NoopArchivalSink),
+        };
+        Self::with_paths_and_archival_sink(&log_file, &count_file, archival_sink)
     }
 
     /// Process-wide global singleton ImmutableAuditLog.
@@ -547,7 +691,7 @@ impl ImmutableAuditLog {
     /// `self.inner` itself — `std::sync::Mutex` is not reentrant.
     pub fn initialize_chain(&self, issuer_secret: &[u8]) -> Result<(), String> {
         {
-            let mut inner = self.inner.lock().expect("lock poisoned");
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let log_file = inner.log_file.clone();
 
             if Path::new(&log_file).exists() {
@@ -566,7 +710,7 @@ impl ImmutableAuditLog {
         } // `inner` lock released before verify_chain_disk re-locks it.
 
         if !self.verify_chain_disk(issuer_secret) {
-            let mut inner = self.inner.lock().expect("lock poisoned");
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.event_count = 0;
             inner.last_hash = GENESIS_HASH.to_string();
             return Err(
@@ -596,7 +740,18 @@ impl ImmutableAuditLog {
         evaluated_intent: &str,
         traceparent: &str,
     ) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        // O-6: non-blocking probe first — on contention, record the
+        // observation then fall through to the normal blocking lock() below.
+        // This is instrumentation only; the guarded critical section that
+        // follows is unchanged either way.
+        let mut inner = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
+                self.inner.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
 
         let record = AuditRecord {
             timestamp: now_secs(),
@@ -654,7 +809,7 @@ impl ImmutableAuditLog {
 
         // Enqueue for WAL worker (non-blocking — drop if full, per spec §15.2).
         if let Some(ref tx) = self.wal_tx {
-            let msg = WalMessage {
+            let msg = WalMessage::Entry {
                 entry_json,
                 event_count: inner.event_count,
             };
@@ -695,7 +850,7 @@ impl ImmutableAuditLog {
         // never hold `inner` across a callback (same rule `trust_decay.rs`'s
         // `emit` follows for its own, separate subscriber-list mutex).
         drop(inner);
-        for cb in self.subscribers.lock().expect("lock poisoned").iter() {
+        for cb in self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             cb(&record_for_subscribers);
         }
     }
@@ -707,7 +862,7 @@ impl ImmutableAuditLog {
     ///
     /// Returns `false` on any tampering detection.
     pub fn verify_chain(&self, issuer_secret: &[u8]) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if inner.entries.is_empty() {
             // Empty chain — valid iff event_count is also 0.
@@ -732,17 +887,22 @@ impl ImmutableAuditLog {
                 return false; // Chain broken
             }
 
-            // Recompute HMAC over the same canonical record JSON.
-            let record_json = serde_json::to_string(&serde_json::json!({
-                "intent": entry.record.intent,
-                "prev_hash": entry.record.prev_hash,
-                "seq": entry.record.seq,
-                "source": entry.record.source,
-                "target": entry.record.target,
-                "timestamp": entry.record.timestamp,
-                "token_signature": entry.record.token_signature,
-                "traceparent": entry.record.traceparent,
-            })).unwrap_or_default();
+            // M-40 fix: recompute HMAC over the SAME `CanonicalAuditRecord` struct
+            // `append_event` serializes, instead of an independently hand-listed
+            // `json!` field set — previously the two field lists lived in different
+            // functions and had to be kept in sync by hand; any future field
+            // added to one but not the other would silently break verification (or
+            // worse, silently stop covering a field with the HMAC).
+            let record_json = serde_json::to_string(&CanonicalAuditRecord {
+                intent: &entry.record.intent,
+                prev_hash: &entry.record.prev_hash,
+                seq: entry.record.seq,
+                source: &entry.record.source,
+                target: &entry.record.target,
+                timestamp: entry.record.timestamp,
+                token_signature: &entry.record.token_signature,
+                traceparent: &entry.record.traceparent,
+            }).unwrap_or_default();
 
             let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
             mac.update(record_json.as_bytes());
@@ -782,7 +942,7 @@ impl ImmutableAuditLog {
     /// NOTE: This requires the WAL thread to have flushed pending writes to disk.
     /// Use `verify_chain()` for in-process verification without disk I/O.
     pub fn verify_chain_disk(&self, issuer_secret: &[u8]) -> bool {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let log_file = &inner.log_file;
         let count_file = &inner.count_file;
 
@@ -831,16 +991,32 @@ impl ImmutableAuditLog {
                 return false;
             }
 
-            let record_json = serde_json::to_string(&serde_json::json!({
-                "intent":          rec["intent"],
-                "prev_hash":       rec["prev_hash"],
-                "seq":             rec["seq"],
-                "source":          rec["source"],
-                "target":          rec["target"],
-                "timestamp":       rec["timestamp"],
-                "token_signature": rec["token_signature"],
-                "traceparent":     rec["traceparent"],
-            })).unwrap_or_default();
+            // M-40 fix: same `CanonicalAuditRecord` struct `append_event`/`verify_chain`
+            // serialize, instead of a third independently hand-listed `json!` field
+            // set built from untyped `Value`s — see `verify_chain`'s sibling fix for
+            // why keeping these in sync by hand is the actual divergence risk this
+            // closes. Extracting each field with its expected type (rather than
+            // embedding the raw `Value`) also means a malformed/missing field now
+            // fails the parse explicitly (fail-closed) instead of silently
+            // serializing as `null` and merely producing a mismatching HMAC.
+            let intent = match rec["intent"].as_str() { Some(v) => v, None => return false };
+            let seq = match rec["seq"].as_u64() { Some(v) => v, None => return false };
+            let source = match rec["source"].as_str() { Some(v) => v, None => return false };
+            let target = match rec["target"].as_str() { Some(v) => v, None => return false };
+            let timestamp = match rec["timestamp"].as_f64() { Some(v) => v, None => return false };
+            let token_signature = match rec["token_signature"].as_str() { Some(v) => v, None => return false };
+            let traceparent = match rec["traceparent"].as_str() { Some(v) => v, None => return false };
+
+            let record_json = serde_json::to_string(&CanonicalAuditRecord {
+                intent,
+                prev_hash,
+                seq,
+                source,
+                target,
+                timestamp,
+                token_signature,
+                traceparent,
+            }).unwrap_or_default();
 
             let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
             mac.update(record_json.as_bytes());
@@ -859,7 +1035,7 @@ impl ImmutableAuditLog {
 
     /// Return the number of events in the chain.
     pub fn event_count(&self) -> u64 {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.event_count
     }
 
@@ -888,9 +1064,44 @@ impl ImmutableAuditLog {
         self.queue_len.load(Ordering::Relaxed)
     }
 
+    /// L-10 fix: block the calling (native) thread until every `append_event` that
+    /// happened-before this call has been written and `sync_data()`'d to disk, or
+    /// `timeout` elapses. Used as the terminal "flush WAL" step of graceful shutdown
+    /// (`daemon.rs`, `transport/ws.rs`, `transport/tls.rs`, `sidecar.rs`).
+    ///
+    /// This is a **std blocking channel `recv`, not a tokio await point** — the WAL
+    /// worker is a plain OS thread (see `run_wal_worker`'s doc comment), not a tokio
+    /// task, so there is nothing to `.await` here. Callers in an async context MUST
+    /// run this via `tokio::task::spawn_blocking` rather than calling it directly on
+    /// an async task, or they will block that task's executor thread for up to
+    /// `timeout`.
+    ///
+    /// Sends via `SyncSender::send` (blocking, not `try_send`) deliberately — unlike
+    /// `append_event`'s drop-on-full policy (spec §15.2, an event that can't be
+    /// enqueued instantly is dropped rather than blocking the packet path), a
+    /// deliberate shutdown flush should wait for queue room rather than silently
+    /// no-op, since by the time shutdown calls this the caller has already stopped
+    /// accepting new work and genuinely wants to wait.
+    ///
+    /// Returns `false` if the WAL worker is unreachable (e.g. it already exited after
+    /// a fatal open failure) or didn't ack within `timeout`. This is a WEAKER
+    /// guarantee than "confirmed lost" — entries already covered by the periodic
+    /// flush cadence (`AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`/`AUDIT_WAL_FLUSH_INTERVAL_MS`)
+    /// are not lost just because this call couldn't confirm the very latest ones in
+    /// time. Callers should log a warning on `false`, not treat it as fatal.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let Some(ref tx) = self.wal_tx else { return false };
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+        if tx.send(WalMessage::Flush(ack_tx)).is_err() {
+            return false; // worker thread gone (channel disconnected)
+        }
+        self.queue_len.fetch_add(1, Ordering::Relaxed);
+        ack_rx.recv_timeout(timeout).is_ok()
+    }
+
     /// Reset the audit log completely (for test isolation).
     pub fn reset(&self) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let log_file = inner.log_file.clone();
         let count_file = inner.count_file.clone();
         inner.last_hash = GENESIS_HASH.to_string();
@@ -979,6 +1190,107 @@ impl Default for ImmutableAuditLog {
 }
 
 // ---------------------------------------------------------------------------
+// C-4: rotated audit log archival
+// ---------------------------------------------------------------------------
+
+/// Hand-off point for a rotated, gzip-compressed audit log (`<path>.<ts>.bak.gz`).
+/// `maybe_rotate` always compresses; this trait only decides what happens to the
+/// compressed file *after* that — deliberately not a concrete S3/GCS/Azure client
+/// baked into this crate (see [`ImmutableAuditLog`]'s module doc for why: a
+/// cloud-vendor-specific dependency in this security-critical audit path is
+/// disproportionate to what "Must-Have" compliance requires generically). A
+/// deployment that wants real object-storage hand-off implements this trait with
+/// its own client and passes it to [`ImmutableAuditLog::with_paths_and_archival_sink`].
+///
+/// Invoked on a dedicated background thread (`saacp-audit-archival`, spawned by
+/// `maybe_rotate`) — never the `saacp-wal-worker` thread that services live audit
+/// writes — so blocking I/O here (a network upload, say) never delays the next
+/// audit-log entry.
+pub trait ArchivalSink: Send + Sync {
+    /// Called with the path of a `.bak.gz` file once gzip compression has
+    /// completed and been `fsync`'d, and the uncompressed `.bak` has already
+    /// been removed.
+    fn archive(&self, path: &Path) -> io::Result<()>;
+}
+
+/// Default sink: does nothing, leaving the compressed `.bak.gz` file exactly where
+/// `maybe_rotate` wrote it (beside the live WAL). Correct, safe default for any
+/// deployment that hasn't configured real off-box archival.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopArchivalSink;
+
+impl ArchivalSink for NoopArchivalSink {
+    fn archive(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Moves the compressed file into `target_dir` (e.g. a mounted backup volume, or a
+/// directory a separate off-box sync process watches) instead of leaving it beside
+/// the live WAL. Configured via [`ENV_AUDIT_ARCHIVE_DIR`] for `with_default_path`/
+/// `global`. Still no cloud-vendor SDK dependency — real object-storage hand-off is
+/// a deployment's own process watching this directory, or a custom [`ArchivalSink`].
+#[derive(Debug, Clone)]
+pub struct FilesystemArchivalSink {
+    target_dir: std::path::PathBuf,
+}
+
+impl FilesystemArchivalSink {
+    pub fn new(target_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self { target_dir: target_dir.into() }
+    }
+}
+
+impl ArchivalSink for FilesystemArchivalSink {
+    fn archive(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir_all(&self.target_dir)?;
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "archival source path has no file name")
+        })?;
+        fs::rename(path, self.target_dir.join(file_name))
+    }
+}
+
+/// Gzip-compresses `src` to `<src>.gz` (via `flate2`, already a project dependency —
+/// see `framing.rs`'s zlib usage for the sibling precedent), `fsync`s the compressed
+/// output, then removes `src` — only once the compressed copy is confirmed durable,
+/// never delete-then-fail-to-compress. Hands the result to `sink`. Errors are logged,
+/// not propagated: this runs detached on a background thread with no caller to
+/// return a `Result` to, matching `run_wal_worker`'s own error-handling idiom for
+/// this module (log + leave the uncompressed artifact in place, never panic).
+fn compress_and_archive_rotated_log(rotated_path: String, sink: Arc<dyn ArchivalSink>) {
+    let gz_path = format!("{rotated_path}.gz");
+    if let Err(e) = compress_file_to_gzip(&rotated_path, &gz_path) {
+        eprintln!(
+            "[SAACP audit] gzip compression failed for rotated audit log '{rotated_path}': {e} \
+             — uncompressed .bak left in place, not archived."
+        );
+        return;
+    }
+    if let Err(e) = fs::remove_file(&rotated_path) {
+        eprintln!(
+            "[SAACP audit] failed to remove uncompressed '{rotated_path}' after successful \
+             compression to '{gz_path}': {e} — both copies left on disk."
+        );
+    }
+    if let Err(e) = sink.archive(Path::new(&gz_path)) {
+        eprintln!(
+            "[SAACP audit] archival sink failed for '{gz_path}': {e} — compressed file left \
+             in place at that path."
+        );
+    }
+}
+
+fn compress_file_to_gzip(src: &str, dst: &str) -> io::Result<()> {
+    let mut input = File::open(src)?;
+    let output = File::create(dst)?;
+    let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+    io::copy(&mut input, &mut encoder)?;
+    let output = encoder.finish()?;
+    output.sync_all()
+}
+
+// ---------------------------------------------------------------------------
 // WalWriter — persistent buffered file handle for the WAL worker (Fix 1)
 // ---------------------------------------------------------------------------
 
@@ -1006,10 +1318,15 @@ struct WalWriter {
     /// it here means the sentinel can never claim a higher durable count
     /// than the entries it describes.
     pending_event_count: u64,
+    /// C-4: where a rotated `.bak` file's compressed copy gets handed off once
+    /// `maybe_rotate`'s background compression thread finishes. Defaults to
+    /// [`NoopArchivalSink`] — see [`run_wal_worker`]/[`ImmutableAuditLog::with_paths_and_archival_sink`]
+    /// for how a real sink gets plumbed in.
+    archival_sink: Arc<dyn ArchivalSink>,
 }
 
 impl WalWriter {
-    fn open(path: &str) -> io::Result<Self> {
+    fn open(path: &str, archival_sink: Arc<dyn ArchivalSink>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
@@ -1019,6 +1336,7 @@ impl WalWriter {
             entries_since_flush: 0,
             last_flush: Instant::now(),
             pending_event_count: 0,
+            archival_sink,
         })
     }
 
@@ -1036,7 +1354,21 @@ impl WalWriter {
         }
         self.writer = None;
         let rotated = format!("{}.{}.bak", self.path, now_secs() as u64);
-        let _ = fs::rename(&self.path, &rotated);
+        // C-4: only kick off background compression/archival if the rename actually
+        // succeeded — a failed rename means `rotated` doesn't exist, and spawning a
+        // thread to compress a nonexistent file would just be a spurious error log.
+        if fs::rename(&self.path, &rotated).is_ok() {
+            let sink = Arc::clone(&self.archival_sink);
+            let spawn_result = thread::Builder::new()
+                .name("saacp-audit-archival".into())
+                .spawn(move || compress_and_archive_rotated_log(rotated, sink));
+            if let Err(e) = spawn_result {
+                eprintln!(
+                    "[SAACP audit] failed to spawn background archival thread: {e} — rotated \
+                     .bak file left uncompressed."
+                );
+            }
+        }
         let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
         self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
         self.size = 0;
@@ -1064,15 +1396,48 @@ impl WalWriter {
         let should_flush = self.entries_since_flush >= AUDIT_WAL_FLUSH_EVERY_N_ENTRIES
             || self.last_flush.elapsed() >= AUDIT_WAL_FLUSH_INTERVAL;
         if should_flush {
-            let w = self.writer.as_mut().expect("writer present after maybe_rotate");
+            self.flush_and_sync(count_file)?;
+        }
+        Ok(())
+    }
+
+    /// L-10 fix: unconditional flush+`sync_data()`+sentinel-write, factored out of
+    /// `write_entry`'s periodic `should_flush` branch so [`ImmutableAuditLog::flush`]
+    /// (driven by `WalMessage::Flush`) can force the same durability guarantee
+    /// on-demand, not just at the periodic cadence.
+    fn flush_and_sync(&mut self, count_file: &str) -> io::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
             w.flush()?;
             w.get_ref().sync_data()?;
-            // Sentinel batched into the same flush boundary — see the
-            // `pending_event_count` field doc.
-            fs::write(count_file, self.pending_event_count.to_string())?;
-            self.entries_since_flush = 0;
-            self.last_flush = Instant::now();
         }
+        // Sentinel batched into the same flush boundary — see the
+        // `pending_event_count` field doc.
+        //
+        // C-5: atomic write. A direct `fs::write` overwrites the sentinel
+        // in place, which can leave a truncated/corrupt count file if the
+        // process is killed mid-write (power loss, `kill -9`). Instead write
+        // to a sibling temp file, fsync its contents so they're durable,
+        // then `rename` it over the real sentinel — a rename is atomic on
+        // both POSIX (same-filesystem rename) and Windows (`fs::rename` is
+        // backed by `MoveFileExW` with the replace-existing flag).
+        let tmp_path = format!("{count_file}.tmp-{}", std::process::id());
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(self.pending_event_count.to_string().as_bytes())?;
+            tmp.sync_all()?;
+        }
+        // Windows can transiently fail a rename with ERROR_ACCESS_DENIED if
+        // the destination is momentarily opened elsewhere (e.g. a concurrent
+        // reader of the sentinel); retry once after a short backoff before
+        // propagating the error. On a second failure the temp file is left
+        // in place deliberately — that's a diagnostic artifact, not silent
+        // data loss, and the real sentinel is guaranteed untouched either way.
+        if let Err(first_err) = fs::rename(&tmp_path, count_file) {
+            thread::sleep(Duration::from_millis(20));
+            fs::rename(&tmp_path, count_file).map_err(|_| first_err)?;
+        }
+        self.entries_since_flush = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 }
@@ -1091,18 +1456,25 @@ fn run_wal_worker(
     health: &AtomicU8,
     wal_write_failures: &AtomicU64,
     queue_len: &AtomicUsize,
+    archival_sink: Arc<dyn ArchivalSink>,
 ) {
     // In-memory-only mode (`ImmutableAuditLog::new("")`): drain without any
     // disk I/O. This is a deliberate no-persistence mode, not a failure —
-    // health stays HEALTHY for the life of the instance.
+    // health stays HEALTHY for the life of the instance. L-10 fix: a `Flush`
+    // message must still be acked immediately here — there's nothing to sync,
+    // but a caller blocking on `flush()`'s ack must not hang forever just
+    // because this instance never persists anything.
     if log_file.is_empty() {
-        for _msg in wal_rx.iter() {
+        for msg in wal_rx.iter() {
             queue_len.fetch_sub(1, Ordering::Relaxed);
+            if let WalMessage::Flush(ack_tx) = msg {
+                let _ = ack_tx.send(());
+            }
         }
         return;
     }
 
-    let mut wal = match WalWriter::open(log_file) {
+    let mut wal = match WalWriter::open(log_file, archival_sink) {
         Ok(w) => w,
         Err(e) => {
             // Fix 2: a WAL worker that can't open its log file is not
@@ -1124,21 +1496,45 @@ fn run_wal_worker(
 
     for msg in wal_rx.iter() {
         queue_len.fetch_sub(1, Ordering::Relaxed);
-        if let Err(e) = wal.write_entry(&msg.entry_json, msg.event_count, count_file) {
-            // Fix 3: an atomic counter, not an inline eprintln! on this loop
-            // — a sustained disk fault must not reintroduce the original
-            // per-event-print hot-path bug.
-            wal_write_failures.fetch_add(1, Ordering::Relaxed);
-            // Fix 4: sticky FATAL. Log only on the transition into FATAL so a
-            // sustained fault logs once, not once per failed write.
-            let already_fatal =
-                health.swap(AuditHealth::Fatal as u8, Ordering::SeqCst) == AuditHealth::Fatal as u8;
-            if !already_fatal {
-                eprintln!(
-                    "[SAACP audit] FATAL: WAL write failed for '{log_file}': {e} — audit \
-                     subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
-                     referencing this log until a fresh ImmutableAuditLog is constructed."
-                );
+        match msg {
+            WalMessage::Entry { entry_json, event_count } => {
+                if let Err(e) = wal.write_entry(&entry_json, event_count, count_file) {
+                    // Fix 3: an atomic counter, not an inline eprintln! on this loop
+                    // — a sustained disk fault must not reintroduce the original
+                    // per-event-print hot-path bug.
+                    wal_write_failures.fetch_add(1, Ordering::Relaxed);
+                    // Fix 4: sticky FATAL. Log only on the transition into FATAL so a
+                    // sustained fault logs once, not once per failed write.
+                    let already_fatal = health.swap(AuditHealth::Fatal as u8, Ordering::SeqCst)
+                        == AuditHealth::Fatal as u8;
+                    if !already_fatal {
+                        eprintln!(
+                            "[SAACP audit] FATAL: WAL write failed for '{log_file}': {e} — audit \
+                             subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
+                             referencing this log until a fresh ImmutableAuditLog is constructed."
+                        );
+                    }
+                }
+            }
+            WalMessage::Flush(ack_tx) => {
+                // L-10 fix: force a flush+sync outside the periodic cadence, then ack
+                // regardless of outcome — a failed flush here is already covered by
+                // the same FATAL/wal_write_failures signal path as a failed
+                // `write_entry`, and the caller's `flush()` returning `false` on a
+                // missing/late ack is the documented (non-fatal) failure mode.
+                if let Err(e) = wal.flush_and_sync(count_file) {
+                    wal_write_failures.fetch_add(1, Ordering::Relaxed);
+                    let already_fatal = health.swap(AuditHealth::Fatal as u8, Ordering::SeqCst)
+                        == AuditHealth::Fatal as u8;
+                    if !already_fatal {
+                        eprintln!(
+                            "[SAACP audit] FATAL: WAL flush failed for '{log_file}': {e} — audit \
+                             subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
+                             referencing this log until a fresh ImmutableAuditLog is constructed."
+                        );
+                    }
+                }
+                let _ = ack_tx.send(()); // best-effort; caller may have already timed out
             }
         }
     }
@@ -1196,6 +1592,39 @@ mod tests {
         }
     }
 
+    // -- M-4: NonceTracker::track_scoped session isolation --
+
+    #[test]
+    fn test_nonce_scoped_same_nonce_different_sessions_both_accepted() {
+        let tracker = NonceTracker::new();
+        // The SAME raw nonce value used by two DIFFERENT sessions must not
+        // collide — each session has its own independent nonce space.
+        assert!(tracker.track_scoped("session-A", 42).is_ok());
+        assert!(tracker.track_scoped("session-B", 42).is_ok());
+        assert_eq!(tracker.count(), 2);
+    }
+
+    #[test]
+    fn test_nonce_scoped_replay_within_same_session_detected() {
+        let tracker = NonceTracker::new();
+        tracker.track_scoped("session-A", 42).unwrap();
+        let err = tracker.track_scoped("session-A", 42).unwrap_err();
+        assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+    }
+
+    #[test]
+    fn test_nonce_scoped_and_unscoped_share_no_special_relationship() {
+        // track() and track_scoped() both ultimately write into the same
+        // underlying keyspace via different key-derivation functions; this
+        // just documents that calling both with logically related inputs
+        // does not error out unexpectedly (they operate on distinct derived
+        // keys with overwhelming probability).
+        let tracker = NonceTracker::new();
+        assert!(tracker.track(42).is_ok());
+        assert!(tracker.track_scoped("session-A", 42).is_ok());
+        assert_eq!(tracker.count(), 2);
+    }
+
     // -- ImmutableAuditLog tests --
 
     fn test_audit_log(name: &str) -> ImmutableAuditLog {
@@ -1204,6 +1633,25 @@ mod tests {
         let log = ImmutableAuditLog::with_paths(&log_file, &count_file);
         log.reset(); // Clean slate
         log
+    }
+
+    /// Resolve a relative audit fixture path the same way `with_paths` does, so
+    /// test read-backs hit the actual file the WAL worker wrote — under
+    /// `SAACP_TEST_LOG_DIR` (the RAM disk) when set, else CWD. Without this a
+    /// test that writes through the env var but reads a bare relative path looks
+    /// on the SSD/repo-root for a file that only exists on R:.
+    fn resolve_test_log_path(relative: &str) -> String {
+        match std::env::var("SAACP_TEST_LOG_DIR") {
+            Ok(dir) if !dir.is_empty() => {
+                let p = Path::new(relative);
+                if p.is_relative() {
+                    Path::new(&dir).join(p).to_string_lossy().to_string()
+                } else {
+                    relative.to_string()
+                }
+            }
+            _ => relative.to_string(),
+        }
     }
 
     #[test]
@@ -1216,6 +1664,79 @@ mod tests {
 
         assert_eq!(log.event_count(), 2);
         assert!(log.verify_chain(secret));
+        log.reset();
+    }
+
+    // -- L-10: WAL flush() tests --
+
+    #[test]
+    fn test_flush_confirms_and_persists_pending_entries() {
+        let log = test_audit_log("flush_confirms");
+        let secret = b"audit_secret_key";
+
+        for i in 0..5 {
+            log.append_event(
+                secret, "agent-a", "agent-b", &format!("sig-{i}"), "read:data", &format!("trace-{i}"),
+            );
+        }
+
+        // Before an explicit flush, the periodic cadence (200 entries / 50ms) may not
+        // have fired yet — `flush()` forces it and blocks until acked.
+        assert!(log.flush(Duration::from_secs(2)), "flush() should confirm within 2s");
+        assert_eq!(log.queue_len(), 0);
+
+        // On-disk line count must match the appended event count once flush() has
+        // returned true.
+        let log_file = resolve_test_log_path(&format!("test_audit_{}.log", "flush_confirms"));
+        let contents = fs::read_to_string(&log_file).expect("log file should exist after flush");
+        assert_eq!(contents.lines().count(), 5);
+
+        log.reset();
+    }
+
+    #[test]
+    fn test_flush_on_in_memory_only_log_does_not_hang() {
+        // `ImmutableAuditLog::new("")` is the deliberate no-persistence mode (see
+        // `run_wal_worker`'s doc comment) — `flush()` must still return promptly
+        // (acked with nothing to sync) rather than blocking until `timeout`.
+        let log = ImmutableAuditLog::new("");
+        let secret = b"audit_secret_key";
+        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+
+        let start = Instant::now();
+        assert!(log.flush(Duration::from_secs(2)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "in-memory flush() should ack near-instantly, not wait out the timeout"
+        );
+    }
+
+    #[test]
+    fn test_sentinel_write_is_atomic_and_leaves_no_temp_file() {
+        // C-5: flush_and_sync must swap the sentinel in with a rename, not an
+        // in-place overwrite. Observable from a unit test as: (a) the final
+        // sentinel content is correct, (b) no `.tmp-<pid>` artifact survives
+        // a successful flush.
+        let log = test_audit_log("sentinel_atomic");
+        let secret = b"audit_secret_key";
+
+        for i in 0..3 {
+            log.append_event(
+                secret, "agent-a", "agent-b", &format!("sig-{i}"), "read:data", &format!("trace-{i}"),
+            );
+        }
+        assert!(log.flush(Duration::from_secs(2)));
+
+        let count_file = resolve_test_log_path(&format!("test_audit_{}.sentinel", "sentinel_atomic"));
+        let sentinel = fs::read_to_string(&count_file).expect("sentinel file should exist after flush");
+        assert_eq!(sentinel.trim().parse::<u64>().unwrap(), 3);
+
+        let tmp_leftover = format!("{count_file}.tmp-{}", std::process::id());
+        assert!(
+            !Path::new(&tmp_leftover).exists(),
+            "temp sentinel file must not survive a successful flush"
+        );
+
         log.reset();
     }
 
@@ -1357,12 +1878,12 @@ mod tests {
     #[test]
     fn test_initialize_chain_accepts_valid_disk_state() {
         let log = test_audit_log("init_chain_valid");
-        let log_file = "test_audit_init_chain_valid.log";
+        let log_file = resolve_test_log_path("test_audit_init_chain_valid.log");
         let secret = b"init_chain_secret";
         log.append_event(secret, "a", "b", "sig-1", "intent-1", "trace-1");
         log.append_event(secret, "b", "c", "sig-2", "intent-2", "trace-2");
         // 2 real events + 1 flush-forcing event.
-        force_wal_flush_and_drain(&log, secret, log_file, 3);
+        force_wal_flush_and_drain(&log, secret, &log_file, 3);
 
         assert!(log.initialize_chain(secret).is_ok());
         assert_eq!(log.event_count(), 3);
@@ -1375,20 +1896,20 @@ mod tests {
     #[test]
     fn test_initialize_chain_rejects_tampered_disk_state() {
         let log = test_audit_log("init_chain_tampered");
-        let log_file = "test_audit_init_chain_tampered.log";
+        let log_file = resolve_test_log_path("test_audit_init_chain_tampered.log");
         let secret = b"init_chain_secret_2";
         log.append_event(secret, "a", "b", "sig-1", "intent-1", "trace-1");
         // 1 real event + 1 flush-forcing event.
-        force_wal_flush_and_drain(&log, secret, log_file, 2);
+        force_wal_flush_and_drain(&log, secret, &log_file, 2);
 
         // Tamper with the on-disk chain_hash of the first entry.
-        let content = fs::read_to_string(log_file).expect("log file must exist");
+        let content = fs::read_to_string(&log_file).expect("log file must exist");
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
         assert_eq!(lines.len(), 2, "expected both entries flushed to disk");
         let mut entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         entry["chain_hash"] = serde_json::Value::String("deadbeef".repeat(8));
         lines[0] = entry.to_string();
-        fs::write(log_file, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        fs::write(&log_file, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
 
         let result = log.initialize_chain(secret);
         assert!(result.is_err());
@@ -1522,5 +2043,120 @@ mod tests {
         assert_eq!(decrypt_intent(secret, &stored_intent).unwrap(), plaintext_intent);
 
         log.reset();
+    }
+
+    // -- C-4: rotated audit log archival --
+
+    #[test]
+    fn test_compress_file_to_gzip_roundtrip() {
+        use std::io::Read;
+
+        let src = "test_c4_compress_src.txt";
+        let dst = "test_c4_compress_src.txt.gz";
+        let _ = fs::remove_file(src);
+        let _ = fs::remove_file(dst);
+
+        let content = b"the quick brown fox jumps over the lazy dog\n".repeat(100);
+        fs::write(src, &content).unwrap();
+
+        compress_file_to_gzip(src, dst).expect("compression must succeed");
+        assert!(Path::new(dst).exists(), "compressed .gz file must exist");
+
+        let compressed = fs::read(dst).unwrap();
+        assert!(compressed.len() < content.len(), "gzip output should be smaller than repetitive input");
+        let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, content);
+
+        fs::remove_file(src).unwrap();
+        fs::remove_file(dst).unwrap();
+    }
+
+    #[test]
+    fn test_noop_archival_sink_is_ok_and_side_effect_free() {
+        let sink = NoopArchivalSink;
+        // Deliberately a path that doesn't exist — Noop must never touch the
+        // filesystem, so a missing file must not surface as an error either.
+        let path = Path::new("test_c4_noop_target_need_not_exist.gz");
+        assert!(sink.archive(path).is_ok());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_filesystem_archival_sink_moves_file_into_target_dir() {
+        let target_dir = "test_c4_archive_dir";
+        let _ = fs::remove_dir_all(target_dir);
+        let src_path = "test_c4_archival_source.bak.gz";
+        fs::write(src_path, b"compressed-ish content").unwrap();
+
+        let sink = FilesystemArchivalSink::new(target_dir);
+        sink.archive(Path::new(src_path)).expect("archive must succeed");
+
+        assert!(!Path::new(src_path).exists(), "source must be moved, not copied");
+        let dest = Path::new(target_dir).join(src_path);
+        assert!(dest.exists(), "compressed file must land in target_dir");
+        assert_eq!(fs::read(&dest).unwrap(), b"compressed-ish content");
+
+        fs::remove_dir_all(target_dir).unwrap();
+    }
+
+    #[test]
+    fn test_maybe_rotate_compresses_bak_and_removes_uncompressed_copy() {
+        let log_file = "test_c4_rotate_wal.log";
+        let cleanup = || {
+            let _ = fs::remove_file(log_file);
+            if let Ok(dir) = fs::read_dir(".") {
+                for entry in dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("test_c4_rotate_wal.log.") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        };
+        cleanup();
+
+        let mut wal = WalWriter::open(log_file, Arc::new(NoopArchivalSink)).unwrap();
+        // Force rotation on the next call without needing to actually write
+        // AUDIT_MAX_LOG_SIZE (50MB) worth of entries first.
+        wal.size = AUDIT_MAX_LOG_SIZE + 1;
+        wal.maybe_rotate().expect("maybe_rotate must succeed");
+
+        // The rename to `.bak` happens synchronously inside `maybe_rotate` — only
+        // compression happens on the detached `saacp-audit-archival` background
+        // thread — so the `.bak` file is already on disk with a known name the
+        // instant `maybe_rotate()` returns, before compression has necessarily
+        // finished (`GzEncoder`'s `File::create` for the `.gz` destination happens
+        // near-instantly, well before the compressed bytes are fully written and
+        // fsync'd — polling for the `.gz` path to merely *appear* would race).
+        let bak_path = fs::read_dir(".")
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with("test_c4_rotate_wal.log.") && name.ends_with(".bak")
+            })
+            .expect("expected a *.bak file to exist immediately after maybe_rotate()");
+
+        // Poll for that exact `.bak` file's removal — the background thread only
+        // deletes it after the compressed copy is confirmed written+fsync'd.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bak_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !bak_path.exists(),
+            "uncompressed .bak must be removed after successful compression (timed out waiting)"
+        );
+
+        let gz_path = format!("{}.gz", bak_path.to_string_lossy());
+        assert!(
+            Path::new(&gz_path).exists(),
+            "expected a compressed .bak.gz file to exist once the uncompressed .bak was removed"
+        );
+
+        cleanup();
     }
 }

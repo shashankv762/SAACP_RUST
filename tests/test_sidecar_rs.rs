@@ -10,8 +10,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use saacp::security::{AuditRecord, ImmutableAuditLog};
-use saacp::sidecar::{run, SidecarConfig, SIDECAR_INBOX_CAPACITY};
+use saacp::sidecar::{run, run_with_shutdown, SidecarConfig, SIDECAR_INBOX_CAPACITY};
 
 async fn free_addr() -> SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,6 +90,74 @@ async fn sidecar_receive_times_out_with_204_when_empty() {
     assert_eq!(recv_resp.status(), 204);
 }
 
+/// M-17 regression: a second concurrent `/receive` call must fail fast with
+/// 409 CONFLICT instead of queueing behind the first call's `wait_secs`
+/// timeout. Before the fix, the second call would have blocked on
+/// `Inbox::rx`'s Mutex until the first call's long wait completed.
+#[tokio::test]
+async fn sidecar_concurrent_receive_returns_409() {
+    let (_saacp_addr, http_addr) = spawn_sidecar("agent-concurrent-recv", [0x13u8; 32]).await;
+    let client = reqwest::Client::new();
+
+    // First call: a long wait, held open deliberately so the second call
+    // below is guaranteed to observe the permit as taken.
+    let first_client = client.clone();
+    let first_http_addr = http_addr;
+    let first = tokio::spawn(async move {
+        first_client
+            .get(format!("http://{}/receive?wait_secs=2.0", first_http_addr))
+            .send()
+            .await
+            .expect("first receive request failed")
+    });
+
+    // Give the first call a moment to actually reach the handler and acquire
+    // the permit before firing the second.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let second_resp = client
+        .get(format!("http://{}/receive?wait_secs=2.0", http_addr))
+        .send()
+        .await
+        .expect("second receive request failed");
+    assert_eq!(
+        second_resp.status(),
+        409,
+        "a concurrent /receive call must fail fast with 409, not queue"
+    );
+
+    // The first call must still complete normally (204, since the inbox is
+    // empty and its own wait_secs eventually elapses) — the fix must not
+    // break the legitimate single-caller case.
+    let first_resp = first.await.expect("first receive task panicked");
+    assert_eq!(first_resp.status(), 204);
+}
+
+/// After the first `/receive` call's permit is released (the call
+/// completed), a subsequent call must succeed normally — the semaphore must
+/// not remain permanently exhausted after one use.
+#[tokio::test]
+async fn sidecar_receive_permit_released_after_completion() {
+    let (_saacp_addr, http_addr) = spawn_sidecar("agent-recv-release", [0x14u8; 32]).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .get(format!("http://{}/receive?wait_secs=0.1", http_addr))
+        .send()
+        .await
+        .expect("first receive request failed");
+    assert_eq!(first.status(), 204);
+
+    // A second, sequential call (after the first has fully completed) must
+    // succeed, not be permanently blocked by a leaked permit.
+    let second = client
+        .get(format!("http://{}/receive?wait_secs=0.1", http_addr))
+        .send()
+        .await
+        .expect("second receive request failed");
+    assert_eq!(second.status(), 204);
+}
+
 #[tokio::test]
 async fn sidecar_wrong_shared_secret_rejected() {
     let (_a_saacp, agent_a_http) = spawn_sidecar("agent-a2", [0x21u8; 32]).await;
@@ -130,6 +200,35 @@ async fn sidecar_healthz() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["agent_id"], "agent-health");
     assert_eq!(body["status"], "ok");
+}
+
+/// Production-hardening regression proof: if the inner SAACP protocol listener fails to
+/// bind (here, because its port is already taken), the sidecar keeps serving HTTP but
+/// `/healthz` must report the degradation (503 + `"status":"degraded"`) instead of a
+/// misleading `"ok"` — otherwise the process looks healthy while unable to receive any
+/// peer traffic.
+#[tokio::test]
+async fn sidecar_healthz_reports_degraded_when_protocol_listener_fails() {
+    // Hold the SAACP protocol port so the daemon's own bind fails.
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let saacp_addr = occupied.local_addr().unwrap();
+    let http_addr = free_addr().await;
+
+    let config = SidecarConfig::new("agent-degraded", [0x44u8; 32], saacp_addr, http_addr);
+    tokio::spawn(async move { run(config).await; });
+    // Give the daemon time to attempt (and fail) its bind and flip the health flag.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/healthz", http_addr))
+        .send()
+        .await
+        .expect("healthz failed");
+    assert_eq!(resp.status(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["protocol_listener"], "down");
 }
 
 /// Production-hardening regression proof #1: a peer with its own pairwise `peer_secrets`
@@ -332,4 +431,146 @@ async fn sidecar_send_logs_delegation_edge_with_real_target_agent() {
     assert_eq!(delegation.target, "agent-delegate-target");
     assert!(delegation.intent.contains("parent=agent-delegator"));
     assert!(delegation.intent.contains("child=agent-delegate-target"));
+}
+
+/// M-22 fix: with `http_bearer_token` unset (default), `/healthz` and `/receive` remain
+/// unauthenticated — proves the opt-in default preserves today's exact behavior.
+#[tokio::test]
+async fn sidecar_no_bearer_token_configured_is_unauthenticated() {
+    let (_saacp, http_addr) = spawn_sidecar("agent-noauth", [0x21u8; 32]).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/healthz", http_addr))
+        .send()
+        .await
+        .expect("healthz failed");
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(format!("http://{}/receive", http_addr))
+        .send()
+        .await
+        .expect("receive failed");
+    assert_ne!(resp.status(), 401);
+}
+
+/// M-22 fix: with `http_bearer_token` set, `/receive` rejects a missing or wrong
+/// `Authorization` header with 401, accepts the correct one, and `/healthz` stays
+/// ungated regardless (matching `command_center.rs`'s existing precedent).
+#[tokio::test]
+async fn sidecar_bearer_token_gates_send_and_receive_not_healthz() {
+    let (_saacp, http_addr) = spawn_sidecar_with("agent-auth", [0x22u8; 32], |cfg| {
+        cfg.http_bearer_token = Some("s3cr3t-token".to_string());
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    // /healthz never gated.
+    let resp = client
+        .get(format!("http://{}/healthz", http_addr))
+        .send()
+        .await
+        .expect("healthz failed");
+    assert_eq!(resp.status(), 200);
+
+    // /receive with no Authorization header -> 401.
+    let resp = client
+        .get(format!("http://{}/receive", http_addr))
+        .send()
+        .await
+        .expect("receive failed");
+    assert_eq!(resp.status(), 401);
+
+    // /receive with a wrong token -> 401.
+    let resp = client
+        .get(format!("http://{}/receive", http_addr))
+        .bearer_auth("wrong-token")
+        .send()
+        .await
+        .expect("receive failed");
+    assert_eq!(resp.status(), 401);
+
+    // /receive with the correct token -> not 401 (204 No Content, since the inbox is empty).
+    let resp = client
+        .get(format!("http://{}/receive", http_addr))
+        .bearer_auth("s3cr3t-token")
+        .send()
+        .await
+        .expect("receive failed");
+    assert_ne!(resp.status(), 401);
+}
+
+// -- M-15: sidecar graceful shutdown --
+//
+// Mirrors `test_daemon_shutdown_rs.rs`'s coverage of
+// `SAACPNetworkDaemon::start_with_shutdown` for the sidecar's own
+// `run_with_shutdown`, proving both the inner SAACP protocol listener and the
+// outer plain-HTTP/JSON API actually stop when the shared `CancellationToken`
+// is cancelled, instead of running forever with no way to stop short of
+// killing the process.
+
+/// Cancelling the shutdown token must let `run_with_shutdown` return promptly
+/// (well within a generous bound), and the HTTP API must stop accepting new
+/// connections once it has.
+#[tokio::test]
+async fn run_with_shutdown_returns_promptly_and_stops_serving() {
+    let saacp_addr = free_addr().await;
+    let http_addr = free_addr().await;
+    let config = SidecarConfig::new("agent-shutdown", [0x22u8; 32], saacp_addr, http_addr);
+    let shutdown = CancellationToken::new();
+
+    let shutdown_clone = shutdown.clone();
+    let handle = tokio::spawn(async move { run_with_shutdown(config, shutdown_clone).await });
+
+    // Give both listeners a moment to bind before checking they're live.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/healthz", http_addr))
+        .send()
+        .await
+        .expect("healthz must succeed before shutdown");
+    assert_eq!(resp.status(), 200);
+
+    shutdown.cancel();
+
+    // `run_with_shutdown` (an `async fn` with no explicit return type) must
+    // complete — bounded well within the daemon's own drain timeout.
+    tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("run_with_shutdown did not return within 15s")
+        .expect("sidecar task panicked");
+
+    // The HTTP listener must no longer be accepting connections post-shutdown.
+    let post_shutdown = client
+        .get(format!("http://{}/healthz", http_addr))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+    assert!(
+        post_shutdown.is_err(),
+        "HTTP API must stop accepting connections after shutdown, got: {:?}",
+        post_shutdown.map(|r| r.status())
+    );
+}
+
+/// `run` (the public, no-shutdown-token entry point used by the standalone
+/// `saacp-sidecar` binary) must remain unaffected — same signature, same
+/// "runs forever" behavior, proving `run_with_shutdown`'s addition didn't
+/// change `run`'s existing contract.
+#[tokio::test]
+async fn run_without_shutdown_token_still_serves_normally() {
+    let saacp_addr = free_addr().await;
+    let http_addr = free_addr().await;
+    let config = SidecarConfig::new("agent-no-shutdown", [0x33u8; 32], saacp_addr, http_addr);
+    tokio::spawn(async move { run(config).await; });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/healthz", http_addr))
+        .send()
+        .await
+        .expect("healthz must succeed");
+    assert_eq!(resp.status(), 200);
 }

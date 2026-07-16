@@ -61,14 +61,17 @@ impl CapabilityTransparencyLog {
     }
 
     pub fn append(&self, entry: CapabilityAuditEntry) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries.lock().unwrap().push(entry);
     }
 
     pub fn entry_count(&self) -> usize {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries.lock().unwrap().len()
     }
 
     pub fn entries(&self) -> Vec<CapabilityAuditEntry> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries.lock().unwrap().clone()
     }
 }
