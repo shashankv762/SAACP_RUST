@@ -75,32 +75,32 @@ agent's business logic.
 
 ```
    ┌──────────────┐      plain HTTP/JSON        ┌──────────────────────┐
-   │  Your agent  │ ─────────────────────────▶  │   saacp-sidecar       │
-   │ (any lang)   │ ◀─────────────────────────  │  (optional edge)      │
+   │  Your agent  │ ─────────────────────────▶  │   saacp-sidecar      │
+   │ (any lang)   │ ◀─────────────────────────  │  (optional edge)     │
    └──────────────┘                             └──────────┬───────────┘
                                                             │  real SAACP wire
                                                             ▼
    ┌────────────────────────────────────────────────────────────────────────┐
-   │                     SAACPNetworkDaemon (src/daemon.rs)                    │
-   │   TCP / WebSocket / TLS transport  ·  per-IP circuit breakers            │
+   │                     SAACPNetworkDaemon (src/daemon.rs)                 │
+   │   TCP / WebSocket / TLS transport  ·  per-IP circuit breakers          │
    └───────────────────────────────┬────────────────────────────────────────┘
                                     ▼
    ┌────────────────────────────────────────────────────────────────────────┐
-   │            SAACPProtocolHandler::intercept_packet(_full/_encrypted)      │
-   │                                                                          │
-   │  Gate 0  Crypto integrity  (AES-256-GCM + replay window + Adler-32)      │
-   │  Gate 1.0 Capability token validation (Ed25519/HMAC, revocation, expiry) │
-   │  Gate 2.5 Kinetic firewall (action-class escalation guard)              │
-   │  Gate 1.5 Intent envelope (root-intent binding + drift + dangerous verb) │
-   │  Gate 0.5 Financial circuit breaker (token-budget cap)                  │
-   │  Gate 3.0 Lateral-movement guard (secondary token for mutations)        │
-   │  Gate 4.0 Prompt-injection scanner (Unicode-normalized, multi-encoding)  │
-   │  Gate 5.0 Epistemic circuit breaker (confidence sanity, schema 3)       │
-   │  Gate 5.0b Scope-consistency reinforcement                              │
-   │  Gate 6.0 Immutable audit checkpoint (HMAC hash-chain, WAL)             │
-   │  Gate 9.0 JSON schema validation + RGC resource governance              │
-   │  Gate 11.0 AEGF hop-limit + causal-graph governance                     │
-   │  Gate 12.0 CSCS oscillation / loop detection                            │
+   │            SAACPProtocolHandler::intercept_packet(_full/_encrypted)    │
+   │                                                                        │
+   │  Gate 0  Crypto integrity  (AES-256-GCM + replay window + Adler-32)    │
+   │  Gate 1.0 Capability token validation (Ed25519/HMAC, revocation, expiry)│
+   │  Gate 2.5 Kinetic firewall (action-class escalation guard)             │
+   │  Gate 1.5 Intent envelope (root-intent binding + drift + dangerous verb)│
+   │  Gate 0.5 Financial circuit breaker (token-budget cap)                 │
+   │  Gate 3.0 Lateral-movement guard (secondary token for mutations)       │
+   │  Gate 4.0 Prompt-injection scanner (Unicode-normalized, multi-encoding)│
+   │  Gate 5.0 Epistemic circuit breaker (confidence sanity, schema 3)      │
+   │  Gate 5.0b Scope-consistency reinforcement                             │
+   │  Gate 6.0 Immutable audit checkpoint (HMAC hash-chain, WAL)            │
+   │  Gate 9.0 JSON schema validation + RGC resource governance             │
+   │  Gate 11.0 AEGF hop-limit + causal-graph governance                    │
+   │  Gate 12.0 CSCS oscillation / loop detection                           │
    └───────────────────────────────┬────────────────────────────────────────┘
                                     ▼
                           delivered to receiving agent
