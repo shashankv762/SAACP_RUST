@@ -69,9 +69,21 @@ confidence interval around the median and the median is the point estimate.
 | Audit log append (hash-chain + WAL) | **2.54 µs** | per event, chain-length-independent |
 | WAL sustained append throughput | **276.5 ms / 100k events** | ≈ **362k events/sec** |
 
-> **Full-pipeline throughput:** a valid frame traverses all mandatory gates in ~2.0 µs
-> on this hardware — on the order of **~500k packets/sec per core** for the pass path,
-> before I/O. The audit WAL sustains ~362k appended events/sec (see T14).
+> **Full-pipeline throughput (gate-pipeline compute only — NOT a system throughput
+> claim):** a valid frame traverses all mandatory gates in ~2.0 µs on this hardware,
+> i.e. on the order of **~500k packets/sec per core of gate-pipeline compute**.
+>
+> P-3: this figure is measured single-threaded, one pre-parsed `ParsedPacket` at a
+> time, with no I/O and no concurrency. Real daemon throughput is materially lower,
+> because the serving path additionally pays: TCP accept + read, the X25519 ECDH
+> handshake (amortized across a persistent connection), tokio task-spawn and
+> `spawn_blocking` hand-off for the gate pipeline, and cross-connection contention on
+> the shared audit-WAL and rate-limiter state. Treat ~500k as an upper bound on the
+> compute half of one core, never as "this system serves 500k packets/sec".
+>
+> The audit WAL sustains ~333k appended events/sec (see T14) — that IS a concurrent,
+> lock-serialized number, so in practice it, not the 2 µs gate cost, is the ceiling
+> that a real deployment reaches first.
 
 ---
 
@@ -407,7 +419,12 @@ thread spawn/join overhead per iteration.)
 | e2e_100_frames_sequential_throughput (100/iter) | 200.87 µs | **201.10 µs** | 201.37 µs |
 
 The 100-frame batch ≈ **2.01 µs/frame**, matching the single-frame figures — the full
-mandatory pipeline runs in ~2 µs per packet on this hardware (**~497k packets/sec/core**).
+mandatory pipeline runs in ~2 µs per packet on this hardware
+(**~497k packets/sec/core of gate-pipeline compute**).
+
+> P-3 caveat: single-threaded, pre-parsed packets, no I/O, no concurrency. This is the
+> compute cost of the gate pipeline in isolation — not end-to-end system throughput.
+> See the "Full-pipeline throughput" note above for what the serving path adds.
 
 ### WC9 — Circuit breaker cascade / boundary attacks
 | Benchmark | low | median | high |

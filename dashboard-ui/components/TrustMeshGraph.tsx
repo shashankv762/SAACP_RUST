@@ -200,10 +200,35 @@ export function TrustMeshGraph({ compact = false, showControls = false }: Props)
 
     function showTip(e: MouseEvent, d: SimNode) {
       if (!tip) return;
-      tip.innerHTML =
-        `<div class="nt-id">${d.id}</div>` +
-        `<div class="nt-row">Status <span class="badge ${statusClass(d)}">${statusLabel(d)}</span></div>` +
-        `<div class="nt-row">Trust Score <b>${d.known ? d.score.toFixed(3) : "—"}</b></div>`;
+      // S-1 fix: build the tooltip with textContent/createElement instead of
+      // innerHTML. `d.id` is the agent-supplied agent_id and reaches this sink
+      // unescaped — interpolating it into an HTML string is stored XSS (an
+      // agent registering as `<img src=x onerror=...>` runs script in the
+      // operator's dashboard session). statusClass/statusLabel return fixed
+      // literals and d.score is a number, but they go through textContent too
+      // so no value in this tooltip can ever be parsed as markup.
+      tip.textContent = "";
+
+      const idDiv = document.createElement("div");
+      idDiv.className = "nt-id";
+      idDiv.textContent = d.id;
+
+      const statusDiv = document.createElement("div");
+      statusDiv.className = "nt-row";
+      statusDiv.append("Status ");
+      const badge = document.createElement("span");
+      badge.className = `badge ${statusClass(d)}`;
+      badge.textContent = statusLabel(d);
+      statusDiv.append(badge);
+
+      const scoreDiv = document.createElement("div");
+      scoreDiv.className = "nt-row";
+      scoreDiv.append("Trust Score ");
+      const scoreVal = document.createElement("b");
+      scoreVal.textContent = d.known ? d.score.toFixed(3) : "—";
+      scoreDiv.append(scoreVal);
+
+      tip.append(idDiv, statusDiv, scoreDiv);
       tip.style.left = Math.min(e.clientX + 16, window.innerWidth - 220) + "px";
       tip.style.top = e.clientY + 14 + "px";
       tip.classList.add("show");

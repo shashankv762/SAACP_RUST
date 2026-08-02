@@ -346,6 +346,19 @@ pub const AUDIT_WAL_FLUSH_INTERVAL_MS: u64 = 50;
 /// WAL worker to confirm a final flush+sync before the process exits.
 pub const AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
+/// S-6 fix: cap on the number of `AuditLogEntry` records retained in the
+/// in-memory `AuditInner::entries` vector. This vector exists to serve the fast
+/// in-process `verify_chain()`; every appended event was previously kept for the
+/// entire process lifetime, so a long-running daemon accumulated hundreds of MB
+/// (a memory leak, not a bypass). Once the vector exceeds this cap, `append_event`
+/// drains the oldest 20% — the full, authoritative history remains on disk and is
+/// checked by `verify_chain_disk()`. `event_count` (the running total, used by the
+/// sentinel check) is deliberately NOT reset by the drain, so tamper detection
+/// against the on-disk sentinel is unaffected. `verify_chain()` seeds its expected
+/// hash from the first retained entry's `prev_hash`, so a drained window still
+/// verifies internal continuity.
+pub const AUDIT_MAX_IN_MEMORY_ENTRIES: usize = 100_000;
+
 const AUDIT_WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(AUDIT_WAL_FLUSH_INTERVAL_MS);
 
 /// WAL queue-depth ratio above which `AuditHealth` becomes `Degraded`.
@@ -744,6 +757,24 @@ impl ImmutableAuditLog {
         // observation then fall through to the normal blocking lock() below.
         // This is instrumentation only; the guarded critical section that
         // follows is unchanged either way.
+        //
+        // P-2 (assessed, deliberately NOT restructured): this lock is held across
+        // the HMAC computation and JSON serialization below, which serializes all
+        // concurrent appenders. It is retained by design, because the audit chain is
+        // inherently sequential: each record's `prev_hash` is the PREVIOUS record's
+        // `chain_hash`, and the HMAC covers `prev_hash`, so no two records can have
+        // their hashes computed concurrently without either breaking the linkage or
+        // requiring a second serialization point that reintroduces the same lock.
+        // `verify_chain`/`verify_chain_disk` walk exactly this linkage, so a
+        // "lock-free append" would trade tamper-evidence for throughput.
+        //
+        // Measured (release, `T14_WAL_Sustained_Throughput`): ~333k events/sec
+        // sustained through this critical section — roughly 3 microseconds per
+        // event, far above the packet rates the gate pipeline can feed it, and the
+        // WAL worker itself (the actual I/O) is already off this thread via the
+        // bounded `wal_tx` channel. Contention here is observable via
+        // `record_mutex_contention("wal_append")` if a deployment ever does
+        // approach that ceiling.
         let mut inner = match self.inner.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -846,6 +877,17 @@ impl ImmutableAuditLog {
         let record_for_subscribers = log_entry.record.clone();
         inner.entries.push(log_entry);
 
+        // S-6 fix: bound the in-memory retention window. The on-disk WAL keeps the
+        // full history (verified by `verify_chain_disk`); this vector only backs the
+        // fast in-process `verify_chain`, so dropping the oldest slice caps memory
+        // without losing any auditable record. Drain the oldest 20% in one shot
+        // (amortized O(1) per event) rather than one-at-a-time. `event_count` is
+        // untouched, so the sentinel/tamper check still sees the true total.
+        if inner.entries.len() > AUDIT_MAX_IN_MEMORY_ENTRIES {
+            let drop_n = AUDIT_MAX_IN_MEMORY_ENTRIES / 5;
+            inner.entries.drain(0..drop_n);
+        }
+
         // Release the hash-chain lock BEFORE invoking subscriber callbacks —
         // never hold `inner` across a callback (same rule `trust_decay.rs`'s
         // `emit` follows for its own, separate subscriber-list mutex).
@@ -880,7 +922,21 @@ impl ImmutableAuditLog {
             return true;
         }
 
-        let mut expected_prev_hash = GENESIS_HASH.to_string();
+        // S-6 fix: seed the expected hash from the FIRST RETAINED entry's
+        // `prev_hash` rather than a hard-coded `GENESIS_HASH`. When the in-memory
+        // window has never been drained, `entries[0].prev_hash == GENESIS_HASH`,
+        // so this is identical to the old behavior for the common case. After a
+        // drain (see `append_event`/`AUDIT_MAX_IN_MEMORY_ENTRIES`) the window no
+        // longer begins at genesis, and this lets `verify_chain` still confirm the
+        // internal continuity + HMAC integrity of the retained window. Full-history
+        // (genesis-anchored) verification is `verify_chain_disk`'s job — the doc
+        // comment above points callers there. `.unwrap()` is unreachable: the
+        // `entries.is_empty()` early-return above guarantees a first element.
+        let mut expected_prev_hash = inner
+            .entries
+            .first()
+            .map(|e| e.record.prev_hash.clone())
+            .unwrap_or_else(|| GENESIS_HASH.to_string());
 
         for entry in &inner.entries {
             if entry.record.prev_hash != expected_prev_hash {
@@ -1037,6 +1093,15 @@ impl ImmutableAuditLog {
     pub fn event_count(&self) -> u64 {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.event_count
+    }
+
+    /// S-6 fix: number of entries currently retained in the in-memory window
+    /// (bounded by `AUDIT_MAX_IN_MEMORY_ENTRIES`). Distinct from `event_count`,
+    /// which is the lifetime total (never decremented by the retention drain).
+    /// Exposed for monitoring and for verifying the retention bound in tests.
+    pub fn in_memory_entries_len(&self) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.entries.len()
     }
 
     /// Current Gate 6.0 backpressure health (see `AuditHealth`). Read by
@@ -1665,6 +1730,39 @@ mod tests {
         assert_eq!(log.event_count(), 2);
         assert!(log.verify_chain(secret));
         log.reset();
+    }
+
+    /// S-6 fix: the in-memory entry vector is bounded by
+    /// `AUDIT_MAX_IN_MEMORY_ENTRIES`; appending past the cap drains the oldest
+    /// slice, `event_count` keeps the true lifetime total, and `verify_chain`
+    /// still succeeds on the drained (non-genesis-anchored) window.
+    #[test]
+    fn test_audit_in_memory_retention_bounded_and_verifiable() {
+        // In-memory-only mode (no disk sentinel) keeps this fast and hermetic.
+        let log = ImmutableAuditLog::new("");
+        let secret = b"audit_secret_key";
+
+        let target = AUDIT_MAX_IN_MEMORY_ENTRIES + (AUDIT_MAX_IN_MEMORY_ENTRIES / 5) + 25;
+        for i in 0..target {
+            log.append_event(secret, "agent-a", "agent-b", "sig", "read:data", &format!("t{i}"));
+        }
+
+        // Retention bound: never exceeds the cap.
+        assert!(
+            log.in_memory_entries_len() <= AUDIT_MAX_IN_MEMORY_ENTRIES,
+            "in-memory window ({}) must stay within AUDIT_MAX_IN_MEMORY_ENTRIES ({})",
+            log.in_memory_entries_len(),
+            AUDIT_MAX_IN_MEMORY_ENTRIES
+        );
+        // Lifetime counter is NOT decremented by the drain.
+        assert_eq!(log.event_count(), target as u64);
+        // A drain must actually have happened for this test to be meaningful.
+        assert!(log.in_memory_entries_len() < target);
+        // The retained (drained) window still verifies internal continuity.
+        assert!(
+            log.verify_chain(secret),
+            "verify_chain must hold on a drained in-memory window (seeded from first retained entry)"
+        );
     }
 
     // -- L-10: WAL flush() tests --

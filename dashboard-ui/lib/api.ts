@@ -9,9 +9,10 @@ export const API_BASE =
 export const DASHBOARD_TOKEN = process.env.NEXT_PUBLIC_DASHBOARD_TOKEN || "";
 
 // NOTE (v1 scope, matches command_center.rs's own honesty convention): this token is
-// baked into the client bundle via NEXT_PUBLIC_*, same tradeoff the backend already makes
-// by accepting the token as an SSE `?token=` query parameter. Fine for a local/operator-
-// only dashboard; not meant for a multi-tenant public deployment as-is.
+// baked into the client bundle via NEXT_PUBLIC_*. Fine for a local/operator-only
+// dashboard; not meant for a multi-tenant public deployment as-is. The token is sent
+// only as an `Authorization: Bearer` header now — the SSE stream uses a one-time
+// ticket (see `openEventSource`), so the bearer token is no longer placed in any URL.
 
 export interface AgentTrustSnapshot {
   agent_id: string;
@@ -112,11 +113,23 @@ export const api = {
   financial: () => getJson<FinancialResponse>("/api/financial"),
   readyz: () => getJson<ReadyzResponse>("/api/readyz"),
   reloadConfig: () => postJson<ReloadedConfig>("/api/config/reload"),
+  eventsTicket: () => postJson<{ ticket: string; ttl_secs: number }>("/api/events/ticket"),
 };
 
-/** SSE endpoint URL, token passed as a query param since EventSource can't set headers. */
-export function eventsUrl(): string {
+/**
+ * S-7 fix: open the SSE stream without leaking the long-lived bearer token in the
+ * URL. `EventSource` can't set an Authorization header, so we first POST (WITH the
+ * bearer header) to `/api/events/ticket` to obtain a single-use, short-lived
+ * ticket, then connect `EventSource` with `?ticket=<t>`. The ticket is consumed
+ * server-side on first use, so even though it appears in the URL it can't be
+ * replayed from history/logs/Referer the way the old `?token=<bearer>` could.
+ *
+ * Returns the connected `EventSource`. Throws if the ticket request fails (e.g.
+ * bad/absent bearer token) — the caller decides how to surface that.
+ */
+export async function openEventSource(): Promise<EventSource> {
+  const { ticket } = await api.eventsTicket();
   const url = new URL(`${API_BASE}/events`);
-  if (DASHBOARD_TOKEN) url.searchParams.set("token", DASHBOARD_TOKEN);
-  return url.toString();
+  url.searchParams.set("ticket", ticket);
+  return new EventSource(url.toString());
 }

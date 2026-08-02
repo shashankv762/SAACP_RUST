@@ -44,10 +44,15 @@
 //!   audit entry (and one `DashboardEvent::DelegationEdge`) per message. The `/api/trust-mesh`
 //!   REST snapshot itself IS deduped (one entry per pair, `last_seen`/`depth` updated
 //!   in place) — only the live SSE feed repeats.
-//! - `/events` (SSE) accepts the dashboard token as a `?token=` query parameter as well as
-//!   an `Authorization` header, since browsers' native `EventSource` cannot set custom
-//!   headers — a stated v1 simplification (tokens in URLs can leak via logs/referrers). A
-//!   session-cookie-based v2 is the natural fix if a deployment's threat model cares.
+//! - `/events` (SSE) authenticates either via an `Authorization: Bearer` header
+//!   (non-browser clients) or a one-time `?ticket=` query parameter obtained from
+//!   `POST /api/events/ticket` (browsers, whose native `EventSource` cannot set
+//!   custom headers). S-7 fix: this replaced the former `?token=<bearer>` query
+//!   parameter, which leaked the long-lived dashboard token into browser history,
+//!   access logs, and Referer headers. The ticket is single-use and short-lived
+//!   (`SSE_TICKET_TTL_SECS`), so its brief appearance in the URL is not a durable
+//!   credential. A session-cookie-based v2 remains a natural further step if a
+//!   deployment's threat model cares.
 //! - "Tokens Blocked" / "dollars saved" measures *rejected claimed cost*
 //!   (`estimated_cost` summed at every `BudgetExceeded` rejection), never *actual*
 //!   prevented spend, which this system has no way to observe. Label it honestly in any
@@ -111,6 +116,20 @@ pub const COMMAND_CENTER_DEFAULT_DOLLARS_PER_TOKEN: f64 = 0.00002;
 /// (`RecvError::Lagged`) rather than blocking the (permanent, process-wide)
 /// publishing subscriptions on the global engines.
 const DASHBOARD_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// S-7 fix: lifetime of a one-time SSE connection ticket. The browser POSTs
+/// (with its bearer header) to `/api/events/ticket`, receives a short-lived
+/// random ticket, then opens the `EventSource` with `?ticket=<t>`. The ticket is
+/// consumed on first use, so even though it briefly appears in the URL it can't
+/// be replayed from browser history / logs / Referer the way the old long-lived
+/// `?token=<bearer>` could. 60s is ample for the immediate connect that follows
+/// the POST.
+const SSE_TICKET_TTL_SECS: f64 = 60.0;
+/// S-7 fix: hard cap on outstanding (unconsumed) SSE tickets, so a client that
+/// mints tickets without ever connecting can't grow the map without bound. On
+/// overflow the oldest-expiring tickets are swept first (and any already-expired
+/// ones dropped); mirrors the crate's other bounded-map conventions.
+const SSE_TICKET_MAX_OUTSTANDING: usize = 4096;
 
 /// Default browser `Origin`s permitted to make cross-origin requests to this API
 /// (CORS allowlist). The dashboard-ui frontend (`dashboard-ui/`, a separate
@@ -287,14 +306,14 @@ pub enum DashboardEvent {
 
 struct CommandCenterState {
     /// Hex encoding of `CommandCenterConfig::dashboard_token` — the actual
-    /// wire representation clients present via `Authorization: Bearer
-    /// <hex>` or `?token=<hex>`. Computed once at [`run`] startup rather
-    /// than comparing a header string's raw bytes against the 32 raw secret
-    /// bytes directly: a random 32-byte key is not, in general, valid
-    /// ASCII/UTF-8, so no real HTTP client could construct a header (or URL
-    /// query parameter) carrying it literally. Hex keeps the wire value
-    /// ASCII-safe for both transports while `constant_time_eq` still does a
-    /// full-length, branch-resistant comparison (never a plain `==`).
+    /// wire representation clients present via `Authorization: Bearer <hex>`
+    /// (S-7 removed the `?token=<hex>` query-parameter transport; browsers now
+    /// use a one-time `?ticket=` instead). Computed once at [`run`] startup
+    /// rather than comparing a header string's raw bytes against the 32 raw
+    /// secret bytes directly: a random 32-byte key is not, in general, valid
+    /// ASCII/UTF-8, so no real HTTP client could construct a header carrying it
+    /// literally. Hex keeps the wire value ASCII-safe while `constant_time_eq`
+    /// still does a full-length, branch-resistant comparison (never a plain `==`).
     ///
     /// Deliberately NOT part of `HotReloadableConfig` (R-4): the dashboard bearer
     /// secret is security-critical, and Architecture Principle #3/#4 (opusplan.md Part
@@ -313,6 +332,11 @@ struct CommandCenterState {
     /// `dashboard_token_hex`: which browser origins may reach the API is a
     /// security-relevant trust decision, excluded from `HotReloadableConfig`.
     allowed_origins: Vec<String>,
+    /// S-7 fix: outstanding one-time SSE tickets, mapping `ticket -> expiry epoch
+    /// seconds`. Minted by `POST /api/events/ticket` (bearer-authenticated),
+    /// consumed (removed) on first use by `GET /events?ticket=`. Bounded by
+    /// `SSE_TICKET_MAX_OUTSTANDING`; expired entries are swept lazily on mint/use.
+    sse_tickets: Mutex<HashMap<String, f64>>,
 }
 
 /// R-4: the illustrative $/token conversion and the two response-size caps —
@@ -661,9 +685,76 @@ async fn handle_healthz(State(_state): State<Arc<CommandCenterState>>) -> Json<s
 
 #[derive(Deserialize)]
 struct EventsQuery {
-    /// v1 accommodation for `EventSource` (see module doc's "V1 scope limits").
+    /// S-7 fix: a one-time SSE ticket obtained from `POST /api/events/ticket`.
+    /// Replaces the former long-lived `?token=<bearer>` query parameter, which
+    /// leaked the dashboard bearer token into browser history / access logs /
+    /// Referer headers. A ticket is single-use and short-lived, so its brief
+    /// appearance in the URL is not a durable credential exposure.
     #[serde(default)]
-    token: Option<String>,
+    ticket: Option<String>,
+}
+
+/// S-7 fix: mint a one-time SSE ticket. Sits behind `require_auth` (so only a
+/// caller holding the real bearer token can obtain one), then the browser opens
+/// `EventSource` with `?ticket=<t>` instead of putting the bearer token in the URL.
+async fn handle_events_ticket(State(state): State<Arc<CommandCenterState>>) -> Response {
+    let ticket = mint_sse_ticket(&state);
+    Json(serde_json::json!({
+        "ticket": ticket,
+        "ttl_secs": SSE_TICKET_TTL_SECS,
+    }))
+    .into_response()
+}
+
+/// Generate a random ticket, insert it with a TTL, and lazily evict expired /
+/// over-cap entries. Uses the crate's standard `OsRng` CSPRNG (same source as
+/// `hrt.rs`/`daemon.rs`).
+fn mint_sse_ticket(state: &CommandCenterState) -> String {
+    mint_sse_ticket_in(&state.sse_tickets, now_epoch_secs())
+}
+
+/// Core of [`mint_sse_ticket`], parameterized on the ticket map and current time
+/// so it is unit-testable without constructing a full `CommandCenterState`.
+fn mint_sse_ticket_in(tickets: &Mutex<HashMap<String, f64>>, now: f64) -> String {
+    use rand::RngCore;
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    let ticket = hex::encode(raw);
+
+    let mut tickets = tickets.lock().unwrap_or_else(|e| e.into_inner());
+    // Drop expired tickets first (cheap, keeps the common case bounded).
+    tickets.retain(|_, &mut exp| now < exp);
+    // Hard cap: if still full, evict the soonest-to-expire entries until under cap.
+    if tickets.len() >= SSE_TICKET_MAX_OUTSTANDING {
+        let mut by_exp: Vec<(f64, String)> =
+            tickets.iter().map(|(k, &v)| (v, k.clone())).collect();
+        by_exp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let evict = tickets.len() + 1 - SSE_TICKET_MAX_OUTSTANDING;
+        for (_, k) in by_exp.into_iter().take(evict) {
+            tickets.remove(&k);
+        }
+    }
+    tickets.insert(ticket.clone(), now + SSE_TICKET_TTL_SECS);
+    ticket
+}
+
+/// Consume a one-time SSE ticket: returns true iff the ticket exists and is
+/// unexpired, removing it so it can never be reused (replay protection).
+fn consume_sse_ticket(state: &CommandCenterState, ticket: &str) -> bool {
+    consume_sse_ticket_in(&state.sse_tickets, ticket, now_epoch_secs())
+}
+
+/// Core of [`consume_sse_ticket`], parameterized for unit testing.
+fn consume_sse_ticket_in(
+    tickets: &Mutex<HashMap<String, f64>>,
+    ticket: &str,
+    now: f64,
+) -> bool {
+    let mut tickets = tickets.lock().unwrap_or_else(|e| e.into_inner());
+    match tickets.remove(ticket) {
+        Some(exp) => now < exp,
+        None => false,
+    }
 }
 
 async fn handle_events(
@@ -671,14 +762,19 @@ async fn handle_events(
     headers: HeaderMap,
     Query(q): Query<EventsQuery>,
 ) -> Response {
+    // A non-browser client (curl, tests, server-side proxy) can still present the
+    // bearer token directly via the Authorization header. Browsers, whose
+    // `EventSource` cannot set headers, use the one-time `?ticket=` obtained from
+    // `POST /api/events/ticket`. The former `?token=<bearer>` path is removed (S-7).
     let header_ok = bearer_token(&headers)
         .map(|tok| constant_time_eq(tok.as_bytes(), state.dashboard_token_hex.as_bytes()))
         .unwrap_or(false);
-    let query_ok = q.token
+    let ticket_ok = q
+        .ticket
         .as_deref()
-        .map(|tok| constant_time_eq(tok.as_bytes(), state.dashboard_token_hex.as_bytes()))
+        .map(|t| consume_sse_ticket(&state, t))
         .unwrap_or(false);
-    if !(header_ok || query_ok) {
+    if !(header_ok || ticket_ok) {
         return unauthorized_response();
     }
 
@@ -773,6 +869,7 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
         trust_mesh,
         event_tx,
         allowed_origins: config.allowed_origins.clone(),
+        sse_tickets: Mutex::new(HashMap::new()),
     });
 
     let protected = Router::new()
@@ -783,6 +880,7 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
         .route("/api/metrics", get(handle_metrics))
         .route("/api/readyz", get(handle_readyz))
         .route("/api/config/reload", post(handle_config_reload))
+        .route("/api/events/ticket", post(handle_events_ticket))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_auth));
 
     let app = Router::new()
@@ -815,6 +913,45 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    /// S-7 fix: a minted SSE ticket is single-use (consumed on first use, so a
+    /// replay from browser history / logs fails), rejects unknown tickets, and
+    /// rejects expired tickets.
+    #[test]
+    fn sse_ticket_is_single_use_and_expiring() {
+        let tickets: Mutex<HashMap<String, f64>> = Mutex::new(HashMap::new());
+        let now = 1000.0;
+
+        let t = mint_sse_ticket_in(&tickets, now);
+        // First use (still within TTL) succeeds.
+        assert!(consume_sse_ticket_in(&tickets, &t, now + 1.0));
+        // Replay of the same ticket fails — it was removed on first use.
+        assert!(!consume_sse_ticket_in(&tickets, &t, now + 1.0));
+
+        // An unknown ticket is rejected.
+        assert!(!consume_sse_ticket_in(&tickets, "deadbeef", now));
+
+        // An expired ticket is rejected (consumed after TTL elapsed).
+        let t2 = mint_sse_ticket_in(&tickets, now);
+        assert!(!consume_sse_ticket_in(&tickets, &t2, now + SSE_TICKET_TTL_SECS + 1.0));
+    }
+
+    /// S-7 fix: minting sweeps expired tickets so the outstanding-ticket map stays
+    /// bounded even if a client mints without ever connecting.
+    #[test]
+    fn sse_ticket_mint_sweeps_expired() {
+        let tickets: Mutex<HashMap<String, f64>> = Mutex::new(HashMap::new());
+        // Mint an old ticket, then mint another far in the future: the sweep in the
+        // second mint should drop the first (now-expired) one.
+        let _old = mint_sse_ticket_in(&tickets, 0.0);
+        assert_eq!(tickets.lock().unwrap().len(), 1);
+        let _new = mint_sse_ticket_in(&tickets, 100_000.0);
+        assert_eq!(
+            tickets.lock().unwrap().len(),
+            1,
+            "the expired ticket must be swept, leaving only the fresh one"
+        );
     }
 
     #[test]

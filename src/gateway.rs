@@ -78,6 +78,22 @@ pub const RATE_LIMITER_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// regardless of which token each one actually concerned.
 const REVOKED_TOKENS_SHARDS: usize = 16;
 
+/// S-2 fix: hard cap on the aggregate number of individually-revoked token
+/// signature hashes retained across all `revoked_tokens` shards. Mirrors the
+/// crate's other bounded-map caps (`TOKEN_CACHE_MAX`, `RATE_LIMITER_MAX_ENTRIES`,
+/// `RRBC_REPLAY_REGISTRY_MAX`). Once exceeded, `revoke_token` first prunes
+/// already-expired entries, then — if still over cap — evicts lowest-`exp`
+/// (soonest-to-expire, hence least-valuable) entries until back under cap.
+pub const REVOKED_TOKENS_MAX: usize = 100_000;
+
+/// S-2 fix: fallback TTL (seconds) applied when a revoked token carries no
+/// parseable `exp` claim, so a malformed/legacy token still gets an eventual
+/// eviction deadline instead of pinning its entry forever. Generous relative to
+/// normal capability-token lifetimes (this is only a memory-reclaim floor, never
+/// a security window — the blanket-revocation `iat` check and Gate 1.0 expiry
+/// still apply independently).
+pub const REVOKED_TOKENS_FALLBACK_TTL: f64 = 30.0 * 24.0 * 3600.0;
+
 /// Maps a token signature hash to its shard index using the first byte of the
 /// hash itself. Unlike `trust_decay::trust_shard_index`'s key space, a
 /// signature hash is never namespace-prefixed (it's always a raw SHA-256 hex
@@ -595,7 +611,21 @@ pub struct ZeroTrustGateway {
     /// Part 6.3: sharded 16-way on the signature hash's first byte (see
     /// `revoked_token_shard_index`) — access via `revoked_shard()`, never
     /// directly.
-    revoked_tokens: Vec<Mutex<HashSet<String>>>,
+    ///
+    /// S-2 fix: maps `sig_hash -> token exp (epoch seconds)` rather than a bare
+    /// `HashSet<String>`. Previously this set had no TTL and no cap — every
+    /// individually-revoked token's signature hash persisted for the entire
+    /// process lifetime, so an operator/automation revoking tokens steadily grew
+    /// it without bound (OOM on long-running daemons), unlike every other
+    /// unbounded-cardinality map in this crate (`TOKEN_CACHE_MAX`,
+    /// `RATE_LIMITER_MAX_ENTRIES`, `RRBC_REPLAY_REGISTRY_MAX`). Storing `exp`
+    /// lets `prune_expired_revocations` drop entries whose bound token has
+    /// already expired — an expired token is rejected by Gate 1.0's own expiry
+    /// check regardless, so its revocation entry has zero protective value past
+    /// `exp` and is safe to evict. `REVOKED_TOKENS_MAX` is a hard backstop cap
+    /// (oldest-`exp`-first eviction) for the pathological case where every
+    /// revoked token has a far-future `exp`.
+    revoked_tokens: Vec<Mutex<HashMap<String, f64>>>,
     token_cache: Mutex<HashMap<String, CacheEntry>>,
     // S-3 fix: issuer secrets are long-term key material held for the life of the
     // process — wrapped in `Zeroizing` so a value is cleared from heap memory
@@ -624,7 +654,7 @@ pub struct ZeroTrustGateway {
 impl ZeroTrustGateway {
     pub fn new() -> Self {
         Self {
-            revoked_tokens: (0..REVOKED_TOKENS_SHARDS).map(|_| Mutex::new(HashSet::new())).collect(),
+            revoked_tokens: (0..REVOKED_TOKENS_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             token_cache: Mutex::new(HashMap::new()),
             trusted_issuer_keys: Mutex::new(HashMap::new()),
             strict_asymmetric_mode: Mutex::new(false),
@@ -777,22 +807,100 @@ impl ZeroTrustGateway {
     /// `ZeroTrustGateway::global()` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing revocation enforcement entirely.
-    fn revoked_shard(&self, sig_hash: &str) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    fn revoked_shard(&self, sig_hash: &str) -> std::sync::MutexGuard<'_, HashMap<String, f64>> {
         self.revoked_tokens[revoked_token_shard_index(sig_hash)].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Revoke a token by adding its signature hash to the revocation set.
+    ///
+    /// S-2 fix: records the token's own `exp` (epoch seconds) as the entry value
+    /// so `prune_expired_revocations` can later reclaim it — an expired token is
+    /// already rejected by Gate 1.0's expiry check, so keeping its revocation
+    /// entry past `exp` serves no protective purpose. After inserting, enforces
+    /// `REVOKED_TOKENS_MAX` (prune-then-evict-oldest) so a flood of revocations
+    /// can never grow this set without bound.
     pub fn revoke_token(&self, token_b64: &[u8]) -> Result<(), String> {
-        let (_token_json, signature) = parse_token_wire(token_b64)
+        let (token_json, signature) = parse_token_wire(token_b64)
             .map_err(|e| format!("Token revocation failed: {}", e))?;
         if signature.is_empty() {
             return Err("Token has no signature to revoke.".into());
         }
+        // Extract the token's `exp` claim (epoch seconds) so the revocation entry
+        // inherits the token's own expiry deadline. A token with no parseable
+        // `exp` (malformed/legacy wire form) falls back to a fixed TTL from now so
+        // it still eventually becomes eligible for eviction rather than pinning
+        // its shard forever.
+        let exp = serde_json::from_slice::<serde_json::Value>(&token_json)
+            .ok()
+            .and_then(|v| v.get("exp").and_then(|e| e.as_f64()))
+            .unwrap_or_else(|| now_epoch_secs() + REVOKED_TOKENS_FALLBACK_TTL);
         let sig_hash = sha256_hex(&signature);
-        self.revoked_shard(&sig_hash).insert(sig_hash);
+        {
+            let mut shard = self.revoked_shard(&sig_hash);
+            shard.insert(sig_hash, exp);
+        }
+        self.enforce_revoked_tokens_cap();
         self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         Ok(())
+    }
+
+    /// S-2 fix: remove revocation entries whose bound token has already expired.
+    /// Returns the number of entries pruned. Safe because an expired token can
+    /// never pass Gate 1.0's own `exp` check, so its revocation record is dead
+    /// weight past that point. Intended to be called periodically from
+    /// `MaintenanceCoordinator` (wired in both bin entrypoints) and opportunistically
+    /// from `enforce_revoked_tokens_cap`.
+    pub fn prune_expired_revocations(&self) -> usize {
+        let now = now_epoch_secs();
+        let mut pruned = 0usize;
+        for shard in &self.revoked_tokens {
+            let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let before = map.len();
+            map.retain(|_, &mut exp| now < exp);
+            pruned += before - map.len();
+        }
+        pruned
+    }
+
+    /// Current aggregate number of individually-revoked tokens across all shards
+    /// (for monitoring / tests).
+    pub fn revoked_tokens_len(&self) -> usize {
+        self.revoked_tokens
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
+    }
+
+    /// S-2 fix: enforce `REVOKED_TOKENS_MAX`. First prunes expired entries; if the
+    /// aggregate is still over cap, evicts lowest-`exp` (soonest-to-expire, hence
+    /// least-valuable) entries until back under cap. Cheap on the common path: the
+    /// aggregate count is checked first and the expensive global sort only runs in
+    /// the pathological over-cap case.
+    fn enforce_revoked_tokens_cap(&self) {
+        if self.revoked_tokens_len() <= REVOKED_TOKENS_MAX {
+            return;
+        }
+        self.prune_expired_revocations();
+        let total = self.revoked_tokens_len();
+        if total <= REVOKED_TOKENS_MAX {
+            return;
+        }
+        // Still over cap after pruning: gather every (exp, sig_hash) and evict the
+        // lowest-exp entries. This is O(n log n) but only reached when >100k
+        // far-future-exp tokens are actively revoked — a degenerate case.
+        let mut all: Vec<(f64, String)> = Vec::with_capacity(total);
+        for shard in &self.revoked_tokens {
+            let map = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for (hash, &exp) in map.iter() {
+                all.push((exp, hash.clone()));
+            }
+        }
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let evict_count = total - REVOKED_TOKENS_MAX;
+        for (_, hash) in all.into_iter().take(evict_count) {
+            self.revoked_shard(&hash).remove(&hash);
+        }
     }
 
     /// Returns the current revocation epoch.
@@ -802,7 +910,7 @@ impl ZeroTrustGateway {
 
     /// Check if a token signature hash is in the revocation set.
     pub fn is_token_revoked(&self, token_sig_hash: &str) -> bool {
-        self.revoked_shard(token_sig_hash).contains(token_sig_hash)
+        self.revoked_shard(token_sig_hash).contains_key(token_sig_hash)
     }
 
     /// PSK Compromise Recovery: revoke ALL tokens, flush ALL caches (M-6 fix).
@@ -883,7 +991,7 @@ impl ZeroTrustGateway {
 
         // Check revocation
         let sig_hash = sha256_hex(&signature);
-        if self.revoked_shard(&sig_hash).contains(&sig_hash) {
+        if self.revoked_shard(&sig_hash).contains_key(&sig_hash) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::LateralMovementBlocked,
                 "Capability Token has been REVOKED.",
@@ -1988,8 +2096,72 @@ mod tests {
         assert_eq!(err.bytecode, SAACPBytecodes::LateralMovementBlocked);
     }
 
-    /// H-2 regression: a token issued AFTER `revoke_all_tokens()` must remain
-    /// valid — the blanket check must not reject everything indiscriminately.
+    /// S-2 fix: `prune_expired_revocations` reclaims revocation entries whose
+    /// bound token has already expired, but leaves still-live revocations intact.
+    /// A pruned entry is safe to drop because an expired token is independently
+    /// rejected by Gate 1.0's expiry check.
+    #[test]
+    fn test_prune_expired_revocations_reclaims_only_expired() {
+        // Craft a signed token with an explicit `exp`, revoke it, return the b64 wire form.
+        fn signed_token_with_exp(secret: &[u8], iss: &str, exp: f64) -> Vec<u8> {
+            let json = serde_json::json!({
+                "iss": iss,
+                "iat": 0,
+                "exp": exp,
+                "allow": ["agent-b"],
+                "forbid": [],
+                "max_action_class": 0,
+            });
+            let token_json = serde_json::to_vec(&json).unwrap();
+            let signature = hmac_sha256(secret, &token_json);
+            let mut packed = Vec::with_capacity(4 + token_json.len() + signature.len());
+            packed.extend_from_slice(&(token_json.len() as u32).to_be_bytes());
+            packed.extend_from_slice(&token_json);
+            packed.extend_from_slice(&signature);
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+        }
+
+        let gw = ZeroTrustGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+
+        // One already-expired (exp in the past) and one long-lived revocation.
+        let expired = signed_token_with_exp(secret, "agent-a", 1.0);
+        let live = signed_token_with_exp(secret, "agent-a", 9_999_999_999.0);
+        gw.revoke_token(&expired).unwrap();
+        gw.revoke_token(&live).unwrap();
+        assert_eq!(gw.revoked_tokens_len(), 2, "both revocations recorded");
+
+        let pruned = gw.prune_expired_revocations();
+        assert_eq!(pruned, 1, "exactly the expired-token revocation is reclaimed");
+        assert_eq!(gw.revoked_tokens_len(), 1, "the live revocation survives");
+
+        // The live revocation is still enforced end-to-end.
+        assert!(
+            gw.validate_lateral_movement("agent-b", &live, secret).is_err(),
+            "a non-expired revoked token must still be blocked after a prune"
+        );
+    }
+
+    /// S-2 fix: `revoke_all_tokens()` must NOT clear the (now `HashMap`) revocation
+    /// set — the H-2 fail-open invariant is preserved across the HashSet→HashMap
+    /// change. Mirrors `test_revoke_all_tokens_preserves_individual_revocations`
+    /// but asserts on the map length directly.
+    #[test]
+    fn test_revoke_all_tokens_preserves_revocation_map_entries() {
+        let gw = ZeroTrustGateway::new();
+        let secret = b"test-secret-key-32-bytes-long!!!";
+        let token = gw.issue_capability_token(
+            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
+        );
+        gw.revoke_token(&token).unwrap();
+        assert_eq!(gw.revoked_tokens_len(), 1);
+        gw.revoke_all_tokens();
+        assert_eq!(
+            gw.revoked_tokens_len(), 1,
+            "revoke_all_tokens must not clear individual revocation entries (H-2)"
+        );
+    }
     #[test]
     fn test_revoke_all_tokens_does_not_reject_freshly_issued_tokens() {
         let gw = ZeroTrustGateway::new();
