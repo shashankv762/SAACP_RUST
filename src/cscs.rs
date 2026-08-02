@@ -16,6 +16,18 @@ pub const CSCS_WINDOW_SIZE: usize = 128;
 /// many short-lived sessions accumulated one permanent entry per session_id
 /// ever seen. Mirrors `streaming::StreamRegistry`'s oldest-first eviction.
 pub const CSCS_MAX_TRACKED_SESSIONS: usize = 50_000;
+/// P-1 fix: number of independent lock shards for `OscillationFingerprinter`'s
+/// session-history map, mirroring `gateway::RATE_LIMITER_SHARDS` /
+/// `trust_decay::TRUST_SHARDS`. Before sharding, every session's fingerprint
+/// recording across the entire process serialized behind ONE `Mutex` — the WC11
+/// benchmark showed 2ms–209ms median variance under 1000 concurrent sessions,
+/// because `record_and_count` runs on essentially every packet (Gate 12.0).
+const CSCS_SHARDS: usize = 16;
+/// Per-shard soft capacity, chosen so the aggregate across all shards still equals
+/// `CSCS_MAX_TRACKED_SESSIONS` — sharding must not silently multiply the effective
+/// capacity of this bounded map (same invariant as
+/// `gateway::RATE_LIMITER_PER_SHARD_MAX_ENTRIES`).
+const CSCS_PER_SHARD_MAX_SESSIONS: usize = CSCS_MAX_TRACKED_SESSIONS / CSCS_SHARDS;
 /// Bounded capacity of the best-effort trip-event mirror channel used by
 /// `CSCSLoopDetector::with_backend`. A full channel silently drops the event
 /// (forensic visibility only — never consulted by `cs_detect_loop`'s own
@@ -41,7 +53,38 @@ struct SessionHistory {
 pub struct OscillationFingerprinter {
     /// Maps session ID -> limited sliding window of recent metadata hashes
     /// (plus a last-seen timestamp used only for outer-map eviction).
-    history: Mutex<HashMap<String, SessionHistory>>,
+    ///
+    /// P-1 fix: sharded `CSCS_SHARDS`-way on a whole-key hash (see
+    /// `cscs_shard_index`) — access via `shard()`, never directly.
+    history: Vec<Mutex<HashMap<String, SessionHistory>>>,
+}
+
+/// Maps a `session_id` to its shard index.
+///
+/// P-1 fix — deliberately NOT the first-byte `% N` convention used by
+/// `gateway::ratelimit_shard_index` / `revoked_token_shard_index`. Those key
+/// spaces are agent ids and raw SHA-256 hex where the first byte varies widely.
+/// A CSCS `session_id` is `handler.rs`'s `ParsedPacket::session_uuid`, which on
+/// the encrypted path is `hex::encode(session_id)` — a HEX string, so its first
+/// byte is drawn only from `[0-9a-f]`. Those 16 codepoints (0x30–0x39, 0x61–0x66)
+/// collapse onto just 10 distinct values mod 16, leaving 6 of 16 shards
+/// permanently dead and loading the hottest shard ~2x above ideal (measured over
+/// 120k uuid4 hex ids). That is precisely the failure mode
+/// `trust_decay::trust_shard_index_distributes_across_namespace_prefixes`
+/// guards against for ITS key space.
+///
+/// FNV-1a over the WHOLE key mixes every byte, so all 16 shards stay live and
+/// balanced within ~3% of ideal on the same corpus. It is a non-cryptographic
+/// hash, which is fine: this only selects a lock, never a security decision, and
+/// a hostile session_id can at worst concentrate load on one shard — exactly what
+/// the unsharded code did for every session already.
+fn cscs_shard_index(session_id: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
+    for b in session_id.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    (hash % CSCS_SHARDS as u64) as usize
 }
 
 impl Default for OscillationFingerprinter {
@@ -60,8 +103,18 @@ fn now_secs() -> f64 {
 impl OscillationFingerprinter {
     pub fn new() -> Self {
         Self {
-            history: Mutex::new(HashMap::new()),
+            history: (0..CSCS_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
         }
+    }
+
+    /// Lock the shard owning `session_id`. M-38 fix: recover from poison via
+    /// `into_inner()` — `GLOBAL_CSCS` is a process-wide singleton, so one
+    /// poisoning panic must not cascade into every other session's
+    /// loop-detection calls.
+    fn shard(&self, session_id: &str) -> std::sync::MutexGuard<'_, HashMap<String, SessionHistory>> {
+        self.history[cscs_shard_index(session_id)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Hashes stable causal identity (oaid+cid+action_class) to detect oscillation.
@@ -87,18 +140,21 @@ impl OscillationFingerprinter {
 
     /// Records the fingerprint and returns the count of times it has been seen in the current window.
     pub fn record_and_count(&self, session_id: &str, fingerprint: &str) -> usize {
-        // M-38 fix: recover from poison via `into_inner()` — `GLOBAL_CSCS` is a
-        // process-wide singleton, so one poisoning panic must not cascade into
-        // every other session's loop-detection calls.
-        let mut hist = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        // P-1 fix: lock only the shard owning this session, not a process-wide
+        // mutex. Two packets for different sessions now contend only on a 1-in-16
+        // hash collision instead of always.
+        let mut hist = self.shard(session_id);
         let now = now_secs();
 
-        // IoT / low-resource fix: sweep the least-recently-seen sessions once the
-        // outer map exceeds its cap, so the process can't accumulate one entry per
+        // IoT / low-resource fix: sweep the least-recently-seen sessions once this
+        // shard exceeds its cap, so the process can't accumulate one entry per
         // session_id ever seen. Only triggers when actually over cap — active
-        // fleets under the limit never pay this cost.
-        if hist.len() >= CSCS_MAX_TRACKED_SESSIONS && !hist.contains_key(session_id) {
-            let evict_count = hist.len() + 1 - CSCS_MAX_TRACKED_SESSIONS;
+        // fleets under the limit never pay this cost. P-1: the bound is now
+        // per-shard (`CSCS_PER_SHARD_MAX_SESSIONS`), and the aggregate across all
+        // shards still equals `CSCS_MAX_TRACKED_SESSIONS`, so sharding does not
+        // multiply the effective capacity.
+        if hist.len() >= CSCS_PER_SHARD_MAX_SESSIONS && !hist.contains_key(session_id) {
+            let evict_count = hist.len() + 1 - CSCS_PER_SHARD_MAX_SESSIONS;
             let mut by_age: Vec<(String, f64)> = hist.iter()
                 .map(|(k, v)| (k.clone(), v.last_seen))
                 .collect();
@@ -123,7 +179,16 @@ impl OscillationFingerprinter {
     }
 
     pub fn clear(&self, session_id: &str) {
-        self.history.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        self.shard(session_id).remove(session_id);
+    }
+
+    /// Aggregate number of sessions currently tracked across all shards
+    /// (monitoring / tests). Bounded by `CSCS_MAX_TRACKED_SESSIONS`.
+    pub fn tracked_sessions(&self) -> usize {
+        self.history
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 }
 
@@ -248,8 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn cscs_new_behavior_unchanged_without_backend() {
-        let det = CSCSLoopDetector::new(Arc::new(DistributedExecutionGraph::new()));
+    fn cscs_new_behavior_unchanged_without_backend() {        let det = CSCSLoopDetector::new(Arc::new(DistributedExecutionGraph::new()));
         let meta = test_meta("sess-1");
         let mut tripped = false;
         for _ in 0..CSCS_MAX_OSCILLATION_COUNT {
@@ -293,5 +357,127 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(found, "expected a mirrored trip event to appear in the backend");
+    }
+
+    /// P-1 regression: `cscs_shard_index` must keep ALL 16 shards live over the
+    /// real key space — hex-encoded session uuids. The codebase's usual
+    /// first-byte-`% N` convention collapses here, because a hex string's first
+    /// byte is only ever `[0-9a-f]`; those 16 codepoints map onto just 10 distinct
+    /// values mod 16, leaving 6 shards permanently dead. This test fails loudly if
+    /// anyone "simplifies" the whole-key hash back to a first-byte sample.
+    #[test]
+    fn cscs_shard_index_keeps_all_shards_live_over_hex_session_ids() {
+        use std::collections::HashSet;
+
+        // Hex-encoded 16-byte session ids, exactly like
+        // `handler.rs`'s `hex::encode(parsed.session_id)`.
+        let ids: Vec<String> = (0..4096u32)
+            .map(|i| {
+                let mut raw = [0u8; 16];
+                raw[..4].copy_from_slice(&i.to_be_bytes());
+                hex::encode(raw)
+            })
+            .collect();
+
+        let used: HashSet<usize> = ids.iter().map(|s| cscs_shard_index(s)).collect();
+        assert_eq!(
+            used.len(),
+            CSCS_SHARDS,
+            "all {} shards must be reachable over hex session ids — got {}. A \
+             first-byte-sampling shard index would show ~10 here.",
+            CSCS_SHARDS,
+            used.len()
+        );
+
+        // Balance: no shard may carry more than 2x the ideal share.
+        let mut counts = vec![0usize; CSCS_SHARDS];
+        for s in &ids {
+            counts[cscs_shard_index(s)] += 1;
+        }
+        let ideal = ids.len() as f64 / CSCS_SHARDS as f64;
+        let max = *counts.iter().max().unwrap() as f64;
+        assert!(
+            max <= ideal * 2.0,
+            "shard load imbalance too high: hottest shard {max} vs ideal {ideal}"
+        );
+    }
+
+    /// P-1: sharding must not multiply the effective capacity of the bounded
+    /// session map. Inserting well past the global cap must leave the aggregate
+    /// bounded by `CSCS_MAX_TRACKED_SESSIONS`, not 16x it.
+    #[test]
+    fn cscs_sharding_does_not_multiply_tracked_session_capacity() {
+        let fp = OscillationFingerprinter::new();
+        // Push past the global cap so per-shard eviction has to engage.
+        for i in 0..(CSCS_MAX_TRACKED_SESSIONS + 5_000) {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            fp.record_and_count(&hex::encode(raw), "fp-const");
+        }
+        let tracked = fp.tracked_sessions();
+        assert!(
+            tracked <= CSCS_MAX_TRACKED_SESSIONS,
+            "aggregate tracked sessions ({tracked}) must stay within \
+             CSCS_MAX_TRACKED_SESSIONS ({CSCS_MAX_TRACKED_SESSIONS}) — sharding must \
+             not multiply capacity"
+        );
+    }
+
+    /// P-1: sharding must not change detection semantics. A session that
+    /// oscillates still trips at exactly `CSCS_MAX_OSCILLATION_COUNT`, and an
+    /// unrelated session sharing no fingerprint is unaffected.
+    #[test]
+    fn cscs_sharding_preserves_per_session_isolation_and_trip_point() {
+        let fp = OscillationFingerprinter::new();
+        // Distinct sessions must not pollute each other's windows even if they
+        // land on the same shard.
+        for i in 0..64 {
+            let sid = format!("{:032x}", i);
+            assert_eq!(
+                fp.record_and_count(&sid, "same-fingerprint"),
+                1,
+                "each distinct session must start its own window at count 1"
+            );
+        }
+        // A single session repeating one fingerprint counts up monotonically.
+        let sid = "deadbeefdeadbeefdeadbeefdeadbeef";
+        assert_eq!(fp.record_and_count(sid, "fp-x"), 1);
+        assert_eq!(fp.record_and_count(sid, "fp-x"), 2);
+        assert_eq!(fp.record_and_count(sid, "fp-x"), 3);
+        // A different fingerprint in the same session is counted separately.
+        assert_eq!(fp.record_and_count(sid, "fp-y"), 1);
+        // clear() removes only that session.
+        fp.clear(sid);
+        assert_eq!(fp.record_and_count(sid, "fp-x"), 1, "cleared session restarts");
+    }
+
+    /// P-1: concurrent recording across many distinct sessions must not serialize.
+    /// Not a strict timing assertion (too noisy to gate CI on), but it exercises the
+    /// sharded path under real thread contention to catch deadlocks, lock-poisoning
+    /// regressions, and cross-shard corruption.
+    #[test]
+    fn concurrent_multi_session_recording_is_correct_under_contention() {
+        let fp = Arc::new(OscillationFingerprinter::new());
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let fp = Arc::clone(&fp);
+                std::thread::spawn(move || {
+                    for i in 0..500u32 {
+                        let mut raw = [0u8; 16];
+                        raw[..4].copy_from_slice(&(t * 1000 + i).to_be_bytes());
+                        let sid = hex::encode(raw);
+                        assert_eq!(
+                            fp.record_and_count(&sid, "fp"),
+                            1,
+                            "each distinct session must be isolated across shards"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("no thread may panic or deadlock");
+        }
+        assert_eq!(fp.tracked_sessions(), 8 * 500);
     }
 }

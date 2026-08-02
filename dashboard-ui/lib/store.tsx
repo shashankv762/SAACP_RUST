@@ -16,7 +16,7 @@
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from "react";
 import {
   api,
-  eventsUrl,
+  openEventSource,
   AgentTrustSnapshot,
   DashboardEvent,
   TrustMeshEdge,
@@ -268,16 +268,31 @@ export function DashboardStoreProvider({ children }: { children: React.ReactNode
       .catch(() => {});
 
     // ── one SSE connection ───────────────────────────────────────────────
-    const source = new EventSource(eventsUrl());
-    source.onopen = () => store.setConnection("live");
-    source.onerror = () => store.setConnection("offline");
-    source.onmessage = (msg) => {
-      try {
-        store.ingest(JSON.parse(msg.data) as DashboardEvent);
-      } catch {
-        /* malformed/partial event — ignore rather than crash the feed */
-      }
-    };
+    // S-7 fix: opening the stream is now async (POST for a one-time ticket, then
+    // connect EventSource with it) so the bearer token never lands in the URL.
+    // `source` is assigned once the ticket resolves; the cleanup below closes it
+    // whether or not the connect has completed yet.
+    let source: EventSource | null = null;
+    openEventSource()
+      .then((es) => {
+        if (cancelled) {
+          es.close();
+          return;
+        }
+        source = es;
+        es.onopen = () => store.setConnection("live");
+        es.onerror = () => store.setConnection("offline");
+        es.onmessage = (msg) => {
+          try {
+            store.ingest(JSON.parse(msg.data) as DashboardEvent);
+          } catch {
+            /* malformed/partial event — ignore rather than crash the feed */
+          }
+        };
+      })
+      .catch(() => {
+        if (!cancelled) store.setConnection("offline");
+      });
 
     // ── pollers ──────────────────────────────────────────────────────────
     const pollFinancial = () =>
@@ -326,7 +341,7 @@ export function DashboardStoreProvider({ children }: { children: React.ReactNode
 
     return () => {
       cancelled = true;
-      source.close();
+      if (source) source.close();
       clearInterval(finId);
       clearInterval(healthId);
       clearInterval(agentsId);

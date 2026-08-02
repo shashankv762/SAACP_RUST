@@ -152,6 +152,7 @@ def wrap(
     default_peer: Optional[str] = None,
     saacp_listen_addr: Optional[str] = None,
     http_listen_addr: Optional[str] = None,
+    http_bearer_token: Optional[str] = None,
     auto_start: bool = True,
 ) -> Any:
     """Secure `agent` with SAACP — the literal one-liner: `agent = saacp.wrap(agent)`.
@@ -169,6 +170,11 @@ def wrap(
     generated for this process and a warning is printed — it won't match any separately
     started peer unless shared out-of-band. Set `secret=` or `SAACP_TOKEN_SECRET` for
     real multi-process use.
+
+    `http_bearer_token` (falling back to `SAACP_HTTP_BEARER_TOKEN`) authorizes calls to
+    a sidecar this call did *not* start — a reused or manually-started one whose local
+    HTTP API requires a token. When `auto_start` spawns a fresh sidecar, a token is
+    generated automatically and this argument is unnecessary.
     """
     resolved_agent_id = agent_id or os.environ.get("SAACP_AGENT_ID")
     if not resolved_agent_id:
@@ -192,6 +198,11 @@ def wrap(
 
     resolved_saacp_addr = saacp_listen_addr or os.environ.get("SAACP_LISTEN_ADDR", DEFAULT_SAACP_LISTEN_ADDR)
     resolved_http_addr = http_listen_addr or os.environ.get("SAACP_HTTP_ADDR", DEFAULT_HTTP_LISTEN_ADDR)
+    # S-5 fix: only needed when talking to a sidecar this call did NOT start (a
+    # reused or manually-started one that has SAACP_HTTP_BEARER_TOKEN set). For a
+    # sidecar we start ourselves, get_or_start generates the token and returns it
+    # on the handle, which takes precedence over this value.
+    resolved_bearer_token = http_bearer_token or os.environ.get("SAACP_HTTP_BEARER_TOKEN")
 
     if auto_start:
         handle = get_or_start(
@@ -201,10 +212,16 @@ def wrap(
             http_listen_addr=resolved_http_addr,
         )
         http_url = handle.http_url
+        # S-5 fix: use the auto-generated local HTTP API bearer token when we
+        # started the sidecar, so /send and /receive are authorized. When the
+        # sidecar was *reused* (started by someone else) `handle.bearer_token`
+        # is None, so fall back to the explicitly-supplied one.
+        bearer_token = handle.bearer_token or resolved_bearer_token
     else:
         http_url = f"http://{resolved_http_addr}"
+        bearer_token = resolved_bearer_token
 
-    client = SaacpClient(http_url)
+    client = SaacpClient(http_url, bearer_token=bearer_token)
     resolved_peers = peers or {}
 
     if _looks_like_conversable(agent):

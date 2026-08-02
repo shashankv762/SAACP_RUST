@@ -155,6 +155,15 @@ async fn main() -> std::io::Result<()> {
                 // (opusplan.md Phase 4 "Timeout: DeadMansSwitch triggers session
                 // cleanup"); see saacp_sidecar.rs's identical wiring comment.
                 let _ = saacp::temporal::DeadMansSwitch::global().check_timeouts();
+            })
+            .with_custom("revoked_tokens_global", || {
+                // S-2 fix: reclaim individually-revoked token entries whose bound
+                // token has expired. An expired token can't pass Gate 1.0's expiry
+                // check anyway, so its revocation record is dead weight past `exp`.
+                // Without this sweep the set only ever grows (see gateway.rs
+                // `revoked_tokens` doc). Same global-singleton wiring rationale as
+                // the four sweepers above.
+                let _ = saacp::gateway::ZeroTrustGateway::global().prune_expired_revocations();
             });
         if mace_enabled {
             coordinator.with_custom("mace_global", saacp::mace::sweep_and_enforce)

@@ -45,9 +45,22 @@ class SendResult:
 class SaacpClient:
     """Talks to one locally-running ``saacp-sidecar`` instance over plain HTTP."""
 
-    def __init__(self, sidecar_url: str = DEFAULT_SIDECAR_URL, timeout: float = 15.0):
+    def __init__(
+        self,
+        sidecar_url: str = DEFAULT_SIDECAR_URL,
+        timeout: float = 15.0,
+        bearer_token: Optional[str] = None,
+    ):
         self.sidecar_url = sidecar_url.rstrip("/")
         self.timeout = timeout
+        # S-5 fix: when the sidecar's local HTTP API requires a bearer token
+        # (the managed-spawn path in sidecar_manager.get_or_start now generates
+        # one by default), every /send and /receive call must carry it. None =
+        # no header (talking to an unauthenticated sidecar, e.g. a manually
+        # started one), preserving prior behavior.
+        self._auth_headers = (
+            {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+        )
 
     def send(
         self,
@@ -78,6 +91,7 @@ class SaacpClient:
                     "priority": priority,
                     "action_class": action_class,
                 },
+                headers=self._auth_headers,
                 timeout=self.timeout,
             )
         except requests.RequestException as e:
@@ -100,6 +114,7 @@ class SaacpClient:
         resp = requests.get(
             f"{self.sidecar_url}/receive",
             params={"wait_secs": wait_secs},
+            headers=self._auth_headers,
             timeout=wait_secs + 5.0,
         )
         if resp.status_code == 204:
@@ -108,6 +123,8 @@ class SaacpClient:
         return resp.json()
 
     def healthz(self) -> dict[str, Any]:
+        # /healthz is intentionally never gated on the sidecar, so it needs no
+        # Authorization header (sending one anyway would be harmless).
         resp = requests.get(f"{self.sidecar_url}/healthz", timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()

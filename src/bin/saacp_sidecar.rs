@@ -31,6 +31,12 @@
 //!                               instead of passing it via env (same secret-
 //!                               hygiene pattern as SAACP_TOKEN_SECRET_FILE).
 //!                               Takes precedence over SAACP_HTTP_BEARER_TOKEN.
+//!   SAACP_HTTP_TOKEN_OUT_FILE — path this binary WRITES a freshly generated bearer
+//!                               token to when none was supplied (S-5). Enables the
+//!                               auto-generate path below; the co-located agent reads
+//!                               the token from this file. Never exposed over HTTP.
+//!   SAACP_ALLOW_UNAUTHENTICATED_HTTP=1 — opt out of S-5 auto-generation and run the
+//!                               loopback API with no auth at all (pre-S-5 behavior).
 //!   SAACP_MAX_CONCURRENT_SENDS — bound on concurrent outbound /send dispatches
 //!                               (default: SIDECAR_DEFAULT_MAX_CONCURRENT_SENDS)
 //!   SAACP_SEND_RETRY_ATTEMPTS — retries for a transient TCP-connect failure only
@@ -106,6 +112,43 @@ fn read_http_bearer_token() -> Option<String> {
     }
 }
 
+/// S-5 fix: generate a fresh 32-byte hex bearer token and write it to `path` so a
+/// co-located agent (same UID) can read it. On POSIX the file is created 0600 via
+/// `OpenOptions::mode`, so the window where it exists with looser permissions never
+/// occurs; on Windows it inherits the directory ACL (POSIX mode bits are not honored
+/// there, so the operator is responsible for the directory's ACL).
+///
+/// The token is deliberately NOT published on `/healthz`: that route is intentionally
+/// unauthenticated (see `sidecar.rs::require_bearer_auth`), and S-5's stated threat is
+/// exactly "any local process on the same host" — serving the token there would hand it
+/// to the attacker it defends against. A file gated on UID is what opusplan2.md §3 (S-5)
+/// prescribes.
+fn generate_and_write_http_token(path: &str) -> String {
+    use rand::RngCore;
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    let token = hex::encode(raw);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .unwrap_or_else(|e| panic!("failed to open SAACP_HTTP_TOKEN_OUT_FILE '{path}': {e}"));
+    {
+        use std::io::Write;
+        f.write_all(token.as_bytes())
+            .unwrap_or_else(|e| panic!("failed to write SAACP_HTTP_TOKEN_OUT_FILE '{path}': {e}"));
+        f.flush()
+            .unwrap_or_else(|e| panic!("failed to flush SAACP_HTTP_TOKEN_OUT_FILE '{path}': {e}"));
+    }
+    token
+}
+
 #[tokio::main]
 async fn main() {
     let agent_id = std::env::var("SAACP_AGENT_ID")
@@ -125,13 +168,50 @@ async fn main() {
     // authentication. If the operator binds a non-loopback interface, a bearer
     // token is mandatory. On loopback (the default) it stays optional, matching
     // the library's opt-in default for the co-located-agent case.
-    let http_bearer_token = read_http_bearer_token();
+    let mut http_bearer_token = read_http_bearer_token();
     if !http_listen_addr.ip().is_loopback() && http_bearer_token.is_none() {
         panic!(
             "SAACP_HTTP_ADDR binds non-loopback address {http_listen_addr} but no \
              SAACP_HTTP_BEARER_TOKEN(_FILE) is set — refusing to expose an \
              unauthenticated message-issuance API. Set a bearer token or bind loopback."
         );
+    }
+
+    // S-5 fix: previously a loopback bind with no token supplied ran the local API
+    // fully unauthenticated, so ANY same-host process could issue messages as this
+    // agent and drain its inbox. When the operator names an output path we now
+    // generate a token and write it there for the co-located agent to read, closing
+    // that gap without breaking the managed-spawn path (sidecar_manager.py supplies
+    // SAACP_HTTP_BEARER_TOKEN_FILE itself, so this branch never fires for it).
+    //
+    // Not unconditional: with no output path there is nowhere to publish the token,
+    // so auto-generating one would lock out every existing hand-started agent with no
+    // way to authenticate. Instead the unauthenticated case warns loudly and remains
+    // opt-out-able, matching opusplan2.md Open Question #3's deprecation-path concern.
+    if http_bearer_token.is_none() {
+        let opted_out = std::env::var("SAACP_ALLOW_UNAUTHENTICATED_HTTP")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        match std::env::var("SAACP_HTTP_TOKEN_OUT_FILE") {
+            Ok(path) if !path.trim().is_empty() => {
+                http_bearer_token = Some(generate_and_write_http_token(path.trim()));
+                eprintln!(
+                    "[saacp-sidecar] no bearer token supplied — generated one and wrote it \
+                     to {} (S-5). The co-located agent must send it as `Authorization: Bearer`.",
+                    path.trim()
+                );
+            }
+            _ if !opted_out => {
+                eprintln!(
+                    "[saacp-sidecar] WARNING: the local HTTP API on {http_listen_addr} is \
+                     running UNAUTHENTICATED — any process on this host can issue messages \
+                     as '{agent_id}' and drain its inbox (opusplan2.md S-5). Set \
+                     SAACP_HTTP_BEARER_TOKEN(_FILE), or SAACP_HTTP_TOKEN_OUT_FILE to have one \
+                     generated. Set SAACP_ALLOW_UNAUTHENTICATED_HTTP=1 to silence this."
+                );
+            }
+            _ => {}
+        }
     }
 
     let mut config = SidecarConfig::new(agent_id, token_issuer_secret, saacp_listen_addr, http_listen_addr);
@@ -191,6 +271,15 @@ async fn main() {
                 // dead session out — opusplan.md Phase 4 "Timeout: DeadMansSwitch
                 // triggers session cleanup".
                 let _ = saacp::temporal::DeadMansSwitch::global().check_timeouts();
+            })
+            .with_custom("revoked_tokens_global", || {
+                // S-2 fix: reclaim individually-revoked token entries whose bound
+                // token has expired. An expired token can't pass Gate 1.0's expiry
+                // check anyway, so its revocation record is dead weight past `exp`.
+                // Without this sweep the set only ever grows (see gateway.rs
+                // `revoked_tokens` doc). Same global-singleton wiring rationale as
+                // the four sweepers above.
+                let _ = saacp::gateway::ZeroTrustGateway::global().prune_expired_revocations();
             });
         if mace_enabled {
             coordinator.with_custom("mace_global", saacp::mace::sweep_and_enforce)
