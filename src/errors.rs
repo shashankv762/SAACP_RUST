@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// All SAACP protocol bytecodes (0x00 through 0x40).
+/// All SAACP protocol bytecodes (0x00 through 0x49).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SAACPBytecodes {
@@ -119,6 +119,25 @@ pub enum SAACPBytecodes {
     /// -> Trust + DRI: Collusion detection simultaneously penalizes trust AND
     /// revokes credentials"). *New in Rust* — no Python parity.
     CollusionDetected = 0x47,
+
+    /// `cluster.rs` (Active-Active Clustering & Failover) — an inbound cluster
+    /// membership message was refused: bad/absent Ed25519 signature, an untrusted or
+    /// unrostered sender, a replayed or stale message, or an envelope whose plaintext
+    /// routing fields disagreed with the signed body. See
+    /// `cluster::ClusterRejection` for the specific reason. *New in Rust* — no Python
+    /// parity.
+    ClusterMessageRejected = 0x48,
+
+    /// `rulepack.rs` (Dynamic Hot-Reloadable Injection Rules) — a pushed
+    /// injection-signature rule pack was refused and NOT adopted: absent or
+    /// unmatched trust anchor, bad Ed25519 signature, an expired/not-yet-valid
+    /// or over-long validity window, a replayed or downgraded `version`, or a
+    /// rule that is over-broad enough to be a denial of service. See
+    /// `rulepack::RulePackRejection` for the specific reason. Rejection leaves
+    /// the previously active rule set untouched, so detection never degrades —
+    /// packs are additive-only over the compiled-in baseline (Monotonic
+    /// Security, Part 12 principle 9). *New in Rust* — no Python parity.
+    RulePackRejected = 0x49,
 }
 
 impl fmt::Display for SAACPBytecodes {

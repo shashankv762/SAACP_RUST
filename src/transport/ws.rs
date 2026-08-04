@@ -225,6 +225,8 @@ pub struct SAACPWebSocketDaemon {
     server_agent_id: Option<String>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 }
 
 impl SAACPWebSocketDaemon {
@@ -245,6 +247,7 @@ impl SAACPWebSocketDaemon {
             on_delivered: None,
             server_agent_id: None,
             gossip: None,
+            cluster: None,
         }
     }
 
@@ -296,6 +299,13 @@ impl SAACPWebSocketDaemon {
     /// `SAACPNetworkDaemon::with_gossip_engine` — identical semantics.
     pub fn with_gossip_engine(mut self, engine: Arc<crate::gossip::GossipEngine>) -> Self {
         self.gossip = Some(engine);
+        self
+    }
+
+    /// Opt in to the Active-Active cluster membership mesh. See
+    /// `SAACPNetworkDaemon::with_cluster_engine` — identical semantics.
+    pub fn with_cluster_engine(mut self, engine: Arc<crate::cluster::ClusterEngine>) -> Self {
+        self.cluster = Some(engine);
         self
     }
 
@@ -383,6 +393,7 @@ impl SAACPWebSocketDaemon {
                             let on_delivered    = self.on_delivered.clone();
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip          = self.gossip.clone();
+                            let cluster         = self.cluster.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -393,7 +404,7 @@ impl SAACPWebSocketDaemon {
                                 let _conn_count_guard = crate::telemetry::ConnectionCountGuard::ws();
                                 serve_ws_connection(
                                     stream, peer_addr, cbs, secret, seed,
-                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip,
+                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                 ).await;
                             });
                         }
@@ -450,6 +461,7 @@ async fn serve_ws_connection(
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
     server_agent_id: Option<String>,
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 ) {
     // H-19 fix: cap the incoming WebSocket message/frame size at the same
     // `MAX_PAYLOAD_SIZE` the raw-TCP path already enforces for MEASC payloads (+1024
@@ -497,6 +509,7 @@ async fn serve_ws_connection(
         on_delivered,
         server_agent_id,
         gossip,
+        cluster,
     )
     .await;
 }

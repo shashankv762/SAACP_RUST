@@ -392,6 +392,16 @@ const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLO
 ///   on the hot path. `Degraded`'s rejection of IRREVERSIBLE_ACTION packets
 ///   is already in effect here, protecting against irreversible actions
 ///   proceeding without a durable audit trail.
+///
+///   **Sticky on drop.** A queue-full drop is not transient pressure — it is a
+///   permanently missing audit record. Recomputing health purely from live
+///   queue depth would return to `Healthy` the moment the backlog drained,
+///   re-authorizing IRREVERSIBLE_ACTION under an audit chain that already has
+///   a hole in it. So the first drop raises a floor that pins health at
+///   `Saturated` until an operator explicitly calls
+///   [`ImmutableAuditLog::acknowledge_dropped_audits`]. Gate 2.5 therefore
+///   keeps rejecting irreversible actions for as long as the gap is
+///   unacknowledged, rather than for as long as the queue happens to be deep.
 /// - `Fatal` — The WAL writer cannot write at all (log file open failed, or
 ///   an actual write returned an OS error). Distinguishable from `Saturated`
 ///   (queue pressure) — this means the writer tried and failed, not merely
@@ -513,6 +523,13 @@ pub struct ImmutableAuditLog {
     /// Count of events dropped because the WAL queue was full (or the worker
     /// thread had already exited after a fatal open failure).
     dropped_audits: Arc<AtomicU64>,
+    /// Sticky floor under the health level, raised to `Saturated` the first
+    /// time an event is dropped and only lowered by
+    /// `acknowledge_dropped_audits`. A drop means a permanently missing audit
+    /// record, so health must not drift back to `Healthy` (re-authorizing
+    /// IRREVERSIBLE_ACTION at Gate 2.5) just because the queue later drained
+    /// — see `AuditHealth`'s "Sticky on drop" note.
+    health_floor: Arc<AtomicU8>,
     /// Count of WAL write failures — distinct from queue-full drops: the
     /// worker actually attempted a write and the OS returned an error.
     wal_write_failures: Arc<AtomicU64>,
@@ -609,6 +626,7 @@ impl ImmutableAuditLog {
 
         let health: Arc<AtomicU8> = Arc::new(AtomicU8::new(AuditHealth::Healthy as u8));
         let dropped_audits: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let health_floor: Arc<AtomicU8> = Arc::new(AtomicU8::new(AuditHealth::Healthy as u8));
         let wal_write_failures: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let queue_len: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
@@ -646,6 +664,7 @@ impl ImmutableAuditLog {
             wal_tx: Some(wal_tx),
             health,
             dropped_audits,
+            health_floor,
             wal_write_failures,
             queue_len,
             subscribers: Mutex::new(Vec::new()),
@@ -768,13 +787,13 @@ impl ImmutableAuditLog {
         // `verify_chain`/`verify_chain_disk` walk exactly this linkage, so a
         // "lock-free append" would trade tamper-evidence for throughput.
         //
-        // Measured (release, `T14_WAL_Sustained_Throughput`): ~333k events/sec
-        // sustained through this critical section — roughly 3 microseconds per
-        // event, far above the packet rates the gate pipeline can feed it, and the
-        // WAL worker itself (the actual I/O) is already off this thread via the
-        // bounded `wal_tx` channel. Contention here is observable via
-        // `record_mutex_contention("wal_append")` if a deployment ever does
-        // approach that ceiling.
+        // Measured (release, `T14_WAL_Sustained_Throughput`): ~250k-360k events/sec
+        // sustained through this critical section, depending on host load and backing
+        // store — roughly 3-4 microseconds per event, far above the packet rates the
+        // gate pipeline can feed it, and the WAL worker itself (the actual I/O) is
+        // already off this thread via the bounded `wal_tx` channel. Contention here is
+        // observable via `record_mutex_contention("wal_append")` if a deployment ever
+        // does approach that ceiling.
         let mut inner = match self.inner.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -852,6 +871,14 @@ impl ImmutableAuditLog {
                 // this branch hundreds of thousands of times, each printing,
                 // was the actual root cause of the original latency spike.)
                 self.dropped_audits.fetch_add(1, Ordering::Relaxed);
+                // This event is now permanently absent from the audit trail —
+                // not merely late. Raise the sticky floor so health cannot fall
+                // back to Healthy when the queue drains, keeping Gate 2.5
+                // fail-closed on IRREVERSIBLE_ACTION until an operator calls
+                // `acknowledge_dropped_audits`. See `AuditHealth`'s "Sticky on
+                // drop" note.
+                self.health_floor
+                    .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
                 crate::telemetry::global_telemetry().record_gate_rejection("gate_6_0_audit");
             }
 
@@ -859,6 +886,11 @@ impl ImmutableAuditLog {
             // refuses to overwrite a sticky `Fatal` — only the WAL worker sets
             // that (on an actual I/O failure), and only a fresh
             // `ImmutableAuditLog` clears it.
+            //
+            // The sticky drop floor is deliberately NOT folded into this stored
+            // value: `health()` applies it on read instead. Baking it in here
+            // would leave the floor's level latched in `health` even after
+            // `acknowledge_dropped_audits` cleared the floor itself.
             let pct = self.queue_len.load(Ordering::Relaxed) as f64
                 / AUDIT_WAL_QUEUE_CAPACITY as f64;
             let level = if pct > AUDIT_HEALTH_SATURATED_PCT {
@@ -1107,12 +1139,38 @@ impl ImmutableAuditLog {
     /// Current Gate 6.0 backpressure health (see `AuditHealth`). Read by
     /// `handler::gate_2_5_kinetic_firewall` to decide whether IRREVERSIBLE_ACTION
     /// packets should be rejected while the audit trail is degraded or blind.
+    ///
+    /// Never reports below the sticky drop floor: once an event has been dropped
+    /// the trail has a permanent hole, so this stays at least `Saturated` until
+    /// [`Self::acknowledge_dropped_audits`] is called, regardless of how far the
+    /// WAL queue has since drained.
     pub fn health(&self) -> AuditHealth {
-        AuditHealth::from_u8(self.health.load(Ordering::Relaxed))
+        let live = self.health.load(Ordering::Relaxed);
+        AuditHealth::from_u8(live.max(self.health_floor.load(Ordering::Relaxed)))
+    }
+
+    /// Clear the sticky drop floor raised by a queue-full audit drop, returning
+    /// the `dropped_audit_count()` at the moment of acknowledgement.
+    ///
+    /// This is an explicit operator action, deliberately not automatic: a drop
+    /// means audit records were permanently lost, and Gate 2.5 keeps rejecting
+    /// IRREVERSIBLE_ACTION until someone has actually reconciled that gap. Call
+    /// this only after the loss has been recorded out-of-band. Does not clear a
+    /// `Fatal` health state (a failed *write* is a different, non-recoverable
+    /// condition — only constructing a fresh `ImmutableAuditLog` clears that),
+    /// and does not reset the `dropped_audit_count()` lifetime total.
+    pub fn acknowledge_dropped_audits(&self) -> u64 {
+        self.health_floor
+            .store(AuditHealth::Healthy as u8, Ordering::Relaxed);
+        self.dropped_audits.load(Ordering::Relaxed)
     }
 
     /// Count of audit events dropped because the WAL queue was full (or the
     /// worker thread had already exited after a fatal open failure).
+    ///
+    /// Lifetime total — never reset. A non-zero value means the audit chain has
+    /// a permanent hole, which pins `health()` at `Saturated` until
+    /// [`Self::acknowledge_dropped_audits`] is called.
     pub fn dropped_audit_count(&self) -> u64 {
         self.dropped_audits.load(Ordering::Relaxed)
     }
@@ -1172,6 +1230,8 @@ impl ImmutableAuditLog {
         inner.last_hash = GENESIS_HASH.to_string();
         inner.event_count = 0;
         inner.entries.clear();
+        self.health_floor
+            .store(AuditHealth::Healthy as u8, Ordering::Relaxed);
         let _ = fs::remove_file(&log_file);
         let _ = fs::remove_file(&count_file);
     }
@@ -2062,6 +2122,51 @@ mod tests {
         assert_eq!(log.health(), AuditHealth::Healthy);
         assert_eq!(log.dropped_audit_count(), 0);
         assert_eq!(log.wal_write_failure_count(), 0);
+        log.reset();
+    }
+
+    /// SC-4 (white-box): the sticky drop floor must survive a fully drained WAL
+    /// queue. The integration test in `tests/test_gate6_backpressure_rs.rs` can
+    /// only reach the drop path via a *Fatal* worker (which is sticky on its own
+    /// account), so this test raises the floor directly on an otherwise perfectly
+    /// healthy log — isolating the exact behavior the fix adds.
+    ///
+    /// Pre-fix, `health()` returned `AuditHealth::from_u8(self.health.load(..))`,
+    /// which a drained queue had already recomputed back to `Healthy`, letting
+    /// `gate_2_5_kinetic_firewall` re-authorize IRREVERSIBLE_ACTION against an
+    /// audit chain with a permanent hole in it.
+    #[test]
+    fn test_dropped_audit_floor_survives_drained_queue() {
+        let log = test_audit_log("sticky_drop_floor");
+        let secret = b"sticky_floor_key";
+
+        log.append_event(secret, "src", "dst", "sig", "execute", "tp-sticky");
+        assert!(log.flush(Duration::from_secs(2)), "flush should confirm");
+        assert_eq!(log.queue_len(), 0, "queue drained");
+        assert_eq!(log.health(), AuditHealth::Healthy);
+
+        // Simulate what `append_event`'s queue-full branch does on a drop.
+        log.health_floor
+            .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
+
+        // Appending again recomputes health from a (still empty) queue — the
+        // precise condition that used to reset it to Healthy.
+        log.append_event(secret, "src", "dst", "sig2", "execute", "tp-sticky2");
+        assert!(log.flush(Duration::from_secs(2)));
+        assert_eq!(log.queue_len(), 0);
+        assert_eq!(
+            log.health(), AuditHealth::Saturated,
+            "a dropped audit record must pin health at Saturated even with an empty \
+             queue, so Gate 2.5 stays fail-closed on IRREVERSIBLE_ACTION"
+        );
+
+        // Only an explicit operator acknowledgement clears it.
+        log.acknowledge_dropped_audits();
+        assert_eq!(
+            log.health(), AuditHealth::Healthy,
+            "acknowledge_dropped_audits must release the floor on a log with no \
+             underlying Fatal condition"
+        );
         log.reset();
     }
 

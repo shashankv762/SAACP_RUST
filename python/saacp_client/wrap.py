@@ -17,7 +17,9 @@ into a secured version of itself:
   ``SendResult`` — this is secure **fire-and-forget delivery**, not a synchronous RPC
   with a return value, because that's what SAACP's schema-1 "Task" message actually is
   (see ``../../src/sidecar.rs``'s module doc). Not overclaiming a request/response bridge
-  the protocol doesn't have.
+  the protocol doesn't have. Because this changes the return contract for every existing
+  caller of the tool, it must be acknowledged explicitly via ``fire_and_forget=True``;
+  otherwise ``wrap()`` raises ``TypeError`` rather than silently rewiring the call.
 
 Anything else raises ``TypeError`` naming the two supported shapes, rather than silently
 doing nothing.
@@ -34,6 +36,7 @@ import base64
 import os
 import secrets
 import threading
+import warnings
 from typing import Any, Dict, Optional
 
 from . import SaacpClient
@@ -100,6 +103,32 @@ class SecuredCallable:
         return f"SecuredCallable(peers={list(self._peers)!r}, default_peer={self._default_peer!r})"
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _ephemeral_secret_allowed(explicit: Optional[bool]) -> bool:
+    """SC-2: is generating a throwaway mesh secret explicitly permitted?
+
+    `explicit` (the `allow_ephemeral_secret=` argument) wins when set, so a caller
+    can force the safe answer even if the environment says otherwise.
+    """
+    if explicit is not None:
+        return explicit
+    return _env_flag("SAACP_ALLOW_EPHEMERAL_SECRET")
+
+
+def _fire_and_forget_ack(explicit: Optional[bool]) -> bool:
+    """SC-6: has the caller acknowledged that a tool-shaped wrap returns a
+    `SendResult` instead of the original callable's value?
+
+    `explicit` (the `fire_and_forget=` argument) wins when set.
+    """
+    if explicit is not None:
+        return explicit
+    return _env_flag("SAACP_FIRE_AND_FORGET")
+
+
 def _looks_like_conversable(agent: Any) -> bool:
     return (
         hasattr(agent, "send")
@@ -154,6 +183,8 @@ def wrap(
     http_listen_addr: Optional[str] = None,
     http_bearer_token: Optional[str] = None,
     auto_start: bool = True,
+    allow_ephemeral_secret: Optional[bool] = None,
+    fire_and_forget: Optional[bool] = None,
 ) -> Any:
     """Secure `agent` with SAACP — the literal one-liner: `agent = saacp.wrap(agent)`.
 
@@ -166,10 +197,19 @@ def wrap(
     `SAACP_LISTEN_ADDR` their sidecar was started with, not their HTTP address), so the
     wrapped agent can address peers by name instead of raw sockets.
 
-    If `secret` is omitted and `SAACP_TOKEN_SECRET` isn't set, an ephemeral secret is
-    generated for this process and a warning is printed — it won't match any separately
-    started peer unless shared out-of-band. Set `secret=` or `SAACP_TOKEN_SECRET` for
-    real multi-process use.
+    **A secret is required.** If `secret` is omitted and `SAACP_TOKEN_SECRET` isn't set,
+    this raises `SaacpError` rather than quietly generating a throwaway one: an ephemeral
+    secret produces an agent that looks secured but can never reach a separately-started
+    peer. For single-process demos and tests, opt in with `allow_ephemeral_secret=True`
+    (or `SAACP_ALLOW_EPHEMERAL_SECRET=1`) to generate one and get a `RuntimeWarning`.
+
+    **`fire_and_forget` is required for tool-shaped inputs.** Wrapping a callable /
+    `.run()` / `.invoke()` object returns a `SecuredCallable`, which delivers the input
+    to a peer and returns a `SendResult` — it never calls the original and never returns
+    its value, because SAACP's Task message has no request/response channel. That
+    silently changes the return contract for every caller of a LangChain-shaped tool, so
+    it must be acknowledged: pass `fire_and_forget=True`. `.send()/.receive()`-shaped
+    agents are unaffected (they are already message-passing) and ignore this argument.
 
     `http_bearer_token` (falling back to `SAACP_HTTP_BEARER_TOKEN`) authorizes calls to
     a sidecar this call did *not* start — a reused or manually-started one whose local
@@ -186,12 +226,33 @@ def wrap(
         if env_secret:
             resolved_secret = base64.b64decode(env_secret)
         else:
+            # SC-2 fix: generating an ephemeral secret is a silent security
+            # downgrade — the agent comes up "secured" but can never talk to any
+            # separately-started peer, and a `print()` is not a signal anyone is
+            # guaranteed to see under a container runtime, a supervisor that
+            # discards stdout, or an unattended deployment. (Same failure class as
+            # the `eprintln!` bug already fixed once in Gate 6.) So this now fails
+            # closed and must be opted into explicitly.
+            if not _ephemeral_secret_allowed(allow_ephemeral_secret):
+                raise SaacpError(
+                    "no secret provided and SAACP_TOKEN_SECRET is unset. Generating an "
+                    "ephemeral secret would silently isolate this agent — it cannot "
+                    "reach any separately-started peer, since SAACP capability tokens "
+                    "are symmetric-HMAC and every peer must hold the same secret. Pass "
+                    "secret=, set SAACP_TOKEN_SECRET, or (single-process demos and tests "
+                    "only) pass allow_ephemeral_secret=True / set "
+                    "SAACP_ALLOW_EPHEMERAL_SECRET=1."
+                )
             resolved_secret = secrets.token_bytes(32)
-            print(
-                "[saacp.wrap] no secret provided and SAACP_TOKEN_SECRET is unset — "
-                "generated an ephemeral one for this process only. It will not match any "
-                "separately-started peer unless shared out-of-band; pass secret= or set "
-                "SAACP_TOKEN_SECRET for real multi-process use.",
+            # `warnings` routes through the logging/warning machinery an operator can
+            # actually capture, unlike a bare print to stdout.
+            warnings.warn(
+                "saacp.wrap: no secret provided and SAACP_TOKEN_SECRET is unset — "
+                "generated an ephemeral one for this process only. It will not match "
+                "any separately-started peer unless shared out-of-band; pass secret= "
+                "or set SAACP_TOKEN_SECRET for real multi-process use.",
+                RuntimeWarning,
+                stacklevel=2,
             )
     if len(resolved_secret) != 32:
         raise SaacpError(f"secret must be exactly 32 bytes, got {len(resolved_secret)}")
@@ -227,6 +288,23 @@ def wrap(
     if _looks_like_conversable(agent):
         return _wrap_conversable(agent, client, resolved_peers)
     if _looks_like_tool(agent):
+        # SC-6 fix: returning a `SecuredCallable` converts a synchronous call that
+        # returned a value into fire-and-forget delivery that returns a
+        # `SendResult`. For a LangChain-shaped tool that is a silent contract
+        # change for every caller — code that did `answer = tool(q)` keeps running
+        # and starts acting on a value the tool never produced. Disclosing it in
+        # the docs isn't enough; the caller has to acknowledge it.
+        if not _fire_and_forget_ack(fire_and_forget):
+            raise TypeError(
+                f"{type(agent)!r} is tool-shaped (callable / .run() / .invoke()), so "
+                "wrap() would return a SecuredCallable: calling it delivers the input "
+                "to a peer and returns a SendResult — it does NOT invoke the original "
+                "or return its value, because SAACP's Task message has no "
+                "request/response channel. Any caller expecting the original return "
+                "value would silently act on a value that was never computed. Pass "
+                "fire_and_forget=True to accept these semantics (or set "
+                "SAACP_FIRE_AND_FORGET=1)."
+            )
         return SecuredCallable(client, resolved_peers, default_peer)
     raise TypeError(
         "saacp.wrap() supports objects with both .send()/.receive() methods "

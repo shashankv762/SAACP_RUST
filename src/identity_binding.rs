@@ -93,6 +93,53 @@ impl AgentIdentityCertificate {
         cert
     }
 
+    /// Issue an identity certificate whose CA signature is produced by an
+    /// [`crate::hrt::HardwareKeyStore`] rather than an in-process key.
+    ///
+    /// This is the highest-value application of hardware key storage in the crate. The
+    /// CA key is the root of the identity hierarchy: anyone holding it can mint a
+    /// certificate for *any* `agent_id`, so it is precisely the key that should never
+    /// exist as bytes in a long-running network daemon's memory. Backing it with a
+    /// PKCS#11 token or a cloud KMS means a full compromise of this process yields only
+    /// the ability to request signatures while the compromise lasts — bounded and
+    /// revocable — rather than a permanent, silent power to forge identities.
+    ///
+    /// Identical to [`Self::issue`] in every other respect; the produced certificate is
+    /// byte-compatible and verifies through the same [`IdentityVerifier`] path, since an
+    /// Ed25519 signature is an Ed25519 signature regardless of where the key lived.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_with_keystore(
+        agent_id: &str,
+        public_key_hex: &str,
+        store: &dyn crate::hrt::HardwareKeyStore,
+        signing_key_id: &str,
+        ca_kid: &str,
+        issuer_id: &str,
+        ttl_seconds: f64,
+        algorithm: &str,
+    ) -> Result<Self, crate::hrt::HrtError> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let cert_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let mut cert = Self {
+            cert_id,
+            agent_id: agent_id.to_string(),
+            public_key_hex: public_key_hex.to_string(),
+            algorithm: algorithm.to_string(),
+            issued_at: now,
+            expires_at: now + ttl_seconds,
+            ca_kid: ca_kid.to_string(),
+            issuer_id: issuer_id.to_string(),
+            cert_signature: Vec::new(),
+        };
+        let body = cert.body_bytes()
+            .expect("AgentIdentityCertificate::body_bytes: see its doc comment — cannot fail for this struct");
+        cert.cert_signature = store.sign(signing_key_id, &body)?;
+        Ok(cert)
+    }
+
     /// Canonical bytes over which cert_signature is computed (no signature field).
     /// Returns deterministic JSON with sorted keys.
     ///

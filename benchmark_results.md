@@ -67,7 +67,7 @@ confidence interval around the median and the median is the point estimate.
 | Ed25519 capability token verify (valid) | **93.6 µs** | verification incl. lookup |
 | Prompt-injection scan, clean 50 B | **3.66 µs** | Unicode-normalized |
 | Audit log append (hash-chain + WAL) | **2.54 µs** | per event, chain-length-independent |
-| WAL sustained append throughput | **276.5 ms / 100k events** | ≈ **362k events/sec** |
+| WAL sustained append throughput | **276.5 ms / 100k events** | ≈ **362k events/sec** (load-dependent; 246k–333k on repeat runs — see T14) |
 
 > **Full-pipeline throughput (gate-pipeline compute only — NOT a system throughput
 > claim):** a valid frame traverses all mandatory gates in ~2.0 µs on this hardware,
@@ -81,9 +81,23 @@ confidence interval around the median and the median is the point estimate.
 > the shared audit-WAL and rate-limiter state. Treat ~500k as an upper bound on the
 > compute half of one core, never as "this system serves 500k packets/sec".
 >
-> The audit WAL sustains ~333k appended events/sec (see T14) — that IS a concurrent,
-> lock-serialized number, so in practice it, not the 2 µs gate cost, is the ceiling
-> that a real deployment reaches first.
+> The audit WAL sustains roughly 250k–360k appended events/sec (see T14; the figure is
+> host-load dependent) — that IS a concurrent, lock-serialized number, so in practice
+> it, not the 2 µs gate cost, is the ceiling a real deployment reaches first.
+>
+> **This ceiling is enforced, not merely observed.** Exceeding it is not a silent
+> throughput cliff: the WAL queue fills, `AuditHealth` climbs to `Saturated`, and
+> `handler::gate_2_5_kinetic_firewall` starts rejecting `IRREVERSIBLE_ACTION` packets
+> with `SAACPBytecodes::AuditSubsystemDegraded` — an irreversible action is never
+> authorized on the basis that the audit subsystem happens to be keeping up. Reversible
+> and read-only traffic continues to flow.
+>
+> Once the queue is genuinely full, further events are dropped and counted
+> (`dropped_audit_count()`). A drop is a permanently missing audit record, so it raises
+> a sticky floor pinning health at `Saturated` even after the backlog drains — Gate 2.5
+> keeps rejecting irreversible actions until an operator calls
+> `acknowledge_dropped_audits()`. Sizing a deployment above this ceiling therefore costs
+> availability of irreversible actions, not audit integrity.
 
 ---
 
@@ -163,6 +177,35 @@ confidence interval around the median and the median is the point estimate.
 | 4096 | 198.45 µs | **199.29 µs** | 200.26 µs |
 | 16384 | 787.07 µs | **791.30 µs** | 796.13 µs |
 | 65536 | 1.0752 ms | **1.0789 ms** | 1.0829 ms |
+
+#### P-4 / S-3: cost of the head+tail scan window
+
+The S-3 fix made `normalize` scan BOTH the leading and trailing `MAX_SCAN_LENGTH`
+(16 KB) window for oversized payloads, closing the "append the injection past 16 KB"
+bypass. Re-measured after that change:
+
+| Payload bytes | before (head only) | after (head+tail) | ratio |
+|--------------:|------------------:|------------------:|------:|
+| 64 | 4.71 µs | 5.42 µs | 1.15x |
+| 512 | 26.9 µs | 31.8 µs | 1.18x |
+| 4096 | 199 µs | 231 µs | 1.16x |
+| 16384 | 791 µs | 906 µs | 1.14x |
+| 65536 | 1.08 ms | 2.01 ms | **1.86x** |
+
+This is exactly the intended shape. Payloads **at or below 16 KB take a single
+window** — their ~1.15x is run-to-run/host-load noise, not extra scanning work (the
+`text.len() <= MAX_SCAN_LENGTH` fast path returns after one `normalize_window`). Only
+payloads **larger than 16 KB** pay the second window, and there the cost converges on
+the expected ~2x, bounded regardless of how large the payload gets: a 10 MB body still
+scans only 32 KB, not 10 MB.
+
+Tradeoff accepted deliberately (opusplan2.md §7 Q2): a bounded ~2x on oversized
+payloads buys closure of the append-past-the-limit bypass, versus the alternative of
+scanning the full body (~500 ms for a 10 MB payload — a DoS lever in itself). The
+residual gap is that content strictly *interior* to a payload >32 KB is still unscanned;
+that limit is regression-locked by
+`handler.rs::test_scan_middle_of_oversized_payload_is_known_gap` so any future widening
+fails loudly rather than silently.
 
 ### Gate 5.0 — Epistemic circuit breaker
 | Benchmark | low | median | high |
@@ -261,6 +304,11 @@ the single-append figure.
 | scan_max_depth_8 | 8.3629 µs | **8.4112 µs** | 8.4621 µs |
 | scan_wide_1000_items | 1.0150 ms | **1.0166 ms** | 1.0186 ms |
 
+> S-3 note: `scan_100KB_clean` predates the head+tail scan window. A >16 KB payload now
+> scans two 16 KB windows instead of one, so expect roughly ~2x this figure (see the
+> P-4 table under "Gate 4.0 — Payload size scaling"). The cost stays bounded at 32 KB
+> of scanning no matter how large the payload is.
+
 ### T6 — Multi-agent rate-limiter scaling
 | Agents | low | median | high |
 |-------:|----:|-------:|-----:|
@@ -314,6 +362,31 @@ prior entries.
 
 **≈ 361,700 events/sec** sustained (100,000 events / 276.5 ms), steady-state, with the
 persistent `BufWriter<File>` batching flush/sync every 200 entries or 50 ms.
+
+> **P-2 re-measurement (later run, same benchmark, different machine load):** five
+> repeat runs on a RAM-disk-backed target measured **246k–333k events/sec**
+> (400–300 ms / 100k events) rather than the 362k above. This benchmark is sensitive
+> to host load and to the backing store's flush behavior, so treat the WAL ceiling as
+> **~250k–360k events/sec, hardware- and load-dependent** — not a fixed constant.
+>
+> P-2 also assessed whether the `inner` mutex held across HMAC + serialization should
+> be restructured (e.g. lock-free append). Conclusion: **no** — the audit chain is
+> inherently sequential (each record's HMAC covers the previous record's `chain_hash`
+> as its `prev_hash`), so concurrent hash computation would break the very linkage
+> `verify_chain`/`verify_chain_disk` rely on for tamper-evidence. The measured ceiling
+> is well above what the gate pipeline feeds it, and the actual disk I/O already runs
+> off-thread behind the bounded `wal_tx` channel. See `security.rs::append_event`'s
+> P-2 comment. Contention is observable via `record_mutex_contention("wal_append")`.
+>
+> **What happens past the ceiling.** Sustained load above this rate fills the bounded
+> `wal_tx` queue (`AUDIT_WAL_QUEUE_CAPACITY` = 100,000). At >70% depth `AuditHealth`
+> becomes `Degraded`; at >95% it becomes `Saturated`, and `gate_2_5_kinetic_firewall`
+> begins rejecting `IRREVERSIBLE_ACTION` packets outright rather than authorizing them
+> against an audit trail that can't record them. Beyond that, events are dropped and
+> counted, which raises a sticky floor holding health at `Saturated` until
+> `acknowledge_dropped_audits()` is called — so a transient overload can't quietly
+> re-enable irreversible actions once the queue drains. Verified end to end in
+> `tests/test_gate6_backpressure_rs.rs`.
 
 ---
 

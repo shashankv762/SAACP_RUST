@@ -227,7 +227,20 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         | B::IdentityBindingMissing
         | B::IdentityMisbinding
         | B::TranscriptHashMismatch
-        | B::IdentityNotVerified => ExternalCode::AccessDenied,
+        | B::IdentityNotVerified
+        // Phase 6 gates. Each is a credential/authorization failure for which
+        // retrying the identical request cannot succeed, so each maps alongside
+        // its closest already-mapped analog rather than falling through to the
+        // INTERNAL_FAILURE catch-all below (the CRIT-11 bug class):
+        //   - SemanticInjectionDetected mirrors PromptInjectionDetected (0x06),
+        //     the keyword-scan gate it runs immediately after.
+        //   - InsufficientAttestation is an identity-assurance shortfall, like
+        //     IdentityNotVerified (0x3F).
+        //   - CollusionDetected revokes the agent's credentials outright, like
+        //     KeyRevoked (0x2C).
+        | B::SemanticInjectionDetected
+        | B::InsufficientAttestation
+        | B::CollusionDetected => ExternalCode::AccessDenied,
 
         // ── SESSION_TERMINATED ──────────────────────────────────────────
         B::EpistemicUncertainty
@@ -240,6 +253,11 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         | B::AegfLoopDetected
         | B::AegfTtlExpired
         | B::AegfInvalidTransition
+        // IEVL (`ievl.rs`): the agent executed a more dangerous action than the
+        // intent it registered at Gate 1.5. Like SessionSpliceDetected below,
+        // this triggers immediate revocation — the session cannot continue, and
+        // a retry of the same receipt is meaningless.
+        | B::IntentClassEscalationDetected
         | B::SessionSpliceDetected => ExternalCode::SessionTerminated,
 
         // ── RATE_LIMITED ────────────────────────────────────────────────
@@ -261,6 +279,17 @@ pub fn internal_to_external(bytecode: SAACPBytecodes) -> ExternalCode {
         // policy violation (session must terminate) behind a generic code.
         B::TrustReauthRequired => ExternalCode::AccessDenied,
         B::IntentChainDriftExceeded => ExternalCode::SessionTerminated,
+
+        // `cluster.rs`: a refused cluster membership message is an authentication
+        // failure (unrostered/untrusted sender, bad signature, replay) — retrying the
+        // identical message cannot succeed, so it maps alongside the other credential
+        // failures rather than falling through to INTERNAL_FAILURE.
+        B::ClusterMessageRejected => ExternalCode::AccessDenied,
+
+        // `rulepack.rs`: a refused injection rule pack is an authentication failure
+        // (absent/unmatched trust anchor, bad signature, replayed version). Re-pushing
+        // the identical pack cannot succeed — it must be re-signed or re-versioned.
+        B::RulePackRejected => ExternalCode::AccessDenied,
 
         // ── Everything else maps to INTERNAL_FAILURE ────────────────────
         // Only genuinely internal-only codes remain here (Success,
@@ -343,6 +372,17 @@ pub fn internal_to_external_raw(bytecode: u8) -> ExternalCode {
         0x41 => B::AuditSubsystemDegraded,
         0x42 => B::TrustReauthRequired,
         0x43 => B::IntentChainDriftExceeded,
+        // Phase 6 bytecodes. These were absent here, so every one of them fell
+        // through to the `_ =>` arm below and was reported to external callers as
+        // a generic INTERNAL_FAILURE — hiding an access-denial or a terminated
+        // session behind a code that invites a pointless retry. Same CRIT-11 class
+        // of bug the 0x42/0x43 comment in `internal_to_external` describes.
+        0x44 => B::IntentClassEscalationDetected,
+        0x45 => B::SemanticInjectionDetected,
+        0x46 => B::InsufficientAttestation,
+        0x47 => B::CollusionDetected,
+        0x48 => B::ClusterMessageRejected,
+        0x49 => B::RulePackRejected,
         _ => return ExternalCode::InternalFailure,
     };
     internal_to_external(bc)
@@ -1031,5 +1071,62 @@ mod tests {
         let h2 = hash_sensitive("192.168.1.1");
         assert_eq!(h1, h2); // deterministic
         assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    /// Every *rejection* bytecode must be reachable through the raw-byte table and
+    /// must not degrade to INTERNAL_FAILURE.
+    ///
+    /// This is a guard against the CRIT-11 bug class rather than a test of one fix:
+    /// `internal_to_external_raw` is a hand-maintained `u8 -> bytecode` table, so a
+    /// bytecode added to `errors.rs` without a row here silently becomes
+    /// INTERNAL_FAILURE on the wire — telling the caller "retry, it's our fault"
+    /// when the truth is "access denied, re-authenticate". That is exactly how
+    /// 0x44-0x49 were missed. Listing the codes explicitly (rather than scanning a
+    /// range) means a newly-added bytecode fails this test until it is triaged.
+    #[test]
+    fn every_rejection_bytecode_maps_to_a_specific_external_code() {
+        // The five internal-only codes deliberately excluded: they are not
+        // rejections and must never reach `internal_to_external` as one.
+        const INTERNAL_ONLY: &[u8] = &[
+            0x00, // Success
+            0x08, // InputRequired
+            0x0A, // PreFlightBudget
+            0x0B, // CostEstimate
+            0x0F, // HeartbeatPing
+        ];
+
+        let all: Vec<u8> = (0x00..=0x49).collect();
+        for code in all {
+            if INTERNAL_ONLY.contains(&code) {
+                continue;
+            }
+            // 0x44-0x49 are contiguous with no gaps, so every byte in the range
+            // is a real bytecode; assert the mapping is specific.
+            let external = internal_to_external_raw(code);
+            assert_ne!(
+                external,
+                ExternalCode::InternalFailure,
+                "bytecode 0x{code:02X} degrades to INTERNAL_FAILURE — it is missing a row \
+                 in `internal_to_external_raw`'s table or an arm in `internal_to_external`. \
+                 A rejection reported as an internal fault invites a retry that can never \
+                 succeed. Add an explicit mapping (see the 0x44-0x49 comment)."
+            );
+        }
+    }
+
+    /// The confidentiality layer's category table must agree with the code above.
+    /// These are two independent hand-maintained tables over the same bytecode
+    /// space; both were missing 0x44-0x49, so they can and do drift apart.
+    #[test]
+    fn phase6_bytecodes_have_a_specific_confidentiality_category() {
+        use crate::error_confidentiality::{ErrorCategory, ErrorConfidentialityFilter};
+        for code in [0x44u8, 0x45, 0x46, 0x47, 0x48, 0x49] {
+            assert_ne!(
+                ErrorConfidentialityFilter::bytecode_to_category(code),
+                ErrorCategory::Internal,
+                "bytecode 0x{code:02X} has no row in `BYTECODE_CATEGORY_MAP` and falls \
+                 through to the Internal catch-all"
+            );
+        }
     }
 }

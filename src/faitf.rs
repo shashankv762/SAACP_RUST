@@ -216,13 +216,12 @@ pub struct AgentCredential {
 }
 
 impl AgentCredential {
-    /// Issuer signs the public fields of an AgentIdentity to create a credential.
-    pub fn issue(
-        identity: &AgentIdentity,
-        issuer_signing_key: &SigningKey,
-        issuer_verifying_key: &VerifyingKey,
-    ) -> Self {
-        let payload = serde_json::json!({
+    /// The signed payload for `identity`. Factored out so the software and
+    /// hardware-backed issuance paths cannot drift: both must sign byte-identical
+    /// content, or credentials issued through one path would fail verification when
+    /// checked against the other.
+    fn credential_payload(identity: &AgentIdentity) -> serde_json::Value {
+        serde_json::json!({
             "faitf_version": FAITF_VERSION,
             "agent_id": identity.agent_id,
             "public_key_b64": B64.encode(identity.public_key_bytes()),
@@ -235,7 +234,16 @@ impl AgentCredential {
             "supported_protocols": identity.supported_protocols,
             "capability_constraints": identity.capability_constraints,
             "attestation_type": identity.attestation_type.value(),
-        });
+        })
+    }
+
+    /// Issuer signs the public fields of an AgentIdentity to create a credential.
+    pub fn issue(
+        identity: &AgentIdentity,
+        issuer_signing_key: &SigningKey,
+        issuer_verifying_key: &VerifyingKey,
+    ) -> Self {
+        let payload = Self::credential_payload(identity);
         let payload_bytes = sorted_json_bytes(&payload);
         let sig = sign_data(issuer_signing_key, &payload_bytes);
         Self {
@@ -243,6 +251,34 @@ impl AgentCredential {
             signature: sig,
             issuer_public_key_id: pub_key_fingerprint(issuer_verifying_key),
         }
+    }
+
+    /// Issue a credential whose *issuer* signature comes from an
+    /// [`crate::hrt::HardwareKeyStore`].
+    ///
+    /// Scoped deliberately to the issuer key. An `AgentIdentity`'s own `signing_key` is
+    /// used for several operations beyond signing (identity proofs, delegation, cluster
+    /// message signing) and is a public field read across module boundaries, so it is
+    /// **not** a candidate for hardware backing. The issuer key, by contrast, is used for
+    /// nothing but signing — which is exactly the shape an HSM supports.
+    ///
+    /// `issuer_verifying_key` stays a caller-supplied parameter rather than being fetched
+    /// from the store: it is only needed to compute a fingerprint, and re-fetching an
+    /// immutable public key on every issuance would add a network round-trip per
+    /// credential for no benefit.
+    pub fn issue_with_keystore(
+        identity: &AgentIdentity,
+        store: &dyn crate::hrt::HardwareKeyStore,
+        issuer_key_id: &str,
+        issuer_verifying_key: &VerifyingKey,
+    ) -> Result<Self, crate::hrt::HrtError> {
+        let payload = Self::credential_payload(identity);
+        let payload_bytes = sorted_json_bytes(&payload);
+        Ok(Self {
+            payload,
+            signature: store.sign(issuer_key_id, &payload_bytes)?,
+            issuer_public_key_id: pub_key_fingerprint(issuer_verifying_key),
+        })
     }
 
     /// Serialize to wire format: base64(4-byte-BE-json-len || json || sig || issuer_key_id).

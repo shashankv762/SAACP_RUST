@@ -359,7 +359,9 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 | `error_confidentiality.rs` | Fixed-size opaque error responses |
 | `telemetry.rs` | Metrics, gate-rejection counters, security alert feed |
 | `gossip.rs` | Revocation gossip protocol |
-| `hrt.rs` | Hardware Root of Trust trait abstraction (TPM/SGX/PKCS#11 seams) |
+| `hrt.rs` | Hardware Root of Trust — `HardwareKeyStore` seam plus real PKCS#11 / AWS KMS / GCP KMS backends |
+| `rulepack.rs` | Dynamic hot-reloadable injection rules — Ed25519-signed, versioned, additive-only rule packs adopted without a restart |
+| `cluster.rs` | Active-active clustering, leader leases, and failover over signed membership messages |
 | `type_state.rs` | Compile-time gate-ordering enforcement (`PipelineToken`) |
 | `maintenance.rs` | Background maintenance sweeps |
 | `sidecar.rs` | Local HTTP proxy: plain JSON ⇄ SAACP-secured traffic |
@@ -468,8 +470,20 @@ agent.send("Execute the quarterly report", "agent-b")  # now routed through SAAC
 shape and LangChain's callable/`.run()/.invoke()` shape. Your agent never sees a
 capability token, a session key, or a gate rejection code — it sends a task and gets
 back `success` or `rejected`. The Python package is `saacp-client` (`requests`-only
-dependency, Python ≥ 3.8). Full details and production hardening (per-peer secrets,
-bounded concurrency, secret-file hygiene) are in [`python/README.md`](python/README.md).
+dependency, Python ≥ 3.8).
+
+Two places `wrap()` deliberately refuses rather than downgrading silently:
+
+- **No secret available** raises `SaacpError` instead of generating an ephemeral one —
+  that would yield an agent that looks secured but can never reach a separately-started
+  peer. Opt in with `allow_ephemeral_secret=True` for single-process demos.
+- **Wrapping a tool-shaped object** (callable / `.run()` / `.invoke()`) requires
+  `fire_and_forget=True`, because the returned `SecuredCallable` delivers the input and
+  returns a `SendResult` — it never invokes the original or returns its value. SAACP's
+  Task message has no request/response channel to bridge.
+
+Full details and production hardening (per-peer secrets, local HTTP API auth, bounded
+concurrency, secret-file hygiene) are in [`python/README.md`](python/README.md).
 
 ---
 
@@ -507,7 +521,10 @@ for embedded targets.
 | `sidecar` | `saacp-sidecar` HTTP proxy binary | axum |
 | `command-center` | `saacp-command-center` REST+SSE dashboard backend | (reuses axum, futures-util) |
 | `mpf` | Metadata Privacy Filter (cover traffic, adaptive padding, timing jitter) | — |
-| `hrt-tpm` / `hrt-sgx` / `hrt-pkcs11` | Hardware Root of Trust backend seams (compile placeholders) | — |
+| `hrt-pkcs11` | **Hardware Root of Trust: PKCS#11.** Signing keys held in an on-premise HSM or token (Thales, Entrust, Utimaco, YubiHSM, SoftHSM2) — the private key never enters process memory. | cryptoki |
+| `hrt-aws-kms` | **Hardware Root of Trust: AWS KMS.** `ECC_NIST_EDWARDS25519` keys; every signature lands in CloudTrail. | aws-sdk-kms, aws-config |
+| `hrt-gcp-kms` | **Hardware Root of Trust: Google Cloud KMS.** `EC_SIGN_ED25519` key versions. | gcloud-sdk |
+| `hrt-tpm` / `hrt-sgx` | Hardware Root of Trust seams for TPM 2.0 / Intel SGX (compile placeholders — return `NotImplemented`) | — |
 | `unsafe-structural-only` | **Debug only.** Exposes unauthenticated structural header parsing. **Must never be enabled in production.** | — |
 
 Release profile is tuned for performance: `lto = "thin"`, `codegen-units = 1`,

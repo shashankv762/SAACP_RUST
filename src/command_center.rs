@@ -671,6 +671,97 @@ async fn handle_config_reload(State(state): State<Arc<CommandCenterState>>) -> J
     Json(state.hot_config.reload_from_env())
 }
 
+/// `POST /api/rules/reload` — push a signed injection rule pack (`rulepack.rs`)
+/// and adopt it without restarting the process, so a newly-observed zero-day
+/// signature reaches production in seconds instead of a release cycle.
+///
+/// Unlike `handle_config_reload` (R-4), this endpoint carries security-relevant
+/// content, and is admissible only because the *authority* over that content is
+/// still fixed at provisioning time: the request body must be Ed25519-signed by
+/// the one key installed at startup via `RulePackStore::provision_trust_anchor`,
+/// which this endpoint cannot change. The bearer token authenticates the
+/// *channel*; the pack signature authorizes the *content*. Holding the dashboard
+/// token alone is therefore not sufficient to alter detection — see
+/// `rulepack.rs`'s module doc for the full argument against Architecture
+/// Principle #3/#4.
+///
+/// Responds 200 with what was actually applied, or 400 with the coarse rejection
+/// reason. The reason string is a fixed low-cardinality token that never echoes a
+/// pattern, so a caller probing this endpoint learns nothing about the live rule
+/// set (CRIT-10 posture). On any rejection the previously active rule set is left
+/// untouched — detection never degrades because a push failed.
+async fn handle_rules_reload(body: String) -> Response {
+    match crate::rulepack::install_from_json(&body) {
+        Ok(status) => Json(RulePackApplied {
+            pack_id: status.pack_id,
+            version: status.version,
+            builtin_rules: status.builtin_rules,
+            pack_rules: status.pack_rules,
+            total_rules: status.total_rules,
+            valid_until: status.valid_until,
+        })
+        .into_response(),
+        Err(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "rule_pack_rejected", "reason": reason.as_str() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/rules` — what Gate 4.0 is currently scanning with. Reports counts
+/// and pack provenance only, never the patterns themselves: the active signature
+/// list is exactly the thing an attacker wants, and this route sits on the same
+/// admin plane as `/api/alerts`.
+async fn handle_rules_status() -> Json<RulePackState> {
+    let store = crate::rulepack::RulePackStore::global();
+    let builtin = crate::handler::builtin_injection_patterns().len();
+    match store.current() {
+        Some(active) => Json(RulePackState {
+            trust_anchor_provisioned: store.has_trust_anchor(),
+            pack_installed: true,
+            pack_id: Some(active.pack_id().to_string()),
+            version: Some(active.version()),
+            valid_until: Some(active.valid_until()),
+            builtin_rules: active.builtin_count(),
+            pack_rules: active.pack_rule_count(),
+            total_rules: active.total_count(),
+        }),
+        None => Json(RulePackState {
+            trust_anchor_provisioned: store.has_trust_anchor(),
+            pack_installed: false,
+            pack_id: None,
+            version: None,
+            valid_until: None,
+            builtin_rules: builtin,
+            pack_rules: 0,
+            total_rules: builtin,
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct RulePackApplied {
+    pack_id: String,
+    version: u64,
+    builtin_rules: usize,
+    pack_rules: usize,
+    total_rules: usize,
+    valid_until: f64,
+}
+
+#[derive(Serialize)]
+struct RulePackState {
+    trust_anchor_provisioned: bool,
+    pack_installed: bool,
+    pack_id: Option<String>,
+    version: Option<u64>,
+    valid_until: Option<f64>,
+    builtin_rules: usize,
+    pack_rules: usize,
+    total_rules: usize,
+}
+
 /// L-32 fix: `/healthz` is the one route deliberately excluded from `require_auth` (load
 /// balancer / orchestrator liveness probes can't present a bearer token), so it must not
 /// leak anything beyond bare liveness — process uptime was free reconnaissance
@@ -880,6 +971,8 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
         .route("/api/metrics", get(handle_metrics))
         .route("/api/readyz", get(handle_readyz))
         .route("/api/config/reload", post(handle_config_reload))
+        .route("/api/rules", get(handle_rules_status))
+        .route("/api/rules/reload", post(handle_rules_reload))
         .route("/api/events/ticket", post(handle_events_ticket))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_auth));
 

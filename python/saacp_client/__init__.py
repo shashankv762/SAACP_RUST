@@ -110,6 +110,25 @@ class SaacpClient:
         Returns ``None`` if nothing arrived within ``wait_secs`` (the sidecar responds
         ``204 No Content``). The returned dict has ``from_agent``, ``task``, ``priority``,
         ``action_class``, ``session_uuid`` keys.
+
+        **Ordering and capacity guarantees** (see ``SIDECAR_INBOX_CAPACITY`` in
+        ``../../src/sidecar.rs`` for the authoritative statement). For a multi-hop
+        agent delegation chain, message order is a correctness property, so these
+        are contract, not incidental behavior:
+
+        - **Strict FIFO.** Messages are returned in the exact order the sidecar's
+          gate pipeline delivered them. This orders deliveries *into* the sidecar,
+          which is not end-to-end ordering: each ``send()`` opens its own one-shot
+          connection, so a peer's concurrent sends can arrive in any order.
+        - **Single consumer.** Only one ``receive()`` may be in flight per sidecar.
+          A concurrent second call gets ``409 CONFLICT`` (raised by
+          ``raise_for_status``) rather than silently interleaving — so two pollers
+          can never reorder the stream between them.
+        - **Bounded, newest-dropped.** The sidecar queues at most
+          ``SIDECAR_INBOX_CAPACITY`` (1000) undelivered messages. Past that,
+          *newly arriving* messages are dropped and the queued backlog is kept.
+          Stop polling long enough and you permanently miss messages — check
+          ``healthz()["inbox_dropped"]`` to detect it.
         """
         resp = requests.get(
             f"{self.sidecar_url}/receive",

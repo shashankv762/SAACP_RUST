@@ -100,6 +100,17 @@ static BYTECODE_CATEGORY_MAP: LazyLock<HashMap<u8, ErrorCategory>> = LazyLock::n
         (0x41, ResourceLimit),   // AuditSubsystemDegraded -> ServiceUnavailable
         (0x42, AuthFailure),     // TrustReauthRequired -> AccessDenied
         (0x43, PolicyViolation), // IntentChainDriftExceeded -> SessionTerminated
+        // Phase 6 additions. Same CRIT-11 reasoning as 0x41-0x43 above: without
+        // these rows every one of them fell through to the `Internal` catch-all
+        // in `categorize`, so a policy or auth rejection was reported to external
+        // callers as an internal fault. Categories match the `ExternalCode` each
+        // one maps to in `pecf::internal_to_external`.
+        (0x44, PolicyViolation), // IntentClassEscalationDetected -> SessionTerminated
+        (0x45, PolicyViolation), // SemanticInjectionDetected (mirrors 0x06)
+        (0x46, AuthFailure),     // InsufficientAttestation -> AccessDenied
+        (0x47, AuthFailure),     // CollusionDetected -> AccessDenied
+        (0x48, AuthFailure),     // ClusterMessageRejected -> AccessDenied
+        (0x49, AuthFailure),     // RulePackRejected -> AccessDenied
     ];
     for &(bytecode, cat) in entries {
         m.insert(bytecode, cat);

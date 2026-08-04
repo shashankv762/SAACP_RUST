@@ -16,16 +16,34 @@
 //! (no duplicated bookkeeping) and only adds the one operation `klms.rs` itself doesn't
 //! provide: turning a `KeyRegistry` entry's raw material into an actual Ed25519 signature.
 //!
-//! Per Phase 6 item 8's own scope note ("(trait abstraction)"), this module ships the
-//! trait and the software default only. `TpmKeyStore`/`SgxKeyStore`/`Pkcs11KeyStore` are
-//! feature-gated compile-only placeholders (`hrt-tpm`/`hrt-sgx`/`hrt-pkcs11`, all off by
-//! default and absent from the default build) that return
-//! [`HrtError::NotImplemented`] — real hardware integration for each is a distinct,
-//! multi-week project outside what this pass specifies concretely enough to build
-//! correctly. Existing signing call sites (`klms.rs`, `identity_binding.rs`, `factf.rs`'s
-//! threshold-signing paths, `hth.rs`) are NOT rewired onto `Arc<dyn HardwareKeyStore>` in
-//! this pass — that migration touches four crypto-critical modules and is deliberately
-//! deferred to its own explicitly-scoped change, per Part A.2's phased-rollout intent.
+//! Per Phase 6 item 8's original "(trait abstraction)" scope note, this module once
+//! shipped the trait and a software default only. It no longer does: [`pkcs11`],
+//! [`aws_kms`], and [`gcp_kms`] are real, working backends, each behind its own Cargo
+//! feature and off by default. `TpmKeyStore`/`SgxKeyStore` remain feature-gated
+//! compile-only placeholders (`hrt-tpm`/`hrt-sgx`) that return
+//! [`HrtError::NotImplemented`] — unlike PKCS#11 and the cloud KMSes, neither has a
+//! maintained integration path that can be implemented *and tested* here.
+//!
+//! ## Which call sites use this
+//!
+//! The credential-issuance paths — the long-lived keys whose compromise is permanent and
+//! silent — can now be hardware-backed, each through an additive constructor that leaves
+//! the original software API untouched:
+//!
+//! - [`crate::identity_binding::AgentIdentityCertificate::issue_with_keystore`] — the CA
+//!   key, the root of the identity hierarchy and the highest-value key in the crate.
+//! - [`crate::acsvaf::CapabilityIssuanceAuthority::with_keystore`] — the key that
+//!   authorizes every action any agent may take.
+//! - [`crate::faitf::AgentCredential::issue_with_keystore`] — the issuer key (and only
+//!   the issuer key; see that method's doc for why an agent's own key is not a
+//!   candidate).
+//! - [`crate::aca::AttestationAuthority::with_keystore`] — the operator attestation key.
+//!
+//! Deliberately *not* migrated: per-session ephemeral keys and the two `daemon.rs`
+//! handshake paths. Those are per-connection operations on the data plane, where a
+//! network KMS round-trip per handshake would be a self-inflicted latency and
+//! availability problem; the keys involved are also short-lived, which is most of what
+//! hardware storage is protecting against in the first place.
 
 use std::sync::Arc;
 
@@ -33,10 +51,41 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey, Signature};
 
 use crate::klms::{KeyAlgorithm, KeyRegistry};
 
-/// Errors a [`HardwareKeyStore`] implementation can return. Deliberately does not
-/// implement `std::error::Error` (matching this codebase's existing lightweight
-/// string/enum error style, e.g. `faitf::DRIError`) — callers needing interop with
-/// `std::error::Error`-based code can wrap this at their boundary.
+// ---------------------------------------------------------------------------
+// Backend submodules
+// ---------------------------------------------------------------------------
+
+/// Synchronous-to-asynchronous bridge shared by the cloud KMS backends. Compiled
+/// whenever either cloud backend is enabled; PKCS#11 does not need it (`cryptoki`
+/// is natively synchronous).
+#[cfg(any(feature = "hrt-aws-kms", feature = "hrt-gcp-kms"))]
+pub mod remote;
+
+/// PKCS#11 (Cryptoki) hardware token / network HSM backend.
+#[cfg(feature = "hrt-pkcs11")]
+pub mod pkcs11;
+
+/// AWS KMS backend.
+#[cfg(feature = "hrt-aws-kms")]
+pub mod aws_kms;
+
+/// Google Cloud KMS backend.
+#[cfg(feature = "hrt-gcp-kms")]
+pub mod gcp_kms;
+
+
+/// Errors a [`HardwareKeyStore`] implementation can return.
+///
+/// Implements `std::error::Error` (unlike the lighter `faitf::DRIError` style used
+/// elsewhere in this crate) because the real hardware backends interoperate with
+/// third-party SDK error types that expect it. `Backend`/`Configuration` carry an
+/// owned `String` rather than a `&'static str` for the same reason: the detail comes
+/// from a vendor SDK at runtime.
+///
+/// These strings are for operator logs only. Nothing here reaches a protocol peer
+/// directly — a signing failure surfaces on the wire through `pecf.rs`'s
+/// error-confidentiality filter like every other internal fault, so a KMS IAM message
+/// can never leak to a remote agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HrtError {
     /// No key is registered under this key_id (or none of its versions are `Active`).
@@ -53,6 +102,24 @@ pub enum HrtError {
     /// A feature-gated hardware backend compiled in but not yet wired to real hardware —
     /// see the module doc comment.
     NotImplemented(&'static str),
+    /// The backend was reachable but the operation failed (PKCS#11 `CKR_*` error, a KMS
+    /// API error, a denied IAM policy). `detail` is the backend's own message, kept for
+    /// operator logs — it is never surfaced to a protocol peer, since `hrt.rs` sits
+    /// behind the `pecf.rs` error-confidentiality filter like every other subsystem.
+    Backend { backend: &'static str, detail: String },
+    /// The backend did not answer within the configured timeout. Distinct from
+    /// [`Self::Backend`] because it is the one failure a caller may sensibly retry:
+    /// a network KMS can be transiently slow, whereas a `CKR_KEY_HANDLE_INVALID`
+    /// will fail identically forever.
+    Timeout { backend: &'static str },
+    /// The keystore could not be constructed from the supplied configuration (missing
+    /// module path, unreadable PIN file, malformed key identifier). Always fatal at
+    /// startup — a misconfigured HSM must never silently degrade to software keys.
+    Configuration(String),
+    /// The backend returned a signature or public key that was not the size Ed25519
+    /// requires. Treated as a hard failure rather than passed through: a truncated
+    /// signature would fail verification much later, somewhere far less diagnosable.
+    MalformedResponse { backend: &'static str, expected: usize, got: usize },
 }
 
 impl std::fmt::Display for HrtError {
@@ -64,8 +131,77 @@ impl std::fmt::Display for HrtError {
             Self::MalformedKeyMaterial(id) => write!(f, "HRT: key_id '{id}' has malformed key material"),
             Self::VerificationFailed => write!(f, "HRT: signature verification failed"),
             Self::NotImplemented(backend) => write!(f, "HRT: {backend} backend is not implemented"),
+            Self::Backend { backend, detail } => write!(f, "HRT: {backend} backend error: {detail}"),
+            Self::Timeout { backend } => write!(f, "HRT: {backend} backend timed out"),
+            Self::Configuration(detail) => write!(f, "HRT: misconfigured key store: {detail}"),
+            Self::MalformedResponse { backend, expected, got } => write!(
+                f,
+                "HRT: {backend} backend returned {got} bytes where Ed25519 requires {expected}"
+            ),
         }
     }
+}
+
+impl std::error::Error for HrtError {}
+
+/// Raw Ed25519 signature length. Every backend must return exactly this.
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+/// Raw Ed25519 public key length.
+pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
+
+/// DER prefix of an Ed25519 `SubjectPublicKeyInfo` (RFC 8410 §4).
+///
+/// Both AWS KMS `GetPublicKey` and GCP KMS `GetPublicKey` hand back an SPKI
+/// structure rather than the bare 32-byte point, so both backends need to strip
+/// this exact 12-byte header. Spelled out byte-by-byte because an off-by-one here
+/// yields a public key that silently fails every verification:
+///
+/// ```text
+/// 30 2A                          SEQUENCE (42 bytes)
+///   30 05                        SEQUENCE (5 bytes)  -- AlgorithmIdentifier
+///     06 03 2B 65 70             OID 1.3.101.112     -- id-Ed25519
+///   03 21 00                     BIT STRING (33 bytes, 0 unused bits)
+///     <32 bytes of public key>
+/// ```
+pub const ED25519_SPKI_PREFIX: [u8; 12] =
+    [0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
+
+/// Extract the raw 32-byte Ed25519 public key from a DER `SubjectPublicKeyInfo`.
+///
+/// Shared by the AWS and GCP KMS backends. Validates the full prefix rather than
+/// blindly slicing the last 32 bytes: if a provider ever returns a key for a
+/// *different* algorithm (an operator pointing at an ECDSA P-256 key by mistake is
+/// the realistic case), that must be a loud configuration error, not a 32-byte
+/// tail that looks plausible and fails verification much later.
+pub fn ed25519_public_key_from_spki(der: &[u8], backend: &'static str) -> Result<Vec<u8>, HrtError> {
+    let expected = ED25519_SPKI_PREFIX.len() + ED25519_PUBLIC_KEY_LEN;
+    if der.len() != expected {
+        return Err(HrtError::MalformedResponse { backend, expected, got: der.len() });
+    }
+    if der[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        return Err(HrtError::Backend {
+            backend,
+            detail: "GetPublicKey returned a SubjectPublicKeyInfo that is not id-Ed25519 \
+                     (1.3.101.112) — the configured key is not an Ed25519 signing key"
+                .to_string(),
+        });
+    }
+    Ok(der[ED25519_SPKI_PREFIX.len()..].to_vec())
+}
+
+/// Check a backend's signature is exactly 64 bytes before handing it upward.
+///
+/// Only referenced by the feature-gated backends, so it is unused in a default build.
+#[cfg(any(feature = "hrt-pkcs11", feature = "hrt-aws-kms", feature = "hrt-gcp-kms"))]
+fn check_signature_len(sig: Vec<u8>, backend: &'static str) -> Result<Vec<u8>, HrtError> {
+    if sig.len() != ED25519_SIGNATURE_LEN {
+        return Err(HrtError::MalformedResponse {
+            backend,
+            expected: ED25519_SIGNATURE_LEN,
+            got: sig.len(),
+        });
+    }
+    Ok(sig)
 }
 
 /// Seam between "something signs a message with a named key" and the actual place that
@@ -173,20 +309,11 @@ impl HardwareKeyStore for SgxKeyStore {
     }
 }
 
-/// Compile-only placeholder for a PKCS#11-token-backed [`HardwareKeyStore`]. See
-/// [`TpmKeyStore`]'s doc comment — identical rationale.
-#[cfg(feature = "hrt-pkcs11")]
-pub struct Pkcs11KeyStore;
-
-#[cfg(feature = "hrt-pkcs11")]
-impl HardwareKeyStore for Pkcs11KeyStore {
-    fn sign(&self, _key_id: &str, _message: &[u8]) -> Result<Vec<u8>, HrtError> {
-        Err(HrtError::NotImplemented("PKCS#11"))
-    }
-    fn public_key(&self, _key_id: &str) -> Result<Vec<u8>, HrtError> {
-        Err(HrtError::NotImplemented("PKCS#11"))
-    }
-}
+// NOTE: there is no `Pkcs11KeyStore` placeholder here. The real implementation lives in
+// [`pkcs11`] and is re-exported from `lib.rs` under the same name — a stub alongside it
+// would be a name collision that resolves to whichever the caller imported, and a
+// deployment that accidentally got the stub would see every signature fail at runtime
+// with NotImplemented.
 
 #[cfg(test)]
 mod tests {

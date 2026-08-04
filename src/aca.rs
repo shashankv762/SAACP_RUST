@@ -174,11 +174,29 @@ impl AttestationClaim {
 // AttestationAuthority — the operator's issuing keypair
 // ---------------------------------------------------------------------------
 
+/// Where an [`AttestationAuthority`]'s signing key actually lives.
+///
+/// `Local` is the original behavior: a `SigningKey` value held in this process's memory.
+/// `Hardware` routes signing through an [`crate::hrt::HardwareKeyStore`] — a PKCS#11
+/// token, AWS KMS, or GCP KMS — so the private key is never present in the address space
+/// and cannot be exfiltrated by a memory-disclosure bug or a core dump.
+enum AttestationKeySource {
+    Local(SigningKey),
+    Hardware {
+        store: std::sync::Arc<dyn crate::hrt::HardwareKeyStore>,
+        key_id: String,
+    },
+}
+
 /// The deployment's attestation-issuing operator. Distinct from any agent's
 /// own identity — mirrors how `faitf.rs`'s `AgentCredential::issue` is signed
 /// by a separate issuer keypair, not the agent's own.
 pub struct AttestationAuthority {
-    signing_key: SigningKey,
+    source: AttestationKeySource,
+    /// Cached in both modes. For a hardware store this is fetched exactly once, at
+    /// construction: `key_id()` is called on every `issue`, and a KMS round-trip per
+    /// issuance to re-fetch an immutable value would make an HSM-backed authority
+    /// pointlessly slower than a software one.
     verifying_key: VerifyingKey,
 }
 
@@ -186,7 +204,32 @@ impl AttestationAuthority {
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
-        Self { signing_key, verifying_key }
+        Self { source: AttestationKeySource::Local(signing_key), verifying_key }
+    }
+
+    /// Build an authority whose signing key lives in hardware.
+    ///
+    /// `key_id` is resolved by the backend: a PKCS#11 `CKA_LABEL`, a KMS key id / ARN /
+    /// alias, or a Cloud KMS CryptoKeyVersion resource name. The public key is fetched
+    /// once here, which also serves as an eager health check — a misconfigured key id or
+    /// an unreachable HSM fails at construction rather than at the first attempt to issue
+    /// an attestation, when it would be far more disruptive.
+    pub fn with_keystore(
+        store: std::sync::Arc<dyn crate::hrt::HardwareKeyStore>,
+        key_id: impl Into<String>,
+    ) -> Result<Self, crate::hrt::HrtError> {
+        let key_id = key_id.into();
+        let public_key = store.public_key(&key_id)?;
+        let bytes: [u8; 32] = public_key.as_slice().try_into().map_err(|_| {
+            crate::hrt::HrtError::MalformedResponse {
+                backend: "attestation authority",
+                expected: 32,
+                got: public_key.len(),
+            }
+        })?;
+        let verifying_key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|_| crate::hrt::HrtError::MalformedKeyMaterial(key_id.clone()))?;
+        Ok(Self { source: AttestationKeySource::Hardware { store, key_id }, verifying_key })
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -199,6 +242,13 @@ impl AttestationAuthority {
 
     /// Issue a freshly-signed claim for `agent_id`, valid for `ttl_seconds`
     /// from now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a hardware-backed signing call fails. Use [`Self::try_issue`] on any
+    /// authority built with [`Self::with_keystore`] — a network KMS can fail
+    /// transiently, and this signature (kept for backward compatibility with the
+    /// software path, where signing is infallible) has no way to report that.
     pub fn issue(
         &self,
         agent_id: &str,
@@ -206,19 +256,35 @@ impl AttestationAuthority {
         execution_environment: &str,
         ttl_seconds: u64,
     ) -> AttestationClaim {
+        self.try_issue(agent_id, safety_level, execution_environment, ttl_seconds)
+            .expect("attestation signing failed — use try_issue() with a hardware key store")
+    }
+
+    /// Fallible form of [`Self::issue`]. Always succeeds for a software key; may return
+    /// a backend error for a hardware-backed one.
+    pub fn try_issue(
+        &self,
+        agent_id: &str,
+        safety_level: SafetyLevel,
+        execution_environment: &str,
+        ttl_seconds: u64,
+    ) -> Result<AttestationClaim, crate::hrt::HrtError> {
         let issued_at = now_secs();
         let expires_at = issued_at + ttl_seconds as f64;
         let body = AttestationClaim::canonical_bytes(agent_id, safety_level, execution_environment, issued_at, expires_at);
-        let signature = self.signing_key.sign(&body);
-        AttestationClaim {
+        let operator_signature = match &self.source {
+            AttestationKeySource::Local(sk) => sk.sign(&body).to_bytes().to_vec(),
+            AttestationKeySource::Hardware { store, key_id } => store.sign(key_id, &body)?,
+        };
+        Ok(AttestationClaim {
             agent_id: agent_id.to_string(),
             safety_level,
             execution_environment: execution_environment.to_string(),
             issued_at,
             expires_at,
             operator_key_id: self.key_id(),
-            operator_signature: signature.to_bytes().to_vec(),
-        }
+            operator_signature,
+        })
     }
 }
 

@@ -67,6 +67,27 @@ axum = { version = "0.7", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# ── Hardware Root of Trust backends (src/hrt/) ──────────────────────────────────
+# All three are optional and off by default; see the `hrt-*` feature comments below.
+#
+# PKCS#11. `cryptoki` is a safe wrapper over the C PKCS#11 API and is natively
+# synchronous, so the `HardwareKeyStore` trait's synchronous `sign` maps onto it
+# directly with no runtime bridge. Note `cryptoki::session::Session` is deliberately
+# `!Sync` (the C API forbids concurrent use of one session), which is why
+# `Pkcs11KeyStore` holds it behind a `Mutex` — see that module's doc.
+cryptoki = { version = "0.12", optional = true }
+# AWS KMS. `aws-config` supplies the standard credential-provider chain (env,
+# profile, IMDS, IRSA) so this crate never handles AWS credentials itself.
+aws-sdk-kms = { version = "1", optional = true }
+aws-config = { version = "1", optional = true, features = ["behavior-version-latest"] }
+# GCP KMS. `gcloud-sdk` is used rather than a hand-rolled REST client because it
+# carries the Application Default Credentials chain (service-account JSON, workload
+# identity, metadata server) that a production GCP deployment expects.
+gcloud-sdk = { version = "0.30", optional = true, default-features = false, features = [
+    "google-cloud-kms-v1",
+    "tls-roots",
+] }
+
 [features]
 default = []
 # WebSocket tunneling transport (src/transport/ws.rs) — tunnels SAACP MEASC
@@ -120,18 +141,37 @@ command-center = ["dep:axum", "dep:futures-util"]
 # structural path was migrated to build genuinely-encrypted frames via
 # `encode_encrypted` instead. See CRIT-1 in opusplan.md.
 unsafe-structural-only = []
-# Hardware Root of Trust (src/hrt.rs, Phase 6 / item 8 / Part 8.8) — trait-abstraction
-# feature gates for hardware-backed `HardwareKeyStore` implementations. The default
-# build stays lightweight: `SoftwareKeyStore` (the default `HardwareKeyStore` impl,
-# delegating to `klms::KeyRegistry`) needs zero additional dependencies. Each of these
-# three flags is a compile-only placeholder for a specific hardware backend's real
-# integration (TPM 2.0, Intel SGX, PKCS#11) — a distinct, multi-week hardware-integration
-# project each, genuinely out of scope for a single pass; the flags exist so the trait
-# seam and Cargo feature wiring are already in place when that work happens, per this
-# item's own "(trait abstraction)" scope note in opusplan.md.
+# Hardware Root of Trust (src/hrt/, Phase 6 / item 8 / Part 8.8) — hardware-backed
+# `HardwareKeyStore` implementations, so a long-lived signing key can live inside a
+# device that never releases it rather than in this process's address space.
+#
+# The default build stays lightweight and dependency-free: `SoftwareKeyStore` (the
+# default `HardwareKeyStore` impl, delegating to `klms::KeyRegistry`) needs nothing
+# extra. Each backend below is off by default because each pulls a substantial and
+# entirely optional dependency tree, and because a deployment that does not have the
+# corresponding hardware must never accidentally compile — let alone silently depend
+# on — a backend it cannot use.
+#
+# PKCS#11 (`cryptoki`) is the backend for on-premise banking/defense environments:
+# Thales/Entrust/Utimaco network HSMs, YubiHSM, and SoftHSM2 for testing. It is
+# natively synchronous, so it needs no runtime bridge.
+hrt-pkcs11 = ["dep:cryptoki"]
+# AWS KMS. Requires an `ECC_NIST_EDWARDS25519` / SIGN_VERIFY key; AWS added Ed25519
+# (EdDSA) support in November 2025, exposed in the Rust SDK as
+# `SigningAlgorithmSpec::Ed25519Sha512`.
+hrt-aws-kms = ["dep:aws-sdk-kms", "dep:aws-config"]
+# Google Cloud KMS. Requires an `EC_SIGN_ED25519` (ASYMMETRIC_SIGN) key version.
+# Ed25519 in Cloud KMS is "pure mode": the request carries the raw message in `data`,
+# never a pre-computed digest.
+hrt-gcp-kms = ["dep:gcloud-sdk"]
+# TPM 2.0 and Intel SGX remain compile-only placeholders returning
+# `HrtError::NotImplemented`. Unlike PKCS#11/KMS above, neither has a mature,
+# maintained, pure-Rust integration path that can be implemented and *tested* here:
+# TPM signing key provisioning is platform-specific, and SGX requires an enclave
+# build toolchain. The flags exist so the trait seam and feature wiring are already
+# in place when that work happens.
 hrt-tpm = []
 hrt-sgx = []
-hrt-pkcs11 = []
 
 [dev-dependencies]
 serial_test = "3"

@@ -331,7 +331,55 @@ async fn sidecar_healthz_reports_inbox_and_peer_counts() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["inbox_depth"], 0);
     assert_eq!(body["inbox_capacity"], SIDECAR_INBOX_CAPACITY);
+    // SC-5: the inbox's bounded/newest-dropped capacity guarantee is only
+    // meaningful if losses are observable — a local agent that stops polling
+    // long enough to miss messages must be able to detect that.
+    assert_eq!(body["inbox_dropped"], 0);
     assert_eq!(body["peers_configured"], 2);
+}
+
+/// SC-5: `/receive` guarantees strict FIFO delivery — message order is a
+/// correctness property for a multi-hop agent delegation chain, not a
+/// convenience, so it gets a test rather than only a doc comment.
+///
+/// Sends are issued sequentially (each `/send` awaited before the next begins)
+/// so the peer's own delivery order is unambiguous; the assertion is that the
+/// sidecar hands them to `/receive` in that same order.
+#[tokio::test]
+async fn sidecar_receive_preserves_fifo_order() {
+    let secret = [0x5Au8; 32];
+    let (_a_saacp, a_http) = spawn_sidecar("agent-fifo-a", secret).await;
+    let (b_saacp, b_http) = spawn_sidecar("agent-fifo-b", secret).await;
+
+    let client = reqwest::Client::new();
+    const N: usize = 5;
+    for i in 0..N {
+        let resp = client
+            .post(format!("http://{}/send", a_http))
+            .json(&serde_json::json!({
+                "to_agent": "agent-fifo-b",
+                "target_addr": b_saacp.to_string(),
+                "task": format!("task-{i}"),
+            }))
+            .send()
+            .await
+            .expect("send failed");
+        assert_eq!(resp.status(), 200, "send {i} should be accepted");
+    }
+
+    for i in 0..N {
+        let resp = client
+            .get(format!("http://{}/receive?wait_secs=5", b_http))
+            .send()
+            .await
+            .expect("receive failed");
+        assert_eq!(resp.status(), 200, "message {i} should have arrived");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["task"], format!("task-{i}"),
+            "messages must be delivered in strict FIFO order"
+        );
+    }
 }
 
 /// Production-hardening regression proof #3: `max_concurrent_sends` is a real bound, not
