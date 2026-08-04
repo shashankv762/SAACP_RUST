@@ -390,7 +390,7 @@ mod tests {
         );
 
         // Balance: no shard may carry more than 2x the ideal share.
-        let mut counts = vec![0usize; CSCS_SHARDS];
+        let mut counts = [0usize; CSCS_SHARDS];
         for s in &ids {
             counts[cscs_shard_index(s)] += 1;
         }

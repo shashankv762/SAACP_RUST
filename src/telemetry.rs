@@ -127,6 +127,30 @@ pub struct Counters {
     /// (`sweep_and_rotate`).
     pub key_rotations_total:           AtomicU64,
     pub psk_compromise_recoveries:     AtomicU64,
+
+    // ── Active-Active clustering (`cluster.rs`) ──────────────────────────────
+    /// Inbound cluster membership messages refused by `ClusterEngine`. Deliberately a
+    /// single counter rather than one series per `ClusterRejection` variant or per peer
+    /// node id — see this struct's cardinality note above.
+    pub cluster_messages_rejected:     AtomicU64,
+    /// Leadership changes observed by this node, including stepping down on quorum loss.
+    /// Equals this node's fencing epoch, so a rising rate means election flapping.
+    pub cluster_leadership_changes:    AtomicU64,
+    /// Members transitioned to `Dead` by the failure detector — the failover trigger.
+    pub cluster_members_failed:        AtomicU64,
+
+    // ── Dynamic injection rule packs (`rulepack.rs`) ─────────────────────────
+    /// Signed rule packs successfully verified and adopted.
+    pub rulepack_installs_total:       AtomicU64,
+    /// Rule packs refused for any reason. Bounded-cardinality by design: a single
+    /// counter, never one series per `RulePackRejection` variant, per pack id, or
+    /// per issuer — the specific reason goes to the alert feed instead.
+    pub rulepack_rejections_total:     AtomicU64,
+    /// Active packs dropped by the maintenance sweep because `valid_until` passed.
+    pub rulepack_expirations_total:    AtomicU64,
+    /// Gauge (not a counter): injection signatures currently loaded, built-ins
+    /// included. Equals the built-in count when no pack is installed.
+    pub rulepack_active_rules:         AtomicU64,
     pub easi_encryptions:              AtomicU64,
     pub easi_decryptions:              AtomicU64,
     pub replay_attacks_blocked:        AtomicU64,
@@ -220,6 +244,13 @@ impl Counters {
             epoch_rotations:               z!(),
             key_rotations_total:           z!(),
             psk_compromise_recoveries:     z!(),
+            cluster_messages_rejected:     z!(),
+            cluster_leadership_changes:    z!(),
+            cluster_members_failed:        z!(),
+            rulepack_installs_total:       z!(),
+            rulepack_rejections_total:     z!(),
+            rulepack_expirations_total:    z!(),
+            rulepack_active_rules:         z!(),
             easi_encryptions:              z!(),
             easi_decryptions:              z!(),
             replay_attacks_blocked:        z!(),
@@ -675,6 +706,18 @@ impl TelemetryCollector {
     pub fn record_delegation_exceeded(&self) { self.counters.delegation_depth_exceeded.fetch_add(1, Ordering::Relaxed); }
     pub fn record_identity_failed(&self)     { self.counters.identity_binding_failed.fetch_add(1, Ordering::Relaxed); }
     pub fn record_psk_recovery(&self)        { self.counters.psk_compromise_recoveries.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_cluster_message_rejected(&self)  { self.counters.cluster_messages_rejected.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_cluster_leadership_change(&self) { self.counters.cluster_leadership_changes.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_cluster_member_failed(&self)     { self.counters.cluster_members_failed.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_rulepack_installed(&self)  { self.counters.rulepack_installs_total.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_rulepack_rejected(&self)   { self.counters.rulepack_rejections_total.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_rulepack_expired(&self)    { self.counters.rulepack_expirations_total.fetch_add(1, Ordering::Relaxed); }
+
+    /// Set the live injection-signature count (a gauge, not a counter — it can
+    /// fall when a pack expires and the process reverts to the built-in baseline).
+    pub fn set_rulepack_active_rules(&self, n: u64) {
+        self.counters.rulepack_active_rules.store(n, Ordering::Relaxed);
+    }
 
     /// Record one gate's processing latency (O-1). `gate` should be the same
     /// `&'static str` used at that call site's `report_gate_rejection`/
@@ -824,6 +867,13 @@ impl TelemetryCollector {
         snap!("epoch_rotations",             c.epoch_rotations);
         snap!("key_rotations_total",         c.key_rotations_total);
         snap!("psk_compromise_recoveries",   c.psk_compromise_recoveries);
+        snap!("cluster_messages_rejected",   c.cluster_messages_rejected);
+        snap!("rulepack_installs_total",     c.rulepack_installs_total);
+        snap!("rulepack_rejections_total",   c.rulepack_rejections_total);
+        snap!("rulepack_expirations_total",  c.rulepack_expirations_total);
+        snap!("rulepack_active_rules",       c.rulepack_active_rules);
+        snap!("cluster_leadership_changes",  c.cluster_leadership_changes);
+        snap!("cluster_members_failed",      c.cluster_members_failed);
         snap!("easi_encryptions",            c.easi_encryptions);
         snap!("easi_decryptions",            c.easi_decryptions);
         snap!("replay_attacks_blocked",      c.replay_attacks_blocked);
@@ -922,12 +972,27 @@ impl TelemetryCollector {
             "ping_flood_detected", "rrbc_replay_blocked", "rrbc_pop_failed",
             "delegation_depth_exceeded", "identity_binding_failed",
             "psk_compromise_recoveries", "cover_traffic_rate_exceeded",
+            "cluster_messages_rejected", "cluster_leadership_changes",
+            "cluster_members_failed",
+            "rulepack_installs_total", "rulepack_rejections_total",
+            "rulepack_expirations_total",
         ] {
             out.push_str(&format!(
                 "saacp_security_events_total{{event=\"{event}\"}} {}\n",
                 snap.get(*event).copied().unwrap_or(0)
             ));
         }
+
+        // Gauge, so it gets its own metric family rather than riding the
+        // `saacp_security_events_total` counter block above.
+        out.push_str(
+            "# HELP saacp_injection_rules_active Injection signatures currently loaded (built-ins plus any signed rule pack).\n",
+        );
+        out.push_str("# TYPE saacp_injection_rules_active gauge\n");
+        out.push_str(&format!(
+            "saacp_injection_rules_active {}\n",
+            snap.get("rulepack_active_rules").copied().unwrap_or(0)
+        ));
 
         // ── Trust Decay Engine ────────────────────────────────────────────────
         out.push_str("# HELP saacp_trust_penalties_total Trust Decay Engine penalties applied, by kind.\n");
@@ -1142,6 +1207,10 @@ impl TelemetryCollector {
         rst!(c.streams_started); rst!(c.streams_completed); rst!(c.streams_aborted);
         rst!(c.stream_frames_processed); rst!(c.stream_bytes_processed);
         rst!(c.epoch_rotations); rst!(c.key_rotations_total); rst!(c.psk_compromise_recoveries);
+        rst!(c.cluster_messages_rejected); rst!(c.cluster_leadership_changes);
+        rst!(c.rulepack_installs_total); rst!(c.rulepack_rejections_total);
+        rst!(c.rulepack_expirations_total); rst!(c.rulepack_active_rules);
+        rst!(c.cluster_members_failed);
         rst!(c.easi_encryptions); rst!(c.easi_decryptions);
         rst!(c.replay_attacks_blocked); rst!(c.psn_out_of_window);
         rst!(c.delegation_depth_exceeded); rst!(c.identity_binding_failed);
@@ -1312,6 +1381,29 @@ pub fn report_financial_rejection(agent_id: &str, estimated_cost: f64) {
         gate: GATE,
         bytecode: "BudgetExceeded".to_string(),
         estimated_cost: Some(estimated_cost),
+    });
+}
+
+/// Record a refused signed injection rule pack (`rulepack.rs`) to the live alert
+/// feed. The counter is bumped by `RulePackStore::install` itself so every entry
+/// point shares it; this adds the operator-visible event.
+///
+/// `reason` must be a `RulePackRejection::as_str()` value — a fixed, low-cardinality
+/// set that never contains a pattern, a pack id, or an issuer. `/api/alerts` is
+/// network-reachable, so the same CRIT-10 posture applies here as to
+/// `SecurityAlert`'s omission of `SAACPHardDrop::message`: a rejected push must not
+/// become an oracle for the active rule set. The `agent_id` slot carries the fixed
+/// string `"rulepack"` rather than a caller identity, since a rule pack arrives on
+/// the authenticated admin plane, not from an agent.
+pub fn report_rulepack_rejection(reason: &str) {
+    const GATE: &str = "rulepack_install";
+    global_telemetry().record_gate_rejection_bytecode(GATE, reason);
+    global_alert_feed().record(SecurityAlert {
+        timestamp: now_epoch_secs(),
+        agent_id: "rulepack".to_string(),
+        gate: GATE,
+        bytecode: format!("RulePackRejected:{reason}"),
+        estimated_cost: None,
     });
 }
 

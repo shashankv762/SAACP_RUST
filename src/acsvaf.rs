@@ -243,13 +243,79 @@ impl SignedCapabilityToken {
 // CapabilityIssuanceAuthority
 // ---------------------------------------------------------------------------
 
+/// Where a [`CapabilityIssuanceAuthority`]'s signing key lives.
+///
+/// Note this wraps the *authority*, not [`CapabilitySigningKey`] itself. That type
+/// exposes `signing_key`/`verifying_key` as public fields and offers an infallible
+/// `sign(&self) -> Signature`; giving it a hardware mode would mean either storing a
+/// dummy `SigningKey` in the public field — which callers reading it directly would use
+/// to produce signatures that fail verification — or making a public field optional,
+/// a breaking change. Wrapping one level up avoids both.
+///
+/// `clippy::large_enum_variant` is allowed deliberately: boxing `Local` would put the
+/// signing key behind an extra allocation and, more importantly, move it out of the
+/// `CapabilitySigningKey` value whose `Zeroize`/`Drop` impl is what wipes the secret
+/// scalar. A 488-vs-280-byte spread on a struct held one-per-authority (not per token)
+/// is not worth weakening that.
+#[allow(clippy::large_enum_variant)]
+enum IssuerKeySource {
+    Local(CapabilitySigningKey),
+    Hardware {
+        store: std::sync::Arc<dyn crate::hrt::HardwareKeyStore>,
+        key_id: String,
+        /// All three are cached at construction because the accessors below return
+        /// borrows, and because each would otherwise cost an HSM round-trip on a path
+        /// that issues tokens continuously.
+        verifying_key: VerifyingKey,
+        kid: String,
+        issuer_id: String,
+    },
+}
+
 pub struct CapabilityIssuanceAuthority {
-    signing_key: CapabilitySigningKey,
+    signing_key: IssuerKeySource,
 }
 
 impl CapabilityIssuanceAuthority {
     pub fn new(signing_key: CapabilitySigningKey) -> Self {
-        Self { signing_key }
+        Self { signing_key: IssuerKeySource::Local(signing_key) }
+    }
+
+    /// Build an authority that signs capability tokens with a hardware-held key.
+    ///
+    /// The capability signing key authorizes every action any agent is permitted to
+    /// take, so holding it in an HSM means a compromise of this process cannot yield a
+    /// key capable of minting arbitrary capabilities offline and indefinitely.
+    ///
+    /// The public key is fetched once here — an eager health check that surfaces a bad
+    /// key id or an unreachable HSM at construction rather than on the first token
+    /// issuance.
+    pub fn with_keystore(
+        store: std::sync::Arc<dyn crate::hrt::HardwareKeyStore>,
+        key_id: impl Into<String>,
+        kid: impl Into<String>,
+        issuer_id: impl Into<String>,
+    ) -> Result<Self, crate::hrt::HrtError> {
+        let key_id = key_id.into();
+        let public_key = store.public_key(&key_id)?;
+        let bytes: [u8; 32] = public_key.as_slice().try_into().map_err(|_| {
+            crate::hrt::HrtError::MalformedResponse {
+                backend: "capability issuance authority",
+                expected: 32,
+                got: public_key.len(),
+            }
+        })?;
+        let verifying_key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|_| crate::hrt::HrtError::MalformedKeyMaterial(key_id.clone()))?;
+        Ok(Self {
+            signing_key: IssuerKeySource::Hardware {
+                store,
+                key_id,
+                verifying_key,
+                kid: kid.into(),
+                issuer_id: issuer_id.into(),
+            },
+        })
     }
 
     /// Issue a signed capability token.
@@ -258,26 +324,54 @@ impl CapabilityIssuanceAuthority {
         claims: Map<String, Value>,
     ) -> Result<SignedCapabilityToken, SAACPHardDrop> {
         let json_bytes = serialize_sorted_json(&claims);
-        let sig = self.signing_key.sign(&json_bytes);
-        Ok(SignedCapabilityToken {
-            claims,
-            signature: sig.to_bytes(),
-        })
+        let signature: [u8; 64] = match &self.signing_key {
+            IssuerKeySource::Local(sk) => sk.sign(&json_bytes).to_bytes(),
+            IssuerKeySource::Hardware { store, key_id, .. } => {
+                let sig = store.sign(key_id, &json_bytes).map_err(|e| {
+                    // Fail closed: an HSM that cannot sign must block issuance, never
+                    // fall back to some other key. The operator-facing detail goes in
+                    // the message; `pecf.rs` strips it before anything reaches a peer.
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::AcsvafKeyNotTrusted,
+                        format!("capability signing key is unavailable: {e}"),
+                    )
+                })?;
+                sig.as_slice().try_into().map_err(|_| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::AcsvafKeyNotTrusted,
+                        format!(
+                            "hardware key store returned a {}-byte signature; Ed25519 requires 64",
+                            sig.len()
+                        ),
+                    )
+                })?
+            }
+        };
+        Ok(SignedCapabilityToken { claims, signature })
     }
 
     /// Get the public key for distribution.
     pub fn public_key(&self) -> &VerifyingKey {
-        &self.signing_key.verifying_key
+        match &self.signing_key {
+            IssuerKeySource::Local(sk) => &sk.verifying_key,
+            IssuerKeySource::Hardware { verifying_key, .. } => verifying_key,
+        }
     }
 
     /// Get the key ID.
     pub fn kid(&self) -> &str {
-        &self.signing_key.kid
+        match &self.signing_key {
+            IssuerKeySource::Local(sk) => &sk.kid,
+            IssuerKeySource::Hardware { kid, .. } => kid,
+        }
     }
 
     /// Get issuer ID.
     pub fn issuer_id(&self) -> &str {
-        &self.signing_key.issuer_id
+        match &self.signing_key {
+            IssuerKeySource::Local(sk) => &sk.issuer_id,
+            IssuerKeySource::Hardware { issuer_id, .. } => issuer_id,
+        }
     }
 }
 

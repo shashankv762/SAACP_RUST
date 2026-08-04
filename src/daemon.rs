@@ -336,6 +336,21 @@ pub struct SAACPNetworkDaemon {
     /// than adding a gossip-specific gate or special-casing schema 11 inside `handler.rs`'s
     /// gate pipeline itself.
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    /// Opt-in Active-Active cluster membership mesh (`cluster.rs`). `None` preserves
+    /// today's exact behavior: a schema_id=12 `Cluster Envelope` packet still passes Gate
+    /// 0 through Gate 12.0 like any other packet (schema 12 is a real, already-registered
+    /// schema — see `schemas.rs`), but nothing acts on its contents. `Some` (via
+    /// `with_cluster_engine`) additionally hands the envelope to
+    /// `cluster::ClusterEngine::receive_envelope` once the packet has cleared the full
+    /// gate pipeline — the same dispatch point the `gossip` field above uses, and for the
+    /// same reason.
+    ///
+    /// Note the layered authentication: clearing the gate pipeline proves the *packet*
+    /// was well-formed and from an authenticated session, but grants a peer nothing at
+    /// the cluster layer. `receive_envelope` independently verifies the message's own
+    /// Ed25519 signature against the cluster `TrustStore` and enforces roster membership,
+    /// freshness, and replay protection before a single field reaches the membership view.
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 }
 
 impl SAACPNetworkDaemon {
@@ -353,6 +368,7 @@ impl SAACPNetworkDaemon {
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
             gossip: None,
+            cluster: None,
         }
     }
 
@@ -452,6 +468,21 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// Opt in to the Active-Active cluster membership mesh (see the `cluster` field doc
+    /// comment). The caller constructs the `ClusterEngine` itself (wiring its own
+    /// `ClusterTransport`, `AgentIdentity`, and `TrustStore` — see `cluster.rs`'s module
+    /// docs) since those are deployment-specific; this daemon only needs to know where to
+    /// hand off an inbound schema_id=12 envelope once it clears the gate pipeline.
+    ///
+    /// Does not itself start the failure detector — call `ClusterEngine::start` separately
+    /// on the same `Arc<ClusterEngine>`, mirroring `with_gossip_engine`'s split of engine
+    /// construction from background-thread startup. Without it this daemon accepts
+    /// membership messages but never detects a dead peer or elects a leader.
+    pub fn with_cluster_engine(mut self, engine: Arc<crate::cluster::ClusterEngine>) -> Self {
+        self.cluster = Some(engine);
+        self
+    }
+
     /// Start listening for connections. Runs forever (until the process is killed) —
     /// equivalent to `start_with_shutdown` with a token that's never cancelled. M-37
     /// fix: returns `Result` (propagates a bind failure) instead of panicking.
@@ -517,6 +548,7 @@ impl SAACPNetworkDaemon {
                             let on_delivered  = self.on_delivered.clone();
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip        = self.gossip.clone();
+                            let cluster       = self.cluster.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -528,7 +560,7 @@ impl SAACPNetworkDaemon {
                                 let _conn_count_guard = crate::telemetry::ConnectionCountGuard::tcp();
                                 handle_client(
                                     stream, peer_addr, cbs, secret, seed,
-                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip,
+                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                 ).await;
                             });
                         }
@@ -610,6 +642,8 @@ pub(crate) async fn handle_client<S>(
     server_agent_id: Option<String>,
     // Phase 6 / item 4: see the `gossip` field doc comment on `SAACPNetworkDaemon`.
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    // Active-Active clustering: see the `cluster` field doc comment on `SAACPNetworkDaemon`.
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 )
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -976,6 +1010,35 @@ where
                 // comment.
                 if parsed.schema_id == 10 {
                     crate::ievl::handle_execution_receipt(&parsed);
+                }
+                // Active-Active clustering (`cluster.rs`): a schema_id=12 packet that
+                // cleared the full gate pipeline is a `Cluster Envelope` — hand it to the
+                // configured `ClusterEngine`. Mirrors the schema_id=11 gossip dispatch
+                // above; see the `cluster` field doc comment for why clearing the gate
+                // pipeline is necessary but not sufficient here (the engine re-verifies
+                // the message's own signature, roster membership, freshness, and replay
+                // window independently).
+                if let Some(engine) = cluster.as_ref() {
+                    if parsed.schema_id == crate::cluster::CLUSTER_SCHEMA_ID {
+                        if let Some((blob, sender, epoch, kind)) =
+                            decode_cluster_envelope(&parsed.payload_dict)
+                        {
+                            if let Err(reason) =
+                                engine.receive_envelope(&blob, &sender, epoch, &kind)
+                            {
+                                // Rejections are logged, never answered — replying would
+                                // give an attacker an oracle for which defense fired, and
+                                // the sender is not a trusted party by definition. The
+                                // `cluster_messages_rejected` counter is incremented by
+                                // `receive_envelope` itself, so every transport gets it.
+                                eprintln!(
+                                    "[SAACP Daemon] Cluster message from '{}' rejected: {}",
+                                    sender,
+                                    reason.as_str(),
+                                );
+                            }
+                        }
+                    }
                 }
                 // Update pinning state
                 if pinned_agent.is_none() && !parsed.source_agent.is_empty() {
@@ -1504,6 +1567,41 @@ fn decode_gossip_envelope(payload_dict: &HashMap<String, JsonValue>) -> Option<c
     let record = crate::faitf::SignedRevocationRecord::from_wire(&wire).ok()?;
 
     Some(crate::gossip::GossipEnvelope { record, hop_count, origin_id, revocation_id })
+}
+
+/// Decode a schema_id=12 (`Cluster Envelope`, `schemas.rs`) packet's already-validated
+/// `payload_dict` into `(cluster_message, sender_id, leader_epoch, message_kind)`.
+///
+/// Like `decode_gossip_envelope` above, `PreCompiledSchemas::validate_payload` has already
+/// confirmed all four keys are present by the time this runs, so this only handles type
+/// coercion from loosely-typed `JsonValue`s. Returns `None` on any type mismatch — a
+/// malformed envelope from a misbehaving or malicious peer must never disrupt this
+/// connection's otherwise-successful packet delivery.
+///
+/// The signed blob is deliberately **not** decoded here: `sender_id`/`leader_epoch`/
+/// `message_kind` are plaintext routing hints only, and `ClusterEngine::receive_envelope`
+/// rejects the message outright if they disagree with the signed body.
+fn decode_cluster_envelope(
+    payload_dict: &HashMap<String, JsonValue>,
+) -> Option<(String, String, u64, String)> {
+    let cluster_message = match payload_dict.get("cluster_message") {
+        Some(JsonValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+    let sender_id = match payload_dict.get("sender_id") {
+        Some(JsonValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+    let leader_epoch = match payload_dict.get("leader_epoch") {
+        Some(JsonValue::Number(n)) if *n >= 0.0 && *n <= u64::MAX as f64 => *n as u64,
+        _ => return None,
+    };
+    let message_kind = match payload_dict.get("message_kind") {
+        Some(JsonValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+
+    Some((cluster_message, sender_id, leader_epoch, message_kind))
 }
 
 async fn send_hard_drop<S>(stream: &mut S, bc: SAACPBytecodes, _msg: &str)

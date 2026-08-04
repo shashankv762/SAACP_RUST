@@ -23,7 +23,7 @@ struct SchemaDefinition {
     additional_fields: &'static [&'static str],
 }
 
-/// Static schema registry (IDs 0-11).
+/// Static schema registry (IDs 0-12).
 const SCHEMAS: &[SchemaDefinition] = &[
     SchemaDefinition { id: 0, name: "Raw Binary", required_keys: &[], additional_fields: &[] },
     SchemaDefinition { id: 1, name: "Task", required_keys: &["task", "priority"], additional_fields: &[] },
@@ -45,6 +45,14 @@ const SCHEMAS: &[SchemaDefinition] = &[
     // JSON, so only the envelope wrapper fields are schema-validated here — the
     // `gossip_record` payload's own signature is verified by `gossip::GossipEngine`.
     SchemaDefinition { id: 11, name: "Gossip Envelope", required_keys: &["gossip_record", "hop_count", "origin_id", "revocation_id"], additional_fields: &[] },
+    // Cluster envelope (Active-Active Clustering & Failover, `cluster.rs`): carries a
+    // pre-signed `ClusterMessage` wire blob. Only the envelope wrapper is validated
+    // here — the `cluster_message` payload's own Ed25519 signature is verified by
+    // `cluster::ClusterEngine::receive_envelope`, which additionally cross-checks that
+    // `sender_id`/`leader_epoch`/`message_kind` (duplicated outside the signature so the
+    // daemon can route without parsing the blob) agree with the signed body, and rejects
+    // the message if they disagree. Mirrors schema 11's signed-blob-in-a-string design.
+    SchemaDefinition { id: 12, name: "Cluster Envelope", required_keys: &["cluster_message", "sender_id", "leader_epoch", "message_kind"], additional_fields: &[] },
 ];
 
 /// Pre-compiled JSON schema validation registry.

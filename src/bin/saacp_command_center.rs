@@ -29,6 +29,14 @@
 //!                                 allowlist (default: http://localhost:3000,
 //!                                 http://127.0.0.1:3000). Set to empty to disable all
 //!                                 cross-origin browser access (fail-closed).
+//!   SAACP_RULEPACK_ISSUER      — issuer id signed rule packs must claim. Required
+//!                                 (with SAACP_RULEPACK_KEY) to enable
+//!                                 POST /api/rules/reload; unset ⇒ every push is
+//!                                 refused with `no_trust_anchor`.
+//!   SAACP_RULEPACK_KEY         — hex-encoded 32-byte Ed25519 PUBLIC key that must have
+//!                                 signed any accepted rule pack. Read once at startup
+//!                                 and never re-read: changing who may push injection
+//!                                 rules requires a restart, by design.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,9 +72,45 @@ fn read_dashboard_token() -> [u8; 32] {
     parse_secret(&raw)
 }
 
+/// Provision the one Ed25519 key allowed to sign injection rule packs
+/// (`rulepack.rs`), from `SAACP_RULEPACK_KEY` (hex, 32 bytes) plus
+/// `SAACP_RULEPACK_ISSUER`. Both must be set or nothing is provisioned and
+/// `POST /api/rules/reload` refuses every push with `no_trust_anchor` — the
+/// fail-closed default, never "unconfigured means unrestricted".
+///
+/// Deliberately read exactly once here, at startup, and never re-read: the
+/// authority over injection rules must require a full re-provisioning restart to
+/// change, which is what makes hot-reloading the *rules* compatible with
+/// Architecture Principle #3/#4 (see `rulepack.rs`'s module doc).
+fn provision_rulepack_anchor() {
+    let (Ok(issuer), Ok(key_hex)) = (
+        std::env::var("SAACP_RULEPACK_ISSUER"),
+        std::env::var("SAACP_RULEPACK_KEY"),
+    ) else {
+        eprintln!(
+            "[SAACP Command Center] No rule-pack trust anchor configured \
+             (set SAACP_RULEPACK_ISSUER + SAACP_RULEPACK_KEY to enable \
+             POST /api/rules/reload); Gate 4.0 uses the built-in signature baseline"
+        );
+        return;
+    };
+    let bytes = hex::decode(key_hex.trim())
+        .unwrap_or_else(|e| panic!("SAACP_RULEPACK_KEY is not valid hex: {e}"));
+    let key_bytes = <[u8; 32]>::try_from(bytes.as_slice())
+        .unwrap_or_else(|_| panic!("SAACP_RULEPACK_KEY must decode to exactly 32 bytes"));
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+        .unwrap_or_else(|e| panic!("SAACP_RULEPACK_KEY is not a valid Ed25519 public key: {e}"));
+
+    saacp::rulepack::RulePackStore::global().provision_trust_anchor(&issuer, verifying_key);
+    saacp::telemetry::global_telemetry()
+        .set_rulepack_active_rules(saacp::handler::builtin_injection_patterns().len() as u64);
+    eprintln!("[SAACP Command Center] Rule-pack trust anchor provisioned for issuer '{issuer}'");
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let dashboard_token = read_dashboard_token();
+    provision_rulepack_anchor();
 
     let listen_addr: SocketAddr = env_or("SAACP_COMMAND_CENTER_ADDR", "127.0.0.1:9090")
         .parse()
@@ -164,7 +208,11 @@ async fn main() -> std::io::Result<()> {
                 // `revoked_tokens` doc). Same global-singleton wiring rationale as
                 // the four sweepers above.
                 let _ = saacp::gateway::ZeroTrustGateway::global().prune_expired_revocations();
-            });
+            })
+            // Drop an active signed rule pack once its `valid_until` passes, so a
+            // pack signed with a since-rotated key stops applying without an
+            // operator action. Cheap no-op when no pack is installed.
+            .with_rulepack();
         if mace_enabled {
             coordinator.with_custom("mace_global", saacp::mace::sweep_and_enforce)
         } else {

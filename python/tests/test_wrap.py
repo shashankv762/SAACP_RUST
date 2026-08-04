@@ -11,10 +11,12 @@ Run from the ``python/`` directory: ``python -m unittest tests.test_wrap -v``
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import time
 import unittest
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -134,6 +136,9 @@ class WrapEndToEndTests(unittest.TestCase):
             default_peer="py-tool-peer",
             saacp_listen_addr=f"127.0.0.1:{tool_saacp_port}",
             http_listen_addr=f"127.0.0.1:{tool_http_port}",
+            # SC-6: wrapping a tool-shaped object replaces its return value with a
+            # SendResult, so the caller must acknowledge those semantics explicitly.
+            fire_and_forget=True,
         )
         self.assertIsInstance(secured, SecuredCallable)
 
@@ -145,6 +150,77 @@ class WrapEndToEndTests(unittest.TestCase):
             "peer never received the task",
         )
         self.assertEqual(peer_agent.received, [("please do the task", "py-tool-caller")])
+
+
+class WrapContractTests(unittest.TestCase):
+    """SC-2 / SC-6: the two places `wrap()` used to silently downgrade something.
+
+    These need no sidecar binary — they assert `wrap()` refuses *before* it would
+    reach out to one, which is exactly the point of both fixes.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.pop(k, None)
+            for k in (
+                "SAACP_TOKEN_SECRET",
+                "SAACP_ALLOW_EPHEMERAL_SECRET",
+                "SAACP_FIRE_AND_FORGET",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_missing_secret_raises_instead_of_generating_ephemeral(self):
+        """SC-2: an ephemeral secret silently isolates the agent from every
+        separately-started peer. A `print()` is not a signal a container runtime or
+        unattended deployment is guaranteed to surface, so this must fail closed.
+        """
+        with self.assertRaises(SaacpError) as ctx:
+            wrap(lambda x: x, agent_id="a", auto_start=False, fire_and_forget=True)
+        self.assertIn("ephemeral", str(ctx.exception))
+
+    def test_ephemeral_secret_opt_in_warns_through_warnings_module(self):
+        """SC-2: when explicitly opted into, the downgrade is still signalled — but
+        via `warnings` (capturable, routable to logs), not a bare print to stdout.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            wrap(
+                lambda x: x,
+                agent_id="a",
+                allow_ephemeral_secret=True,
+                auto_start=False,
+                fire_and_forget=True,
+            )
+        self.assertTrue(
+            any(issubclass(w.category, RuntimeWarning) for w in caught),
+            "the ephemeral-secret downgrade must emit a capturable RuntimeWarning",
+        )
+
+    def test_tool_shape_requires_explicit_fire_and_forget(self):
+        """SC-6: wrapping a tool swaps its return value for a `SendResult`. Code
+        doing `answer = tool(q)` would keep running against a value the tool never
+        produced, so the caller must acknowledge the changed contract.
+        """
+        with self.assertRaises(TypeError) as ctx:
+            wrap(lambda x: x, agent_id="a", secret=b"\x33" * 32, auto_start=False)
+        self.assertIn("fire_and_forget=True", str(ctx.exception))
+
+    def test_conversable_shape_is_unaffected_by_fire_and_forget(self):
+        """SC-6 applies only to tool-shaped inputs — `.send()/.receive()` agents are
+        already message-passing, so their contract is unchanged and they must not be
+        forced to pass the flag.
+        """
+        agent = FakeConversableAgent()
+        # `auto_start=False` avoids needing a real sidecar; no send is issued here.
+        result = wrap(agent, agent_id="a", secret=b"\x44" * 32, auto_start=False)
+        self.assertIs(result, agent)
 
 
 if __name__ == "__main__":

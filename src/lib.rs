@@ -8,9 +8,11 @@ pub mod aegf;
 pub mod faitf;
 pub mod factf;
 pub mod gossip;
+pub mod cluster;
 pub mod pecf;
 pub mod klms;
 pub mod handler;
+pub mod rulepack;
 pub mod gateway;
 pub mod cscs;
 pub mod crypto_governance;
@@ -133,6 +135,13 @@ pub use handler::{
     SAACPProtocolHandler, GATE_EXECUTION_BUDGET_SECONDS,
     EPISTEMIC_THRESHOLD, EPISTEMIC_CLAIMED_CONFIDENCE_MAX, INTENT_MIN_OVERLAP,
     MANDATORY_GATES, serde_value_to_json_value,
+    builtin_injection_patterns, normalize_scan_window,
+};
+pub use rulepack::{
+    InjectionRule, RulePack, RulePackRejection, RulePackStatus, RulePackStore,
+    CompiledRuleSet, active_ruleset, install_from_json,
+    MAX_RULES_PER_PACK, MAX_PATTERN_LEN, MAX_RULE_ID_LEN,
+    MIN_NORMALIZED_PATTERN_LEN, MAX_PACK_LIFETIME_SECS, RULEPACK_FORMAT,
 };
 pub use gateway::{
     ZeroTrustGateway, AgentRateLimiter, DelegationGuard,
@@ -229,9 +238,34 @@ pub use daemon::{
     MAX_ASSEMBLY_TIME, MAX_CIRCUIT_BREAKER_IPS, HANDSHAKE_TIMEOUT_SECS,
     IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS,
 };
+pub use cluster::{
+    ClusterConfig, ClusterEngine, ClusterMessage, ClusterMessageKind, ClusterRejection,
+    ClusterTransport, LeadershipChange, MemberRecord, MemberUpdate, NodeState,
+    StaticClusterTransport, TickOutcome,
+    CLUSTER_MAX_CLOCK_SKEW, CLUSTER_MAX_MEMBERS, CLUSTER_SCHEMA_ID,
+    DEFAULT_DEAD_TIMEOUT, DEFAULT_LEASE_TTL, DEFAULT_MESSAGE_MAX_AGE, DEFAULT_SUSPECT_TIMEOUT,
+    LEASE_KEY_PREFIX,
+};
 pub use easi::EasiEncryptor;
-pub use telemetry::{TelemetryCollector, global_telemetry, GLOBAL_TELEMETRY};
-pub use hrt::{HardwareKeyStore, SoftwareKeyStore, HrtError};
+pub use telemetry::{
+    TelemetryCollector, global_telemetry, GLOBAL_TELEMETRY,
+    report_rulepack_rejection,
+};
+pub use hrt::{
+    HardwareKeyStore, SoftwareKeyStore, HrtError,
+    ed25519_public_key_from_spki,
+    ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN, ED25519_SPKI_PREFIX,
+};
+/// PKCS#11 (Cryptoki) hardware token / network HSM key store — on-premise HSMs
+/// (Thales, Entrust, Utimaco, YubiHSM) and SoftHSM2.
+#[cfg(feature = "hrt-pkcs11")]
+pub use hrt::pkcs11::Pkcs11KeyStore;
+/// AWS KMS key store (`ECC_NIST_EDWARDS25519` keys).
+#[cfg(feature = "hrt-aws-kms")]
+pub use hrt::aws_kms::AwsKmsKeyStore;
+/// Google Cloud KMS key store (`EC_SIGN_ED25519` key versions).
+#[cfg(feature = "hrt-gcp-kms")]
+pub use hrt::gcp_kms::GcpKmsKeyStore;
 pub use type_state::PipelineToken;
 pub use sid::{SemanticInjectionDefense, SID_THRESHOLD};
 pub use sid::{

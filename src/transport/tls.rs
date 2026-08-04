@@ -124,6 +124,8 @@ pub struct SAACPTlsDaemon {
     server_agent_id: Option<String>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 }
 
 impl SAACPTlsDaemon {
@@ -150,6 +152,7 @@ impl SAACPTlsDaemon {
             on_delivered: None,
             server_agent_id: None,
             gossip: None,
+            cluster: None,
         }
     }
 
@@ -203,6 +206,13 @@ impl SAACPTlsDaemon {
     /// `SAACPNetworkDaemon::with_gossip_engine` — identical semantics.
     pub fn with_gossip_engine(mut self, engine: Arc<crate::gossip::GossipEngine>) -> Self {
         self.gossip = Some(engine);
+        self
+    }
+
+    /// Opt in to the Active-Active cluster membership mesh. See
+    /// `SAACPNetworkDaemon::with_cluster_engine` — identical semantics.
+    pub fn with_cluster_engine(mut self, engine: Arc<crate::cluster::ClusterEngine>) -> Self {
+        self.cluster = Some(engine);
         self
     }
 
@@ -291,12 +301,13 @@ impl SAACPTlsDaemon {
                             let on_delivered    = self.on_delivered.clone();
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip          = self.gossip.clone();
+                            let cluster         = self.cluster.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
                                 serve_tls_connection(
                                     stream, peer_addr, tls_acceptor, cbs, secret, seed,
-                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip,
+                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                 ).await;
                             });
                         }
@@ -355,6 +366,7 @@ async fn serve_tls_connection(
     on_delivered: Option<Arc<dyn Fn(ParsedPacket) + Send + Sync>>,
     server_agent_id: Option<String>,
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
+    cluster: Option<Arc<crate::cluster::ClusterEngine>>,
 ) {
     // H-18-equivalent fix: bound the TLS handshake itself, so a peer that opens the TCP
     // socket and then never completes (or trickles) ClientHello cannot hold a spawned task
@@ -386,6 +398,7 @@ async fn serve_tls_connection(
         on_delivered,
         server_agent_id,
         gossip,
+        cluster,
     )
     .await;
 }

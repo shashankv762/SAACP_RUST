@@ -62,7 +62,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
@@ -84,9 +84,37 @@ use crate::security::ImmutableAuditLog;
 use crate::MAX_PAYLOAD_SIZE;
 
 /// Bounded inbox capacity — matches this codebase's existing bounded-queue idiom (e.g.
-/// `AUDIT_WAL_QUEUE_CAPACITY` in `security.rs`) rather than an unbounded channel. A sidecar
-/// whose local Python agent stops polling `/receive` will start dropping the oldest-pending
-/// deliveries once this fills, rather than growing memory without bound.
+/// `AUDIT_WAL_QUEUE_CAPACITY` in `security.rs`) rather than an unbounded channel.
+///
+/// ## Delivery contract (`/receive`)
+///
+/// These are protocol guarantees the local agent may rely on, not incidental
+/// behavior — a multi-hop agent delegation chain treats message order as a
+/// correctness property, so it has to be stated rather than inferred:
+///
+/// - **Ordering: strict FIFO.** Messages are handed to `/receive` in the exact
+///   order the gate pipeline delivered them, backed by a single
+///   `tokio::sync::mpsc` channel with one consumer. `/receive` is
+///   single-consumer by construction (a concurrent second call gets `409
+///   CONFLICT` rather than interleaving — see `Inbox::try_recv_permit`), so
+///   two pollers can never reorder the stream between them.
+///
+///   Note this orders *deliveries into this sidecar*, which is not the same as
+///   the peer's send order: each `/send` opens its own one-shot connection (see
+///   the module doc), so concurrent sends from one peer can land in any order.
+///   Ordering is guaranteed from the delivery point onward, not end to end.
+///
+/// - **Capacity: bounded, newest-dropped.** Once `SIDECAR_INBOX_CAPACITY`
+///   undelivered messages are queued, further arrivals are **dropped on
+///   arrival** — the already-queued backlog is preserved and the *newest*
+///   message is discarded (`mpsc::Sender::try_send` rejects rather than
+///   evicting). An earlier version of this comment claimed the oldest-pending
+///   delivery was dropped; that was never what the code did.
+///
+/// - **Drops are observable.** Every dropped delivery increments a counter
+///   surfaced as `inbox_dropped` on `/healthz`, so a local agent that stops
+///   polling long enough to lose messages can detect it rather than silently
+///   missing work.
 pub const SIDECAR_INBOX_CAPACITY: usize = 1000;
 
 /// Upper bound on `/receive?wait_secs=N` long-poll duration, so a slow/idle caller can't
@@ -576,6 +604,11 @@ struct SidecarState {
     allow_private_targets: bool,
     /// M-22 fix — see `SidecarConfig::http_bearer_token`.
     http_bearer_token: Option<String>,
+    /// Count of inbound deliveries dropped because the inbox was at
+    /// `SIDECAR_INBOX_CAPACITY` (see its "Delivery contract" doc). Surfaced on
+    /// `/healthz` as `inbox_dropped` so a local agent that stopped polling long
+    /// enough to lose messages can actually detect the loss.
+    inbox_dropped: Arc<AtomicU64>,
     /// Set `false` if the inner SAACP protocol listener (`daemon.rs`) exits with an
     /// error (e.g. its TCP bind failed). Without this, a dead protocol listener left
     /// the sidecar serving HTTP while silently unable to receive any peer traffic, and
@@ -670,6 +703,12 @@ struct ReceiveQuery {
 }
 fn default_wait_secs() -> f64 { 5.0 }
 
+/// Long-poll for the next delivered message.
+///
+/// Delivery is strict FIFO and single-consumer: a second concurrent call gets
+/// `409 CONFLICT` rather than interleaving with the first. See
+/// `SIDECAR_INBOX_CAPACITY`'s "Delivery contract" for the full ordering and
+/// capacity guarantees this endpoint provides.
 async fn handle_receive(
     State(state): State<Arc<SidecarState>>,
     Query(q): Query<ReceiveQuery>,
@@ -699,6 +738,10 @@ async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Response {
         "agent_id": state.agent_id,
         "inbox_depth": state.inbox.len().await,
         "inbox_capacity": state.inbox_capacity,
+        // Lifetime count of deliveries dropped because the inbox was full. A
+        // non-zero value means this agent has permanently missed messages —
+        // see `SIDECAR_INBOX_CAPACITY`'s delivery contract.
+        "inbox_dropped": state.inbox_dropped.load(Ordering::Relaxed),
         "peers_configured": state.peer_secrets.len(),
     });
     let code = if protocol_healthy {
@@ -781,6 +824,8 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
             });
     }
 
+    let inbox_dropped = Arc::new(AtomicU64::new(0));
+    let delivery_dropped = Arc::clone(&inbox_dropped);
     let daemon = SAACPNetworkDaemon::new(
         &config.saacp_listen_addr.ip().to_string(),
         config.saacp_listen_addr.port(),
@@ -792,8 +837,13 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
             if let Some(msg) = DeliveredMessage::from_parsed(&parsed) {
                 // Synchronous, non-blocking — called from inside `spawn_blocking` (see
                 // `SAACPNetworkDaemon`'s `on_delivered` field doc comment). A full inbox
-                // drops the message rather than blocking the gate-pipeline thread.
-                let _ = tx.try_send(msg);
+                // drops the NEWEST message (preserving the queued backlog) rather than
+                // blocking the gate-pipeline thread — see `SIDECAR_INBOX_CAPACITY`'s
+                // delivery contract. Counted so the loss is visible on `/healthz`
+                // instead of silent.
+                if tx.try_send(msg).is_err() {
+                    delivery_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }));
 
@@ -823,6 +873,7 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
         allow_private_targets: config.allow_private_targets,
         http_bearer_token: config.http_bearer_token,
         protocol_listener_healthy,
+        inbox_dropped,
     });
 
     // M-22 fix: `/send`/`/receive` sit behind bearer-token auth (opt-in, see

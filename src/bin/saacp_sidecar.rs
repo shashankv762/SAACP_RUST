@@ -4,19 +4,47 @@
 //! itself carries no assumptions about deployment shape (systemd unit, container, plain
 //! shell). See `src/sidecar.rs` for what each address/secret is used for.
 //!
+//! ## Choosing an authentication mode (read this first)
+//!
+//! Capability tokens are authenticated with symmetric HMAC, so **whoever can verify a
+//! token can also mint one**. That makes the choice between the two modes below a
+//! security decision, not a deployment convenience:
+//!
+//! - **Per-peer secrets (`SAACP_PEER_SECRETS_FILE`) — recommended.** Each peer gets its
+//!   own pairwise secret, so compromising one sidecar does not let the attacker forge
+//!   messages from any *other* agent in the mesh. Registering any peer makes the registry
+//!   authoritative: unknown issuers are hard-rejected with no shared-secret fallback.
+//! - **Single shared mesh secret (`SAACP_TOKEN_SECRET`) — v1 default, weakest.** One
+//!   32-byte value is held by *every* sidecar in the mesh. Any one of them (or anyone who
+//!   reads the secret from any one host) can impersonate any agent, and the audit trail
+//!   cannot distinguish the real sender from the forger. This is exactly the
+//!   "every verifier can also forge" property Ed25519 was adopted in the core to
+//!   eliminate. Acceptable only for single-tenant dev/test meshes where every peer is
+//!   already fully trusted.
+//!
+//! Running on the shared secret with no per-peer entries logs a startup warning. Set
+//! `SAACP_REQUIRE_PEER_SECRETS=1` to make that configuration a hard startup failure
+//! instead — the fail-closed posture for production.
+//!
 //! Environment variables:
 //!   SAACP_AGENT_ID            — this sidecar's agent identity (required)
 //!   SAACP_TOKEN_SECRET        — base64-encoded 32-byte shared mesh secret (required
-//!                               unless SAACP_TOKEN_SECRET_FILE is set)
+//!                               unless SAACP_TOKEN_SECRET_FILE is set). Shared by every
+//!                               sidecar in the mesh, so any holder can forge any
+//!                               agent's messages — see the mode comparison above.
 //!   SAACP_TOKEN_SECRET_FILE   — path to a file containing the base64 secret instead of
 //!                               passing it directly via env (avoids the secret being
 //!                               visible via /proc/<pid>/environ or process listings).
 //!                               Takes precedence over SAACP_TOKEN_SECRET if both are set.
-//!   SAACP_PEER_SECRETS_FILE   — optional path to a JSON file
+//!   SAACP_PEER_SECRETS_FILE   — RECOMMENDED. Path to a JSON file
 //!                               {"peer-agent-id": "<base64 32 bytes>", ...} of pairwise
 //!                               per-peer secrets (see sidecar.rs's "per-peer issuer
-//!                               secrets" doc section). Omitted = today's single-shared-
-//!                               secret mesh, unchanged.
+//!                               secrets" doc section). Confines forgery to a single
+//!                               compromised pair instead of the whole mesh. Omitted =
+//!                               the weaker single-shared-secret mode.
+//!   SAACP_REQUIRE_PEER_SECRETS=1 — refuse to start unless SAACP_PEER_SECRETS_FILE
+//!                               supplies at least one peer. Turns the shared-secret
+//!                               warning into a hard failure (fail-closed).
 //!   SAACP_LISTEN_ADDR         — address the real SAACP protocol listener binds
 //!                               (default: 127.0.0.1:7443)
 //!   SAACP_HTTP_ADDR           — address the local plain-HTTP/JSON API binds
@@ -77,7 +105,7 @@ fn read_token_secret() -> [u8; 32] {
 }
 
 /// Optional per-peer pairwise secrets — see `sidecar.rs`'s module doc. Absent env var =
-/// empty map = today's single-shared-secret behavior, unchanged.
+/// empty map = the weaker single-shared-secret mode (see this module's doc).
 fn read_peer_secrets() -> HashMap<String, [u8; 32]> {
     let Ok(path) = std::env::var("SAACP_PEER_SECRETS_FILE") else {
         return HashMap::new();
@@ -90,6 +118,41 @@ fn read_peer_secrets() -> HashMap<String, [u8; 32]> {
         .into_iter()
         .map(|(agent_id, secret_b64)| (agent_id, parse_token_secret(&secret_b64)))
         .collect()
+}
+
+/// SC-1: a mesh running on one shared symmetric secret gives every sidecar the power to
+/// forge every other agent's messages — the exact "every verifier can also forge"
+/// property the core adopted Ed25519 to eliminate. `SAACP_PEER_SECRETS_FILE` is the real
+/// fix, so an operator who hasn't configured it must be told, on the default path,
+/// rather than discovering it buried in a hardening section.
+///
+/// `SAACP_REQUIRE_PEER_SECRETS=1` upgrades that warning to a hard startup failure, which
+/// is the correct posture for a production mesh: fail closed instead of silently running
+/// mesh-wide-forgeable.
+fn enforce_peer_secret_posture(peer_secrets: &HashMap<String, [u8; 32]>, agent_id: &str) {
+    if !peer_secrets.is_empty() {
+        return;
+    }
+    let required = matches!(
+        std::env::var("SAACP_REQUIRE_PEER_SECRETS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    if required {
+        panic!(
+            "SAACP_REQUIRE_PEER_SECRETS is set but no per-peer secrets were supplied — \
+             refusing to start '{agent_id}' on a single shared mesh secret, where any \
+             sidecar in the mesh can forge messages from any agent. Set \
+             SAACP_PEER_SECRETS_FILE to a JSON map of per-peer pairwise secrets."
+        );
+    }
+    eprintln!(
+        "[saacp-sidecar] WARNING: '{agent_id}' is running on the single shared mesh \
+         secret (SAACP_TOKEN_SECRET). Capability tokens are symmetric-HMAC, so EVERY \
+         sidecar holding this secret can forge messages from ANY agent, and the audit \
+         trail cannot tell a forgery from the real sender. Set SAACP_PEER_SECRETS_FILE \
+         to give each peer its own pairwise secret, or SAACP_REQUIRE_PEER_SECRETS=1 to \
+         make this configuration a hard startup failure."
+    );
 }
 
 /// Bearer token for the local HTTP API. `SAACP_HTTP_BEARER_TOKEN_FILE` (if set)
@@ -155,6 +218,7 @@ async fn main() {
         .unwrap_or_else(|_| panic!("SAACP_AGENT_ID environment variable is required"));
     let token_issuer_secret = read_token_secret();
     let peer_secrets = read_peer_secrets();
+    enforce_peer_secret_posture(&peer_secrets, &agent_id);
 
     let saacp_listen_addr: SocketAddr = env_or("SAACP_LISTEN_ADDR", "127.0.0.1:7443")
         .parse()
@@ -280,7 +344,16 @@ async fn main() {
                 // `revoked_tokens` doc). Same global-singleton wiring rationale as
                 // the four sweepers above.
                 let _ = saacp::gateway::ZeroTrustGateway::global().prune_expired_revocations();
-            });
+            })
+            // Drop an installed injection rule pack once its `valid_until` passes.
+            // The sidecar exposes no `/api/rules/reload` route, so no pack can be
+            // pushed *here* today — but `RulePackStore` is a process-global, and
+            // anything that installs one in-process (embedding this binary's
+            // modules, or a future sidecar reload route) would otherwise keep an
+            // expired pack active forever, since expiry is swept and never checked
+            // on the scan path. Registering it unconditionally costs one atomic
+            // load per 60s cycle when no pack is installed.
+            .with_rulepack();
         if mace_enabled {
             coordinator.with_custom("mace_global", saacp::mace::sweep_and_enforce)
         } else {

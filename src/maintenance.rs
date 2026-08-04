@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::cluster::ClusterEngine;
 use crate::faitf::IdentityProver;
 use crate::gossip::GossipEngine;
 use crate::ievl::IevlEngine;
@@ -181,6 +182,34 @@ impl MaintenanceCoordinator {
     pub fn with_checkpointed_session(self, session: Arc<CheckpointedSession>) -> Self {
         self.with_custom("checkpointed_session", move || {
             let _ = session.sweep_expired();
+        })
+    }
+
+    /// Register `engine.sweep_expired()` (removal of cluster members that have been
+    /// `Dead`/`Left` for longer than the configured dead-timeout, plus their replay
+    /// high-water entries) to run on every sweep cycle.
+    ///
+    /// Deliberately registers the *sweep*, not `ClusterEngine::tick`: this coordinator
+    /// runs on a 60s cadence, which is far too slow for a failure detector. Run `tick` on
+    /// its own thread via `ClusterEngine::start`.
+    pub fn with_cluster(self, engine: Arc<ClusterEngine>) -> Self {
+        self.with_custom("cluster", move || {
+            let _ = engine.sweep_expired();
+        })
+    }
+
+    /// Register the signed injection rule-pack store (`rulepack.rs`) so an active
+    /// pack whose `valid_until` has passed is dropped and the process reverts to
+    /// the compiled-in signature baseline.
+    ///
+    /// Expiry is swept here rather than checked inside Gate 4.0 because that gate
+    /// is the per-packet hot path and a wall-clock read per scan would cost more
+    /// than the check is worth. Because packs are additive-only, an expired pack
+    /// surviving up to one sweep interval can only over-detect, never
+    /// under-detect — a bounded, deliberate residue.
+    pub fn with_rulepack(self) -> Self {
+        self.with_custom("rulepack", || {
+            crate::rulepack::RulePackStore::global().sweep_expired();
         })
     }
 

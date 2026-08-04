@@ -216,9 +216,31 @@ static INJECTION_PATTERNS: &[&str] = &[
 /// Aho-Corasick automaton built once at process start from INJECTION_PATTERNS.
 /// Replaces 56 sequential O(n) contains() calls with a single O(n) pass over
 /// the text — all patterns searched simultaneously via a precompiled state machine.
+///
+/// This remains the baseline every scan falls back to. A signed rule pack
+/// (`rulepack.rs`) can additively supersede it with a recompiled automaton that
+/// still contains every pattern below; see [`PromptInjectionScanner::scan_string_patterns`].
 static INJECTION_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::new(INJECTION_PATTERNS).expect("injection patterns are valid")
 });
+
+/// The compiled-in injection signature baseline, exposed so `rulepack.rs` can
+/// build its combined automaton as `builtin ++ pack` — the additive-only
+/// invariant that keeps a compromised pack signer from ever removing a shipped
+/// signature. Returns the same slice `INJECTION_AC` is built from, in the same
+/// order, so built-in match indices are stable across a reload.
+pub fn builtin_injection_patterns() -> &'static [&'static str] {
+    INJECTION_PATTERNS
+}
+
+/// The exact per-window normalization Gate 4.0 applies to payload text, exposed
+/// so `rulepack.rs` can normalize an operator-authored pattern identically at
+/// install time. Without this a pack rule written as `"Ignore previous
+/// instructions"` would be stored verbatim and could never match the normalized
+/// text the scanner actually searches.
+pub fn normalize_scan_window(text: &str) -> String {
+    PromptInjectionScanner::normalize_window(text)
+}
 
 /// Replace a confusable Unicode character with its ASCII lookalike.
 ///
@@ -553,7 +575,34 @@ impl PromptInjectionScanner {
     }
 
     /// Scan a single normalized string against all injection patterns.
+    ///
+    /// Two paths, selected by one relaxed atomic load in `rulepack::active_ruleset`:
+    ///
+    /// - **No pack installed** (the default, and every deployment that never
+    ///   provisions a rule-pack trust anchor): the untouched `INJECTION_AC`
+    ///   baseline, byte-for-byte the behavior that shipped.
+    /// - **Pack installed**: the pack's combined automaton, which is
+    ///   `builtin ++ pack rules` by construction (`rulepack::RulePack::compile`),
+    ///   so this branch can only ever detect a strict superset. The `Arc` is
+    ///   cloned and the scan runs outside the store's lock, so a concurrent
+    ///   reload never blocks a packet.
+    ///
+    /// The label table is carried inside the same `Arc` as the automaton because
+    /// `find` reports a match as an index into the pattern list — resolving that
+    /// index against a separately-swapped table would mislabel the rejection.
     fn scan_string_patterns(normalized: &str) -> Result<(), SAACPHardDrop> {
+        if let Some(rules) = crate::rulepack::active_ruleset() {
+            if let Some(m) = rules.automaton().find(normalized) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::PromptInjectionDetected,
+                    format!(
+                        "Prompt Injection Pattern Detected: '{}'",
+                        rules.label_at(m.pattern().as_usize())
+                    ),
+                ));
+            }
+            return Ok(());
+        }
         // Single O(n) pass over all 56 patterns simultaneously via Aho-Corasick.
         // Replaces 56 sequential contains() calls (O(n·m)) with one automaton scan.
         if let Some(m) = INJECTION_AC.find(normalized) {
