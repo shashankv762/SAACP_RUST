@@ -808,7 +808,7 @@ criterion_group!(
     bench_wal_sustained_throughput,
 );
 
-criterion_main!(gate_groups, throughput_groups, worst_case_groups);
+criterion_main!(gate_groups, throughput_groups, worst_case_groups, contention_groups);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // WORST-CASE / ADVERSARIAL BENCHMARKS
@@ -1847,6 +1847,404 @@ fn bench_wc13_session_explosion(c: &mut Criterion) {
 
     group.finish();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTENTION BENCHMARKS (T20-T27) — multi-threaded lock pressure
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Every other throughput benchmark in this file is SINGLE-THREADED. An
+// uncontended mutex costs ~15 ns, so a single-threaded harness cannot observe
+// lock contention at all: a change that removes a global lock and a change that
+// adds one produce the same number. These benchmarks close that blind spot by
+// running K threads against one shared structure and reporting aggregate
+// throughput, so the scaling curve — not the single-shot latency — is what moves.
+//
+// Method, uniform across all of them:
+//   * `iter_custom` + an explicit `Barrier` so thread-spawn and join cost is
+//     outside the timed region; only the contended work is measured.
+//   * Wall-clock elapsed for `threads x iters` operations, reported via
+//     `Throughput::Elements`, so the y-axis is ops/sec across the whole machine.
+//   * Each thread writes DISTINCT keys (thread_id is part of every key) unless
+//     the benchmark is specifically probing the same-key case, so what's measured
+//     is lock contention rather than logical conflict on one entry.
+//
+// Reading these honestly: this host is an i7-14700K, 8 P-cores + 12 E-cores
+// (20C/28T), which is heterogeneous. A 28-thread figure is NOT 28x a
+// single-P-core figure — 12 of those cores are substantially slower and 8 of the
+// 28 threads are SMT siblings. Compare within a sweep, and treat the ratio
+// throughput(K) / (K * throughput(1)) as the scaling efficiency. Criterion's
+// sampling model also assumes i.i.d. samples, which contended benchmarks violate;
+// a wide confidence interval here is DATA ABOUT CONTENTION, not noise to discard.
+
+/// Thread counts swept by the contention benchmarks. 28 = this host's logical
+/// core count; 1 is the uncontended baseline every other point is divided by.
+const CONTENTION_THREADS: &[usize] = &[1, 2, 4, 8, 16, 28];
+
+/// Run `body(thread_id, iters)` on `threads` threads and return the wall-clock
+/// duration of the contended region only.
+///
+/// The barrier is the load-bearing part: without it, thread 0 can finish its
+/// entire workload before thread 7 has even started, so the benchmark measures
+/// staggered execution rather than simultaneous contention.
+fn contended_elapsed<F>(threads: usize, iters: u64, body: F) -> std::time::Duration
+where
+    F: Fn(usize, u64) + Send + Sync,
+{
+    let barrier = std::sync::Barrier::new(threads + 1);
+    let body = &body;
+    let barrier_ref = &barrier;
+
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                barrier_ref.wait(); // release: all threads start together
+                body(t, iters);
+                barrier_ref.wait(); // rendezvous: all threads finished
+            });
+        }
+        barrier_ref.wait();
+        let start = std::time::Instant::now();
+        barrier_ref.wait();
+        start.elapsed()
+    })
+}
+
+/// T20 — `ImmutableAuditLog::append_event` (`security.rs:797`).
+///
+/// The single global mutex is held across HMAC-SHA256 + JSON serialization, so
+/// every appender serializes here. `benchmark_results.md` measures ~250k-360k
+/// events/sec and identifies this — not the 2 us gate pipeline — as the ceiling
+/// a real deployment reaches first. Expect near-flat scaling until it's sharded.
+///
+/// Uses `ImmutableAuditLog::new("")` (in-memory mode, `security.rs:1592`) so this
+/// measures the hash-chain critical section alone, with no disk I/O and no
+/// multi-GB log file on the RAM disk this crate builds to.
+fn bench_t20_audit_append_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T20_Audit_Append_Contended");
+    group.sample_size(10);
+
+    let secret = [0xB0u8; 32];
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            let log = Arc::new(ImmutableAuditLog::new(""));
+            b.iter_custom(|iters| {
+                let log = Arc::clone(&log);
+                contended_elapsed(threads, iters, move |tid, iters| {
+                    for i in 0..iters {
+                        log.append_event(
+                            black_box(&secret),
+                            black_box("bench-source"),
+                            black_box("bench-target"),
+                            black_box(&format!("sig_{tid}_{i}")),
+                            black_box("contended append benchmark"),
+                            black_box("00-t20-contended-00-01"),
+                        );
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// T22 — token cache (`gateway.rs:629`), one global `Mutex<HashMap<..>>` read on
+/// essentially every packet and written on every miss.
+///
+/// Two hit ratios: `hit_100` re-validates one token so every lookup is a cache
+/// hit (pure lock contention, no crypto); `hit_0` uses a distinct token per
+/// thread-iteration so every lookup misses and takes the write path too.
+fn bench_t22_token_cache_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T22_Token_Cache_Contended");
+    group.sample_size(10);
+
+    let secret = [0x22u8; 32];
+    let gw = Arc::new(ZeroTrustGateway::new());
+    gw.register_issuer_key("t22-issuer", &secret).unwrap();
+
+    // One shared token -> every lookup is a cache HIT after the first.
+    let hot_token = gw.issue_capability_token(
+        &secret, "t22-issuer", &["t22-target"], &[], 3600, None, 0, None);
+    // Many distinct tokens -> lookups MISS and exercise the insert/evict path.
+    let cold_tokens: Vec<Vec<u8>> = (0..512).map(|_| {
+        gw.issue_capability_token(
+            &secret, "t22-issuer", &["t22-target"], &[], 3600, None, 0, None)
+    }).collect();
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("hit_100", threads), &threads, |b, &threads| {
+                b.iter_custom(|iters| {
+                    let gw = Arc::clone(&gw);
+                    let tok = &hot_token;
+                    contended_elapsed(threads, iters, move |_tid, iters| {
+                        for _ in 0..iters {
+                            let _ = black_box(gw.validate_lateral_movement(
+                                black_box("t22-target"), black_box(tok), black_box(&secret)));
+                        }
+                    })
+                })
+            });
+
+        group.bench_with_input(
+            BenchmarkId::new("hit_0", threads), &threads, |b, &threads| {
+                b.iter_custom(|iters| {
+                    let gw = Arc::clone(&gw);
+                    let toks = &cold_tokens;
+                    contended_elapsed(threads, iters, move |tid, iters| {
+                        for i in 0..iters {
+                            let tok = &toks[(tid.wrapping_mul(97) + i as usize) % toks.len()];
+                            let _ = black_box(gw.validate_lateral_movement(
+                                black_box("t22-target"), black_box(tok), black_box(&secret)));
+                        }
+                    })
+                })
+            });
+    }
+
+    group.finish();
+}
+
+/// T23 — `TelemetryCollector::record_gate_latency` (`telemetry.rs:387`).
+///
+/// `GateLatencyHistograms` takes an `RwLock` READ lock per observation, and the
+/// gate pipeline observes ~12 gates per packet, so this runs ~12x per request for
+/// a gate set that is fixed at compile time. `Histogram::observe` itself is
+/// already lock-free atomics — the map lookup is the only lock, and a read-heavy
+/// `RwLock` still bounces its cache line across every core.
+fn bench_t23_telemetry_observe_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T23_Telemetry_Observe_Contended");
+    group.sample_size(10);
+
+    // The REAL per-packet gate sequence — these must be the exact names
+    // `handler.rs` passes to `timed_gate!`/`report_gate_rejection`, because
+    // telemetry resolves them to distinct histogram slots by name. Using
+    // invented names (`gate_0` instead of `gate_0_crypto`) would collapse all 12
+    // observations onto the single "other" overflow slot and measure 12 threads
+    // fighting over ONE histogram instead of the 12 independent ones a real
+    // packet touches.
+    const GATES: [&str; 12] = [
+        "gate_0_crypto", "gate_0_5_financial", "gate_1_0_token", "gate_1_5_intent",
+        "gate_2_5_kinetic", "gate_3_0_lateral", "gate_4_0_inject", "gate_5_0_epistemic",
+        "gate_9_0_schema", "gate_11_0_aegf", "gate_12_0_cscs", "sid_semantic",
+    ];
+    let elapsed = std::time::Duration::from_nanos(1_500);
+
+    for &threads in CONTENTION_THREADS {
+        // 12 observations per iteration, so elements = threads * 12.
+        group.throughput(Throughput::Elements(threads as u64 * GATES.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                contended_elapsed(threads, iters, move |_tid, iters| {
+                    let tel = saacp::telemetry::global_telemetry();
+                    for _ in 0..iters {
+                        for g in GATES {
+                            tel.record_gate_latency(black_box(g), black_box(elapsed));
+                        }
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// T24 — `TelemetryCollector::record_gate_rejection_bytecode` (`telemetry.rs:449`).
+///
+/// A full global `Mutex` plus a `String` allocation on EVERY rejection. Under an
+/// all-reject attack burst — precisely when the protocol most needs headroom —
+/// this is a process-wide serialization point that also allocates per event.
+fn bench_t24_gate_rejection_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T24_Gate_Rejection_Contended");
+    group.sample_size(10);
+
+    // Real `SAACPBytecodes` Debug spellings and a real gate name — telemetry
+    // resolves both to dense slots by name, so synthetic values would not
+    // exercise the production path.
+    const BYTECODES: [&str; 4] = [
+        "PromptInjectionDetected", "LateralMovementBlocked",
+        "InvalidSignature", "TokenExpired",
+    ];
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                contended_elapsed(threads, iters, move |_tid, iters| {
+                    let tel = saacp::telemetry::global_telemetry();
+                    for i in 0..iters {
+                        tel.record_gate_rejection_bytecode(
+                            black_box("gate_4_0"),
+                            black_box(BYTECODES[(i as usize) % BYTECODES.len()]),
+                        );
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// T25 — `AEGFGovernor::submit_and_complete`'s policy read (`aegf.rs:1106`).
+///
+/// The policy is a `Mutex<AEGFPolicy>` that is locked AND DEEP-CLONED on every
+/// packet, for data that changes approximately never. Both halves of that cost —
+/// the global lock and the clone — are pure overhead on the hot path.
+fn bench_t25_aegf_policy_read_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T25_AEGF_Policy_Read_Contended");
+    group.sample_size(10);
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            let gov = Arc::new(AEGFGovernor::new(None));
+            b.iter_custom(|iters| {
+                let gov = Arc::clone(&gov);
+                contended_elapsed(threads, iters, move |tid, iters| {
+                    for i in 0..iters {
+                        let meta = AEGFMetadata::new(
+                            "t25-agent", &format!("s-{tid}-{i}"), None, None, 60.0, 0, 0);
+                        black_box(gov.submit_and_complete(black_box(&meta)));
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// T26 — `AgentRateLimiter` shard selection (`gateway.rs:119`) under three key
+/// distributions. **This is the benchmark that exposes the shard-hash bug.**
+///
+/// `ratelimit_shard_index` is `key.as_bytes().first() % 16` — it hashes exactly
+/// ONE byte. The three distributions separate "sharding works" from "sharding
+/// appears to work because the test data happened to be uniform":
+///
+///   * `uniform_random` — keys start with random hex, so first bytes are already
+///     spread. This distribution HIDES the bug completely and will barely move
+///     when the hash is fixed. It is here to demonstrate exactly that: a
+///     plausible-looking benchmark that proves nothing.
+///   * `realistic_prefix` — `agent-0001`, `agent-0002`, ... Every key starts with
+///     `'a'`, so ALL of them map to one shard and 15 of 16 mutexes sit unused.
+///     This is the common real-world naming convention, and it degenerates to the
+///     pre-sharding single-mutex behavior.
+///   * `single_agent` — one hot key; the irreducible worst case, which no shard
+///     hash can fix (it bounds what sharding can ever buy).
+fn bench_t26_ratelimiter_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("T26_RateLimiter_Contended");
+    group.sample_size(10);
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("uniform_random", threads), &threads, |b, &threads| {
+                let rl = Arc::new(AgentRateLimiter::new());
+                b.iter_custom(|iters| {
+                    let rl = Arc::clone(&rl);
+                    contended_elapsed(threads, iters, move |tid, iters| {
+                        for i in 0..iters {
+                            // Leading hex nibble varies -> first byte is spread
+                            // across the alphabet, so even a 1-byte hash spreads.
+                            let key = format!("{:08x}-agent", (tid as u64) << 32 | i);
+                            black_box(rl.is_locked(black_box(&key)));
+                        }
+                    })
+                })
+            });
+
+        group.bench_with_input(
+            BenchmarkId::new("realistic_prefix", threads), &threads, |b, &threads| {
+                let rl = Arc::new(AgentRateLimiter::new());
+                b.iter_custom(|iters| {
+                    let rl = Arc::clone(&rl);
+                    contended_elapsed(threads, iters, move |tid, iters| {
+                        for i in 0..iters {
+                            // Every key starts with 'a' -> single-byte hash sends
+                            // 100% of traffic to one shard.
+                            let key = format!("agent-{:04}", (tid as u64 * 10_000) + i);
+                            black_box(rl.is_locked(black_box(&key)));
+                        }
+                    })
+                })
+            });
+
+        group.bench_with_input(
+            BenchmarkId::new("single_agent", threads), &threads, |b, &threads| {
+                let rl = Arc::new(AgentRateLimiter::new());
+                b.iter_custom(|iters| {
+                    let rl = Arc::clone(&rl);
+                    contended_elapsed(threads, iters, move |_tid, iters| {
+                        for _ in 0..iters {
+                            black_box(rl.is_locked(black_box("agent-hot-single")));
+                        }
+                    })
+                })
+            });
+    }
+
+    group.finish();
+}
+
+/// T27 — `ExecutionStateMachine` (`aegf.rs:360`), an unsharded
+/// `Mutex<HashMap<String, StateRecord>>`.
+///
+/// `submit_and_complete` acquires this SAME mutex three times per packet
+/// (`aegf.rs:1151` create, `:1162` and `:1181` transition), so it is the dominant
+/// AEGF lock cost now that the DEG has a fast path. Mirrors that exact 3-call
+/// sequence rather than a single call, so the measured cost matches production.
+fn bench_t27_aegf_esm_contended(c: &mut Criterion) {
+    use saacp::{ExecutionStateMachine, ExecutionState};
+
+    let mut group = c.benchmark_group("T27_AEGF_ESM_Contended");
+    group.sample_size(10);
+
+    for &threads in CONTENTION_THREADS {
+        group.throughput(Throughput::Elements(threads as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            let esm = Arc::new(ExecutionStateMachine::new());
+            b.iter_custom(|iters| {
+                let esm = Arc::clone(&esm);
+                contended_elapsed(threads, iters, move |tid, iters| {
+                    for i in 0..iters {
+                        // Distinct RID per thread: measures LOCK contention, not
+                        // logical conflict over one map entry.
+                        let rid = format!("t27-{tid}-{i}");
+                        let _ = esm.create(black_box(&rid), "bench");
+                        // Created -> Processing -> Completed is the legal path
+                        // (`aegf.rs:134 allowed_transitions`); an illegal
+                        // transition would return Err early and skip the map
+                        // write, understating the real lock cost.
+                        let _ = esm.transition(
+                            black_box(&rid), ExecutionState::Processing, "bench");
+                        let _ = esm.transition(
+                            black_box(&rid), ExecutionState::Completed, "bench");
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    contention_groups,
+    bench_t20_audit_append_contended,
+    bench_t22_token_cache_contended,
+    bench_t23_telemetry_observe_contended,
+    bench_t24_gate_rejection_contended,
+    bench_t25_aegf_policy_read_contended,
+    bench_t26_ratelimiter_contended,
+    bench_t27_aegf_esm_contended,
+);
 
 // ─── Criterion Groups & Entry Point (worst-case) ──────────────────────────────
 

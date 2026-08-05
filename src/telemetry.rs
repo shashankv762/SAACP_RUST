@@ -15,7 +15,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -362,67 +362,144 @@ impl Histogram {
         let avg = if count > 0 { sum_secs / count as f64 } else { 0.0 };
         (avg, count)
     }
+
+    /// Zero every bucket and both aggregates (test-support, via
+    /// `TelemetryCollector::reset`).
+    ///
+    /// Needed because the histograms now live in a fixed array rather than a map
+    /// that could simply be cleared — a zeroed histogram is indistinguishable
+    /// from a never-observed one to `render`/`summary`, which both skip
+    /// `count == 0`.
+    fn reset(&self) {
+        for b in &self.buckets {
+            b.store(0, Ordering::SeqCst);
+        }
+        self.sum_nanos.store(0, Ordering::SeqCst);
+        self.count.store(0, Ordering::SeqCst);
+    }
 }
 
-/// Registry of per-gate `Histogram`s, keyed by the same `&'static str` gate
-/// names used by `record_gate_rejection`/`report_gate_rejection`. Gate names
-/// are a small, fixed, compile-time-constant set (not attacker-controlled
-/// input), so an `RwLock<HashMap<..>>` is bounded by construction — never an
-/// unbounded-cardinality label risk the way a per-agent label would be.
+/// Every gate name that can reach the telemetry layer, via either
+/// `handler.rs`'s `timed_gate!` macro or `report_gate_rejection`.
 ///
-/// Read-lock fast path once a gate's histogram exists (the common case after
-/// process warm-up): only the very first observation of each distinct gate
-/// name pays a write-lock. `Histogram::observe` itself is then lock-free.
+/// This set is fixed at compile time and small; it is NOT attacker-controlled
+/// input. Making it an explicit table lets both the latency histograms and the
+/// per-(gate, bytecode) rejection counters live in fixed-size arrays indexed by
+/// position, removing a lock and a hash lookup from paths that run ~12 times and
+/// once per packet respectively.
+///
+/// Adding a gate here is cheap; forgetting to add one is safe — see
+/// [`gate_slot`], which falls back to the overflow slot rather than dropping the
+/// observation or panicking.
+pub(crate) const GATE_NAMES: [&str; 14] = [
+    "gate_0_crypto",
+    "gate_0_5_financial",
+    "gate_1_0_token",
+    "gate_1_0_identity_binding",
+    "gate_1_5_intent",
+    "gate_2_5_kinetic",
+    "gate_3_0_lateral",
+    "gate_4_0_inject",
+    "gate_5_0_epistemic",
+    "gate_9_0_schema",
+    "gate_11_0_aegf",
+    "gate_12_0_cscs",
+    "aca_attestation",
+    "sid_semantic",
+];
+
+/// One extra slot past [`GATE_NAMES`] that absorbs any gate name not in the
+/// table (a newly added gate, or a name used only by a test).
+///
+/// The alternative designs are both worse: silently dropping the observation
+/// loses security telemetry precisely when someone is adding a new gate, and
+/// panicking turns a metrics-plumbing oversight into a downed daemon. Overflow
+/// observations are aggregated under the `"other"` label, which is visible in
+/// the exported metrics and therefore self-announcing.
+const GATE_OVERFLOW_SLOT: usize = GATE_NAMES.len();
+const GATE_SLOTS: usize = GATE_NAMES.len() + 1;
+const GATE_OVERFLOW_LABEL: &str = "other";
+
+/// Map a gate name to its dense slot.
+///
+/// A linear scan with a length check first, over 14 short strings, beats a hash
+/// on this path. Deliberately NOT `ptr::eq`: identical `&'static str` literals
+/// are not guaranteed to be deduplicated across codegen units, so pointer
+/// comparison could silently miss and send everything to the overflow slot.
+#[inline]
+fn gate_slot(gate: &str) -> usize {
+    let bytes = gate.as_bytes();
+    let mut i = 0;
+    while i < GATE_NAMES.len() {
+        let candidate = GATE_NAMES[i].as_bytes();
+        if candidate.len() == bytes.len() && candidate == bytes {
+            return i;
+        }
+        i += 1;
+    }
+    GATE_OVERFLOW_SLOT
+}
+
+/// Label to export for a given slot.
+#[inline]
+fn gate_label(slot: usize) -> &'static str {
+    if slot < GATE_NAMES.len() { GATE_NAMES[slot] } else { GATE_OVERFLOW_LABEL }
+}
+
+/// Registry of per-gate `Histogram`s, addressed by dense slot rather than by
+/// name.
+///
+/// Previously an `RwLock<HashMap<&'static str, Histogram>>`. Even on the
+/// read-lock fast path that cost an atomic RMW on one shared cache line per
+/// observation — and the gate pipeline observes ~12 gates per packet, so the
+/// line was bounced ~12 times per request across every core in the system. With
+/// a fixed array the lookup is an index and `Histogram::observe` (already
+/// lock-free atomics) is the only remaining synchronization.
 struct GateLatencyHistograms {
-    histograms: RwLock<HashMap<&'static str, Histogram>>,
+    histograms: [Histogram; GATE_SLOTS],
 }
 
 impl GateLatencyHistograms {
     fn new() -> Self {
-        Self { histograms: RwLock::new(HashMap::new()) }
+        Self { histograms: std::array::from_fn(|_| Histogram::new()) }
     }
 
-    fn observe(&self, gate: &'static str, elapsed: Duration) {
-        {
-            let map = self.histograms.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(h) = map.get(gate) {
-                h.observe(elapsed);
-                return;
-            }
-        }
-        let mut map = self.histograms.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(gate).or_insert_with(Histogram::new).observe(elapsed);
+    #[inline]
+    fn observe(&self, gate: &str, elapsed: Duration) {
+        self.histograms[gate_slot(gate)].observe(elapsed);
     }
 
     fn render(&self, out: &mut String) {
-        let map = self.histograms.read().unwrap_or_else(|e| e.into_inner());
-        let mut gates: Vec<&'static str> = map.keys().copied().collect();
-        gates.sort();
-        for gate in gates {
-            if let Some(h) = map.get(gate) {
-                h.render(gate, out);
+        for (slot, h) in self.histograms.iter().enumerate() {
+            // Skip never-observed gates. The map-backed implementation only
+            // held entries for gates that had actually been observed, so
+            // emitting all-zero series here would change the exported metric
+            // set (and break tests asserting a reset gate is absent).
+            if h.count.load(Ordering::Relaxed) == 0 {
+                continue;
             }
+            h.render(gate_label(slot), out);
         }
     }
 
-    /// R-3: `(gate, avg_seconds, count)` for every gate observed so far, sorted by
-    /// gate name — the compact form `/api/readyz` needs, versus `render`'s full
-    /// Prometheus bucket text.
+    /// R-3: `(gate, avg_seconds, count)` for every gate observed so far — the
+    /// compact form `/api/readyz` needs, versus `render`'s Prometheus buckets.
     fn summary(&self) -> Vec<(&'static str, f64, u64)> {
-        let map = self.histograms.read().unwrap_or_else(|e| e.into_inner());
-        let mut gates: Vec<&'static str> = map.keys().copied().collect();
-        gates.sort();
-        gates
-            .into_iter()
-            .filter_map(|gate| map.get(gate).map(|h| {
+        self.histograms
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, h)| {
                 let (avg, count) = h.avg_and_count();
-                (gate, avg, count)
-            }))
+                if count == 0 { return None; }
+                Some((gate_label(slot), avg, count))
+            })
             .collect()
     }
 
     fn reset(&self) {
-        self.histograms.write().unwrap_or_else(|e| e.into_inner()).clear();
+        for h in &self.histograms {
+            h.reset();
+        }
     }
 }
 
@@ -433,38 +510,94 @@ impl GateLatencyHistograms {
 // `TelemetryCollector::record_gate_rejection` (above) already counts
 // rejections per gate; this adds the bytecode dimension the O-2 spec calls
 // for ("Counter per gate per bytecode"). Bounded cardinality: both the gate
-// name and the bytecode's `Debug` string come from fixed, finite, non-
-// attacker-controlled enums (≤12 gates × a few dozen `SAACPBytecodes`
-// variants — a few hundred entries at most, never growing further).
+// name and the bytecode come from fixed, finite, non-attacker-controlled
+// enums, so the full (gate x bytecode) product is allocated up front as a
+// dense atomic bank — 15 slots x 74 bytecodes x 8 B ~= 8.9 KB.
+//
+// Was a `Mutex<HashMap<(&'static str, String), u64>>`, which took a global lock
+// AND allocated a `String` on EVERY rejection. Under an all-reject attack burst
+// — exactly when the protocol most needs headroom — that made this a
+// process-wide serialization point with a heap allocation per event. Indexing a
+// preallocated array removes both.
 struct GateBytecodeCounters {
-    counts: Mutex<HashMap<(&'static str, String), u64>>,
+    counts: Vec<AtomicU64>, // GATE_SLOTS * SAACPBytecodes::COUNT, row-major by gate
 }
 
 impl GateBytecodeCounters {
     fn new() -> Self {
-        Self { counts: Mutex::new(HashMap::new()) }
+        Self {
+            counts: (0..GATE_SLOTS * crate::errors::SAACPBytecodes::COUNT)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
     }
 
-    fn record(&self, gate: &'static str, bytecode: &str) {
-        let mut m = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        *m.entry((gate, bytecode.to_string())).or_insert(0) += 1;
+    /// Record one rejection. `bytecode` is the `Debug` spelling of a
+    /// [`SAACPBytecodes`](crate::errors::SAACPBytecodes) variant, matching the
+    /// existing `report_gate_rejection` call convention.
+    ///
+    /// An unrecognized bytecode name is dropped rather than counted, because
+    /// there is no dense slot to attribute it to and mis-attributing it to a
+    /// real bytecode would corrupt security metrics. Every in-crate caller
+    /// formats a real variant, so this is unreachable in practice.
+    #[inline]
+    fn record(&self, gate: &str, bytecode: &str) {
+        let Some(bc) = bytecode_slot(bytecode) else { return };
+        self.counts[gate_slot(gate) * crate::errors::SAACPBytecodes::COUNT + bc]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn render(&self, out: &mut String) {
-        let m = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries: Vec<((&'static str, String), u64)> =
-            m.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        entries.sort();
-        for ((gate, bytecode), count) in entries {
-            out.push_str(&format!(
-                "saacp_gate_rejections_by_bytecode_total{{gate=\"{gate}\",bytecode=\"{bytecode}\"}} {count}\n"
-            ));
+        let n = crate::errors::SAACPBytecodes::COUNT;
+        for slot in 0..GATE_SLOTS {
+            for bc in 0..n {
+                let count = self.counts[slot * n + bc].load(Ordering::Relaxed);
+                // Skip untouched pairs: the map-backed version only held pairs
+                // that had actually occurred, and emitting ~1100 all-zero series
+                // per scrape would bloat every Prometheus payload.
+                if count == 0 {
+                    continue;
+                }
+                let bytecode = crate::errors::SAACPBytecodes::from_index(bc)
+                    .expect("bc < SAACPBytecodes::COUNT");
+                out.push_str(&format!(
+                    "saacp_gate_rejections_by_bytecode_total{{gate=\"{}\",bytecode=\"{:?}\"}} {count}\n",
+                    gate_label(slot), bytecode,
+                ));
+            }
         }
     }
 
     fn reset(&self) {
-        self.counts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        for c in &self.counts {
+            c.store(0, Ordering::SeqCst);
+        }
     }
+}
+
+/// The `Debug` spelling of every bytecode, built once, indexed by dense slot.
+///
+/// Materialized eagerly on first use so [`bytecode_slot`] can compare borrowed
+/// strings with no per-call allocation. Deriving the names from
+/// `SAACPBytecodes::ALL` rather than re-listing them by hand means the table
+/// cannot drift out of sync with the enum.
+static BYTECODE_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    crate::errors::SAACPBytecodes::ALL
+        .iter()
+        .map(|bc| format!("{bc:?}"))
+        .collect()
+});
+
+/// Resolve a bytecode's `Debug` name to its dense index.
+///
+/// Linear scan over 74 short strings with a length pre-check, and — critically —
+/// **no allocation**: it borrows from the prebuilt [`BYTECODE_NAMES`] table.
+/// Runs only on the rejection path, never on an accepted packet, and replaces a
+/// `String` allocation plus a hash plus a global mutex acquisition.
+fn bytecode_slot(name: &str) -> Option<usize> {
+    BYTECODE_NAMES
+        .iter()
+        .position(|n| n.len() == name.len() && n == name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1676,22 +1809,61 @@ mod tests {
     #[test]
     fn test_gate_latency_histogram_buckets_are_cumulative() {
         let t = TelemetryCollector::new();
-        t.record_gate_latency("gate_test_hist", Duration::from_micros(2)); // falls in the 10µs bucket and above
-        t.record_gate_latency("gate_test_hist", Duration::from_millis(2)); // falls in the 5ms bucket and above
+        // A REAL gate name: histograms live in a fixed array indexed by
+        // `GATE_NAMES`, so a synthetic name would be aggregated into the
+        // `"other"` overflow slot and render under that label instead.
+        t.record_gate_latency("gate_0_crypto", Duration::from_micros(2)); // falls in the 10µs bucket and above
+        t.record_gate_latency("gate_0_crypto", Duration::from_millis(2)); // falls in the 5ms bucket and above
         let prom = t.render_prometheus();
-        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_test_hist\",le=\"0.00001\"} 1"));
-        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_test_hist\",le=\"0.005\"} 2"));
-        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_test_hist\",le=\"+Inf\"} 2"));
-        assert!(prom.contains("saacp_gate_latency_seconds_count{gate=\"gate_test_hist\"} 2"));
+        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_0_crypto\",le=\"0.00001\"} 1"));
+        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_0_crypto\",le=\"0.005\"} 2"));
+        assert!(prom.contains("saacp_gate_latency_seconds_bucket{gate=\"gate_0_crypto\",le=\"+Inf\"} 2"));
+        assert!(prom.contains("saacp_gate_latency_seconds_count{gate=\"gate_0_crypto\"} 2"));
     }
 
     #[test]
     fn test_gate_latency_reset_clears_histograms() {
         let t = TelemetryCollector::new();
-        t.record_gate_latency("gate_test_reset", Duration::from_micros(1));
+        t.record_gate_latency("gate_3_0_lateral", Duration::from_micros(1));
+        assert!(t.render_prometheus().contains("gate=\"gate_3_0_lateral\""));
         t.reset();
         let prom = t.render_prometheus();
-        assert!(!prom.contains("gate=\"gate_test_reset\""));
+        assert!(!prom.contains("gate=\"gate_3_0_lateral\""));
+    }
+
+    /// A gate name absent from `GATE_NAMES` must still be counted — under the
+    /// `"other"` label — rather than silently dropped or panicking.
+    ///
+    /// Dropping would lose security telemetry exactly when someone adds a new
+    /// gate and forgets to register it; panicking would turn a metrics-plumbing
+    /// oversight into a downed daemon. Aggregating under a visible `"other"`
+    /// label makes the omission self-announcing in the exported metrics.
+    #[test]
+    fn test_unregistered_gate_name_falls_back_to_overflow_slot() {
+        let t = TelemetryCollector::new();
+        t.record_gate_latency("gate_not_in_table", Duration::from_micros(1));
+        let prom = t.render_prometheus();
+        assert!(
+            prom.contains("saacp_gate_latency_seconds_count{gate=\"other\"} 1"),
+            "unregistered gate should aggregate under the `other` label:\n{prom}",
+        );
+        assert!(!prom.contains("gate_not_in_table"));
+    }
+
+    /// Every gate name used by `handler.rs` must have a dedicated slot — none
+    /// may silently land in the `"other"` overflow bucket, which would merge
+    /// distinct gates' latencies into one meaningless series.
+    #[test]
+    fn every_production_gate_name_has_a_dedicated_slot() {
+        for (i, name) in GATE_NAMES.iter().enumerate() {
+            assert_eq!(
+                gate_slot(name), i,
+                "GATE_NAMES[{i}] = {name:?} does not resolve to its own slot",
+            );
+            assert_eq!(gate_label(i), *name);
+        }
+        assert_eq!(gate_slot("definitely-not-a-gate"), GATE_OVERFLOW_SLOT);
+        assert_eq!(gate_label(GATE_OVERFLOW_SLOT), GATE_OVERFLOW_LABEL);
     }
 
     #[test]

@@ -153,8 +153,13 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// Maps an IEVL key to its shard index, hashing the whole key.
+///
+/// Keys are `declaration_id` values — SHA-256 hex, whose first byte spans only
+/// `[0-9a-f]` and so reached just ten of the sixteen shards under the previous
+/// first-byte scheme. See `shard.rs`.
 fn ievl_shard_index(key: &str) -> usize {
-    (key.as_bytes().first().copied().unwrap_or(0) as usize) % IEVL_SHARDS
+    crate::shard::fnv1a_shard(key, IEVL_SHARDS)
 }
 
 /// Deterministic declaration ID both the declaring agent and this engine can

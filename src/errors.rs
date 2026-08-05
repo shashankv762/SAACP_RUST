@@ -140,6 +140,77 @@ pub enum SAACPBytecodes {
     RulePackRejected = 0x49,
 }
 
+impl SAACPBytecodes {
+    /// Number of distinct bytecodes. Discriminants run contiguously from
+    /// `Success = 0x00` to `RulePackRejected = 0x49` with no gaps, so this is
+    /// also one past the largest discriminant.
+    pub const COUNT: usize = 0x49 + 1;
+
+    /// Dense array index for this bytecode — its `#[repr(u8)]` discriminant.
+    ///
+    /// Lets callers keep a fixed `[T; SAACPBytecodes::COUNT]` bank instead of a
+    /// `HashMap` keyed by the `Debug` string, which is what `telemetry.rs`'s
+    /// per-(gate, bytecode) rejection counters do: no hashing, no allocation,
+    /// and no lock on a path that runs once per rejected packet.
+    #[inline]
+    pub fn index(self) -> usize {
+        self as u8 as usize
+    }
+
+    /// Inverse of [`index`](Self::index) — `None` if `index >= COUNT`.
+    ///
+    /// Needed to render a dense counter bank back into labelled Prometheus
+    /// output, where the bytecode NAME (not its number) is the label value.
+    pub fn from_index(index: usize) -> Option<Self> {
+        if index >= Self::COUNT {
+            return None;
+        }
+        // Safety-by-construction: the discriminant range is contiguous and
+        // `#[repr(u8)]`, and `ALL` is asserted below to cover it exactly, so an
+        // in-range index always names a real variant. Using the table rather
+        // than a transmute keeps this in safe Rust.
+        Some(Self::ALL[index])
+    }
+
+    /// Every bytecode, ordered by discriminant so `ALL[i].index() == i`.
+    ///
+    /// The unit test `bytecodes_are_dense_and_ordered` asserts exactly that
+    /// invariant, so adding a variant without extending this table (or leaving a
+    /// discriminant gap) fails the build's test run rather than silently
+    /// mis-indexing a counter into a neighbouring bytecode's slot.
+    pub const ALL: [SAACPBytecodes; Self::COUNT] = {
+        use SAACPBytecodes::*;
+        [
+            Success, MalformedHeader, SchemaMismatch, InvalidSignature,
+            AmbiguousIntent, LateralMovementBlocked, PromptInjectionDetected,
+            StateExpiredOrStale, InputRequired, BudgetExceeded, PreFlightBudget,
+            CostEstimate, ActionClassEscalation, EpistemicUncertainty,
+            PayloadTooLarge, HeartbeatPing, StateSyncRequired, TemporalTimeout,
+            TokenExpired, ScopeViolation, CircuitBreakerOpen, DelegationRejected,
+            ExternalInputTainted, StreamStart, StreamContinuation, StreamEnd,
+            StreamAbort, PsnReplayDetected, PsnOutOfWindow, EpochExpired,
+            SequenceOverflow, KeyEvolutionRequired, AegfLoopDetected,
+            AegfHopLimitExceeded, AegfDepthLimitExceeded, AegfTtlExpired,
+            AegfInvalidTransition, ScrUnauthorized, ScrNotFound,
+            RrbcReplayDetected, RrbcUsageExhausted, RrbcBindingMismatch,
+            RrbcPopFailed, RgcResourceLimitExceeded, KeyRevoked,
+            KeyVersionMismatch, AcsvafDelegationAmplification,
+            AcsvafDelegationDepthExceeded, AcsvafCircularDelegation,
+            AcsvafOrphanChain, AcsvafMissingCapabilityAuthority,
+            AcsvafKeyNotTrusted, AcsvafThresholdNotReached,
+            AcsvafManifestInvalid, AcsvafSessionBindingViolated,
+            SelfIssuedCapability, UnauthorizedIssuerClass,
+            DelegationMetadataIncomplete, AuthorityClassViolation,
+            FederationRootRequired, IdentityBindingMissing, IdentityMisbinding,
+            TranscriptHashMismatch, IdentityNotVerified, SessionSpliceDetected,
+            AuditSubsystemDegraded, TrustReauthRequired,
+            IntentChainDriftExceeded, IntentClassEscalationDetected,
+            SemanticInjectionDetected, InsufficientAttestation,
+            CollusionDetected, ClusterMessageRejected, RulePackRejected,
+        ]
+    };
+}
+
 impl fmt::Display for SAACPBytecodes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}(0x{:02X})", self, *self as u8)
@@ -169,3 +240,36 @@ impl fmt::Display for SAACPHardDrop {
 }
 
 impl std::error::Error for SAACPHardDrop {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SAACPBytecodes::ALL` must be ordered by discriminant and cover the whole
+    /// contiguous range, because `telemetry.rs` uses `index()` to address a
+    /// fixed-size counter bank and `from_index()` to turn a slot back into a
+    /// Prometheus label.
+    ///
+    /// If a new variant is added without extending `ALL`, or a discriminant gap
+    /// is introduced, this fails loudly. The failure mode it prevents is silent
+    /// and nasty: rejections would be attributed to the WRONG bytecode in
+    /// exported security metrics, or a counter write would land out of bounds.
+    #[test]
+    fn bytecodes_are_dense_and_ordered() {
+        for (i, bc) in SAACPBytecodes::ALL.iter().enumerate() {
+            assert_eq!(
+                bc.index(), i,
+                "SAACPBytecodes::ALL[{i}] is {bc:?}, whose discriminant is \
+                 0x{:02X} — ALL must be sorted by discriminant with no gaps",
+                bc.index(),
+            );
+            assert_eq!(SAACPBytecodes::from_index(i), Some(*bc));
+        }
+        assert_eq!(SAACPBytecodes::ALL.len(), SAACPBytecodes::COUNT);
+        assert_eq!(SAACPBytecodes::from_index(SAACPBytecodes::COUNT), None);
+        // Endpoints, pinned explicitly so a re-ordering that happens to stay
+        // dense still trips.
+        assert_eq!(SAACPBytecodes::Success.index(), 0x00);
+        assert_eq!(SAACPBytecodes::RulePackRejected.index(), 0x49);
+    }
+}

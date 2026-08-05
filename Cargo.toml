@@ -50,6 +50,16 @@ subtle = "2"
 # `parking_lot::Mutex` also never poisons, eliminating the `.unwrap_or_else(|e| e.into_inner())`
 # poison-recovery boilerplate (H-22) this same lock previously needed.
 parking_lot = "0.12"
+# Read-mostly configuration that is read on EVERY packet but written almost
+# never: the AEGF policy (aegf.rs), the gateway's trust store / capability
+# authority handles, and the compiled injection rule set (rulepack.rs). These
+# were `Mutex<T>` / `Mutex<Option<Arc<T>>>`, so the hot path paid a lock — and in
+# the AEGF policy's case a full deep `clone()` under that lock — once per packet
+# for data that changes only on an admin action. `ArcSwap` makes the read a
+# lock-free atomic load, so readers never block each other or a concurrent
+# writer, while keeping the "swap the whole value atomically" semantics that
+# prevents a reader from observing a half-updated config.
+arc-swap = "1"
 aho-corasick = "1"
 flate2 = "1"
 tokio-tungstenite = { version = "0.24", optional = true }
@@ -253,3 +263,16 @@ required-features = ["command-center"]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+
+# `debug = 1` (line tables only) instead of the default full DWARF/PDB. This
+# crate has 60+ modules and heavy dev-dependencies (criterion, reqwest, rcgen),
+# and the build output is pinned to a 6.4 GB RAM disk by .cargo/config.toml —
+# full debug info alone exhausted it, which blocks every build and test run.
+# Line tables keep file/line resolution in panic backtraces (what the failing
+# assertions in tests/ actually need); only interactive variable inspection in
+# a debugger is lost.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1

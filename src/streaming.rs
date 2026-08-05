@@ -203,11 +203,13 @@ impl StreamSession {
 /// measurable contention benefit.
 const STREAM_SHARDS: usize = 8;
 
-/// Maps a `stream_id` to its shard index using the first byte of the string
-/// (falls back to shard 0 for an empty `stream_id`, which the registry never
-/// actually produces itself but a caller-supplied ID is not assumed to avoid).
+/// Maps a `stream_id` to its shard index, hashing the whole id.
+///
+/// Stream ids are caller-supplied and in practice share a prefix or are hex, so
+/// sampling only the first byte concentrated them onto one of the 8 shards. See
+/// `shard.rs`.
 fn stream_shard_index(stream_id: &str) -> usize {
-    (stream_id.as_bytes().first().copied().unwrap_or(0) as usize) % STREAM_SHARDS
+    crate::shard::fnv1a_shard(stream_id, STREAM_SHARDS)
 }
 
 /// Global registry of active stream sessions.
