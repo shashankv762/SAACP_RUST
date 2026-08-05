@@ -559,6 +559,147 @@ Sequential session creation ≈ **1.38 µs/session** (1.38 ms / 1000).
 
 ---
 
+## Contention / multi-core scaling (`T20`–`T27`)
+
+Every benchmark in the sections above is **single-threaded**. An uncontended mutex
+costs ~15 ns, so a single-threaded harness cannot observe lock contention at all —
+a change that removes a global lock and a change that adds one produce identical
+numbers. The `T20`–`T27` group closes that blind spot: K threads hammer one shared
+structure through a `Barrier`, and the reported figure is aggregate throughput
+across the whole machine.
+
+**These are BASELINE numbers, measured before any lock-free work.** They exist to
+be beaten.
+
+### How to read the scaling column
+
+`efficiency = throughput(K) / (K × throughput(1))`. 100% is perfect linear scaling.
+Note that several structures below score **worse than 1 thread in absolute terms** —
+adding cores makes them slower, because every added core contends for the same
+cache line.
+
+| Benchmark | 1T | 8T | 28T | 28T efficiency | Bottleneck |
+|---|---|---|---|---|---|
+| `T20_Audit_Append` | 250.7 K/s | 134.5 K/s | **133.3 K/s** | **1.9%** | `security.rs:797` global hash-chain mutex |
+| `T23_Telemetry_Observe` | 6.67 M/s | 6.19 M/s | 6.56 M/s | 3.5% | `telemetry.rs:387` `RwLock<HashMap>` read lock |
+| `T24_Gate_Rejection` | 5.19 M/s | 3.07 M/s | 2.11 M/s | 1.5% | `telemetry.rs:449` `Mutex` + per-event `String` alloc |
+| `T25_AEGF_Policy_Read` | 315.6 K/s | 319.8 K/s | 259.1 K/s | 2.9% | `aegf.rs:1106` clone-under-lock |
+| `T27_AEGF_ESM` | 609.4 K/s | 401.8 K/s | 293.5 K/s | 1.7% | `aegf.rs:360` unsharded `Mutex<HashMap>` |
+
+Two of these are worth stating plainly:
+
+* **`T20` scales negatively.** 250 K/s on one thread, 133 K/s on 28 — nearly a 2×
+  *slowdown* from adding 27 cores. `benchmark_results.md`'s existing claim that the
+  audit WAL, not the 2 µs gate pipeline, is the ceiling a real deployment reaches
+  first is confirmed here directly rather than inferred.
+* **`T23` is perfectly flat** (6.5 M/s at every thread count). A read-mostly
+  `RwLock` still bounces one cache line across every core, so ~12 observations per
+  packet buy no parallelism whatsoever.
+
+### Measured after each fix
+
+Same benchmarks, same host, after the corresponding change landed:
+
+| Benchmark | Change | 1T | 8T | 28T | vs. baseline @28T |
+|---|---|---|---|---|---|
+| `T23_Telemetry_Observe` | `RwLock<HashMap>` → `[Histogram; 15]` | 10.19 M/s | 4.72 M/s | 5.52 M/s | **+151%** |
+| `T24_Gate_Rejection` | `Mutex<HashMap>` + `String` → `[AtomicU64; 15×74]` | 35.34 M/s | 42.77 M/s | **44.26 M/s** | **+1998%** |
+| `T25_AEGF_Policy_Read` | `Mutex<T>` clone → `ArcSwap<T>` | 440.2 K/s | 452.5 K/s | 285.9 K/s | +8% … +44% |
+
+`T24` is the structural one: it went from **declining under load** (5.19 → 2.11 M/s
+as threads rose) to **scaling positively** (35.3 → 44.3 M/s), a 21× improvement at
+28 threads. Removing the global mutex also removed a heap allocation per rejected
+packet, which is why the single-threaded number improved ~7× on its own.
+
+`T25`'s gain is smaller in relative terms because `submit_and_complete` does real
+work beyond the policy read; the lock and the per-packet deep `clone()` of the
+whole policy are simply no longer part of it.
+
+> **A benchmark bug worth recording.** The first `T23` run after the fix showed a
+> 65% *regression*. The cause was in the benchmark, not the code: it used invented
+> gate names (`gate_0` rather than `gate_0_crypto`), and since telemetry now
+> resolves names to dense slots, all 12 collapsed onto the single `"other"`
+> overflow slot — so it measured 12 threads contending on ONE histogram instead of
+> the 12 independent ones a real packet touches. With the production names it is
+> +151%. Any benchmark of a name-keyed structure has to use the real names.
+
+
+### `T26` — the shard-hash distribution result
+
+`T26` runs the rate limiter under three key distributions. The comparison, not any
+single number, is the finding:
+
+| Threads | `uniform_random` | `realistic_prefix` | `single_agent` |
+|---|---|---|---|
+| 1 | 3.49 M/s | 3.97 M/s | 11.87 M/s |
+| 4 | 10.74 M/s | 7.33 M/s | 7.41 M/s |
+| 8 | 12.60 M/s | 4.47 M/s | 4.97 M/s |
+| 16 | **16.56 M/s** | **4.15 M/s** | 4.92 M/s |
+
+At 16 threads, realistic `agent-NNNN` ids run **4× slower** than random ids — and
+land within noise of the `single_agent` worst case. That is the signature of every
+key hitting one shard.
+
+The cause is `ratelimit_shard_index` (`gateway.rs:119`), which hashes exactly one
+byte: `key.as_bytes().first() % 16`. Every id beginning `agent-` shares the byte
+`'a'`, so all of them map to a single shard and 15 of 16 mutexes sit idle.
+
+Two unit tests pin this down precisely (`src/gateway.rs`, `t28_*`):
+
+* `t28_ratelimit_shard_index_distributes_realistic_agent_ids` — 16,000
+  `agent-NNNN` keys distribute as `[0, 16000, 0, 0, …]`. **1 of 16 shards live.**
+* `t28_hex_prefixed_keys_reach_every_shard` — hex-prefixed ids (fingerprints,
+  session ids) never reach shards 10–15 **at all**. ASCII hex digits occupy only
+  `0x30..0x39` and `0x61..0x66`, which produce just ten distinct residues mod 16,
+  so those six shards are unreachable *by construction* no matter how much entropy
+  the rest of the key carries.
+
+The second result is the one that generalizes: "the keys are random" does not
+rescue a single-byte shard hash — the entropy has to live in the byte actually
+being hashed. It also explains why `uniform_random` above cannot be used to
+validate a shard function; it looks healthy under a hash that is provably broken.
+
+**After the fix** (`shard::fnv1a_shard`, mixing every byte, now shared by all six
+sharded structures):
+
+| Threads | `uniform_random` | `realistic_prefix` | `single_agent` |
+|---|---|---|---|
+| 1 | 3.06 M/s | 2.47 M/s | 13.88 M/s |
+| 8 | 10.55 M/s | 19.21 M/s | 4.48 M/s |
+| 16 | 20.29 M/s | **24.98 M/s** (+481%) | 4.70 M/s |
+
+`realistic_prefix` at 16 threads went from 4.15 M/s to 24.98 M/s and now slightly
+*exceeds* `uniform_random` — the workload that previously pinned every key to one
+shard is no longer the pathological case. `single_agent` is unchanged, which is
+the correct outcome: a single key is one entry under one lock, and no shard
+function can distribute it. It remains the floor on what sharding can buy.
+
+The five replaced functions were `gateway::ratelimit_shard_index`,
+`gateway::revoked_token_shard_index`, `trust_decay::trust_shard_index`,
+`streaming::stream_shard_index`, and `ievl::ievl_shard_index`.
+`cscs::cscs_shard_index` already used full-key FNV-1a (it had diagnosed the hex
+case for its own key space) and now routes through the same shared helper with
+identical constants, so its shard assignment is unchanged.
+
+### Caveats specific to these numbers
+
+* **The host CPU is heterogeneous.** The i7-14700K has 8 P-cores + 12 E-cores
+  (20C/28T). A 28-thread figure is *not* 28× a single-P-core figure: 12 of those
+  cores are substantially slower, and 8 of the 28 threads are SMT siblings sharing
+  a physical core. Efficiency percentages above are therefore a **lower bound** on
+  what the locks are costing, and should be compared within a sweep rather than
+  read as absolute parallel speedup.
+* **Criterion's sampling model assumes i.i.d. samples**, which contended
+  benchmarks violate by construction. A wide confidence interval here is *data
+  about contention*, not noise to be averaged away or re-run until it narrows.
+* `T20` uses `ImmutableAuditLog::new("")` (in-memory mode, `security.rs:1592`) so
+  it measures the hash-chain critical section alone — no disk I/O, and no
+  multi-GB log file on the RAM disk this crate builds to.
+* `T21` (full-pipeline contention) is not yet present; the per-structure
+  benchmarks above localize the bottlenecks first.
+
+---
+
 ## Reproducing
 
 ```sh
@@ -566,6 +707,7 @@ Sequential session creation ≈ **1.38 µs/session** (1.38 ms / 1000).
 cargo bench --bench benchmarks              # full suite (all 175 benchmarks)
 cargo bench -- Gate_                        # per-gate latency only
 cargo bench -- 'T[0-9]'                     # throughput only
+cargo bench -- 'T2[0-7]'                    # contention / multi-core scaling only
 cargo bench -- WC                           # worst-case only
 
 # HTML reports with plots and per-benchmark distributions:

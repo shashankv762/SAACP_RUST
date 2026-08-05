@@ -36,6 +36,13 @@ pub const COVER_TRAFFIC_THRESHOLD: usize = 50;
 pub const COVER_TRAFFIC_WINDOW_SECONDS: f64 = 1.0;
 /// Maximum token cache entries before eviction.
 pub const TOKEN_CACHE_MAX: usize = 10_000;
+/// Number of token-cache shards. Follows the `RATE_LIMITER_SHARDS` convention.
+const TOKEN_CACHE_SHARDS: usize = 16;
+/// Per-shard entry cap. The aggregate bound stays `TOKEN_CACHE_MAX`, enforced
+/// per shard rather than globally so eviction never has to take every lock —
+/// the same split `RATE_LIMITER_PER_SHARD_MAX_ENTRIES` uses. Keys distribute
+/// evenly (`shard::fnv1a_shard`), so per-shard and global caps agree closely.
+const TOKEN_CACHE_PER_SHARD_MAX: usize = TOKEN_CACHE_MAX / TOKEN_CACHE_SHARDS;
 /// Token cache TTL cap (seconds).
 pub const TOKEN_CACHE_TTL: f64 = 30.0;
 /// L-9 fix: hard cap on distinct issuers `ZeroTrustGateway::register_issuer_key` will
@@ -94,13 +101,14 @@ pub const REVOKED_TOKENS_MAX: usize = 100_000;
 /// still apply independently).
 pub const REVOKED_TOKENS_FALLBACK_TTL: f64 = 30.0 * 24.0 * 3600.0;
 
-/// Maps a token signature hash to its shard index using the first byte of the
-/// hash itself. Unlike `trust_decay::trust_shard_index`'s key space, a
-/// signature hash is never namespace-prefixed (it's always a raw SHA-256 hex
-/// digest — see `sha256_hex`), so there is no prefix to skip: the first byte
-/// is already uniformly distributed.
+/// Maps a token signature hash to its shard index.
+///
+/// The hash is a raw SHA-256 **hex** digest (see `sha256_hex`), so its first
+/// byte is drawn only from `[0-9a-f]` — ten distinct residues mod 16, leaving
+/// shards 10-15 permanently unreachable under the previous first-byte scheme.
+/// `fnv1a_shard` mixes the whole digest instead. See `shard.rs`.
 fn revoked_token_shard_index(sig_hash: &str) -> usize {
-    (sig_hash.as_bytes().first().copied().unwrap_or(0) as usize) % REVOKED_TOKENS_SHARDS
+    crate::shard::fnv1a_shard(sig_hash, REVOKED_TOKENS_SHARDS)
 }
 
 // ---------------------------------------------------------------------------
@@ -114,10 +122,14 @@ fn now_epoch_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Maps an `AgentRateLimiter` map key (an `agent_id`) to its shard index using the
-/// first byte of the key, matching `trust_decay::trust_shard_index`'s convention.
+/// Maps an `AgentRateLimiter` map key (an `agent_id`) to its shard index.
+///
+/// Hashes the WHOLE key: agent ids in practice share a common prefix
+/// (`agent-0001`, `agent-0002`, …), so the previous first-byte scheme sent every
+/// one of them to a single shard and left the other 15 mutexes idle. See
+/// `shard.rs` and the `t28_*` tests below.
 fn ratelimit_shard_index(key: &str) -> usize {
-    (key.as_bytes().first().copied().unwrap_or(0) as usize) % RATE_LIMITER_SHARDS
+    crate::shard::fnv1a_shard(key, RATE_LIMITER_SHARDS)
 }
 
 fn new_ratelimit_shards<V>() -> Vec<Mutex<HashMap<String, V>>> {
@@ -604,6 +616,45 @@ impl Drop for AgentRateLimiter {
 struct CacheEntry {
     expiry: f64,
     result: TokenValidationResult,
+    /// The `GatewayEpochs::cache_generation` in force when this verdict was
+    /// computed. A lookup whose generation differs is treated as a miss.
+    ///
+    /// This is what makes invalidation atomic independently of how the cache is
+    /// physically sharded. Clearing 16 shards is NOT atomic — a concurrent
+    /// lookup can hit a not-yet-cleared shard between shard 0 and shard 15 — and
+    /// every caller that clears this cache is a revocation or key-registry
+    /// change, so that window would serve a REVOKED token. Bumping one counter
+    /// in a single atomic publish closes it; the physical clear afterwards is
+    /// then pure memory reclamation with no correctness role.
+    generation: u64,
+}
+
+/// The gateway's revocation/config scalars, read together as one snapshot.
+///
+/// These were four independent `Mutex`es. `validate_lateral_movement` reads
+/// several of them per packet and its decision depends on their **mutual**
+/// consistency, so four independent atomics would be actively unsafe here: a
+/// packet could observe the NEW `revocation_epoch` (concluding its cached
+/// verdict is fresh) alongside the OLD `blanket_revoked_before` (so the blanket
+/// revocation is not applied) and admit a token that must have been rejected.
+/// `revoke_all_tokens` updates exactly that pair together, which is precisely
+/// the window an attacker would target during PSK-compromise recovery.
+///
+/// Holding them in one immutable struct behind an `ArcSwap` means a reader gets
+/// all five fields from a single lock-free load, and a writer publishes all five
+/// at once. A torn read is unrepresentable.
+#[derive(Debug, Clone)]
+struct GatewayEpochs {
+    strict_asymmetric_mode: bool,
+    revocation_epoch: u64,
+    issuer_registry_epoch: u64,
+    /// H-2: any capability token whose `iat` predates this is rejected.
+    blanket_revoked_before: f64,
+    /// Bumped on every event that invalidates cached token verdicts. A
+    /// `CacheEntry` stamped with a stale generation is treated as a miss, which
+    /// makes invalidation atomic and instantaneous regardless of how the cache
+    /// is physically sharded — see `token_cache`.
+    cache_generation: u64,
 }
 
 /// Zero-Trust Tokenized Micro-Gateway.
@@ -626,7 +677,14 @@ pub struct ZeroTrustGateway {
     /// (oldest-`exp`-first eviction) for the pathological case where every
     /// revoked token has a far-future `exp`.
     revoked_tokens: Vec<Mutex<HashMap<String, f64>>>,
-    token_cache: Mutex<HashMap<String, CacheEntry>>,
+    /// Sharded 16-way on the cache key (see `token_cache_shard`). Read on
+    /// essentially every packet and written on every miss, so a single global
+    /// mutex serialized the hot path.
+    ///
+    /// Correctness of invalidation does NOT depend on this sharding: entries
+    /// carry a `generation` stamp and a stale one is a miss, so a partially
+    /// cleared cache can never serve a revoked verdict. See `CacheEntry`.
+    token_cache: Vec<Mutex<HashMap<String, CacheEntry>>>,
     // S-3 fix: issuer secrets are long-term key material held for the life of the
     // process — wrapped in `Zeroizing` so a value is cleared from heap memory
     // the moment it's overwritten (`register_issuer_key` re-registration),
@@ -634,35 +692,40 @@ pub struct ZeroTrustGateway {
     // is dropped, rather than lingering for forensic recovery (core dump, cold
     // boot attack, use-after-free in unrelated code).
     trusted_issuer_keys: Mutex<HashMap<String, Zeroizing<Vec<u8>>>>,
-    strict_asymmetric_mode: Mutex<bool>,
-    revocation_epoch: Mutex<u64>,
-    issuer_registry_epoch: Mutex<u64>,
-    /// H-2 fix: epoch-based blanket rejection for PSK compromise recovery.
-    /// `revoke_all_tokens()` sets this to the recovery timestamp instead of
-    /// clearing `revoked_tokens` — clearing that set would silently un-revoke
-    /// every individually-revoked token, a fail-open bug. Any capability
-    /// token whose `iat` claim predates this timestamp is rejected in
-    /// `validate_lateral_movement`, covering tokens that were never
-    /// individually enumerated in `revoked_tokens`.
-    blanket_revoked_before: Mutex<f64>,
+    /// Read-mostly scalars, published as one consistent snapshot — see
+    /// [`GatewayEpochs`] for why these must not be independent atomics.
+    epochs: arc_swap::ArcSwap<GatewayEpochs>,
+    /// Serializes WRITERS to `epochs` only; never taken on the read path.
+    ///
+    /// Every mutation is read-modify-write (`epoch += 1`), which `ArcSwap`
+    /// cannot make atomic on its own. Writes are rare (key registration,
+    /// revocation, admin config), so a plain mutex around them costs nothing on
+    /// the hot path while preventing two concurrent revocations from both
+    /// reading epoch N and both publishing N+1 — which would leave cached
+    /// verdicts from the first revocation looking current.
+    epoch_write_lock: Mutex<()>,
     /// T3.1 — TrustStore integration (FAITF identity verification)
-    trust_store: Mutex<Option<Arc<TrustStore>>>,
+    trust_store: arc_swap::ArcSwapOption<TrustStore>,
     /// T3.2 — ACSVAF capability verification authority
-    capability_authority: Mutex<Option<Arc<CapabilityVerificationAuthority>>>,
+    capability_authority: arc_swap::ArcSwapOption<CapabilityVerificationAuthority>,
 }
 
 impl ZeroTrustGateway {
     pub fn new() -> Self {
         Self {
             revoked_tokens: (0..REVOKED_TOKENS_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            token_cache: Mutex::new(HashMap::new()),
+            token_cache: (0..TOKEN_CACHE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             trusted_issuer_keys: Mutex::new(HashMap::new()),
-            strict_asymmetric_mode: Mutex::new(false),
-            revocation_epoch: Mutex::new(0),
-            issuer_registry_epoch: Mutex::new(0),
-            blanket_revoked_before: Mutex::new(0.0),
-            trust_store: Mutex::new(None),
-            capability_authority: Mutex::new(None),
+            epochs: arc_swap::ArcSwap::from_pointee(GatewayEpochs {
+                strict_asymmetric_mode: false,
+                revocation_epoch: 0,
+                issuer_registry_epoch: 0,
+                blanket_revoked_before: 0.0,
+                cache_generation: 0,
+            }),
+            epoch_write_lock: Mutex::new(()),
+            trust_store: arc_swap::ArcSwapOption::empty(),
+            capability_authority: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -678,26 +741,65 @@ impl ZeroTrustGateway {
 
     /// When true, HMAC-PSK tokens are rejected outright.
     ///
+    /// Lock and return the token-cache shard responsible for `cache_key`.
+    fn token_cache_shard(&self, cache_key: &str) -> std::sync::MutexGuard<'_, HashMap<String, CacheEntry>> {
+        let idx = crate::shard::fnv1a_shard(cache_key, TOKEN_CACHE_SHARDS);
+        self.token_cache[idx].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drop every cached verdict.
+    ///
+    /// Reclamation only — correctness comes from the `cache_generation` bump in
+    /// `update_epochs`, which every caller of this method performs. Deliberately
+    /// takes one shard lock at a time rather than all 16 at once: a torn clear
+    /// is harmless here (stale entries are already unreachable by generation),
+    /// whereas holding 16 locks simultaneously would be a lock-ordering hazard.
+    fn clear_token_cache(&self) {
+        for shard in &self.token_cache {
+            shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    /// Atomically read-modify-write the epoch snapshot.
+    ///
+    /// `mutate` receives a copy of the current snapshot and adjusts whichever
+    /// fields the caller owns; the result is published as one unit. The write
+    /// lock makes the read-modify-write indivisible, so two concurrent
+    /// revocations cannot both observe epoch N and both publish N+1.
+    ///
+    /// `cache_generation` is bumped here unconditionally, because every caller of
+    /// this helper is an event that invalidates cached token verdicts. That makes
+    /// cache invalidation a single atomic publish — see `token_cache_valid`.
+    fn update_epochs(&self, mutate: impl FnOnce(&mut GatewayEpochs)) {
+        let _w = self.epoch_write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = (**self.epochs.load()).clone();
+        next.cache_generation = next.cache_generation.wrapping_add(1);
+        mutate(&mut next);
+        self.epochs.store(Arc::new(next));
+    }
+
     /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
     /// poison rather than panicking (`.unwrap()`) — `ZeroTrustGateway::global()`
     /// is a process-wide singleton, so one poisoning panic must not cascade
     /// into every other in-flight packet losing token validation/revocation
     /// entirely.
     pub fn set_strict_asymmetric_mode(&self, enabled: bool) {
-        *self.strict_asymmetric_mode.lock().unwrap_or_else(|e| e.into_inner()) = enabled;
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.update_epochs(|e| e.strict_asymmetric_mode = enabled);
+        self.clear_token_cache();
     }
 
     /// T3.1 — Register a FAITF TrustStore for identity verification.
     pub fn register_trust_store(&self, ts: Arc<TrustStore>) {
-        *self.trust_store.lock().unwrap_or_else(|e| e.into_inner()) = Some(ts);
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.trust_store.store(Some(ts));
+        self.update_epochs(|_| {});
+        self.clear_token_cache();
     }
 
     /// T3.2 — Register an ACSVAF CapabilityVerificationAuthority.
     pub fn register_capability_authority(&self, ca: Arc<CapabilityVerificationAuthority>) {
-        *self.capability_authority.lock().unwrap_or_else(|e| e.into_inner()) = Some(ca);
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.capability_authority.store(Some(ca));
+        self.update_epochs(|_| {});
+        self.clear_token_cache();
     }
 
     /// Register the canonical token-signing key for a trusted issuer.
@@ -738,16 +840,16 @@ impl ZeroTrustGateway {
             }
             keys.insert(issuer_agent.to_string(), Zeroizing::new(issuer_secret.to_vec()));
         }
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.clear_token_cache();
+        self.update_epochs(|e| e.issuer_registry_epoch += 1);
         Ok(())
     }
 
     /// Clear trusted issuer registry.
     pub fn clear_trusted_issuers(&self) {
         self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.clear_token_cache();
+        self.update_epochs(|e| e.issuer_registry_epoch += 1);
     }
 
     /// Issue a capability token (HMAC-SHA256 path).
@@ -840,8 +942,8 @@ impl ZeroTrustGateway {
             shard.insert(sig_hash, exp);
         }
         self.enforce_revoked_tokens_cap();
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.clear_token_cache();
+        self.update_epochs(|e| e.revocation_epoch += 1);
         Ok(())
     }
 
@@ -905,7 +1007,7 @@ impl ZeroTrustGateway {
 
     /// Returns the current revocation epoch.
     pub fn get_revocation_epoch(&self) -> u64 {
-        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner())
+        self.epochs.load().revocation_epoch
     }
 
     /// Check if a token signature hash is in the revocation set.
@@ -926,14 +1028,24 @@ impl ZeroTrustGateway {
         // `iat` as a `u64`) — comparing a fractional timestamp against a
         // floored one could spuriously reject a token issued in the same
         // wall-clock second as this call, after it.
-        *self.blanket_revoked_before.lock().unwrap_or_else(|e| e.into_inner()) = now_epoch_secs().floor();
-        self.token_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        //
+        // All three fields are published in ONE swap. This is the site that
+        // makes the snapshot mandatory: with independent atomics a concurrent
+        // packet could see the bumped `revocation_epoch` (so its cache key looks
+        // current) while still reading the pre-recovery `blanket_revoked_before`
+        // of 0.0, and admit a token this call was meant to revoke — during PSK
+        // compromise recovery, which is exactly when that must not happen.
+        let now = now_epoch_secs().floor();
+        self.clear_token_cache();
         self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        let mut rev_epoch = self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner());
-        *rev_epoch += 1;
-        let mut iss_epoch = self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner());
-        *iss_epoch += 1;
-        *rev_epoch
+        let mut new_epoch = 0;
+        self.update_epochs(|e| {
+            e.blanket_revoked_before = now;
+            e.revocation_epoch += 1;
+            e.issuer_registry_epoch += 1;
+            new_epoch = e.revocation_epoch;
+        });
+        new_epoch
     }
 
     /// Evaluate the token before allowing lateral movement.
@@ -947,8 +1059,14 @@ impl ZeroTrustGateway {
     ) -> Result<TokenValidationResult, SAACPHardDrop> {
         let now = now_epoch_secs();
         let fallback_key_hash = sha256_hex(issuer_secret);
-        let registry_epoch = *self.issuer_registry_epoch.lock().unwrap_or_else(|e| e.into_inner());
-        let revocation_epoch = *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        // ONE load for the whole validation. Every epoch/config field this
+        // function consults comes from this single consistent snapshot, so no
+        // interleaving with a concurrent `revoke_all_tokens` can produce a mixed
+        // view (new epoch + stale blanket-revocation timestamp) that would admit
+        // a token that should have been rejected.
+        let epochs = self.epochs.load();
+        let registry_epoch = epochs.issuer_registry_epoch;
+        let revocation_epoch = epochs.revocation_epoch;
 
         // Hash the token before using it as a cache key — never store the plaintext
         // capability token in a data structure that could be heap-dumped or logged.
@@ -962,11 +1080,15 @@ impl ZeroTrustGateway {
             revocation_epoch,
         );
 
-        // Check cache
+        // Check cache. An entry is usable only if it is unexpired AND was
+        // computed under the CURRENT cache generation — a stale generation means
+        // a revocation or key-registry change has happened since, so the cached
+        // verdict is treated as absent regardless of whether the physical
+        // clear-out has reached this shard yet.
         {
-            let cache = self.token_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self.token_cache_shard(&cache_key);
             if let Some(entry) = cache.get(&cache_key) {
-                if now < entry.expiry {
+                if now < entry.expiry && entry.generation == epochs.cache_generation {
                     return Ok(entry.result.clone());
                 }
             }
@@ -1010,7 +1132,7 @@ impl ZeroTrustGateway {
             .unwrap_or("hmac-sha256");
 
         // Reject HMAC in strict mode
-        if *self.strict_asymmetric_mode.lock().unwrap_or_else(|e| e.into_inner()) && sig_alg != "ed25519" {
+        if epochs.strict_asymmetric_mode && sig_alg != "ed25519" {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "HMAC-PSK tokens are rejected in strict asymmetric mode.",
@@ -1074,13 +1196,13 @@ impl ZeroTrustGateway {
                     "Ed25519 capability token is missing its 'kid' claim.",
                 )
             })?;
-            let ca = self.capability_authority.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let ca = self.capability_authority.load_full();
             let ca_key = ca.and_then(|ca| ca.get_verification_key(kid));
             let vk = match ca_key {
                 Some(vk) => vk,
                 None => {
                     // Fallback: FAITF TrustStore identity-pinned key for this issuer.
-                    let ts = self.trust_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let ts = self.trust_store.load_full();
                     match ts.and_then(|ts| ts.get_pinned_key(&source_agent)) {
                         Some(vk) => vk,
                         None => {
@@ -1109,7 +1231,7 @@ impl ZeroTrustGateway {
         // `revoked_tokens`. A token missing `iat` (pre-fix wire format) is
         // treated as issued at time 0 — fail-closed once any blanket
         // revocation has occurred.
-        let blanket_revoked_before = *self.blanket_revoked_before.lock().unwrap_or_else(|e| e.into_inner());
+        let blanket_revoked_before = epochs.blanket_revoked_before;
         if blanket_revoked_before > 0.0 {
             let iat = obj.get("iat").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
             if iat < blanket_revoked_before {
@@ -1244,15 +1366,23 @@ impl ZeroTrustGateway {
         // being evicted, extending its effective validity window.  Evicting soonest-expiring
         // entries is deterministic (based on content, not iteration order) and correct:
         // entries closest to natural expiry provide the least residual value anyway.
+        //
+        // Now applied PER SHARD against `TOKEN_CACHE_PER_SHARD_MAX`, so eviction
+        // touches one lock instead of the whole cache. Keys spread evenly
+        // (`shard::fnv1a_shard`), so the aggregate bound still tracks
+        // `TOKEN_CACHE_MAX`.
         let cache_expiry = (now_epoch_secs() + TOKEN_CACHE_TTL).min(exp);
-        let mut cache = self.token_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= TOKEN_CACHE_MAX {
+        let mut cache = self.token_cache_shard(&cache_key);
+        if cache.len() >= TOKEN_CACHE_PER_SHARD_MAX {
             let current_time = now_epoch_secs();
-            // First pass: drop already-expired entries (free, no ordering needed).
-            cache.retain(|_, v| v.expiry > current_time);
+            // First pass: drop already-expired entries, and any left over from a
+            // superseded generation (free, no ordering needed).
+            cache.retain(|_, v| {
+                v.expiry > current_time && v.generation == epochs.cache_generation
+            });
             // Second pass: if still at/above capacity, evict the 20% soonest to expire.
-            if cache.len() >= TOKEN_CACHE_MAX {
-                let evict_count = TOKEN_CACHE_MAX / 5;
+            if cache.len() >= TOKEN_CACHE_PER_SHARD_MAX {
+                let evict_count = TOKEN_CACHE_PER_SHARD_MAX / 5;
                 let mut by_expiry: Vec<(String, f64)> = cache
                     .iter()
                     .map(|(k, v)| (k.clone(), v.expiry))
@@ -1267,6 +1397,7 @@ impl ZeroTrustGateway {
         cache.insert(cache_key, CacheEntry {
             expiry: cache_expiry,
             result: result.clone(),
+            generation: epochs.cache_generation,
         });
 
         Ok(result)
@@ -1838,6 +1969,84 @@ impl Default for RRBCGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T28 — every shard must receive a roughly equal share of realistic agent
+    /// IDs. Sharding exists to spread lock traffic; a shard function that maps a
+    /// realistic workload onto one shard leaves the other 15 mutexes idle and
+    /// silently reproduces the single-global-mutex behavior it was added to fix.
+    ///
+    /// `agent-0001`, `agent-0002`, ... is the naming convention this protocol's
+    /// own tests, benchmarks, and docs use throughout, so it is the distribution
+    /// that must be spread — not uniformly-random keys, which spread under any
+    /// hash and therefore prove nothing.
+    ///
+    /// Tolerance is +/-10% of the ideal n/SHARDS. That is loose enough that no
+    /// reasonable hash trips it and tight enough to catch a shard function that
+    /// collapses onto a subset.
+    #[test]
+    fn t28_ratelimit_shard_index_distributes_realistic_agent_ids() {
+        const N: usize = 16_000;
+        let mut counts = vec![0usize; RATE_LIMITER_SHARDS];
+        for i in 0..N {
+            counts[ratelimit_shard_index(&format!("agent-{i:04}"))] += 1;
+        }
+
+        let ideal = N as f64 / RATE_LIMITER_SHARDS as f64;
+        let (lo, hi) = (ideal * 0.9, ideal * 1.1);
+        let live = counts.iter().filter(|&&c| c > 0).count();
+
+        assert!(
+            counts.iter().all(|&c| (c as f64) >= lo && (c as f64) <= hi),
+            "shard distribution for realistic `agent-NNNN` ids is not even: {counts:?}\n\
+             ideal {ideal:.0} per shard (+/-10% => {lo:.0}..={hi:.0}), \
+             {live}/{} shards received any traffic.\n\
+             A single-byte shard hash maps every `agent-*` key onto one shard, so \
+             15 of 16 mutexes go unused and the hot path serializes exactly as it \
+             did before sharding was introduced.",
+            RATE_LIMITER_SHARDS,
+        );
+    }
+
+    /// Companion to `t28_...`: even keys whose leading characters look "random"
+    /// must reach every shard.
+    ///
+    /// This one is subtler than the `agent-NNNN` case and worth spelling out.
+    /// Hex-encoded ids (fingerprints, session ids, hashes — used throughout this
+    /// crate) begin with a character drawn from `[0-9a-f]`, whose ASCII codes are
+    /// `0x30..=0x39` and `0x61..=0x66`. Under a shard function that hashes only
+    /// the FIRST BYTE, `c % 16` maps that 16-character alphabet onto just ten
+    /// residues (`'0'..'9'` -> 0..9, and `'a'..'f'` -> 1..6, colliding with the
+    /// digits). Shards 10-15 are therefore **structurally unreachable**: no
+    /// hex-prefixed key can ever land on them, no matter how much entropy the
+    /// rest of the string carries.
+    ///
+    /// So "the keys are random" does NOT rescue a single-byte shard hash — the
+    /// entropy has to be in the byte that is actually hashed.
+    #[test]
+    fn t28_hex_prefixed_keys_reach_every_shard() {
+        const N: usize = 16_000;
+        let mut counts = vec![0usize; RATE_LIMITER_SHARDS];
+        for i in 0..N {
+            // Hex-prefixed, like a key fingerprint or session id.
+            let key = format!("{:08x}-agent", (i as u64).wrapping_mul(2_654_435_761));
+            counts[ratelimit_shard_index(&key)] += 1;
+        }
+
+        let dead: Vec<usize> = counts.iter()
+            .enumerate()
+            .filter(|(_, &c)| c == 0)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(
+            dead.is_empty(),
+            "hex-prefixed keys never reach shards {dead:?}: {counts:?}\n\
+             ASCII hex digits occupy only 0x30-0x39 and 0x61-0x66, so a shard \
+             function that hashes just the first byte can only produce ten \
+             distinct residues mod 16 — the remaining shards are unreachable by \
+             construction, regardless of how random the rest of the key is.",
+        );
+    }
 
     #[test]
     fn test_rate_limiter_basic() {
@@ -2563,6 +2772,73 @@ mod tests {
         assert_eq!(epoch2, epoch + 1, "revocation_epoch must increment on each call");
         // get_revocation_epoch() must match the return value
         assert_eq!(gw.get_revocation_epoch(), epoch2);
+    }
+
+    /// A cached verdict must become unusable the instant the generation is
+    /// bumped — WITHOUT relying on the physical clear having run.
+    ///
+    /// This is the property that makes it safe to shard the token cache at all.
+    /// Clearing 16 shards is not atomic, and every clear site is a revocation or
+    /// key-registry change, so if correctness depended on the clear a concurrent
+    /// lookup could hit a not-yet-cleared shard and be served a REVOKED token.
+    /// Here the entry is left physically in place and must still be rejected.
+    #[test]
+    fn stale_generation_entry_is_never_served_even_if_not_cleared() {
+        let gw = ZeroTrustGateway::new();
+        let secret = b"secret-key-32-bytes-long!!!!!!!!";
+        gw.register_issuer_key("issuer-gen", secret).unwrap();
+        let token = gw.issue_capability_token(
+            secret, "issuer-gen", &["target-gen"], &[], 3600, None, 0, None);
+
+        // Populate the cache, then confirm the entry is really there.
+        gw.validate_lateral_movement("target-gen", &token, secret).unwrap();
+        let cached_key_count: usize =
+            gw.token_cache.iter().map(|s| s.lock().unwrap().len()).sum();
+        assert_eq!(cached_key_count, 1, "validation should have cached one verdict");
+
+        // Bump the generation WITHOUT clearing — simulating the window between
+        // the atomic publish and a shard's physical clear.
+        gw.update_epochs(|_| {});
+        let after: usize = gw.token_cache.iter().map(|s| s.lock().unwrap().len()).sum();
+        assert_eq!(after, 1, "entry must still be physically present for this test to mean anything");
+
+        // The stale entry must be ignored: re-validating recomputes and restamps
+        // it with the current generation rather than returning the old verdict.
+        let epochs_before = gw.epochs.load().cache_generation;
+        gw.validate_lateral_movement("target-gen", &token, secret).unwrap();
+        let stamped: Vec<u64> = gw.token_cache.iter()
+            .flat_map(|s| s.lock().unwrap().values().map(|v| v.generation).collect::<Vec<_>>())
+            .collect();
+        assert!(
+            stamped.iter().all(|&g| g == epochs_before),
+            "cached entries must carry the current generation after revalidation, got {stamped:?}",
+        );
+    }
+
+    /// `revoke_all_tokens` must publish `blanket_revoked_before` and the epoch
+    /// counters together, so no reader can observe the bumped epoch alongside a
+    /// stale (zero) blanket timestamp.
+    ///
+    /// That mixed view is exactly what independent atomics would permit, and it
+    /// would admit a token during PSK-compromise recovery — the one moment the
+    /// blanket revocation exists to cover.
+    #[test]
+    fn revoke_all_tokens_publishes_blanket_timestamp_with_the_epoch_bump() {
+        let gw = ZeroTrustGateway::new();
+        let before = gw.epochs.load();
+        assert_eq!(before.blanket_revoked_before, 0.0);
+
+        let epoch = gw.revoke_all_tokens();
+        let after = gw.epochs.load();
+
+        assert_eq!(after.revocation_epoch, epoch);
+        assert!(
+            after.blanket_revoked_before > 0.0,
+            "blanket_revoked_before must be set in the SAME snapshot that carries \
+             the bumped revocation_epoch — a reader seeing the new epoch with the \
+             old 0.0 timestamp would skip the blanket revocation entirely",
+        );
+        assert!(after.cache_generation > before.cache_generation);
     }
 
     /// Task: cover_traffic_budget_separate_from_error_budget

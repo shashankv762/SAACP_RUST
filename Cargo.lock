@@ -2832,6 +2832,7 @@ dependencies = [
  "adler2",
  "aes-gcm",
  "aho-corasick",
+ "arc-swap",
  "aws-config",
  "aws-sdk-kms",
  "axum 0.7.9",

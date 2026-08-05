@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod schemas;
+pub mod shard;
 pub mod framing;
 pub mod easi;
 pub mod measc;

@@ -412,29 +412,21 @@ const TRUST_SHARDS: usize = 16;
 /// within each shard's own eviction sweep.
 const TRUST_PER_SHARD_MAX_ENTRIES: usize = TRUST_MAX_ENTRIES / TRUST_SHARDS;
 
-/// Maps a trust-map key to its shard index using the first byte of the
-/// *identity*, not the first byte of the raw string — matching Part 6.3's
-/// "first byte of fingerprint" strategy.
+/// Maps a trust-map key to its shard index by hashing the whole key.
 ///
-/// Every key this function ever sees is namespaced (`pk:<fp>` / `aid:<id>` /
-/// `ip:<ip>`, see `trust_key_for`/`ip_trust_key`), so `key.as_bytes().first()`
-/// is always one of the constant prefix letters `'p'`/`'a'`/`'i'` — not a byte
-/// of the actual fingerprint/agent-id/ip. That collapsed all traffic within a
-/// namespace onto a single shard (`'p'` -> shard 0, `'a'` -> shard 1, `'i'` ->
-/// shard 9), silently defeating the 16-way distribution this sharding exists
-/// to provide — 13 of 16 shards were permanently dead, and the one live shard
-/// for each namespace reproduced the pre-sharding single-`Mutex` contention
-/// bottleneck. Skip past the first `':'` before sampling a byte so the shard
-/// key is drawn from the actual identity, not the namespace tag.
+/// Every key this function sees is namespaced (`pk:<fp>` / `aid:<id>` /
+/// `ip:<ip>`, see `trust_key_for`/`ip_trust_key`). Sampling `key.as_bytes()
+/// .first()` would always yield one of the constant prefix letters
+/// `'p'`/`'a'`/`'i'`, collapsing each namespace onto a single shard and leaving
+/// 13 of 16 dead. Skipping past the `':'` fixed that, but still sampled ONE
+/// byte — so `pk:` keys (raw SHA-256 hex fingerprints, drawn from `[0-9a-f]`)
+/// still reached only ten of sixteen shards, and `aid:` keys sharing a common
+/// agent-id prefix still concentrated.
+///
+/// `fnv1a_shard` mixes every byte, which fixes both the namespace tag and the
+/// hex-alphabet cases at once. See `shard.rs`.
 fn trust_shard_index(key: &str) -> usize {
-    let bytes = key.as_bytes();
-    let significant_byte = bytes
-        .iter()
-        .position(|&b| b == b':')
-        .and_then(|colon_idx| bytes.get(colon_idx + 1))
-        .copied()
-        .unwrap_or_else(|| bytes.first().copied().unwrap_or(0));
-    (significant_byte as usize) % TRUST_SHARDS
+    crate::shard::fnv1a_shard(key, TRUST_SHARDS)
 }
 
 /// L-25 fix: opaque handle returned by [`TrustDecayEngine::subscribe`], usable with
@@ -1462,37 +1454,57 @@ mod tests {
 
     #[test]
     fn trust_shard_index_distributes_across_namespace_prefixes() {
-        // Regression test: `trust_shard_index` must sample the byte AFTER the
-        // namespace prefix's ':', not the prefix letter itself. Sampling the
-        // prefix letter ('p'/'a'/'i') would collapse every `pk:`-keyed entry
-        // onto one shard, every `aid:`-keyed entry onto another, and every
-        // `ip:`-keyed entry onto a third — 13 of 16 shards permanently dead.
-        let pk_a = trust_shard_index("pk:aaaa");
-        let pk_z = trust_shard_index("pk:zzzz");
-        assert_ne!(pk_a, pk_z, "two distinct pk: fingerprints must be able to land in \
-            different shards — got the same shard for both, suggesting the namespace \
-            prefix (not the fingerprint byte) is still being sampled");
+        // Regression test: every key here is namespaced (`pk:` / `aid:` / `ip:`),
+        // so a shard function that samples the FIRST byte sees only the constant
+        // prefix letter and collapses each namespace onto a single shard —
+        // 13 of 16 shards permanently dead, and the one live shard per namespace
+        // reproducing the pre-sharding single-`Mutex` bottleneck.
+        //
+        // Asserted as a DISTRIBUTION over many keys rather than "these two keys
+        // differ". Two arbitrary keys collide with probability 1/16 under any
+        // sound hash, so a pairwise assertion would be flaky by construction —
+        // it only held for the old scheme because it compared bytes that
+        // happened to differ. What actually matters is that no namespace
+        // concentrates.
+        const SHARDS: usize = TRUST_SHARDS;
+        const N: usize = 4_000;
 
-        let aid_a = trust_shard_index("aid:aaaa");
-        let aid_z = trust_shard_index("aid:zzzz");
-        assert_ne!(aid_a, aid_z, "two distinct aid: agent ids must be able to land in \
-            different shards");
-
-        let ip_a = trust_shard_index("ip:1.1.1.1");
-        let ip_z = trust_shard_index("ip:9.9.9.9");
-        assert_ne!(ip_a, ip_z, "two distinct ip: keys must be able to land in different shards");
+        for (label, keys) in [
+            ("pk:", (0..N).map(|i| format!("pk:{:064x}", i)).collect::<Vec<_>>()),
+            ("aid:", (0..N).map(|i| format!("aid:agent-{i:05}")).collect()),
+            ("ip:", (0..N).map(|i| format!("ip:10.{}.{}.{}", i / 65536 % 256, i / 256 % 256, i % 256)).collect()),
+        ] {
+            let mut counts = vec![0usize; SHARDS];
+            for k in &keys {
+                counts[trust_shard_index(k)] += 1;
+            }
+            let ideal = N as f64 / SHARDS as f64;
+            let (lo, hi) = (ideal * 0.85, ideal * 1.15);
+            assert!(
+                counts.iter().all(|&c| (c as f64) >= lo && (c as f64) <= hi),
+                "namespace {label} concentrates: {counts:?} \
+                 (ideal {ideal:.0}/shard, tolerance {lo:.0}..={hi:.0}) — the shard \
+                 function is likely sampling the namespace prefix rather than \
+                 mixing the whole key",
+            );
+        }
     }
 
     #[test]
     fn trust_shard_index_handles_missing_or_trailing_colon_without_panicking() {
-        // No colon at all -> falls back to the first byte (defensive, no
-        // current caller produces an unprefixed key).
-        assert_eq!(trust_shard_index(""), 0);
-        let _ = trust_shard_index("no-namespace-here");
-        // Colon is the very last byte (degenerate empty-identity case) -> the
-        // `bytes.get(colon_idx + 1)` lookup returns None, falls back to the
-        // first byte rather than panicking on an out-of-bounds index.
-        let _ = trust_shard_index("pk:");
+        // Degenerate keys must not panic and must stay in range. No current
+        // caller produces these (every caller goes through `trust_key_for` /
+        // `ip_trust_key`), so this is purely defensive.
+        //
+        // Deliberately asserts only the range invariant, not a specific shard
+        // number: which shard the empty key lands on is an artifact of the hash
+        // (FNV's offset basis mod 16), not a property worth pinning.
+        for key in ["", "no-namespace-here", "pk:", ":", "::::"] {
+            assert!(
+                trust_shard_index(key) < TRUST_SHARDS,
+                "trust_shard_index({key:?}) escaped the shard range",
+            );
+        }
     }
 
     // ── IntentDriftTracker ───────────────────────────────────────────────────

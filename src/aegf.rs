@@ -971,7 +971,13 @@ impl Default for AEGFPolicy {
 /// Violations transition states instead of terminating sessions.
 /// Thread-safe.
 pub struct AEGFGovernor {
-    policy: Mutex<AEGFPolicy>,
+    /// Read on every packet (`submit_request`/`submit_and_complete`), written
+    /// only by `set_policy` on an admin action. Was `Mutex<AEGFPolicy>`, which
+    /// forced the hot path to take a global lock AND deep-`clone()` the whole
+    /// policy per packet; `ArcSwap` makes the read a lock-free atomic load with
+    /// no allocation. The value is still swapped as a unit, so a reader can
+    /// never observe a half-applied policy update.
+    policy: arc_swap::ArcSwap<AEGFPolicy>,
     deg: DistributedExecutionGraph,
     esm: ExecutionStateMachine,
 }
@@ -979,7 +985,7 @@ pub struct AEGFGovernor {
 impl AEGFGovernor {
     pub fn new(policy: Option<AEGFPolicy>) -> Self {
         Self {
-            policy: Mutex::new(policy.unwrap_or_default()),
+            policy: arc_swap::ArcSwap::from_pointee(policy.unwrap_or_default()),
             deg: DistributedExecutionGraph::new(),
             esm: ExecutionStateMachine::new(),
         }
@@ -993,15 +999,15 @@ impl AEGFGovernor {
         &self.esm
     }
 
-    /// M-38 fix: every `self.policy.lock()` in this impl block recovers via
-    /// `into_inner()` on poison rather than panicking — `AEGFGovernor` is a
-    /// process-wide singleton (`GLOBAL_AEGF_GOVERNOR`).
+    /// Swaps the policy atomically. Readers in flight continue to see the
+    /// previous value for the remainder of their `load()` guard, and the next
+    /// read observes the new one — a reader can never see a mix of the two.
     pub fn set_policy(&self, policy: AEGFPolicy) {
-        *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
+        self.policy.store(std::sync::Arc::new(policy));
     }
 
     pub fn get_policy(&self) -> AEGFPolicy {
-        self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        (**self.policy.load()).clone()
     }
 
     /// Validate metadata, run DEG governance, update ESM.
@@ -1013,7 +1019,10 @@ impl AEGFGovernor {
     /// 3. DEG cycle + repeated-path detection
     /// 4. ESM registration + transition
     pub fn submit_request(&self, meta: &AEGFMetadata) -> GovernanceDecision {
-        let policy = self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Lock-free atomic load. The guard borrows the current policy for the
+        // rest of this call; the old `Mutex` path deep-cloned the entire policy
+        // per packet purely to pass `&policy` to the DEG below.
+        let policy = self.policy.load();
 
         // Step 1: TTL
         if meta.is_expired() {
@@ -1103,7 +1112,9 @@ impl AEGFGovernor {
     /// step 7 ("DEG fast-path... eliminate 3 lock acquisitions"); ESM's own
     /// lock traffic is a separate concern not in this pass's scope.
     pub fn submit_and_complete(&self, meta: &AEGFMetadata) -> GovernanceDecision {
-        let policy = self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Lock-free atomic load — see `submit_request`. This is the hottest
+        // policy read in the crate (once per packet through Gate 11.0).
+        let policy = self.policy.load();
         let is_root = meta.prid == RID_ROOT;
 
         // Step 1: TTL — identical to submit_request's early-return path.
@@ -1215,7 +1226,7 @@ impl AEGFGovernor {
 
     /// GC terminal ESM states + expired DEG nodes. Returns total evicted.
     pub fn expire_stale_requests(&self) -> usize {
-        let gc_age = self.policy.lock().unwrap_or_else(|e| e.into_inner()).esm_gc_age_seconds;
+        let gc_age = self.policy.load().esm_gc_age_seconds;
         let esm_evicted = self.esm.expire_old(gc_age);
         let deg_evicted = self.deg.evict_expired();
         esm_evicted + deg_evicted

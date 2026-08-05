@@ -566,14 +566,27 @@ static HIGHEST_VERSION: AtomicU64 = AtomicU64::new(0);
 pub struct RulePackStore {
     /// Provisioned once at startup, never replaced — see the module doc.
     anchor: OnceLock<(String, VerifyingKey)>,
-    current: Mutex<Option<Arc<CompiledRuleSet>>>,
+    /// Read on every injection scan, written only on install/revert, so the read
+    /// is a lock-free atomic load. Publication ordering against `ACTIVE` is
+    /// unchanged: `current` is populated before `ACTIVE` is set on install, and
+    /// `ACTIVE` is cleared before `current` on revert.
+    current: arc_swap::ArcSwapOption<CompiledRuleSet>,
+    /// Serializes INSTALLERS only — never taken on the scan path.
+    ///
+    /// `install` must compare `pack.version` against `HIGHEST_VERSION` and then
+    /// publish as one indivisible step, or two concurrent installs of the same
+    /// version could both pass the check and race to publish. `ArcSwapOption`
+    /// gives an atomic swap but not an atomic check-then-swap, so that
+    /// compound operation keeps a mutex of its own.
+    install_lock: Mutex<()>,
 }
 
 impl RulePackStore {
     fn new() -> Self {
         Self {
             anchor: OnceLock::new(),
-            current: Mutex::new(None),
+            current: arc_swap::ArcSwapOption::empty(),
+            install_lock: Mutex::new(()),
         }
     }
 
@@ -680,12 +693,12 @@ impl RulePackStore {
         //    that guards the swap, so two concurrent installs of the same version
         //    cannot both pass the step-5 check and race to publish.
         {
-            let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            let _install = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
             if pack.version <= HIGHEST_VERSION.load(Ordering::SeqCst) {
                 return Err(RulePackRejection::Rollback);
             }
             HIGHEST_VERSION.store(pack.version, Ordering::SeqCst);
-            *current = Some(compiled);
+            self.current.store(Some(compiled));
         }
         // Published only after `current` is populated, so no scan can observe
         // ACTIVE == true with an empty slot.
@@ -705,8 +718,8 @@ impl RulePackStore {
         // Clear the fast-path flag first: a scan racing this call then takes the
         // baseline path, which is always correct and always available.
         ACTIVE.store(false, Ordering::Release);
-        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        *current = None;
+        let _install = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.current.store(None);
         crate::telemetry::global_telemetry()
             .set_rulepack_active_rules(crate::handler::builtin_injection_patterns().len() as u64);
     }
@@ -716,10 +729,7 @@ impl RulePackStore {
         if !ACTIVE.load(Ordering::Acquire) {
             return None;
         }
-        self.current
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.current.load_full()
     }
 
     /// Highest pack version this process has installed (0 if none).

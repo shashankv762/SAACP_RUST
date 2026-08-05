@@ -61,30 +61,19 @@ pub struct OscillationFingerprinter {
 
 /// Maps a `session_id` to its shard index.
 ///
-/// P-1 fix — deliberately NOT the first-byte `% N` convention used by
-/// `gateway::ratelimit_shard_index` / `revoked_token_shard_index`. Those key
-/// spaces are agent ids and raw SHA-256 hex where the first byte varies widely.
-/// A CSCS `session_id` is `handler.rs`'s `ParsedPacket::session_uuid`, which on
-/// the encrypted path is `hex::encode(session_id)` — a HEX string, so its first
-/// byte is drawn only from `[0-9a-f]`. Those 16 codepoints (0x30–0x39, 0x61–0x66)
-/// collapse onto just 10 distinct values mod 16, leaving 6 of 16 shards
-/// permanently dead and loading the hottest shard ~2x above ideal (measured over
-/// 120k uuid4 hex ids). That is precisely the failure mode
-/// `trust_decay::trust_shard_index_distributes_across_namespace_prefixes`
-/// guards against for ITS key space.
+/// P-1 fix — deliberately NOT a first-byte `% N` scheme. A CSCS `session_id` is
+/// `handler.rs`'s `ParsedPacket::session_uuid`, which on the encrypted path is
+/// `hex::encode(session_id)` — a HEX string, so its first byte is drawn only
+/// from `[0-9a-f]`. Those 16 codepoints (0x30–0x39, 0x61–0x66) collapse onto
+/// just 10 distinct values mod 16, leaving 6 of 16 shards permanently dead and
+/// loading the hottest shard ~2x above ideal (measured over 120k uuid4 hex ids).
 ///
-/// FNV-1a over the WHOLE key mixes every byte, so all 16 shards stay live and
-/// balanced within ~3% of ideal on the same corpus. It is a non-cryptographic
-/// hash, which is fine: this only selects a lock, never a security decision, and
-/// a hostile session_id can at worst concentrate load on one shard — exactly what
-/// the unsharded code did for every session already.
+/// Delegates to the crate-wide [`crate::shard::fnv1a_shard`], which mixes every
+/// byte — same algorithm and constants this function used inline, so shard
+/// assignment is unchanged. That helper now backs every sharded structure in the
+/// crate, since the same first-byte failure mode applied to all of them.
 fn cscs_shard_index(session_id: &str) -> usize {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
-    for b in session_id.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
-    (hash % CSCS_SHARDS as u64) as usize
+    crate::shard::fnv1a_shard(session_id, CSCS_SHARDS)
 }
 
 impl Default for OscillationFingerprinter {

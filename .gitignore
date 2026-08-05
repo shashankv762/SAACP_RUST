@@ -16,6 +16,7 @@ __pycache__/
 opusplan.md
 opusplan2.md
 _TEMP_impl_plan.md
+imp_plan*
 
 # Append-only manifest written by scripts/prune_test_results.py — a log of
 # pruned/trimmed test-result files, not a build artifact, but regenerated
