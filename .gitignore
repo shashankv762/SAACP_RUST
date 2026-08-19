@@ -4,6 +4,7 @@ fuzz/corpus/
 fuzz/artifacts/
 *.log
 *.sentinel
+!tests/fixtures/*.sentinel
 
 # Dev-only benchmark artifacts (regenerable, not source)
 benches_output.txt

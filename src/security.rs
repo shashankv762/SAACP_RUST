@@ -370,6 +370,134 @@ const AUDIT_HEALTH_SATURATED_PCT: f64 = 0.95;
 const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLOCK"
 
 // ---------------------------------------------------------------------------
+// Phase 6 — sharded hash chains + Merkle anchoring
+// ---------------------------------------------------------------------------
+
+/// Number of independent hash chains the audit log is split across.
+///
+/// The single `Mutex<AuditInner>` held across HMAC-SHA256 + `serde_json` +
+/// `try_send` was the measured throughput ceiling (~250-360k events/sec, see
+/// `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`'s neighbours and `T14`/`T20`). Splitting it
+/// into N independently-chained shards removes the serialization point without
+/// weakening any per-record guarantee: each shard is a complete, HMAC-covered
+/// prev_hash chain in its own right, and the periodic Merkle anchor ties all N
+/// heads together so no shard can be rewritten, reordered, or dropped wholesale.
+///
+/// **The WAL channel is deliberately NOT sharded** — one `wal_tx`, one worker
+/// thread, one queue capacity. The worker was never the bottleneck (362k
+/// events/sec of pure I/O), so `health`, `health_floor`, `dropped_audits`,
+/// `wal_write_failures`, `queue_len`, the sticky-`Fatal` `fetch_update`, and the
+/// `gate_2_5_kinetic_firewall` saturation contract all carry over completely
+/// unmodified.
+pub const AUDIT_SHARDS: usize = 16;
+
+/// A power of two makes the Merkle tree over `AUDIT_SHARDS` leaves perfectly
+/// complete: every internal node has exactly two children, so there is no
+/// odd-node promotion/duplication rule. That absence is what makes
+/// CVE-2012-2459-style tree malleability (two distinct leaf sets hashing to the
+/// same root by duplicating a lone trailing node) structurally impossible here
+/// rather than merely guarded against. Enforced at compile time so a future
+/// edit to `AUDIT_SHARDS` cannot silently reintroduce the hazard.
+const _: () = assert!(
+    AUDIT_SHARDS.is_power_of_two(),
+    "AUDIT_SHARDS must be a power of two so the Merkle tree is complete and \
+     has no odd-node duplication rule (CVE-2012-2459 class malleability)",
+);
+
+/// Per-shard cap on retained in-memory entries.
+///
+/// The aggregate bound stays [`AUDIT_MAX_IN_MEMORY_ENTRIES`] — sharding must not
+/// silently multiply the memory this vector can consume, the same split
+/// `RATE_LIMITER_PER_SHARD_MAX_ENTRIES` and `TOKEN_CACHE_PER_SHARD_MAX` use.
+///
+/// The drain MUST be per-shard rather than global: `verify_chain` seeds each
+/// shard's expected hash from that shard's first *retained* entry (the S-6
+/// rule), so a drain that removed a prefix of one shard's entries while leaving
+/// another's intact would still leave every shard internally continuous. A
+/// global drain across a merged list would cut shards at arbitrary points and
+/// break that seeding invariant, failing verification spuriously.
+const AUDIT_PER_SHARD_MAX_IN_MEMORY: usize = AUDIT_MAX_IN_MEMORY_ENTRIES / AUDIT_SHARDS;
+
+/// Domain-separation tag for per-shard genesis hashes. Each shard `i` starts
+/// from `SHA256(tag || u16BE(i))` rather than a shared constant, so a record
+/// cannot be relocated from shard `i` to shard `j` and still chain — the first
+/// record of every shard commits to that shard's unique genesis.
+const AUDIT_SHARD_GENESIS_TAG: &[u8] = b"SAACP-audit-shard-genesis-v1";
+
+/// Records written by the sharded (v2) code path carry `v: 2`.
+///
+/// A v1 line has **no** `v` field at all, and that absence is the entire
+/// migration discriminator — `verify_chain_disk` branches on it per line, so a
+/// file may contain a v1 prefix followed by a v2 suffix and still verify end to
+/// end. Never emit `v: 1`; doing so would make old and new logs
+/// indistinguishable from each other by structure.
+const AUDIT_RECORD_VERSION_V2: u8 = 2;
+
+/// Merkle anchor cadence: emit an anchor line after this many events...
+const AUDIT_ANCHOR_EVERY_N_EVENTS: u64 = 4096;
+/// ...or after this much wall-clock time, whichever comes first.
+const AUDIT_ANCHOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// RFC 6962 §2.1 domain separation: leaf hashes are `SHA256(0x00 || leaf)`,
+/// interior nodes `SHA256(0x01 || left || right)`. Without the distinct
+/// prefixes an attacker could present an interior node as a leaf (second
+/// preimage across tree levels).
+const MERKLE_LEAF_PREFIX: u8 = 0x00;
+/// See [`MERKLE_LEAF_PREFIX`].
+const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+/// Marker distinguishing an anchor line from a record line on disk.
+const ANCHOR_LINE_KEY: &str = "anchor";
+
+/// Genesis value for the anchor chain's `prev_root`, so the very first anchor
+/// is still bound to a fixed starting point and an attacker cannot delete the
+/// whole first epoch and present the second as the beginning.
+const ANCHOR_GENESIS_ROOT: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Per-shard genesis hash: `SHA256(AUDIT_SHARD_GENESIS_TAG || u16BE(shard_id))`.
+fn shard_genesis_hash(shard_id: u16) -> String {
+    let mut h = Sha256::new();
+    h.update(AUDIT_SHARD_GENESIS_TAG);
+    h.update(shard_id.to_be_bytes());
+    hex::encode(h.finalize())
+}
+
+/// RFC 6962 leaf hash over a shard head (`SHA256(0x00 || shard_id_be || head)`).
+///
+/// The shard id is inside the leaf, so two shards holding the same head hash
+/// produce different leaves and cannot be transposed within the tree.
+fn merkle_leaf(shard_id: u16, head_hash: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([MERKLE_LEAF_PREFIX]);
+    h.update(shard_id.to_be_bytes());
+    h.update(head_hash.as_bytes());
+    h.finalize().into()
+}
+
+/// Merkle root over exactly [`AUDIT_SHARDS`] leaves.
+///
+/// `AUDIT_SHARDS` is a power of two (statically asserted above), so every level
+/// halves cleanly and the odd-node case simply never arises — no duplication
+/// rule, hence no CVE-2012-2459-class ambiguity.
+fn merkle_root(leaves: &[[u8; 32]]) -> String {
+    debug_assert_eq!(leaves.len(), AUDIT_SHARDS);
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut h = Sha256::new();
+            h.update([MERKLE_NODE_PREFIX]);
+            h.update(pair[0]);
+            h.update(pair[1]);
+            next.push(h.finalize().into());
+        }
+        level = next;
+    }
+    hex::encode(level[0])
+}
+
+// ---------------------------------------------------------------------------
 // AuditHealth — Gate 6.0 backpressure contract
 // ---------------------------------------------------------------------------
 
@@ -441,6 +569,32 @@ pub struct AuditRecord {
     pub traceparent: String,
     pub prev_hash: String,
     pub seq: u64,
+    /// Phase 6: which of the [`AUDIT_SHARDS`] hash chains this record belongs
+    /// to. `None` for a v1 record read back from an older log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<u16>,
+    /// Phase 6: position within `shard_id`'s chain. Distinct from `seq`, which
+    /// stays a globally-monotonic (and HMAC-covered) ordering hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_seq: Option<u64>,
+    /// Phase 6: the Merkle anchor epoch in force when this record was appended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_epoch: Option<u64>,
+}
+
+impl AuditRecord {
+    /// Phase 6: shard-chain fields as the canonical HMAC sees them.
+    ///
+    /// A v1 record (no shard fields) yields `None` for all three, which is
+    /// exactly how [`CanonicalAuditRecord`] reproduces byte-identical v1 output.
+    fn v2_fields(&self) -> (Option<u16>, Option<u64>, Option<u64>, Option<u8>) {
+        match (self.shard_id, self.shard_seq, self.anchor_epoch) {
+            (Some(sid), Some(sseq), Some(ep)) => {
+                (Some(sid), Some(sseq), Some(ep), Some(AUDIT_RECORD_VERSION_V2))
+            }
+            _ => (None, None, None, None),
+        }
+    }
 }
 
 /// A complete audit log entry (record + chain_hash).
@@ -466,16 +620,82 @@ pub struct AuditLogEntry {
 /// `AuditRecord` (whose field *declaration* order is not alphabetical) —
 /// that would require reordering `AuditRecord`'s public fields to get the
 /// same output, a much larger and riskier diff for the same result.
+///
+/// ## Phase 6 — the v1/v2 discriminator lives here
+///
+/// The four sharding fields are `Option`s with `skip_serializing_if`, so when
+/// they are all `None` this struct serializes to **exactly** the eight-field v1
+/// JSON, byte for byte. That is what lets `verify_chain_disk` recompute the
+/// HMAC of a record written by a pre-Phase-6 build using this same struct, and
+/// it is verified against a checked-in pinned fixture
+/// (`tests/test_audit_v1_fixture_rs.rs`) rather than by inspection.
+///
+/// Field order remains alphabetical **including** the new fields
+/// (`anchor_epoch` first, `v` last) — do not group the v2 fields together for
+/// readability, that would change the canonical bytes.
 #[derive(serde::Serialize)]
 struct CanonicalAuditRecord<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor_epoch: Option<u64>,
     intent: &'a str,
     prev_hash: &'a str,
     seq: u64,
+    /// Inside the HMAC input deliberately: combined with the per-shard genesis
+    /// (`shard_genesis_hash`), this is the second of two independent defenses
+    /// against relocating a record from one shard's chain into another's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_seq: Option<u64>,
     source: &'a str,
     target: &'a str,
     timestamp: f64,
     token_signature: &'a str,
     traceparent: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v: Option<u8>,
+}
+
+impl<'a> CanonicalAuditRecord<'a> {
+    /// Build the canonical form of an in-memory [`AuditRecord`].
+    fn from_record(r: &'a AuditRecord) -> Self {
+        let (shard_id, shard_seq, anchor_epoch, v) = r.v2_fields();
+        Self {
+            anchor_epoch,
+            intent: &r.intent,
+            prev_hash: &r.prev_hash,
+            seq: r.seq,
+            shard_id,
+            shard_seq,
+            source: &r.source,
+            target: &r.target,
+            timestamp: r.timestamp,
+            token_signature: &r.token_signature,
+            traceparent: &r.traceparent,
+            v,
+        }
+    }
+
+    /// Serialize and HMAC in one step — the single definition of "the chain
+    /// hash of this record", shared by `append_event`, `verify_chain`, and
+    /// `verify_chain_disk` so the three can never drift apart (the M-40 fix,
+    /// preserved and extended to the v2 fields).
+    fn chain_hash(&self, issuer_secret: &[u8]) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+        mac.update(json.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// As [`Self::chain_hash`], but also returns the canonical JSON so
+    /// `append_event` can reuse it for the on-disk line instead of serializing
+    /// the identical bytes a second time.
+    fn serialize_and_hash(&self, issuer_secret: &[u8]) -> (String, String) {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+        mac.update(json.as_bytes());
+        (json, hex::encode(mac.finalize().into_bytes()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +713,52 @@ enum WalMessage {
     /// enqueued before it, so a caller that observes the ack knows every
     /// happened-before `append_event` is durable.
     Flush(std::sync::mpsc::Sender<()>),
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — shard state
+// ---------------------------------------------------------------------------
+
+/// One shard's independently-chained state. Exactly the fields the old single
+/// `AuditInner` carried per chain, minus the process-wide ones (`log_file`,
+/// `count_file`, total event count) which stay global.
+struct ShardInner {
+    last_hash: String,
+    /// Number of records appended to THIS shard — the record's `shard_seq`.
+    shard_seq: u64,
+    entries: Vec<AuditLogEntry>,
+}
+
+/// The value each shard publishes for the Merkle anchor to read.
+///
+/// Published into an `ArcSwap` **after** the shard's own mutex is released, so
+/// building an anchor never has to acquire all [`AUDIT_SHARDS`] locks at once —
+/// which would be both a contention point and a lock-ordering hazard against
+/// the appenders it is supposed to stay out of the way of.
+struct ShardHead {
+    hash: String,
+}
+
+/// A Merkle anchor line: a commitment to all [`AUDIT_SHARDS`] chain heads at a
+/// point in time, chained to the previous anchor via `prev_root`.
+///
+/// The anchor is what makes the shards a single tamper-evident structure rather
+/// than 16 independent logs. Without it an attacker could delete or rewrite one
+/// entire shard's records and the remaining 15 chains would still verify. With
+/// it, any such edit changes that shard's head, hence the root, and the root is
+/// recomputed from the file's own records during `verify_chain_disk`.
+///
+/// `prev_root` chains anchors to each other so a whole epoch cannot be excised.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MerkleAnchor {
+    epoch: u64,
+    /// Chain heads at anchor time, indexed by shard id.
+    heads: Vec<String>,
+    root: String,
+    prev_root: String,
+    /// Global event count at anchor time.
+    event_count: u64,
+    timestamp: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +780,24 @@ enum WalMessage {
 /// blocking I/O. See `AuditHealth` for the full backpressure contract that
 /// feeds `handler::gate_2_5_kinetic_firewall`.
 pub struct ImmutableAuditLog {
-    inner: Mutex<AuditInner>,
+    /// Phase 6: [`AUDIT_SHARDS`] independent hash chains, replacing the single
+    /// `Mutex<AuditInner>` that serialized every appender across HMAC +
+    /// serialization + enqueue.
+    shards: Vec<Mutex<ShardInner>>,
+    /// Lock-free published head of each shard, for the Merkle anchor. Written
+    /// after the corresponding shard mutex is released — see [`ShardHead`].
+    /// Shared with the WAL worker, which builds the anchors.
+    shard_heads: Arc<Vec<arc_swap::ArcSwap<ShardHead>>>,
+    /// Global lifetime event count. Lock-free, so `event_count()` no longer
+    /// takes any mutex while returning the same value it always did.
+    global_seq: AtomicU64,
+    /// Paths are immutable after construction (no setter exists), so they need
+    /// no lock — they were only inside `AuditInner` because everything was.
+    log_file: String,
+    count_file: String,
+    /// Current Merkle anchor epoch, stamped into every appended record and
+    /// advanced by the WAL worker each time it emits an anchor.
+    anchor_epoch: Arc<AtomicU64>,
     /// WAL worker sender. Always `Some` — even a "" log_file spawns the worker,
     /// but the worker thread no-ops on disk I/O for an empty path (see `new()`).
     wal_tx: Option<mpsc::SyncSender<WalMessage>>,
@@ -546,12 +829,24 @@ pub struct ImmutableAuditLog {
     subscribers: Mutex<Vec<Arc<dyn Fn(&AuditRecord) + Send + Sync>>>,
 }
 
-struct AuditInner {
-    last_hash: String,
-    event_count: u64,
-    log_file: String,
-    count_file: String,
-    entries: Vec<AuditLogEntry>,
+thread_local! {
+    /// Phase 6: this thread's shard slot, assigned round-robin on first use.
+    ///
+    /// **Deliberately a thread-local slot, not a hash of the record content.**
+    /// Hashing `source_agent` (or any other field) would let anyone who controls
+    /// agent ids steer every event onto one shard — a free DoS lever created by
+    /// the optimization itself — and would give zero speedup in the
+    /// single-dominant-agent case that a real load test actually looks like,
+    /// since all of that agent's events would hash to the same lock.
+    ///
+    /// A thread slot has neither problem: the gate pipeline runs under
+    /// `spawn_blocking`, so a given pool thread always touches the same mutex —
+    /// an uncontended fast path plus cache locality — and the assignment is
+    /// completely outside any attacker's influence.
+    static AUDIT_SHARD_SLOT: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % AUDIT_SHARDS
+    };
 }
 
 impl ImmutableAuditLog {
@@ -630,6 +925,21 @@ impl ImmutableAuditLog {
         let wal_write_failures: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let queue_len: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
+        // Phase 6: the published shard heads and the anchor epoch are shared
+        // with the WAL worker, which is the thread that builds Merkle anchors —
+        // it is already the single I/O serialization point, so anchoring needs
+        // no new thread and no new lock.
+        let shard_heads: Arc<Vec<arc_swap::ArcSwap<ShardHead>>> = Arc::new(
+            (0..AUDIT_SHARDS)
+                .map(|i| {
+                    arc_swap::ArcSwap::from_pointee(ShardHead {
+                        hash: shard_genesis_hash(i as u16),
+                    })
+                })
+                .collect(),
+        );
+        let anchor_epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
         // Spawn WAL worker daemon thread. `log_file`/`count_file` never change
         // after construction (no setter exists), so the worker captures its own
         // copies once instead of receiving them on every message.
@@ -638,6 +948,8 @@ impl ImmutableAuditLog {
         let worker_queue_len = Arc::clone(&queue_len);
         let worker_log_file = resolved_log_file.clone();
         let worker_count_file = resolved_count_file.clone();
+        let worker_shard_heads = Arc::clone(&shard_heads);
+        let worker_anchor_epoch = Arc::clone(&anchor_epoch);
         thread::Builder::new()
             .name("saacp-wal-worker".into())
             .spawn(move || {
@@ -649,18 +961,27 @@ impl ImmutableAuditLog {
                     &worker_wal_write_failures,
                     &worker_queue_len,
                     archival_sink,
+                    &worker_shard_heads,
+                    &worker_anchor_epoch,
                 );
             })
             .expect("WAL worker thread spawn failed");
 
         Self {
-            inner: Mutex::new(AuditInner {
-                last_hash: GENESIS_HASH.to_string(),
-                event_count: 0,
-                log_file: resolved_log_file,
-                count_file: resolved_count_file,
-                entries: Vec::new(),
-            }),
+            shards: (0..AUDIT_SHARDS)
+                .map(|i| {
+                    Mutex::new(ShardInner {
+                        last_hash: shard_genesis_hash(i as u16),
+                        shard_seq: 0,
+                        entries: Vec::new(),
+                    })
+                })
+                .collect(),
+            shard_heads,
+            global_seq: AtomicU64::new(0),
+            log_file: resolved_log_file,
+            count_file: resolved_count_file,
+            anchor_epoch,
             wal_tx: Some(wal_tx),
             health,
             dropped_audits,
@@ -718,40 +1039,126 @@ impl ImmutableAuditLog {
     /// in-memory chain is reset to genesis and an error is returned, per the
     /// fail-closed architecture principle (never keep unverified state).
     ///
-    /// The disk read (which populates `event_count`/`last_hash`) must release
-    /// `self.inner`'s lock before calling `verify_chain_disk`, which re-locks
-    /// `self.inner` itself — `std::sync::Mutex` is not reentrant.
+    /// ## Phase 6 — reconstructing per-shard state, and the migration boundary
+    ///
+    /// The file may be pure v1, pure v2, or a v1 prefix followed by a v2 suffix
+    /// (a log an older build wrote and this build is now appending to). Each
+    /// shard's head is restored from the last v2 record carrying that
+    /// `shard_id`.
+    ///
+    /// A shard with no v2 record yet is seeded to
+    /// `SHA256(genesis_tag || u16BE(i) || final_v1_hash)` rather than to its
+    /// bare genesis. This is what anchors the v2 region to the *end* of the v1
+    /// region: without it, every shard would restart from a value an attacker
+    /// can compute offline, making the upgrade point a free "truncate the
+    /// entire v1 history here" edit that still verifies.
     pub fn initialize_chain(&self, issuer_secret: &[u8]) -> Result<(), String> {
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let log_file = inner.log_file.clone();
-
-            if Path::new(&log_file).exists() {
-                if let Ok(content) = fs::read_to_string(&log_file) {
-                    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-                    inner.event_count = lines.len() as u64;
-                    if let Some(last_line) = lines.last() {
-                        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line) {
-                            if let Some(hash) = entry["chain_hash"].as_str() {
-                                inner.last_hash = hash.to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        } // `inner` lock released before verify_chain_disk re-locks it.
-
+        // Verify BEFORE adopting any on-disk state — the file is untrusted
+        // input, and `verify_chain_disk` reads the file itself rather than the
+        // in-memory shards, so it needs no state loaded first.
         if !self.verify_chain_disk(issuer_secret) {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.event_count = 0;
-            inner.last_hash = GENESIS_HASH.to_string();
+            self.reset_chain_state_to_genesis();
             return Err(
                 "audit chain integrity verification failed on load — chain reset to genesis"
                     .to_string(),
             );
         }
 
+        if !Path::new(&self.log_file).exists() {
+            return Ok(());
+        }
+        let Ok(content) = fs::read_to_string(&self.log_file) else {
+            return Ok(());
+        };
+
+        // Walk the file once, tracking the last v1 hash and each shard's last
+        // v2 head. Anchor lines are skipped — they commit to heads, they are
+        // not themselves part of any shard's chain.
+        let mut record_count: u64 = 0;
+        let mut final_v1_hash: Option<String> = None;
+        let mut heads: Vec<Option<(String, u64)>> = vec![None; AUDIT_SHARDS];
+        let mut max_anchor_epoch: u64 = 0;
+
+        for line in content.lines().filter(|l| !l.is_empty()) {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(anchor) = entry.get(ANCHOR_LINE_KEY) {
+                max_anchor_epoch =
+                    max_anchor_epoch.max(anchor.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0));
+                continue;
+            }
+            let Some(chain_hash) = entry["chain_hash"].as_str() else {
+                continue;
+            };
+            record_count += 1;
+            let rec = &entry["record"];
+            match (
+                rec.get("shard_id").and_then(|v| v.as_u64()),
+                rec.get("shard_seq").and_then(|v| v.as_u64()),
+            ) {
+                (Some(sid), Some(sseq)) if (sid as usize) < AUDIT_SHARDS => {
+                    heads[sid as usize] = Some((chain_hash.to_string(), sseq + 1));
+                }
+                // A v1 record (no shard fields). Its hash is a candidate for
+                // the migration seed; the last one wins.
+                _ => final_v1_hash = Some(chain_hash.to_string()),
+            }
+        }
+
+        self.global_seq.store(record_count, Ordering::SeqCst);
+        self.anchor_epoch.store(max_anchor_epoch, Ordering::SeqCst);
+
+        for i in 0..AUDIT_SHARDS {
+            let (hash, shard_seq) = match &heads[i] {
+                Some((h, s)) => (h.clone(), *s),
+                None => (self.migration_seed_hash(i as u16, final_v1_hash.as_deref()), 0),
+            };
+            {
+                let mut shard = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
+                shard.last_hash = hash.clone();
+                shard.shard_seq = shard_seq;
+                shard.entries.clear();
+            }
+            self.shard_heads[i].store(Arc::new(ShardHead { hash }));
+        }
+
         Ok(())
+    }
+
+    /// Seed for a shard that has no v2 record yet.
+    ///
+    /// With no preceding v1 history this is the plain per-shard genesis. When
+    /// the file *does* have a v1 region, the seed folds in that region's final
+    /// hash, binding the start of every v2 chain to the end of the v1 chain —
+    /// see [`Self::initialize_chain`] for why that binding is load-bearing.
+    fn migration_seed_hash(&self, shard_id: u16, final_v1_hash: Option<&str>) -> String {
+        match final_v1_hash {
+            None => shard_genesis_hash(shard_id),
+            Some(v1) => {
+                let mut h = Sha256::new();
+                h.update(AUDIT_SHARD_GENESIS_TAG);
+                h.update(shard_id.to_be_bytes());
+                h.update(v1.as_bytes());
+                hex::encode(h.finalize())
+            }
+        }
+    }
+
+    /// Reset every shard chain to its per-shard genesis and zero the counters.
+    fn reset_chain_state_to_genesis(&self) {
+        self.global_seq.store(0, Ordering::SeqCst);
+        self.anchor_epoch.store(0, Ordering::SeqCst);
+        for i in 0..AUDIT_SHARDS {
+            let genesis = shard_genesis_hash(i as u16);
+            {
+                let mut shard = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
+                shard.last_hash = genesis.clone();
+                shard.shard_seq = 0;
+                shard.entries.clear();
+            }
+            self.shard_heads[i].store(Arc::new(ShardHead { hash: genesis }));
+        }
     }
 
     /// Append one audit event to the in-memory chain and enqueue for WAL persistence.
@@ -763,6 +1170,23 @@ impl ImmutableAuditLog {
     /// packet is NOT rejected (spec §15.2: "Dropping an event is preferred over
     /// rejecting the packet"), and the drop itself is a lock-free atomic
     /// increment, never blocking I/O.
+    ///
+    /// ## Phase 6 — what the lock still covers, and why
+    ///
+    /// P-2 identified the single global mutex held across HMAC + JSON +
+    /// `try_send` as the measured throughput ceiling. The chain is genuinely
+    /// sequential — each record's `prev_hash` is the previous record's
+    /// `chain_hash`, and the HMAC covers `prev_hash`, so two records in the same
+    /// chain cannot have their hashes computed concurrently without breaking the
+    /// linkage that `verify_chain` walks.
+    ///
+    /// The fix is therefore not to shorten the critical section but to have
+    /// [`AUDIT_SHARDS`] of them: each shard is a complete, independently-linked
+    /// chain, so appenders on different shards never wait on each other while
+    /// every record keeps exactly the tamper-evidence it had before. Only the
+    /// read-modify-write of `last_hash`/`shard_seq` plus the HMAC over them is
+    /// inside the lock; serialization of the WAL line, the enqueue, health
+    /// bookkeeping, and subscriber callbacks all happen after it is released.
     pub fn append_event(
         &self,
         issuer_secret: &[u8],
@@ -772,161 +1196,148 @@ impl ImmutableAuditLog {
         evaluated_intent: &str,
         traceparent: &str,
     ) {
-        // O-6: non-blocking probe first — on contention, record the
-        // observation then fall through to the normal blocking lock() below.
-        // This is instrumentation only; the guarded critical section that
-        // follows is unchanged either way.
-        //
-        // P-2 (assessed, deliberately NOT restructured): this lock is held across
-        // the HMAC computation and JSON serialization below, which serializes all
-        // concurrent appenders. It is retained by design, because the audit chain is
-        // inherently sequential: each record's `prev_hash` is the PREVIOUS record's
-        // `chain_hash`, and the HMAC covers `prev_hash`, so no two records can have
-        // their hashes computed concurrently without either breaking the linkage or
-        // requiring a second serialization point that reintroduces the same lock.
-        // `verify_chain`/`verify_chain_disk` walk exactly this linkage, so a
-        // "lock-free append" would trade tamper-evidence for throughput.
-        //
-        // Measured (release, `T14_WAL_Sustained_Throughput`): ~250k-360k events/sec
-        // sustained through this critical section, depending on host load and backing
-        // store — roughly 3-4 microseconds per event, far above the packet rates the
-        // gate pipeline can feed it, and the WAL worker itself (the actual I/O) is
-        // already off this thread via the bounded `wal_tx` channel. Contention here is
-        // observable via `record_mutex_contention("wal_append")` if a deployment ever
-        // does approach that ceiling.
-        let mut inner = match self.inner.try_lock() {
+        let shard_idx = AUDIT_SHARD_SLOT.with(|s| *s);
+        let anchor_epoch = self.anchor_epoch.load(Ordering::Relaxed);
+        // Reserve this record's global sequence number outside the shard lock.
+        // `seq` stays globally monotonic and HMAC-covered as an unforgeable
+        // ordering hint; cross-shard *ordering* is deliberately relaxed (no
+        // consumer depends on it — see the module docs and `verify_chain`).
+        let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
+        let timestamp = now_secs();
+
+        // O-6: non-blocking probe first — on contention, record the observation
+        // then fall through to the normal blocking lock() below.
+        let mut shard = match self.shards[shard_idx].try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
-                self.inner.lock().unwrap_or_else(|e| e.into_inner())
+                self.shards[shard_idx].lock().unwrap_or_else(|e| e.into_inner())
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
 
         let record = AuditRecord {
-            timestamp: now_secs(),
+            timestamp,
             source: source_agent.to_string(),
             target: target_agent.to_string(),
             intent: evaluated_intent.to_string(),
             token_signature: token_signature.to_string(),
             traceparent: traceparent.to_string(),
-            prev_hash: inner.last_hash.clone(),
-            seq: inner.event_count,
+            prev_hash: shard.last_hash.clone(),
+            seq,
+            shard_id: Some(shard_idx as u16),
+            shard_seq: Some(shard.shard_seq),
+            anchor_epoch: Some(anchor_epoch),
         };
 
-        // Serialize deterministically (canonical JSON, alphabetical field
-        // order) via a derived struct rather than the `json!` macro — see
-        // `CanonicalAuditRecord`'s doc comment for why this is both faster
-        // and still exactly reproduces the prior byte-for-byte output.
-        let record_json = serde_json::to_string(&CanonicalAuditRecord {
-            intent: &record.intent,
-            prev_hash: &record.prev_hash,
-            seq: record.seq,
-            source: &record.source,
-            target: &record.target,
-            timestamp: record.timestamp,
-            token_signature: &record.token_signature,
-            traceparent: &record.traceparent,
-        }).unwrap_or_default();
-
-        // HMAC-SHA256 over the canonical record JSON.
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
-        mac.update(record_json.as_bytes());
-        let chain_hash = hex::encode(mac.finalize().into_bytes());
+        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place —
+        // `verify_chain`/`verify_chain_disk` call the same helper, so the three
+        // can never drift apart (M-40).
+        let (record_json, chain_hash) =
+            CanonicalAuditRecord::from_record(&record).serialize_and_hash(issuer_secret);
 
         let log_entry = AuditLogEntry {
             record,
             chain_hash: chain_hash.clone(),
         };
 
-        inner.last_hash = chain_hash;
-        inner.event_count += 1;
+        // Build the JSONL line for disk persistence, reusing `record_json`
+        // (already serialized once, for the HMAC input) as the nested "record"
+        // value instead of re-serializing an identical tree. Safe because
+        // `record_json` is already valid, compact, properly-escaped JSON text
+        // and `chain_hash` is `hex::encode` output — pure lowercase ASCII hex,
+        // never containing `"` or a control character. Formatting is cheap and
+        // touches no shared state, but the actual enqueue happens after the
+        // lock is dropped.
+        let entry_json = format!(r#"{{"record":{record_json},"chain_hash":"{chain_hash}"}}"#);
 
-        // Build JSONL line for disk persistence. Throughput fix: reuses
-        // `record_json` (already serialized above, once, for the HMAC input)
-        // as the nested "record" value instead of re-serializing an
-        // identical Value tree a second time via another `json!` macro call
-        // — this was measured (see `benches/benchmarks.rs`'s
-        // `T14_WAL_Sustained_Throughput`) to roughly halve the per-event
-        // JSON-serialization cost, since building a `serde_json::Value` via
-        // the `json!` macro allocates a full tree (one `String`/`Value` per
-        // field) before `to_string()` even runs. Safe because `record_json`
-        // is already valid, compact, properly-escaped JSON text, and
-        // `chain_hash` is a hex string (`hex::encode` output — pure
-        // lowercase ASCII hex digits, never containing `"` or a control
-        // character), so no escaping is needed to embed it directly.
-        let entry_json = format!(r#"{{"record":{record_json},"chain_hash":"{}"}}"#, log_entry.chain_hash);
-
-        // Enqueue for WAL worker (non-blocking — drop if full, per spec §15.2).
-        if let Some(ref tx) = self.wal_tx {
-            let msg = WalMessage::Entry {
-                entry_json,
-                event_count: inner.event_count,
-            };
-            if tx.try_send(msg).is_ok() {
-                self.queue_len.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // FIX 3: rate-limited signal via an atomic counter — never an
-                // inline eprintln! on this hot path. (A slow consumer forcing
-                // this branch hundreds of thousands of times, each printing,
-                // was the actual root cause of the original latency spike.)
-                self.dropped_audits.fetch_add(1, Ordering::Relaxed);
-                // This event is now permanently absent from the audit trail —
-                // not merely late. Raise the sticky floor so health cannot fall
-                // back to Healthy when the queue drains, keeping Gate 2.5
-                // fail-closed on IRREVERSIBLE_ACTION until an operator calls
-                // `acknowledge_dropped_audits`. See `AuditHealth`'s "Sticky on
-                // drop" note.
-                self.health_floor
-                    .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
-                crate::telemetry::global_telemetry().record_gate_rejection("gate_6_0_audit");
-            }
-
-            // FIX 4: recompute health from live queue pressure. `fetch_update`
-            // refuses to overwrite a sticky `Fatal` — only the WAL worker sets
-            // that (on an actual I/O failure), and only a fresh
-            // `ImmutableAuditLog` clears it.
-            //
-            // The sticky drop floor is deliberately NOT folded into this stored
-            // value: `health()` applies it on read instead. Baking it in here
-            // would leave the floor's level latched in `health` even after
-            // `acknowledge_dropped_audits` cleared the floor itself.
-            let pct = self.queue_len.load(Ordering::Relaxed) as f64
-                / AUDIT_WAL_QUEUE_CAPACITY as f64;
-            let level = if pct > AUDIT_HEALTH_SATURATED_PCT {
-                AuditHealth::Saturated
-            } else if pct > AUDIT_HEALTH_DEGRADED_PCT {
-                AuditHealth::Degraded
-            } else {
-                AuditHealth::Healthy
-            };
-            let _ = self.health.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if cur == AuditHealth::Fatal as u8 { None } else { Some(level as u8) }
-            });
-        }
+        shard.last_hash = chain_hash.clone();
+        shard.shard_seq += 1;
 
         // Keep in-memory for fast verify_chain().
         let record_for_subscribers = log_entry.record.clone();
-        inner.entries.push(log_entry);
+        shard.entries.push(log_entry);
 
-        // S-6 fix: bound the in-memory retention window. The on-disk WAL keeps the
-        // full history (verified by `verify_chain_disk`); this vector only backs the
-        // fast in-process `verify_chain`, so dropping the oldest slice caps memory
-        // without losing any auditable record. Drain the oldest 20% in one shot
-        // (amortized O(1) per event) rather than one-at-a-time. `event_count` is
-        // untouched, so the sentinel/tamper check still sees the true total.
-        if inner.entries.len() > AUDIT_MAX_IN_MEMORY_ENTRIES {
-            let drop_n = AUDIT_MAX_IN_MEMORY_ENTRIES / 5;
-            inner.entries.drain(0..drop_n);
+        // S-6 fix, per-shard: bound the in-memory retention window. The on-disk
+        // WAL keeps the full history (verified by `verify_chain_disk`); this
+        // vector only backs the fast in-process `verify_chain`, so dropping the
+        // oldest slice caps memory without losing any auditable record. The
+        // drain MUST be per-shard: `verify_chain` seeds each shard from that
+        // shard's first retained entry, and a global drain would cut shards at
+        // arbitrary points and break that invariant. `global_seq` is untouched,
+        // so the sentinel/tamper check still sees the true total.
+        if shard.entries.len() > AUDIT_PER_SHARD_MAX_IN_MEMORY {
+            let drop_n = AUDIT_PER_SHARD_MAX_IN_MEMORY / 5;
+            shard.entries.drain(0..drop_n);
         }
 
-        // Release the hash-chain lock BEFORE invoking subscriber callbacks —
-        // never hold `inner` across a callback (same rule `trust_decay.rs`'s
-        // `emit` follows for its own, separate subscriber-list mutex).
-        drop(inner);
+        // Release the shard lock before enqueueing, touching health, or invoking
+        // subscriber callbacks — none of those participate in the chain linkage,
+        // and a callback must never run while a chain lock is held (same rule
+        // `trust_decay.rs::emit` follows).
+        drop(shard);
+
+        // Publish this shard's head for the Merkle anchor. Done after the mutex
+        // is released so building an anchor never needs to take all 16 locks.
+        self.shard_heads[shard_idx].store(Arc::new(ShardHead { hash: chain_hash }));
+
+        self.enqueue_wal_line(entry_json);
+
         for cb in self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             cb(&record_for_subscribers);
         }
+    }
+
+    /// Enqueue one already-serialized JSONL line for the WAL worker, applying
+    /// the full backpressure contract (drop-on-full, sticky floor, health
+    /// recompute). Unchanged from the pre-Phase-6 inline version — factored out
+    /// only so `append_event` can call it after releasing its shard lock.
+    fn enqueue_wal_line(&self, entry_json: String) {
+        let Some(ref tx) = self.wal_tx else { return };
+        let event_count = self.global_seq.load(Ordering::Relaxed);
+        let msg = WalMessage::Entry {
+            entry_json,
+            event_count,
+        };
+        if tx.try_send(msg).is_ok() {
+            self.queue_len.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // FIX 3: rate-limited signal via an atomic counter — never an
+            // inline eprintln! on this hot path.
+            self.dropped_audits.fetch_add(1, Ordering::Relaxed);
+            // This event is now permanently absent from the audit trail — not
+            // merely late. Raise the sticky floor so health cannot fall back to
+            // Healthy when the queue drains, keeping Gate 2.5 fail-closed on
+            // IRREVERSIBLE_ACTION until an operator calls
+            // `acknowledge_dropped_audits`. See `AuditHealth`'s "Sticky on
+            // drop" note.
+            self.health_floor
+                .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
+            crate::telemetry::global_telemetry().record_gate_rejection("gate_6_0_audit");
+        }
+
+        // FIX 4: recompute health from live queue pressure. `fetch_update`
+        // refuses to overwrite a sticky `Fatal` — only the WAL worker sets that
+        // (on an actual I/O failure), and only a fresh `ImmutableAuditLog`
+        // clears it.
+        //
+        // The sticky drop floor is deliberately NOT folded into this stored
+        // value: `health()` applies it on read instead. Baking it in here would
+        // leave the floor's level latched in `health` even after
+        // `acknowledge_dropped_audits` cleared the floor itself.
+        let pct = self.queue_len.load(Ordering::Relaxed) as f64 / AUDIT_WAL_QUEUE_CAPACITY as f64;
+        let level = if pct > AUDIT_HEALTH_SATURATED_PCT {
+            AuditHealth::Saturated
+        } else if pct > AUDIT_HEALTH_DEGRADED_PCT {
+            AuditHealth::Degraded
+        } else {
+            AuditHealth::Healthy
+        };
+        let _ = self
+            .health
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur == AuditHealth::Fatal as u8 { None } else { Some(level as u8) }
+            });
     }
 
     /// Verify the integrity of the in-memory audit chain.
@@ -934,17 +1345,68 @@ impl ImmutableAuditLog {
     /// Also validates the sentinel file count if it exists (spec §15.3):
     /// the event count on disk must be >= the sentinel value.
     ///
+    /// Phase 6: each of the [`AUDIT_SHARDS`] chains is walked independently
+    /// with the same loop body, seeded by the same S-6 rule (first *retained*
+    /// entry's `prev_hash`), plus a check that every entry's `shard_id` actually
+    /// matches the shard it was found in — a record moved between shards would
+    /// otherwise only be caught by the HMAC, and this makes the binding explicit.
+    ///
     /// Returns `false` on any tampering detection.
     pub fn verify_chain(&self, issuer_secret: &[u8]) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let event_count = self.global_seq.load(Ordering::Relaxed);
+        let mut total_retained = 0usize;
 
-        if inner.entries.is_empty() {
+        for (idx, shard_lock) in self.shards.iter().enumerate() {
+            let shard = shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+            total_retained += shard.entries.len();
+            if shard.entries.is_empty() {
+                continue;
+            }
+
+            // S-6 fix: seed the expected hash from the FIRST RETAINED entry's
+            // `prev_hash` rather than a hard-coded genesis. When this shard's
+            // window has never been drained that first `prev_hash` IS the
+            // shard's genesis, so this is identical to a genesis-anchored walk
+            // for the common case. After a drain (see
+            // `append_event`/`AUDIT_PER_SHARD_MAX_IN_MEMORY`) the window no
+            // longer begins at genesis, and this still confirms the internal
+            // continuity + HMAC integrity of what is retained. Full-history
+            // (genesis-anchored) verification is `verify_chain_disk`'s job.
+            let mut expected_prev_hash = shard.entries[0].record.prev_hash.clone();
+
+            for entry in &shard.entries {
+                // Phase 6: the record must claim the shard it is stored in.
+                if entry.record.shard_id != Some(idx as u16) {
+                    return false;
+                }
+                if entry.record.prev_hash != expected_prev_hash {
+                    return false; // Chain broken
+                }
+
+                // M-40 fix: recompute the HMAC via the SAME `CanonicalAuditRecord`
+                // helper `append_event` uses, instead of an independently
+                // hand-listed field set — any future field added to one but not
+                // the other would otherwise silently break verification (or
+                // worse, silently stop covering a field with the HMAC).
+                let expected_sig =
+                    CanonicalAuditRecord::from_record(&entry.record).chain_hash(issuer_secret);
+
+                // SECURITY: use constant-time hex comparison to prevent timing oracle.
+                if !constant_time_eq_hex(&expected_sig, &entry.chain_hash) {
+                    return false; // Tampering detected
+                }
+
+                expected_prev_hash = entry.chain_hash.clone();
+            }
+        }
+
+        if total_retained == 0 {
             // Empty chain — valid iff event_count is also 0.
-            if inner.event_count != 0 {
+            if event_count != 0 {
                 return false;
             }
-            // Check sentinel: if sentinel file exists and shows count > 0, tamper detected.
-            if let Ok(sentinel_str) = fs::read_to_string(&inner.count_file) {
+            // Check sentinel: if it exists and shows count > 0, tamper detected.
+            if let Ok(sentinel_str) = fs::read_to_string(&self.count_file) {
                 if let Ok(sentinel_count) = sentinel_str.trim().parse::<u64>() {
                     if sentinel_count > 0 {
                         return false;
@@ -954,63 +1416,13 @@ impl ImmutableAuditLog {
             return true;
         }
 
-        // S-6 fix: seed the expected hash from the FIRST RETAINED entry's
-        // `prev_hash` rather than a hard-coded `GENESIS_HASH`. When the in-memory
-        // window has never been drained, `entries[0].prev_hash == GENESIS_HASH`,
-        // so this is identical to the old behavior for the common case. After a
-        // drain (see `append_event`/`AUDIT_MAX_IN_MEMORY_ENTRIES`) the window no
-        // longer begins at genesis, and this lets `verify_chain` still confirm the
-        // internal continuity + HMAC integrity of the retained window. Full-history
-        // (genesis-anchored) verification is `verify_chain_disk`'s job — the doc
-        // comment above points callers there. `.unwrap()` is unreachable: the
-        // `entries.is_empty()` early-return above guarantees a first element.
-        let mut expected_prev_hash = inner
-            .entries
-            .first()
-            .map(|e| e.record.prev_hash.clone())
-            .unwrap_or_else(|| GENESIS_HASH.to_string());
-
-        for entry in &inner.entries {
-            if entry.record.prev_hash != expected_prev_hash {
-                return false; // Chain broken
-            }
-
-            // M-40 fix: recompute HMAC over the SAME `CanonicalAuditRecord` struct
-            // `append_event` serializes, instead of an independently hand-listed
-            // `json!` field set — previously the two field lists lived in different
-            // functions and had to be kept in sync by hand; any future field
-            // added to one but not the other would silently break verification (or
-            // worse, silently stop covering a field with the HMAC).
-            let record_json = serde_json::to_string(&CanonicalAuditRecord {
-                intent: &entry.record.intent,
-                prev_hash: &entry.record.prev_hash,
-                seq: entry.record.seq,
-                source: &entry.record.source,
-                target: &entry.record.target,
-                timestamp: entry.record.timestamp,
-                token_signature: &entry.record.token_signature,
-                traceparent: &entry.record.traceparent,
-            }).unwrap_or_default();
-
-            let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
-            mac.update(record_json.as_bytes());
-            let expected_sig = hex::encode(mac.finalize().into_bytes());
-
-            // SECURITY: use constant-time hex comparison to prevent timing oracle.
-            if !constant_time_eq_hex(&expected_sig, &entry.chain_hash) {
-                return false; // Tampering detected
-            }
-
-            expected_prev_hash = entry.chain_hash.clone();
-        }
-
         // Spec §15.3: Total disk count MUST be >= sentinel count.
         // The sentinel records how many events were accepted in-memory.
         // If the sentinel exists and shows a count HIGHER than in-memory, something was erased.
-        if Path::new(&inner.count_file).exists() {
-            if let Ok(sentinel_str) = fs::read_to_string(&inner.count_file) {
+        if Path::new(&self.count_file).exists() {
+            if let Ok(sentinel_str) = fs::read_to_string(&self.count_file) {
                 if let Ok(sentinel_count) = sentinel_str.trim().parse::<u64>() {
-                    if inner.event_count < sentinel_count {
+                    if event_count < sentinel_count {
                         return false; // Events were lost/erased
                     }
                 }
@@ -1029,28 +1441,54 @@ impl ImmutableAuditLog {
     ///
     /// NOTE: This requires the WAL thread to have flushed pending writes to disk.
     /// Use `verify_chain()` for in-process verification without disk I/O.
+    ///
+    /// ## Phase 6 — one pass, three branches
+    ///
+    /// A line is an **anchor**, a **v2 record**, or a **v1 record**, decided per
+    /// line by structure alone (an anchor has an `"anchor"` key; a v2 record has
+    /// `shard_id`/`shard_seq`; a v1 record has neither). A file may therefore be
+    /// pure v1, pure v2, or a v1 prefix followed by a v2 suffix, and all three
+    /// verify through this single walk. For a pure-v1 log only the v1 branch
+    /// ever executes, doing character-for-character what it did before Phase 6 —
+    /// which is what the pinned fixture in `tests/test_audit_v1_fixture_rs.rs`
+    /// exists to prove.
+    ///
+    /// At the migration boundary each shard's expected hash is re-seeded to
+    /// `SHA256(genesis_tag || u16BE(i) || final_v1_hash)`, binding the v2 region
+    /// to the end of the v1 region — see [`Self::initialize_chain`].
     pub fn verify_chain_disk(&self, issuer_secret: &[u8]) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let log_file = &inner.log_file;
-        let count_file = &inner.count_file;
+        let log_file = &self.log_file;
+        let count_file = &self.count_file;
 
         // Read all log entries from disk.
         let content = match fs::read_to_string(log_file) {
             Ok(c) => c,
             Err(_) => {
                 // File missing — valid only if in-memory count is 0.
-                return inner.event_count == 0;
+                return self.global_seq.load(Ordering::Relaxed) == 0;
             }
         };
 
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-        let disk_count = lines.len() as u64;
+
+        // Anchor lines are metadata, not events — they must not inflate the
+        // count the sentinel is compared against.
+        let mut record_lines = 0u64;
+        for line in &lines {
+            if !line.contains(r#""anchor""#) {
+                record_lines += 1;
+            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get(ANCHOR_LINE_KEY).is_none() {
+                    record_lines += 1;
+                }
+            }
+        }
 
         // Check sentinel: disk count must be >= sentinel count.
         if Path::new(count_file).exists() {
             if let Ok(s) = fs::read_to_string(count_file) {
                 if let Ok(sentinel) = s.trim().parse::<u64>() {
-                    if disk_count < sentinel {
+                    if record_lines < sentinel {
                         return false;
                     }
                 }
@@ -1061,13 +1499,62 @@ impl ImmutableAuditLog {
             return true;
         }
 
-        let mut expected_prev_hash = GENESIS_HASH.to_string();
+        // v1 walk state: one linear chain seeded at the global genesis.
+        let mut expected_v1_hash = GENESIS_HASH.to_string();
+        let mut final_v1_hash: Option<String> = None;
+        // v2 walk state: one expected hash per shard, lazily seeded on that
+        // shard's first v2 record (so the seed can incorporate `final_v1_hash`).
+        let mut expected_v2: Vec<Option<String>> = vec![None; AUDIT_SHARDS];
+        // Anchor chain state.
+        let mut expected_prev_root = ANCHOR_GENESIS_ROOT.to_string();
 
         for line in &lines {
             let entry: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => return false,
             };
+
+            // ---- Branch 1: Merkle anchor ----
+            if let Some(anchor_val) = entry.get(ANCHOR_LINE_KEY) {
+                let anchor: MerkleAnchor = match serde_json::from_value(anchor_val.clone()) {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                if anchor.heads.len() != AUDIT_SHARDS {
+                    return false;
+                }
+                // The anchor must chain to the previous anchor, so a whole
+                // epoch cannot be excised from the middle of the file.
+                if anchor.prev_root != expected_prev_root {
+                    return false;
+                }
+                // The committed root must actually be the root of the committed
+                // heads — otherwise the root is a free-form string.
+                let leaves: Vec<[u8; 32]> = anchor
+                    .heads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| merkle_leaf(i as u16, h))
+                    .collect();
+                if merkle_root(&leaves) != anchor.root {
+                    return false;
+                }
+                // Every committed head must match the chain state the records
+                // seen so far actually produced. This is the check that makes
+                // dropping or rewriting a shard's records detectable: the shard
+                // head would no longer match what the anchor committed to.
+                for (i, head) in anchor.heads.iter().enumerate() {
+                    let actual = expected_v2[i]
+                        .clone()
+                        .unwrap_or_else(|| self.migration_seed_hash(i as u16, final_v1_hash.as_deref()));
+                    if &actual != head {
+                        return false;
+                    }
+                }
+                expected_prev_root = anchor.root.clone();
+                continue;
+            }
+
             let rec = &entry["record"];
             let chain_hash = match entry["chain_hash"].as_str() {
                 Some(h) => h,
@@ -1075,18 +1562,13 @@ impl ImmutableAuditLog {
             };
             let prev_hash = rec["prev_hash"].as_str().unwrap_or("");
 
-            if prev_hash != expected_prev_hash {
-                return false;
-            }
-
-            // M-40 fix: same `CanonicalAuditRecord` struct `append_event`/`verify_chain`
-            // serialize, instead of a third independently hand-listed `json!` field
-            // set built from untyped `Value`s — see `verify_chain`'s sibling fix for
-            // why keeping these in sync by hand is the actual divergence risk this
-            // closes. Extracting each field with its expected type (rather than
-            // embedding the raw `Value`) also means a malformed/missing field now
-            // fails the parse explicitly (fail-closed) instead of silently
-            // serializing as `null` and merely producing a mismatching HMAC.
+            // M-40 fix: the same `CanonicalAuditRecord` helper `append_event` and
+            // `verify_chain` use, rather than a third independently hand-listed
+            // field set built from untyped `Value`s. Extracting each field with
+            // its expected type (rather than embedding the raw `Value`) means a
+            // malformed/missing field fails the parse explicitly (fail-closed)
+            // instead of silently serializing as `null` and merely producing a
+            // mismatching HMAC.
             let intent = match rec["intent"].as_str() { Some(v) => v, None => return false };
             let seq = match rec["seq"].as_u64() { Some(v) => v, None => return false };
             let source = match rec["source"].as_str() { Some(v) => v, None => return false };
@@ -1095,15 +1577,88 @@ impl ImmutableAuditLog {
             let token_signature = match rec["token_signature"].as_str() { Some(v) => v, None => return false };
             let traceparent = match rec["traceparent"].as_str() { Some(v) => v, None => return false };
 
+            // ---- Branch 2: v2 (sharded) record ----
+            if let Some(shard_id_raw) = rec.get("shard_id").and_then(|v| v.as_u64()) {
+                if shard_id_raw as usize >= AUDIT_SHARDS {
+                    return false;
+                }
+                let shard_id = shard_id_raw as u16;
+                let shard_seq = match rec.get("shard_seq").and_then(|v| v.as_u64()) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let anchor_epoch = match rec.get("anchor_epoch").and_then(|v| v.as_u64()) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                // The version marker must be present and exact on a v2 record —
+                // an unknown version is rejected rather than guessed at.
+                match rec.get("v").and_then(|v| v.as_u64()) {
+                    Some(v) if v == AUDIT_RECORD_VERSION_V2 as u64 => {}
+                    _ => return false,
+                }
+
+                // Seed this shard on first sight, folding in the final v1 hash
+                // if the file has a v1 region — this is the migration boundary.
+                let expected = expected_v2[shard_id as usize]
+                    .get_or_insert_with(|| self.migration_seed_hash(shard_id, final_v1_hash.as_deref()));
+                if prev_hash != expected.as_str() {
+                    return false;
+                }
+
+                let record_json = serde_json::to_string(&CanonicalAuditRecord {
+                    anchor_epoch: Some(anchor_epoch),
+                    intent,
+                    prev_hash,
+                    seq,
+                    shard_id: Some(shard_id),
+                    shard_seq: Some(shard_seq),
+                    source,
+                    target,
+                    timestamp,
+                    token_signature,
+                    traceparent,
+                    v: Some(AUDIT_RECORD_VERSION_V2),
+                }).unwrap_or_default();
+
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+                mac.update(record_json.as_bytes());
+                let expected_sig = hex::encode(mac.finalize().into_bytes());
+
+                // SECURITY: constant-time hex comparison to prevent timing oracle.
+                if !constant_time_eq_hex(&expected_sig, chain_hash) {
+                    return false;
+                }
+
+                expected_v2[shard_id as usize] = Some(chain_hash.to_string());
+                continue;
+            }
+
+            // ---- Branch 3: v1 record (pre-Phase-6) ----
+            //
+            // A v1 record must not appear after the v2 region has begun: the
+            // upgrade is one-way, and accepting an interleaved v1 line would let
+            // an attacker append records that skip the shard binding entirely.
+            if expected_v2.iter().any(|e| e.is_some()) {
+                return false;
+            }
+            if prev_hash != expected_v1_hash {
+                return false;
+            }
+
             let record_json = serde_json::to_string(&CanonicalAuditRecord {
+                anchor_epoch: None,
                 intent,
                 prev_hash,
                 seq,
+                shard_id: None,
+                shard_seq: None,
                 source,
                 target,
                 timestamp,
                 token_signature,
                 traceparent,
+                v: None,
             }).unwrap_or_default();
 
             let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
@@ -1115,25 +1670,35 @@ impl ImmutableAuditLog {
                 return false;
             }
 
-            expected_prev_hash = chain_hash.to_string();
+            expected_v1_hash = chain_hash.to_string();
+            final_v1_hash = Some(chain_hash.to_string());
         }
 
         true
     }
 
     /// Return the number of events in the chain.
+    ///
+    /// Phase 6: lock-free (`global_seq`), returning the same value the old
+    /// mutex-guarded `event_count` field did.
     pub fn event_count(&self) -> u64 {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.event_count
+        self.global_seq.load(Ordering::Relaxed)
     }
 
     /// S-6 fix: number of entries currently retained in the in-memory window
     /// (bounded by `AUDIT_MAX_IN_MEMORY_ENTRIES`). Distinct from `event_count`,
     /// which is the lifetime total (never decremented by the retention drain).
     /// Exposed for monitoring and for verifying the retention bound in tests.
+    ///
+    /// Phase 6: the sum across all [`AUDIT_SHARDS`] windows. The aggregate bound
+    /// is unchanged — each shard is capped at
+    /// `AUDIT_MAX_IN_MEMORY_ENTRIES / AUDIT_SHARDS`, so sharding cannot silently
+    /// multiply the memory this retains.
     pub fn in_memory_entries_len(&self) -> usize {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.entries.len()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).entries.len())
+            .sum()
     }
 
     /// Current Gate 6.0 backpressure health (see `AuditHealth`). Read by
@@ -1224,16 +1789,11 @@ impl ImmutableAuditLog {
 
     /// Reset the audit log completely (for test isolation).
     pub fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let log_file = inner.log_file.clone();
-        let count_file = inner.count_file.clone();
-        inner.last_hash = GENESIS_HASH.to_string();
-        inner.event_count = 0;
-        inner.entries.clear();
+        self.reset_chain_state_to_genesis();
         self.health_floor
             .store(AuditHealth::Healthy as u8, Ordering::Relaxed);
-        let _ = fs::remove_file(&log_file);
-        let _ = fs::remove_file(&count_file);
+        let _ = fs::remove_file(&self.log_file);
+        let _ = fs::remove_file(&self.count_file);
     }
 
     /// Alias for `event_count()` used by audit facades.
@@ -1571,9 +2131,69 @@ impl WalWriter {
 // WAL worker thread body
 // ---------------------------------------------------------------------------
 
+/// A built anchor line plus the root it committed to, so the caller can chain
+/// the next anchor to it only if the write actually succeeded.
+struct AnchorLine {
+    json: String,
+    root: String,
+}
+
+/// Build one Merkle anchor over the currently-published shard heads.
+///
+/// Reads each head from its `ArcSwap` — never takes a shard mutex, so anchoring
+/// cannot contend with or block appenders. The heads are therefore a slightly
+/// skewed snapshot (shard 3 may have advanced while shard 0 was read), which is
+/// intentional and harmless: the anchor commits to a set of heads that each
+/// genuinely existed, and `verify_chain_disk` replays the file's own records to
+/// check the commitment. A skewed-but-real snapshot cannot make a tampered log
+/// verify; it can only cause an anchor to commit to a slightly older head than
+/// the newest one on disk, which the replay handles because it checks each
+/// anchor against the chain state *at the point the anchor appears in the file*.
+///
+/// Returns `None` if the anchor cannot be serialized (never expected — the
+/// struct is plain data).
+fn build_anchor_line(
+    shard_heads: &[arc_swap::ArcSwap<ShardHead>],
+    anchor_epoch: &AtomicU64,
+    prev_root: &str,
+    event_count: u64,
+) -> Option<AnchorLine> {
+    let heads: Vec<String> = shard_heads
+        .iter()
+        .map(|h| h.load().hash.clone())
+        .collect();
+    let leaves: Vec<[u8; 32]> = heads
+        .iter()
+        .enumerate()
+        .map(|(i, h)| merkle_leaf(i as u16, h))
+        .collect();
+    let root = merkle_root(&leaves);
+    // Advance the epoch so records appended after this anchor carry the new
+    // value — `fetch_add` returns the previous, which is the epoch this anchor
+    // closes.
+    let epoch = anchor_epoch.fetch_add(1, Ordering::Relaxed);
+
+    let anchor = MerkleAnchor {
+        epoch,
+        heads,
+        root: root.clone(),
+        prev_root: prev_root.to_string(),
+        event_count,
+        timestamp: now_secs(),
+    };
+    let json = serde_json::to_string(&serde_json::json!({ ANCHOR_LINE_KEY: anchor })).ok()?;
+    Some(AnchorLine { json, root })
+}
+
 /// Runs for the lifetime of the `ImmutableAuditLog` instance that spawned it
 /// — exits when `wal_tx` is dropped (closing the channel and ending
 /// `wal_rx.iter()`), or immediately if the log file can't be opened (Fix 2).
+///
+/// Phase 6: also emits the periodic Merkle anchor. This thread is already the
+/// single I/O serialization point, so anchoring here needs no new thread and no
+/// new lock — it reads each shard's head from the lock-free `ArcSwap` the
+/// appenders publish into, never taking a shard mutex.
+#[allow(clippy::too_many_arguments)]
 fn run_wal_worker(
     wal_rx: mpsc::Receiver<WalMessage>,
     log_file: &str,
@@ -1582,6 +2202,8 @@ fn run_wal_worker(
     wal_write_failures: &AtomicU64,
     queue_len: &AtomicUsize,
     archival_sink: Arc<dyn ArchivalSink>,
+    shard_heads: &[arc_swap::ArcSwap<ShardHead>],
+    anchor_epoch: &AtomicU64,
 ) {
     // In-memory-only mode (`ImmutableAuditLog::new("")`): drain without any
     // disk I/O. This is a deliberate no-persistence mode, not a failure —
@@ -1619,6 +2241,11 @@ fn run_wal_worker(
         }
     };
 
+    // Phase 6 anchor state, owned entirely by this thread.
+    let mut events_since_anchor: u64 = 0;
+    let mut last_anchor = Instant::now();
+    let mut prev_root = ANCHOR_GENESIS_ROOT.to_string();
+
     for msg in wal_rx.iter() {
         queue_len.fetch_sub(1, Ordering::Relaxed);
         match msg {
@@ -1639,6 +2266,31 @@ fn run_wal_worker(
                              referencing this log until a fresh ImmutableAuditLog is constructed."
                         );
                     }
+                }
+
+                // Phase 6: emit a Merkle anchor every N events or T seconds,
+                // whichever comes first. Failure to write an anchor is counted
+                // like any other WAL write failure but does not abort the loop —
+                // the per-shard chains remain individually verifiable, and the
+                // next anchor re-commits to the same heads.
+                events_since_anchor += 1;
+                if events_since_anchor >= AUDIT_ANCHOR_EVERY_N_EVENTS
+                    || last_anchor.elapsed() >= AUDIT_ANCHOR_INTERVAL
+                {
+                    if let Some(line) = build_anchor_line(
+                        shard_heads,
+                        anchor_epoch,
+                        &prev_root,
+                        event_count,
+                    ) {
+                        if wal.write_entry(&line.json, event_count, count_file).is_err() {
+                            wal_write_failures.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            prev_root = line.root;
+                        }
+                    }
+                    events_since_anchor = 0;
+                    last_anchor = Instant::now();
                 }
             }
             WalMessage::Flush(ack_tx) => {
@@ -2235,12 +2887,15 @@ mod tests {
 
         // The stored intent for the first entry is ciphertext, not plaintext,
         // and decrypts back to the original.
-        // Scoped so the MutexGuard drops before `log.reset()` below re-locks
-        // `inner` — holding a reference derived from it across that call
-        // would deadlock (the lock is not reentrant).
+        //
+        // Phase 6: both appends came from THIS thread, so they are both on this
+        // thread's shard (`AUDIT_SHARD_SLOT`) and in order — the first entry of
+        // that shard is the confidential one. Scoped so the guard drops before
+        // `log.reset()` below re-locks the shard (the lock is not reentrant).
         let stored_intent = {
-            let inner = log.inner.lock().unwrap();
-            inner.entries[0].record.intent.clone()
+            let idx = AUDIT_SHARD_SLOT.with(|s| *s);
+            let shard = log.shards[idx].lock().unwrap();
+            shard.entries[0].record.intent.clone()
         };
         assert_ne!(stored_intent, plaintext_intent);
         assert_eq!(decrypt_intent(secret, &stored_intent).unwrap(), plaintext_intent);
