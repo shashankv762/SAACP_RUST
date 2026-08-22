@@ -198,6 +198,28 @@ impl MaintenanceCoordinator {
         })
     }
 
+    /// Register the MEASC session table's idle reaper (S1 fix): removes
+    /// sessions that have been silent past their idle TTL — never-authenticated
+    /// entries (attacker junk auto-created from random header session_ids)
+    /// after [`crate::measc::MEASC_UNAUTH_SESSION_IDLE_SECS`], authenticated
+    /// sessions after
+    /// [`crate::measc::MEASC_AUTH_SESSION_IDLE_SECS`]. Also sweeps expired
+    /// epoch grace periods via `expire_old_epochs` (previously dead code with
+    /// zero production callers).
+    pub fn with_epoch_manager(self, manager: Arc<crate::measc::SessionEpochManager>) -> Self {
+        self.with_custom("epoch_manager", move || {
+            let expired = manager.expire_old_epochs(None);
+            let reaped = manager.reap_idle_sessions();
+            if expired + reaped > 0 {
+                eprintln!(
+                    "[SAACP maintenance] epoch_manager sweep: {expired} grace epochs \
+                     expired, {reaped} idle sessions reaped ({} tracked)",
+                    manager.session_count()
+                );
+            }
+        })
+    }
+
     /// Register the signed injection rule-pack store (`rulepack.rs`) so an active
     /// pack whose `valid_until` has passed is dropped and the process reverts to
     /// the compiled-in signature baseline.

@@ -5,12 +5,14 @@
 
 #![allow(clippy::assertions_on_constants)]
 
+use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use saacp::{
     provision_issuer, AgentCredential, AgentIdentity, AttestationType,
-    DistributedRevocationInfrastructure, IdentityProver, TrustAnchor, TrustModel, TrustStore,
-    FAITF_MAX_DELEGATION_DEPTH, FAITF_VERSION, IDENTITY_PROOF_TTL, MAX_CLOCK_SKEW,
+    DistributedRevocationInfrastructure, IdentityProver, SignedRevocationRecord, TrustAnchor,
+    TrustModel, TrustStore, FAITF_MAX_DELEGATION_DEPTH, FAITF_VERSION, IDENTITY_PROOF_TTL,
+    MAX_CLOCK_SKEW,
 };
 
 fn generate_issuer_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
@@ -179,6 +181,51 @@ fn test_credential_from_wire_bad_input_fails() {
     // Actually this might be valid base64; use random bytes
     let truly_bad = vec![0xFF, 0xFE, 0xFD];
     let _ = AgentCredential::from_wire(&truly_bad); // Must not panic
+}
+
+#[test]
+fn test_credential_from_wire_rejects_len_overflow() {
+    // F6-class regression: a 4-byte length prefix of 0xFFFF_FFFF made the
+    // pre-fix `payload_len + 4 + 64` wrap on 32-bit targets, passing the
+    // bounds check and panicking on the slice. Must return a clean Err.
+    let mut raw = Vec::with_capacity(68);
+    raw.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    raw.extend_from_slice(&[0u8; 64]); // minimum body so only the len check can fail
+    let wire = base64::engine::general_purpose::STANDARD
+        .encode(&raw)
+        .into_bytes();
+    let res = AgentCredential::from_wire(&wire);
+    assert!(
+        res.is_err(),
+        "near-u32::MAX length must be rejected, got {:?}",
+        res
+    );
+    // Same for a length just under the wrap threshold on 32-bit.
+    let mut raw2 = Vec::with_capacity(68);
+    raw2.extend_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+    raw2.extend_from_slice(&[0u8; 64]);
+    let wire2 = base64::engine::general_purpose::STANDARD
+        .encode(&raw2)
+        .into_bytes();
+    assert!(AgentCredential::from_wire(&wire2).is_err());
+}
+
+#[test]
+fn test_signed_revocation_from_wire_rejects_len_overflow() {
+    // F6-class regression for SignedRevocationRecord: pre-fix
+    // `4 + body_len + 64` wrapped on 32-bit for body_len near u32::MAX.
+    let mut raw = Vec::with_capacity(68);
+    raw.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    raw.extend_from_slice(&[0u8; 64]);
+    let wire = base64::engine::general_purpose::STANDARD
+        .encode(&raw)
+        .into_bytes();
+    let res = SignedRevocationRecord::from_wire(&wire);
+    assert!(
+        res.is_err(),
+        "near-u32::MAX length must be rejected, got {:?}",
+        res
+    );
 }
 
 // ─── TrustAnchor ─────────────────────────────────────────────────────────────

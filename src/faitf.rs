@@ -301,7 +301,14 @@ impl AgentCredential {
             return Err("Credential too short".to_string());
         }
         let payload_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-        if payload_len == 0 || payload_len + 4 + 64 > raw.len() {
+        // F6-class fix: `payload_len + 4 + 64` wraps on 32-bit targets when
+        // payload_len is near u32::MAX, passing the bounds check and panicking
+        // on the slices below. checked_add cannot wrap (cluster.rs idiom).
+        let min_len = 4usize
+            .checked_add(payload_len)
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| "Invalid payload length".to_string())?;
+        if payload_len == 0 || min_len > raw.len() {
             return Err("Invalid payload length".to_string());
         }
         let payload_bytes = &raw[4..4 + payload_len];
@@ -704,7 +711,14 @@ impl SignedRevocationRecord {
             return Err("Too short".to_string());
         }
         let body_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-        if 4 + body_len + 64 > raw.len() {
+        // F6-class fix: same 32-bit wrap hazard as `AgentCredential::from_wire`
+        // above — `4 + body_len + 64` wraps when body_len is near u32::MAX on
+        // a 32-bit target, passing the check and panicking on the slices below.
+        let min_len = 4usize
+            .checked_add(body_len)
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| "Invalid body length".to_string())?;
+        if min_len > raw.len() {
             return Err("Invalid body length".to_string());
         }
         let body_bytes = &raw[4..4 + body_len];

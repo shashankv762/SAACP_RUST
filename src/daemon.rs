@@ -590,6 +590,18 @@ impl SAACPNetworkDaemon {
         &self,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> std::io::Result<()> {
+        // S7 fix: auto-start the cluster failure detector. Pre-fix, a
+        // deployment that configured `with_cluster_engine` but forgot the
+        // separate manual `ClusterEngine::start` call accepted membership
+        // messages without ever detecting a dead peer or electing a leader.
+        // `start` is idempotent (engine-level guard), so a caller that still
+        // starts it manually cannot double-spawn. Tick interval: the suspect
+        // timeout / 2, so a failed peer is detected within roughly one
+        // suspect window (SWIM convention).
+        if let Some(cluster) = self.cluster.clone() {
+            let interval = cluster.suspect_timeout_interval_hint();
+            cluster.start(interval);
+        }
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
 
@@ -912,6 +924,17 @@ pub(crate) async fn handle_client<S>(
     // fail to compile on the next `.clear()`. It keeps its original
     // fresh-per-iteration allocation.
     let mut payload_buf: Vec<u8> = Vec::new();
+    // S1 fix: per-connection cap on DISTINCT header session_ids this
+    // connection may auto-create in the epoch manager. A legitimate
+    // connection multiplexes very few sessions; one that presents a new
+    // random session_id per packet is filling the global session table with
+    // pre-authentication junk (the unbounded-growth DoS). Exceeding the cap
+    // closes the connection — the correct response to header spam. The
+    // global cap (`MEASC_MAX_TRACKED_SESSIONS`) and the idle reaper bound
+    // the process as a whole.
+    let mut created_session_ids: std::collections::HashSet<[u8; 16]> =
+        std::collections::HashSet::new();
+    const MAX_SESSIONS_PER_CONNECTION: usize = 16;
     loop {
         // 2a. Read 128-byte header with 2s timeout
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1081,16 +1104,33 @@ pub(crate) async fn handle_client<S>(
                 .and_then(|s| <[u8; 16]>::try_from(s).ok())
                 .unwrap_or([0u8; 16]);
             if epoch_mgr.get_current_epoch_id(&session_id).is_none() {
-                // Idempotent: ignore "already exists" races from concurrent packets on
-                // the same not-yet-registered session_id — the loser just reuses the
-                // winner's session.
-                let _ = epoch_mgr.create_session(
-                    session_id,
-                    session_key_bytes,
-                    crate::measc::MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
-                    crate::measc::MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
-                    None,
-                );
+                // S1 fix: bound distinct auto-created sessions per connection
+                // (see `created_session_ids` above) — exceeding the cap means
+                // header spam, so close the connection.
+                if created_session_ids.contains(&session_id) {
+                    // Prior auto-create raced/failed; do not grow the set.
+                } else if created_session_ids.len() >= MAX_SESSIONS_PER_CONNECTION {
+                    send_hard_drop(
+                        &mut stream,
+                        SAACPBytecodes::CircuitBreakerOpen,
+                        "Too many distinct session_ids from one connection",
+                    )
+                    .await;
+                    record_error(&circuit_breakers, &ip_key);
+                    break;
+                } else {
+                    // Idempotent: ignore "already exists" races from concurrent packets on
+                    // the same not-yet-registered session_id — the loser just reuses the
+                    // winner's session.
+                    let _ = epoch_mgr.create_session(
+                        session_id,
+                        session_key_bytes,
+                        crate::measc::MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                        crate::measc::MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                        None,
+                    );
+                    created_session_ids.insert(session_id);
+                }
             }
             let gw_for_task = gateway.clone();
             tokio::task::spawn_blocking(move || {

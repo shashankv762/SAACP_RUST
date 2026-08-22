@@ -29,6 +29,25 @@ pub const MEASC_DEFAULT_EPOCH_TIME_SECONDS: u64 = 600;
 pub const MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD: u64 = 1_048_576;
 pub const MEASC_EPOCH_GRACE_PERIOD_SECONDS: u64 = 60;
 pub const MEASC_PSN_MAX: u64 = i64::MAX as u64;
+/// S1 fix: hard cap on distinct sessions tracked by one `SessionEpochManager`.
+/// Pre-fix, the manager grew without bound — every packet whose 16-byte header
+/// `session_id` was unknown auto-created a ~1KB session entry BEFORE any AEAD
+/// verification (`daemon.rs` encrypted-transport path), so a single
+/// unauthenticated connection could grow memory at ~8x bandwidth amplification
+/// forever. The cap fails CLOSED: new legitimate sessions are rejected while
+/// an attacker's junk fills the table, but memory stays bounded at
+/// `cap * ~1KB`. Pair with `reap_idle_sessions` (never-authenticated junk is
+/// reaped within `MEASC_UNAUTH_SESSION_IDLE_SECS`) so slot-exhaustion is also
+/// short-lived. Override per deployment with
+/// [`SessionEpochManager::with_session_cap`].
+pub const MEASC_MAX_TRACKED_SESSIONS: usize = 4096;
+/// S1 fix: idle TTL for a session that has NEVER completed a successful AEAD
+/// decryption (i.e. one of the attacker's auto-created junk entries).
+pub const MEASC_UNAUTH_SESSION_IDLE_SECS: f64 = 60.0;
+/// S1 fix: idle TTL for a fully authenticated session before the reaper may
+/// retire it. Generous by design — an authenticated session going quiet for
+/// half an hour is far more likely a long-lived agent connection than junk.
+pub const MEASC_AUTH_SESSION_IDLE_SECS: f64 = 1800.0;
 pub const MEASC_AUTH_TAG_SIZE: usize = 16;
 pub const MEASC_HEADER_SIZE: usize = 128;
 pub const MEASC_MAGIC: &[u8; 4] = b"SACP";
@@ -651,6 +670,15 @@ struct SessionMeta {
     packet_threshold: u64,
     time_threshold_secs: f64,
     suite_transcript_hash_hex: String,
+    /// S1 fix: liveness bookkeeping for the idle reaper. Skipped from
+    /// `Zeroize` — `Instant` has no key material.
+    #[zeroize(skip)]
+    last_active: Instant,
+    /// S1 fix: true once this session completed at least one successful AEAD
+    /// decryption (`parse_frame`). Never-authenticated sessions are reaped
+    /// after the much shorter `MEASC_UNAUTH_SESSION_IDLE_SECS`.
+    #[zeroize(skip)]
+    authenticated: bool,
 }
 
 /// L-11 fix: lock ordering. This type holds three independent locks (`sessions`,
@@ -669,6 +697,13 @@ pub struct SessionEpochManager {
     pub(crate) sessions: Mutex<HashMap<[u8; 16], HashMap<u32, SessionEpoch>>>,
     meta: Mutex<HashMap<[u8; 16], SessionMeta>>,
     grace: Mutex<HashMap<[u8; 16], HashMap<u32, Instant>>>,
+    /// S1 fix: see [`MEASC_MAX_TRACKED_SESSIONS`].
+    session_cap: usize,
+    /// S1 fix: idle TTLs used by [`Self::reap_idle_sessions`] — injectable so
+    /// tests (and unusual deployments) can shorten them; defaults are the
+    /// [`MEASC_UNAUTH_SESSION_IDLE_SECS`]/[`MEASC_AUTH_SESSION_IDLE_SECS`] consts.
+    unauth_idle_secs: f64,
+    auth_idle_secs: f64,
 }
 
 impl Default for SessionEpochManager {
@@ -683,7 +718,28 @@ impl SessionEpochManager {
             sessions: Mutex::new(HashMap::new()),
             meta: Mutex::new(HashMap::new()),
             grace: Mutex::new(HashMap::new()),
+            session_cap: MEASC_MAX_TRACKED_SESSIONS,
+            unauth_idle_secs: MEASC_UNAUTH_SESSION_IDLE_SECS,
+            auth_idle_secs: MEASC_AUTH_SESSION_IDLE_SECS,
         }
+    }
+
+    /// S1 fix: override the session-table cap (see
+    /// [`MEASC_MAX_TRACKED_SESSIONS`]). Values below 1 are clamped to 1.
+    pub fn with_session_cap(mut self, cap: usize) -> Self {
+        self.session_cap = cap.max(1);
+        self
+    }
+
+    /// S1 fix: override the idle-reaper TTLs (seconds). A
+    /// never-AEAD-authenticated session is reaped after `unauth_idle_secs`;
+    /// an authenticated one only after `auth_idle_secs`. Both clamped to a
+    /// 1ms floor so a zero value cannot reap sessions the instant they are
+    /// created.
+    pub fn with_idle_ttls(mut self, unauth_idle_secs: f64, auth_idle_secs: f64) -> Self {
+        self.unauth_idle_secs = unauth_idle_secs.max(0.001);
+        self.auth_idle_secs = auth_idle_secs.max(0.001);
+        self
     }
 
     pub fn create_session(
@@ -723,6 +779,18 @@ impl SessionEpochManager {
                     format!("Session {} already exists", hex::encode(session_id)),
                 ));
             }
+            // S1 fix: fail-closed session-table cap — see MEASC_MAX_TRACKED_SESSIONS.
+            if sessions.len() >= self.session_cap {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::CircuitBreakerOpen,
+                    format!(
+                        "Session table at capacity ({}) — refusing new session. \
+                         Reap idle sessions (reap_idle_sessions) or raise the cap \
+                         (with_session_cap).",
+                        self.session_cap
+                    ),
+                ));
+            }
             let mut ep_map = HashMap::new();
             ep_map.insert(0u32, epoch);
             sessions.insert(session_id, ep_map);
@@ -737,6 +805,8 @@ impl SessionEpochManager {
                 packet_threshold,
                 time_threshold_secs,
                 suite_transcript_hash_hex: suite_hex,
+                last_active: Instant::now(),
+                authenticated: false,
             },
         );
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
@@ -912,6 +982,52 @@ impl SessionEpochManager {
                 e.destroy();
             }
         }
+    }
+
+    /// S1 fix: mark a session as having completed a successful AEAD decryption
+    /// and refresh its liveness clock. Called by `parse_frame` at Step 6.5 —
+    /// only a genuine traffic-key holder can reach it, so the reaper can trust
+    /// `authenticated == false` as "possibly attacker junk".
+    pub(crate) fn note_authenticated(&self, session_id: &[u8; 16]) {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        if let Some(m) = self.meta.lock().unwrap().get_mut(session_id) {
+            m.last_active = Instant::now();
+            m.authenticated = true;
+        }
+    }
+
+    /// S1 fix: reap idle sessions. A session that NEVER authenticated is
+    /// removed after `unauth_idle_secs` (default 60s — these are, with near
+    /// certainty, entries an unauthenticated peer's random header session_ids
+    /// auto-created); an authenticated session is removed only after
+    /// `auth_idle_secs` (default 30min of total silence). Lock discipline
+    /// follows the L-11 single-lock-at-a-time rule: collect the doom list
+    /// under the `meta` lock, then destroy each id via `destroy_session`
+    /// (which takes each lock in turn). Returns the number of sessions reaped.
+    pub fn reap_idle_sessions(&self) -> usize {
+        let unauth_idle = Duration::from_secs_f64(self.unauth_idle_secs);
+        let auth_idle = Duration::from_secs_f64(self.auth_idle_secs);
+        let now = Instant::now();
+        let doomed: Vec<[u8; 16]> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+            let meta = self.meta.lock().unwrap();
+            meta.iter()
+                .filter(|(_, m)| {
+                    let idle_for = now.duration_since(m.last_active);
+                    if m.authenticated {
+                        idle_for >= auth_idle
+                    } else {
+                        idle_for >= unauth_idle
+                    }
+                })
+                .map(|(sid, _)| *sid)
+                .collect()
+        };
+        let n = doomed.len();
+        for sid in &doomed {
+            self.destroy_session(sid);
+        }
+        n
     }
 
     pub fn expire_old_epochs(&self, grace_seconds: Option<f64>) -> usize {
@@ -1319,6 +1435,11 @@ impl MEASCFrame {
         if !rw_ok {
             return Err(psn_rejection(psn, epoch_id, rw_reason));
         }
+
+        // S1 fix: this session has now PROVEN possession of the traffic key
+        // (AEAD verified) — mark it authenticated and refresh its liveness
+        // clock so the idle reaper treats it as a live session, not junk.
+        epoch_manager.note_authenticated(&session_id);
 
         // GAP-9 / M-2 fix: EASI-decrypt the Context Ref ID.
         // The header was authenticated (Step 6 AES-GCM) with the encrypted form.
@@ -2111,5 +2232,139 @@ mod tests {
         let result =
             mgr.create_session_with_negotiation(sid, [0u8; 32], local, remote, None, 0, 0.0);
         assert!(result.is_err(), "missing baseline must produce an error");
+    }
+
+    /// S1 regression: the session table must fail CLOSED at its cap — an
+    /// unauthenticated flood of distinct session_ids (one per packet header)
+    /// cannot grow memory past `cap` entries. Pre-fix the table grew without
+    /// bound (~1KB per junk entry, ~8x bandwidth amplification).
+    #[test]
+    fn s1_session_table_cap_fails_closed_under_flood() {
+        let mgr = SessionEpochManager::new().with_session_cap(8);
+        for i in 0..8u8 {
+            let r = mgr.create_session(
+                [i; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+            assert!(r.is_ok(), "session {i} within cap must be created");
+        }
+        // The flood: 10_000 further distinct ids must ALL be rejected and the
+        // table must stay exactly at the cap.
+        for i in 0..10_000u32 {
+            let sid = [
+                (i >> 24) as u8,
+                (i >> 16) as u8,
+                (i >> 8) as u8,
+                i as u8,
+                0xAA,
+                0xBB,
+                0xCC,
+                0xDD,
+                0xEE,
+                0xFF,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+            ];
+            let r = mgr.create_session(
+                sid,
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+            assert!(r.is_err(), "beyond-cap session {i} must be rejected");
+        }
+        assert_eq!(
+            mgr.session_count(),
+            8,
+            "memory must stay bounded at the cap"
+        );
+    }
+
+    /// S1 regression: after reaping, capacity returns — the cap is not a
+    /// permanent DoS vector against legitimate new sessions once the junk
+    /// idles out.
+    #[test]
+    fn s1_reaper_frees_capacity_for_new_sessions() {
+        // unauth TTL 40ms so the test runs fast; auth TTL generous.
+        let mgr = SessionEpochManager::new()
+            .with_session_cap(2)
+            .with_idle_ttls(0.04, 60.0);
+        for i in 0..2u8 {
+            let _ = mgr.create_session(
+                [i; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+        }
+        assert!(
+            mgr.create_session(
+                [9u8; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .is_err(),
+            "cap must be enforced while full"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            mgr.reap_idle_sessions(),
+            2,
+            "both never-authed sessions reaped"
+        );
+        assert_eq!(mgr.session_count(), 0);
+        assert!(
+            mgr.create_session(
+                [9u8; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .is_ok(),
+            "capacity must return after reaping"
+        );
+    }
+
+    /// S1 regression: an AUTHENTICATED session survives the short unauth TTL —
+    /// only `note_authenticated` (reachable solely via successful AEAD
+    /// decryption in `parse_frame`) promotes a session to the long TTL.
+    #[test]
+    fn s1_authenticated_sessions_survive_unauth_ttl() {
+        let mgr = SessionEpochManager::new()
+            .with_session_cap(16)
+            .with_idle_ttls(0.04, 60.0);
+        let _ = mgr.create_session(
+            [1u8; 16],
+            [7u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        );
+        let _ = mgr.create_session(
+            [2u8; 16],
+            [7u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        );
+        // Session 1 proves key possession (AEAD verified in production).
+        mgr.note_authenticated(&[1u8; 16]);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(mgr.reap_idle_sessions(), 1, "only the unauth session dies");
+        assert_eq!(mgr.session_count(), 1, "authenticated session survives");
+        assert!(mgr.get_current_epoch_id(&[1u8; 16]).is_some());
+        assert!(mgr.get_current_epoch_id(&[2u8; 16]).is_none());
     }
 }

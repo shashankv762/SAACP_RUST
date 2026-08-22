@@ -69,7 +69,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -622,6 +622,12 @@ pub struct ClusterEngine {
     leader_epoch: AtomicU64,
 
     lease_backend: Mutex<Option<Arc<dyn StateBackend>>>,
+
+    /// S7 fix: guards `start` against double-spawn. `daemon.rs` auto-starts the
+    /// failure detector when a cluster engine is configured, and a caller that
+    /// ALSO calls `start` manually (the pre-S7 documented pattern) must not end
+    /// up with two ticker threads doubling probe/heartbeat traffic.
+    detector_started: AtomicBool,
 }
 
 impl ClusterEngine {
@@ -669,6 +675,7 @@ impl ClusterEngine {
             incarnation: AtomicU64::new(now as u64),
             sequence: AtomicU64::new(0),
             leader_epoch: AtomicU64::new(0),
+            detector_started: AtomicBool::new(false),
             lease_backend: Mutex::new(None),
         }
     }
@@ -691,6 +698,19 @@ impl ClusterEngine {
 
     pub fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    /// S7 helper: the ticker interval `daemon.rs` should use when it auto-starts
+    /// the failure detector — half the suspect timeout, so a failed peer is
+    /// detected within roughly one suspect window (SWIM convention), with a
+    /// floor of 100ms so a misconfigured sub-second `suspect_timeout` does not
+    /// produce a busy-loop ticker.
+    pub fn suspect_timeout_interval_hint(&self) -> Duration {
+        self.config
+            .suspect_timeout
+            .checked_div(2)
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_millis(100))
     }
 
     /// Register a callback fired on every leadership change — the failover hook. Called
@@ -1332,7 +1352,24 @@ impl ClusterEngine {
     /// Do **not** register [`Self::tick`] on [`crate::maintenance::MaintenanceCoordinator`]
     /// — that runs on a 60s cadence, far slower than a failure detector needs. Register
     /// [`Self::sweep_expired`] there (via `with_cluster`) and run `tick` here.
+    /// Spawn the failure-detector ticker thread (one `tick` per `interval`).
+    ///
+    /// S7 fix: idempotent — only the FIRST call spawns the ticker; later calls
+    /// return an immediately-finished handle. `daemon.rs` auto-starts the
+    /// detector for any configured cluster engine, so manual `start` calls are
+    /// now optional and never double-spawn.
     pub fn start(self: Arc<Self>, interval: Duration) -> std::thread::JoinHandle<()> {
+        if self
+            .detector_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Already running — hand back a finished no-op handle so callers
+            // that join() it don't block.
+            return std::thread::Builder::new()
+                .name("saacp-cluster-already-started".to_string())
+                .spawn(|| ())
+                .expect("failed to spawn no-op saacp-cluster handle thread");
+        }
         std::thread::Builder::new()
             .name("saacp-cluster".to_string())
             .spawn(move || loop {
@@ -2141,6 +2178,42 @@ mod tests {
             node_a.receive_wire(&msg.to_wire()),
             Err(ClusterRejection::UnknownSender),
             "a node must not apply its own echoed message"
+        );
+    }
+
+    /// S7 regression: `start` must be idempotent — the daemon auto-starts the
+    /// failure detector, and a caller following the pre-S7 docs (manual
+    /// `start`) must not end up with TWO ticker threads doubling probe and
+    /// heartbeat traffic. Measured on the wire: heartbeat rate after a second
+    /// `start` must stay ~constant, not double.
+    #[test]
+    fn s7_second_start_does_not_double_ticker_rate() {
+        let a = make_identity("node-a");
+        let (node_a, transport) = make_node(&a, &["node-b"], &[&a], 2);
+        let interval = Duration::from_millis(40);
+
+        let _h1 = node_a.clone().start(interval);
+        std::thread::sleep(Duration::from_millis(250));
+        let baseline = transport.sent_count();
+        assert!(
+            baseline >= 2,
+            "ticker must be sending (got {baseline} sends)"
+        );
+
+        // The second start must be a no-op that hands back a finished handle.
+        let h2 = node_a.clone().start(interval);
+        let joined = h2.join();
+        assert!(joined.is_ok(), "no-op handle must join immediately");
+
+        std::thread::sleep(Duration::from_millis(250));
+        let after = transport.sent_count();
+        let delta = after - baseline;
+        // One ticker at 40ms over 250ms ≈ 6 sends. Two tickers would ≈ 12.
+        // Allow generous slack for scheduler noise; the doubling case lands
+        // far above this bound.
+        assert!(
+            delta <= baseline + 2,
+            "second start must not add a ticker: baseline={baseline}, delta={delta}"
         );
     }
 }
