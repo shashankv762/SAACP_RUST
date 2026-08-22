@@ -31,18 +31,21 @@ use crate::security::ImmutableAuditLog;
 /// Cached in a `LazyLock` (not regenerated per call) because every event logged within
 /// one process's lifetime must use the same fallback key for the audit chain's HMAC to
 /// be internally self-consistent.
-static FAITF_AUDIT_KEY: LazyLock<Vec<u8>> = LazyLock::new(|| {
+static FAITF_AUDIT_KEY: LazyLock<zeroize::Zeroizing<Vec<u8>>> = LazyLock::new(|| {
     if let Ok(hex_key) = std::env::var("SAACP_FAITF_AUDIT_KEY") {
+        // S8: the intermediate hex String (the raw secret spelling) is
+        // scrubbed as soon as decoding finishes.
+        let hex_key = zeroize::Zeroizing::new(hex_key);
         if let Ok(bytes) = hex::decode(hex_key.trim()) {
             if bytes.len() >= 32 {
-                return bytes;
+                return zeroize::Zeroizing::new(bytes);
             }
         }
     }
     use rand::RngCore;
     let mut key = vec![0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key);
-    key
+    zeroize::Zeroizing::new(key)
 });
 
 /// L-27 fix: strip ASCII control characters (C0 range `0x00-0x1F` plus `0x7F`) from a

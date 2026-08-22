@@ -110,8 +110,8 @@ async fn tcp_lockout_blocks_subsequent_ws_handshake_when_breakers_are_shared() {
     let shared = new_shared_circuit_breakers();
 
     let tcp_port = free_port().await;
-    let tcp_daemon =
-        SAACPNetworkDaemon::new("127.0.0.1", tcp_port, None).with_circuit_breakers(shared.clone());
+    let tcp_daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", tcp_port, None)
+        .with_circuit_breakers(shared.clone());
     tokio::spawn(async move {
         let _ = tcp_daemon.start().await;
     });
@@ -166,7 +166,7 @@ async fn tcp_lockout_blocks_subsequent_ws_handshake_when_breakers_are_shared() {
 #[tokio::test]
 async fn tcp_lockout_does_not_block_ws_handshake_when_breakers_are_independent() {
     let tcp_port = free_port().await;
-    let tcp_daemon = SAACPNetworkDaemon::new("127.0.0.1", tcp_port, None); // no with_circuit_breakers
+    let tcp_daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", tcp_port, None); // no with_circuit_breakers
     tokio::spawn(async move {
         let _ = tcp_daemon.start().await;
     });

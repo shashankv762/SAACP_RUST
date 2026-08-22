@@ -10,7 +10,7 @@
 //!   (a) a real AES-256-GCM frame carrying a validly-signed token is accepted and decoded,
 //!   (b) tampered ciphertext is AEAD-rejected,
 //!   (c) a token signed with the wrong secret is rejected,
-//!   (d) the plain `SAACPNetworkDaemon::new()` default (no builders) is unchanged.
+//!   (d) the plain `SAACPNetworkDaemon::insecure_for_testing()` default (no builders) is unchanged.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -132,14 +132,17 @@ async fn daemon_encrypted_valid_signed_token_accepted_and_decodes() {
     let delivered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let delivered_cb = Arc::clone(&delivered);
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
-        .with_on_delivered(Arc::new(move |parsed| {
-            if let Some(saacp::handler::JsonValue::String(task)) = parsed.payload_dict.get("task") {
-                delivered_cb.lock().unwrap().push(task.clone());
-            }
-        }));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_on_delivered(Arc::new(move |parsed| {
+                if let Some(saacp::handler::JsonValue::String(task)) =
+                    parsed.payload_dict.get("task")
+                {
+                    delivered_cb.lock().unwrap().push(task.clone());
+                }
+            }));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -181,9 +184,10 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     let mesh_secret = [0x43u8; 32];
     let port = free_port().await;
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -211,9 +215,10 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     let wrong_secret = [0x45u8; 32];
     let port = free_port().await;
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -239,7 +244,7 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
 
 #[tokio::test]
 async fn daemon_plain_new_default_behavior_unchanged() {
-    // Regression guard: a plain `SAACPNetworkDaemon::new()` with no builders must still
+    // Regression guard: a plain `SAACPNetworkDaemon::insecure_for_testing()` with no builders must still
     // ack cover traffic with WIRE_SUCCESS exactly as before this fix — proving the
     // structural (non-encrypted, non-gateway-verified) path is untouched by default.
     //
@@ -257,7 +262,7 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     // fix made Gate 0 verify real crypto instead of accepting any well-shaped bytes)
     // now fails AES-GCM authentication unconditionally.
     let port = free_port().await;
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -302,12 +307,13 @@ async fn daemon_encrypted_two_independent_sessions() {
     let count = Arc::new(AtomicUsize::new(0));
     let count_cb = Arc::clone(&count);
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
-        .with_on_delivered(Arc::new(move |_parsed| {
-            count_cb.fetch_add(1, Ordering::SeqCst);
-        }));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_on_delivered(Arc::new(move |_parsed| {
+                count_cb.fetch_add(1, Ordering::SeqCst);
+            }));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

@@ -517,6 +517,52 @@ impl KeyEvolutionEngine {
         Self { session_secret }
     }
 
+    /// HKDF info prefix for the S4 root ratchet — domain-separated from the
+    /// epoch-key and IV prefixes so a ratcheted root can never be mistaken
+    /// for (or collide with) any other derived value.
+    const ROOT_RATCHET_INFO_PREFIX: &'static [u8] = b"SAACP-MEASC-root-ratchet-v1";
+
+    /// S4: one forward-secrecy ratchet step of the session root secret.
+    ///
+    /// `new_root = HKDF-SHA256(salt = session_id, IKM = old_root XOR
+    /// current_traffic_key, info = ROOT_RATCHET_INFO_PREFIX ||
+    /// new_epoch_id_BE4)`.
+    ///
+    /// Mixing the CURRENT epoch's traffic key into the ratchet is what makes
+    /// this a real ratchet rather than a deterministic chain: after the old
+    /// epoch's grace period expires its traffic key is destroyed (zeroized),
+    /// so a compromise of ONLY the long-term root (the classic PSK/config
+    /// leak) can no longer compute later roots — deriving root_{n+1} requires
+    /// material that no longer exists anywhere. A pure `HKDF(root_n)` chain
+    /// would give the attacker with root_0 every future root forever and add
+    /// no secrecy at all.
+    ///
+    /// Cross-side synchronization: both peers hold identical epoch traffic
+    /// keys at all times (the invariant of this key schedule), so both
+    /// compute the identical `new_root` at the same rotation boundary without
+    /// any wire negotiation. The ratchet is opt-in per
+    /// [`SessionEpochManager::with_root_ratchet`] because it changes derived
+    /// key values versus the v1 (Python-parity) schedule.
+    pub fn ratchet_root(
+        old_root: &[u8; 32],
+        current_traffic_key: &[u8; 32],
+        session_id: &[u8; 16],
+        new_epoch_id: u32,
+    ) -> [u8; 32] {
+        let mut ikm = [0u8; 32];
+        for i in 0..32 {
+            ikm[i] = old_root[i] ^ current_traffic_key[i];
+        }
+        let mut info = Vec::with_capacity(Self::ROOT_RATCHET_INFO_PREFIX.len() + 4);
+        info.extend_from_slice(Self::ROOT_RATCHET_INFO_PREFIX);
+        info.extend_from_slice(&new_epoch_id.to_be_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(session_id), &ikm);
+        let mut okm = [0u8; 32];
+        hk.expand(&info, &mut okm)
+            .expect("HKDF expand failed for root ratchet");
+        okm
+    }
+
     pub fn derive_epoch_key(
         &self,
         session_id: &[u8; 16],
@@ -704,6 +750,12 @@ pub struct SessionEpochManager {
     /// [`MEASC_UNAUTH_SESSION_IDLE_SECS`]/[`MEASC_AUTH_SESSION_IDLE_SECS`] consts.
     unauth_idle_secs: f64,
     auth_idle_secs: f64,
+    /// S4: opt-in forward-secrecy root ratchet — see
+    /// [`KeyEvolutionEngine::ratchet_root`]. Default `false` preserves the
+    /// exact v1 (Python-parity) key schedule; both peers of a session MUST
+    /// set the same value (it is a deployment-level setting, like the
+    /// negotiated suite list).
+    root_ratchet: bool,
 }
 
 impl Default for SessionEpochManager {
@@ -721,7 +773,18 @@ impl SessionEpochManager {
             session_cap: MEASC_MAX_TRACKED_SESSIONS,
             unauth_idle_secs: MEASC_UNAUTH_SESSION_IDLE_SECS,
             auth_idle_secs: MEASC_AUTH_SESSION_IDLE_SECS,
+            root_ratchet: false,
         }
+    }
+
+    /// S4: enable the forward-secrecy root ratchet for every session this
+    /// manager creates — see [`KeyEvolutionEngine::ratchet_root`]. Changes
+    /// derived epoch-key values versus v1, so every peer of these sessions
+    /// must enable it too. The stored root is ratcheted (and the previous
+    /// value overwritten) at every epoch rotation.
+    pub fn with_root_ratchet(mut self) -> Self {
+        self.root_ratchet = true;
+        self
     }
 
     /// S1 fix: override the session-table cap (see
@@ -912,7 +975,20 @@ impl SessionEpochManager {
                 "Epoch ID exhausted — u32 overflow",
             )
         })?;
-        let engine = KeyEvolutionEngine::new(secret);
+        // S4: advance the root through one ratchet step BEFORE deriving the
+        // new epoch key, so the new key is bound to the ratcheted root. The
+        // local `secret` copy (old root) is zeroized right after use; the
+        // stored copy is overwritten below once the rotation commits.
+        let mut secret = secret;
+        let (engine, ratcheted_root) = if self.root_ratchet {
+            let ratcheted =
+                KeyEvolutionEngine::ratchet_root(&secret, &prev_key, session_id, new_epoch_id);
+            use zeroize::Zeroize;
+            secret.zeroize();
+            (KeyEvolutionEngine::new(ratcheted), Some(ratcheted))
+        } else {
+            (KeyEvolutionEngine::new(secret), None)
+        };
         let new_key = engine.derive_epoch_key(session_id, new_epoch_id, Some(&prev_key));
         let new_epoch = SessionEpoch::new(
             *session_id,
@@ -937,6 +1013,12 @@ impl SessionEpochManager {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         if let Some(m) = self.meta.lock().unwrap().get_mut(session_id) {
             m.current_epoch = new_epoch_id;
+            // S4: commit the ratcheted root over the old one. Assigning a
+            // fixed-size array overwrites every byte of the previous value —
+            // no copy of the old root survives in this process.
+            if let Some(new_root) = ratcheted_root {
+                m.secret = new_root;
+            }
         }
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.grace
@@ -1376,7 +1458,7 @@ impl MEASCFrame {
                     SAACPBytecodes::EpochExpired,
                     format!(
                         "Epoch (session={}, epoch_id={}) was destroyed between existence \
-                     check and traffic-key use.",
+                         check and traffic-key use.",
                         hex::encode(&session_id[..4]),
                         epoch_id
                     ),
@@ -2366,5 +2448,94 @@ mod tests {
         assert_eq!(mgr.session_count(), 1, "authenticated session survives");
         assert!(mgr.get_current_epoch_id(&[1u8; 16]).is_some());
         assert!(mgr.get_current_epoch_id(&[2u8; 16]).is_none());
+    }
+
+    /// S4 regression: ratchet ON — a PSK-only compromise (root_0 leaked from
+    /// config, no traffic keys held) cannot derive epoch-1's key: the
+    /// v1-schedule derivation from root_0 mismatches the ratcheted schedule,
+    /// and the stored root itself has advanced past root_0.
+    #[test]
+    fn s4_ratchet_old_root_cannot_derive_later_epochs() {
+        let mgr = SessionEpochManager::new().with_root_ratchet();
+        let sid = [0xA5u8; 16];
+        let root0 = [0x77u8; 32];
+        mgr.create_session(sid, root0, 2, 60.0, None)
+            .expect("create");
+        let key0 = mgr
+            .with_epoch(&sid, 0, |e| *e.traffic_key().expect("key"))
+            .expect("epoch 0");
+        mgr.rotate_epoch(&sid).expect("rotate to 1");
+        let key1 = mgr
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .expect("epoch 1");
+
+        // Attacker holding root0 (+ captured epoch-0 key) tries the v1
+        // schedule: wrong under the ratchet.
+        let attacker_guess = KeyEvolutionEngine::new(root0).derive_epoch_key(&sid, 1, Some(&key0));
+        assert_ne!(
+            attacker_guess, key1,
+            "ratcheted key must not equal a v1-schedule derivation from the old root"
+        );
+
+        // The stored root HAS advanced — root0 is gone from process memory.
+        let stored_root = mgr.meta.lock().unwrap().get(&sid).unwrap().secret;
+        assert_ne!(stored_root, root0, "stored root must be ratcheted");
+    }
+
+    /// S4: both peers (independent managers, same PSK, ratchet ON) derive the
+    /// identical epoch key at every rotation without any wire negotiation —
+    /// the cross-side sync invariant the schedule must preserve.
+    #[test]
+    fn s4_ratchet_peers_stay_in_sync() {
+        let a = SessionEpochManager::new().with_root_ratchet();
+        let b = SessionEpochManager::new().with_root_ratchet();
+        let sid = [0xB7u8; 16];
+        let root0 = [0x31u8; 32];
+        a.create_session(sid, root0, 2, 60.0, None).unwrap();
+        b.create_session(sid, root0, 2, 60.0, None).unwrap();
+        a.rotate_epoch(&sid).unwrap();
+        b.rotate_epoch(&sid).unwrap();
+        let ka = a
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let kb = b
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        assert_eq!(
+            ka, kb,
+            "peers must derive the identical ratcheted epoch-1 key"
+        );
+        a.rotate_epoch(&sid).unwrap();
+        b.rotate_epoch(&sid).unwrap();
+        let k2a = a
+            .with_epoch(&sid, 2, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let k2b = b
+            .with_epoch(&sid, 2, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        assert_eq!(k2a, k2b, "peers must stay in sync on the chained ratchet");
+        assert_ne!(k2a, ka, "epoch keys must advance");
+    }
+
+    /// S4: default OFF — rotation must produce the exact v1 (Python-parity)
+    /// schedule value; the cross-language vectors depend on this.
+    #[test]
+    fn s4_default_off_matches_v1_schedule() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0xC3u8; 16];
+        let root0 = [0x59u8; 32];
+        mgr.create_session(sid, root0, 2, 60.0, None).unwrap();
+        let key0 = mgr
+            .with_epoch(&sid, 0, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        mgr.rotate_epoch(&sid).unwrap();
+        let key1 = mgr
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let v1 = KeyEvolutionEngine::new(root0).derive_epoch_key(&sid, 1, Some(&key0));
+        assert_eq!(
+            key1, v1,
+            "ratchet-off rotation must be byte-identical to the v1 schedule"
+        );
     }
 }

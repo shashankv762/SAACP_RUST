@@ -63,15 +63,26 @@ fn parse_secret(raw: &str) -> [u8; 32] {
 
 /// `SAACP_DASHBOARD_TOKEN_FILE` (if set) takes precedence over
 /// `SAACP_DASHBOARD_TOKEN` — same secret-hygiene pattern as `saacp-sidecar`.
+///
+/// S8: raw token strings are held in `Zeroizing` buffers while parsed, and
+/// the env-var fallback prints a one-time /proc-environ leak notice.
 fn read_dashboard_token() -> [u8; 32] {
+    use zeroize::Zeroizing;
     if let Ok(path) = std::env::var("SAACP_DASHBOARD_TOKEN_FILE") {
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read SAACP_DASHBOARD_TOKEN_FILE '{path}': {e}"));
+        let raw =
+            Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("failed to read SAACP_DASHBOARD_TOKEN_FILE '{path}': {e}")
+            }));
         return parse_secret(raw.trim());
     }
-    let raw = std::env::var("SAACP_DASHBOARD_TOKEN").unwrap_or_else(|_| {
+    eprintln!(
+        "[SAACP Command Center] NOTE: dashboard token read from the SAACP_DASHBOARD_TOKEN \
+         environment variable — prefer SAACP_DASHBOARD_TOKEN_FILE in production (process \
+         environments are readable via /proc/<pid>/environ by same-user processes)."
+    );
+    let raw = Zeroizing::new(std::env::var("SAACP_DASHBOARD_TOKEN").unwrap_or_else(|_| {
         panic!("either SAACP_DASHBOARD_TOKEN or SAACP_DASHBOARD_TOKEN_FILE environment variable is required")
-    });
+    }));
     parse_secret(&raw)
 }
 

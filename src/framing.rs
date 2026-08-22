@@ -824,6 +824,40 @@ impl MEASCFrame {
     ///   3. Buffer-length check against the full `header + tag + ciphertext` size.
     ///   4. AES-256-GCM authentication tag verification + decryption.
     pub fn parse_header(packet: &[u8], secret_key: &[u8]) -> Result<ParsedFrame, SAACPHardDrop> {
+        Self::parse_header_inner(packet, secret_key, None)
+    }
+
+    /// S3: replay-protected variant of [`Self::parse_header`] for raw
+    /// `MEASCFrame` users that do NOT route through
+    /// `measc::SessionEpochManager` (whose `parse_frame` carries the
+    /// 4096-entry `ReplayWindow`). Applies the same F2 two-phase discipline
+    /// `SAACPFrame::parse_header` already uses:
+    ///
+    /// - **pre-auth** `NonceTracker::contains_scoped` read-only check — an
+    ///   already-recorded `(session, psn)` pair is rejected before any AEAD
+    ///   work, and unauthenticated junk can never consume tracker capacity;
+    /// - **post-auth** `NonceTracker::track_scoped` authoritative insert —
+    ///   only a frame whose tag verified can burn its psn.
+    ///
+    /// Without this (i.e. with bare [`Self::parse_header`]) the per-frame
+    /// HKDF key/IV schedule is deterministic in `(session_id, epoch_id, psn)`,
+    /// so an attacker replaying captured ciphertext decrypts cleanly every
+    /// time — AEAD authenticity holds (the bytes ARE the sender's) but
+    /// freshness does not. Any daemon path not using the epoch manager SHOULD
+    /// use this variant with a shared `NonceTracker`.
+    pub fn parse_header_with_replay(
+        packet: &[u8],
+        secret_key: &[u8],
+        nonce_tracker: &crate::security::NonceTracker,
+    ) -> Result<ParsedFrame, SAACPHardDrop> {
+        Self::parse_header_inner(packet, secret_key, Some(nonce_tracker))
+    }
+
+    fn parse_header_inner(
+        packet: &[u8],
+        secret_key: &[u8],
+        nonce_tracker: Option<&crate::security::NonceTracker>,
+    ) -> Result<ParsedFrame, SAACPHardDrop> {
         let frame = Self::decode(packet)?;
         // SECURITY FIX (BUFFER-SAFETY): `payload_length` is an attacker-controlled
         // u32 read directly from the wire header, and this function (unlike its
@@ -866,6 +900,19 @@ impl MEASCFrame {
         let tag_slice = &packet[MEASC_HEADER_SIZE..ciphertext_start];
         let ciphertext = &packet[ciphertext_start..ciphertext_end];
 
+        // S3: read-only replay pre-check (F2 discipline) — rejects an
+        // already-recorded (session, psn) before any AEAD work, without letting
+        // unauthenticated junk consume tracker capacity.
+        let session_hex = hex::encode(frame.session_id);
+        if let Some(tracker) = nonce_tracker {
+            if tracker.contains_scoped(&session_hex, frame.psn) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "REPLAY ATTACK DETECTED: (session, psn) already used.",
+                ));
+            }
+        }
+
         // AES-256-GCM decryption + authentication. No byte of `payload` is
         // trusted until this call succeeds (Architecture Principle #1).
         let (key, iv) =
@@ -874,7 +921,14 @@ impl MEASCFrame {
         tag.copy_from_slice(tag_slice);
         let payload = SAACPFrame::aes_gcm_decrypt(&key, &iv, &tag, header_bytes, ciphertext)?;
 
-        let session_uuid = hex::encode(frame.session_id);
+        // S3: authoritative nonce recording — AFTER authentication. Only a key
+        // holder can burn a psn; the sender must never reuse one even for a
+        // frame the receiver later rejects downstream.
+        if let Some(tracker) = nonce_tracker {
+            tracker.track_scoped(&session_hex, frame.psn)?;
+        }
+
+        let session_uuid = session_hex;
         let context_state_id = hex::encode(frame.context_ref_id);
         let traceparent = frame.w3c_traceparent.to_vec();
         Ok(ParsedFrame {
@@ -1474,6 +1528,70 @@ mod tests {
         assert_eq!(parsed.payload, payload.as_ref());
         assert_eq!(parsed.schema_id, 1);
         assert_eq!(parsed.sequence_id, 42);
+    }
+
+    /// S3 regression: the SAME wire bytes presented twice (the literal
+    /// whole-frame replay an on-path attacker performs) must be rejected the
+    /// second time by `parse_header_with_replay`.
+    #[test]
+    fn s3_whole_frame_replay_rejected() {
+        let wire = measc_valid_frame(b"{\"task\":\"once\"}");
+        let tracker = crate::security::NonceTracker::new();
+        assert!(
+            MEASCFrame::parse_header_with_replay(&wire, &measc_test_secret(), &tracker).is_ok()
+        );
+        let replay = MEASCFrame::parse_header_with_replay(&wire, &measc_test_secret(), &tracker)
+            .expect_err("replayed frame must be rejected");
+        assert!(
+            replay.message.contains("REPLAY"),
+            "expected replay rejection, got: {}",
+            replay.message
+        );
+    }
+
+    /// S3 regression: the tracker is the shared anti-replay state — a FRESH
+    /// tracker (e.g. one mistakenly created per connection) accepts the same
+    /// frame again. Documents that deployments MUST share one tracker across
+    /// connections; cross-connection replay is the attacker's easy path.
+    #[test]
+    fn s3_replay_accepted_under_fresh_tracker_documents_shared_state_requirement() {
+        let wire = measc_valid_frame(b"{\"task\":\"once\"}");
+        assert!(MEASCFrame::parse_header_with_replay(
+            &wire,
+            &measc_test_secret(),
+            &crate::security::NonceTracker::new()
+        )
+        .is_ok());
+        assert!(
+            MEASCFrame::parse_header_with_replay(
+                &wire,
+                &measc_test_secret(),
+                &crate::security::NonceTracker::new()
+            )
+            .is_ok(),
+            "a fresh tracker has no memory — sharing one tracker is REQUIRED"
+        );
+    }
+
+    /// S3 regression (F2 discipline): a frame whose AEAD tag does NOT verify
+    /// must not burn its psn — the subsequent legitimate frame with that psn
+    /// still parses.
+    #[test]
+    fn s3_unauthenticated_junk_does_not_burn_psn() {
+        let tracker = crate::security::NonceTracker::new();
+        // Junk frame with a tampered tag: flip a ciphertext byte.
+        let mut wire = measc_valid_frame(b"{\"task\":\"junk\"}");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xFF;
+        assert!(
+            MEASCFrame::parse_header_with_replay(&wire, &measc_test_secret(), &tracker).is_err()
+        );
+        // The legitimate frame with the same psn=42 is still accepted — the
+        // junk never entered the tracker.
+        let good = measc_valid_frame(b"{\"task\":\"legitimate\"}");
+        assert!(
+            MEASCFrame::parse_header_with_replay(&good, &measc_test_secret(), &tracker).is_ok()
+        );
     }
 
     #[test]

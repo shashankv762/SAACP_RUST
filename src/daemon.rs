@@ -374,7 +374,48 @@ pub struct SAACPNetworkDaemon {
 }
 
 impl SAACPNetworkDaemon {
+    /// S2 (SECURE-BY-DEFAULT): construct a HARDENED daemon. The returned
+    /// listener always has:
+    ///
+    /// - an **Ed25519-authenticated handshake** — a fresh ephemeral server
+    ///   identity (seed generated here, exposed once via
+    ///   [`Self::server_verifying_key`] so clients can pin it out-of-band) —
+    ///   instead of an unauthenticated X25519 exchange;
+    /// - **AEAD-encrypted transport** (a fresh [`SessionEpochManager`]) —
+    ///   every post-handshake frame is AES-256-GCM verified with per-epoch
+    ///   key evolution and the 4096-entry replay window, instead of the
+    ///   structural-only Gate 0.
+    ///
+    /// Callers wanting the full C-3 identity-bound profile (mutual CA-signed
+    /// client certificates) should use [`Self::secure`]. The permissive
+    /// pre-S2 behavior (unauthenticated handshake, structural-only frames) is
+    /// available ONLY via [`Self::insecure_for_testing`] — its name is the
+    /// documentation.
     pub fn new(host: &str, port: u16, token_issuer_secret: Option<Vec<u8>>) -> Self {
+        use rand::RngCore;
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        Self::insecure_for_testing(host, port, token_issuer_secret)
+            .with_server_auth(seed)
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+    }
+
+    /// S2: the pre-S2 permissive constructor — unauthenticated ECDH
+    /// handshake and structural-only (no AEAD) frame verification. Kept for
+    /// tests and local wire-format experimentation ONLY; every use prints a
+    /// loud warning naming this method so an accidental production use is
+    /// greppable in logs. Production deployments should use [`Self::new`]
+    /// (hardened default) or [`Self::secure`] (identity-bound profile).
+    pub fn insecure_for_testing(
+        host: &str,
+        port: u16,
+        token_issuer_secret: Option<Vec<u8>>,
+    ) -> Self {
+        eprintln!(
+            "[SAACP] WARNING: SAACPNetworkDaemon::insecure_for_testing() constructed a \
+             PERMISSIVE daemon (unauthenticated handshake, structural-only frames). \
+             Use SAACPNetworkDaemon::new() or ::secure() in production."
+        );
         Self {
             host: host.to_string(),
             port,
@@ -1644,7 +1685,51 @@ pub async fn client_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+    client_handshake_inner(stream, identity, None).await
+}
+
+/// S5: `client_handshake` plus optional server-key PINNING for the plain
+/// (non-identity-bound) mode. When `pinned_server_verifying_key` is `Some`
+/// and `identity` is `None`, the target daemon must have been built with
+/// `with_server_auth` (its server response is the full 128-byte
+/// `[pub || sig || vk]` form): the signature is verified AND the verifying
+/// key is compared against the pinned expectation — closing the
+/// unauthenticated-server-pubkey gap for clients that do not use C-3
+/// identity binding (e.g. pinned-appliance deployments, or a TLS tunnel
+/// whose inner SAACP handshake should still authenticate the server key).
+///
+/// Mirrors exactly what the identity-bound path already does (see the
+/// `vk_bytes != cfg.expected_server_verifying_key` check in
+/// `client_handshake_inner`), so the two modes cannot drift.
+pub async fn client_handshake_with_pinned_server<S>(
+    stream: &mut S,
+    identity: Option<&ClientIdentityConfig>,
+    pinned_server_verifying_key: Option<[u8; 32]>,
+) -> Result<(Zeroizing<[u8; 32]>, Option<[u8; 16]>), SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if identity.is_some() && pinned_server_verifying_key.is_some() {
+        // Identity mode already pins via ClientIdentityConfig; refuse the
+        // ambiguous both-set call rather than silently preferring one.
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding,
+            "client_handshake: pass either identity (pins via its config) or \
+             pinned_server_verifying_key, not both",
+        ));
+    }
+    client_handshake_inner(stream, identity, pinned_server_verifying_key).await
+}
+
+async fn client_handshake_inner<S>(
+    stream: &mut S,
+    identity: Option<&ClientIdentityConfig>,
+    pinned_server_verifying_key: Option<[u8; 32]>,
+) -> Result<(Zeroizing<[u8; 32]>, Option<[u8; 16]>), SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use ed25519_dalek::Signer;
     use rand::rngs::OsRng;
 
     let client_nonce: [u8; 32] = rand::random();
@@ -1691,40 +1776,17 @@ where
         // Identity-bound mode implies the daemon was built with `with_identity_binding`,
         // which always enables server auth — read and verify the full authenticated
         // response rather than silently trusting an unauthenticated server pubkey.
-        let mut auth_msg = [0u8; 128];
-        stream.read_exact(&mut auth_msg).await.map_err(|_| {
-            SAACPHardDrop::new(
-                SAACPBytecodes::MalformedHeader,
-                "client_handshake: read authenticated server response failed",
-            )
-        })?;
-        let server_pub_bytes: [u8; 32] = auth_msg[0..32].try_into().unwrap();
-        let sig_bytes: [u8; 64] = auth_msg[32..96].try_into().unwrap();
-        let vk_bytes: [u8; 32] = auth_msg[96..128].try_into().unwrap();
-
-        if vk_bytes != cfg.expected_server_verifying_key {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::IdentityMisbinding,
-                "client_handshake: server verifying key does not match pinned expectation",
-            ));
-        }
-        let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| {
-            SAACPHardDrop::new(
-                SAACPBytecodes::IdentityMisbinding,
-                "client_handshake: server verifying key invalid",
-            )
-        })?;
-        let mut to_verify = Vec::with_capacity(64);
-        to_verify.extend_from_slice(&client_nonce);
-        to_verify.extend_from_slice(&server_pub_bytes);
-        let sig = Signature::from_bytes(&sig_bytes);
-        if server_vk.verify(&to_verify, &sig).is_err() {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::IdentityMisbinding,
-                "client_handshake: server signature verification failed",
-            ));
-        }
-        server_pub_bytes
+        read_and_verify_authed_server_response(
+            stream,
+            &client_nonce,
+            &cfg.expected_server_verifying_key,
+        )
+        .await?
+    } else if let Some(pinned_vk) = pinned_server_verifying_key {
+        // S5: plain-mode server-key pinning — same authenticated-response
+        // discipline as identity mode, for daemons built with
+        // `with_server_auth` (not necessarily `with_identity_binding`).
+        read_and_verify_authed_server_response(stream, &client_nonce, &pinned_vk).await?
     } else {
         let mut server_pub_bytes = [0u8; 32];
         stream
@@ -1759,6 +1821,56 @@ where
     // L-16 fix: see `ecdh_handshake`'s matching doc comment — same rationale applies to
     // the client-initiator side of the handshake.
     Ok((Zeroizing::new(session_key), session_id))
+}
+
+/// Read the 128-byte authenticated server response
+/// `[server_x25519_pub(32) || ed25519_sig(64) || ed25519_vk(32)]`, verify the
+/// Ed25519 signature over `client_nonce || server_x25519_pub`, and PIN the
+/// verifying key against `expected_vk`. Shared by the identity-bound path and
+/// the S5 plain-mode pinning path so the two cannot drift.
+async fn read_and_verify_authed_server_response<S>(
+    stream: &mut S,
+    client_nonce: &[u8; 32],
+    expected_vk: &[u8; 32],
+) -> Result<[u8; 32], SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let mut auth_msg = [0u8; 128];
+    stream.read_exact(&mut auth_msg).await.map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            "client_handshake: read authenticated server response failed",
+        )
+    })?;
+    let server_pub_bytes: [u8; 32] = auth_msg[0..32].try_into().unwrap();
+    let sig_bytes: [u8; 64] = auth_msg[32..96].try_into().unwrap();
+    let vk_bytes: [u8; 32] = auth_msg[96..128].try_into().unwrap();
+
+    if vk_bytes != *expected_vk {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding,
+            "client_handshake: server verifying key does not match pinned expectation",
+        ));
+    }
+    let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding,
+            "client_handshake: server verifying key invalid",
+        )
+    })?;
+    let mut to_verify = Vec::with_capacity(64);
+    to_verify.extend_from_slice(client_nonce);
+    to_verify.extend_from_slice(&server_pub_bytes);
+    let sig = Signature::from_bytes(&sig_bytes);
+    if server_vk.verify(&to_verify, &sig).is_err() {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::IdentityMisbinding,
+            "client_handshake: server signature verification failed",
+        ));
+    }
+    Ok(server_pub_bytes)
 }
 
 /// Client-side configuration for C-3 identity binding (see `client_handshake`'s doc
@@ -2046,6 +2158,29 @@ mod tests {
         let secret = vec![0u8; 32];
         let d = SAACPNetworkDaemon::new("0.0.0.0", 9901, Some(secret.clone()));
         assert_eq!(d.token_issuer_secret.unwrap(), secret);
+    }
+
+    /// S2 (SECURE-BY-DEFAULT) regression: `new()` must return the hardened
+    /// profile — an authenticated handshake key (exposed for pinning) AND an
+    /// AEAD epoch manager — with no builder calls required. The permissive
+    /// pre-S2 shape lives only in `insecure_for_testing`.
+    #[test]
+    fn s2_new_is_hardened_by_default() {
+        let d = SAACPNetworkDaemon::new("127.0.0.1", 9902, None);
+        assert!(
+            d.server_verifying_key().is_some(),
+            "new() must enable the Ed25519-authenticated handshake"
+        );
+        assert!(
+            d.epoch_manager.is_some(),
+            "new() must enable AEAD encrypted transport"
+        );
+
+        let p = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", 9903, None);
+        assert!(
+            p.server_verifying_key().is_none() && p.epoch_manager.is_none(),
+            "insecure_for_testing preserves the pre-S2 permissive shape"
+        );
     }
 
     /// F3 (SECURE-BY-DEFAULT): the one-call hardened profile must compose

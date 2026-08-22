@@ -25,7 +25,7 @@ async fn free_port() -> u16 {
 #[tokio::test]
 async fn start_with_shutdown_returns_promptly_with_no_connections() {
     let port = free_port().await;
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None);
     let shutdown = CancellationToken::new();
 
     let shutdown_clone = shutdown.clone();
@@ -53,7 +53,7 @@ async fn start_with_shutdown_returns_promptly_with_no_connections() {
 #[tokio::test]
 async fn start_with_shutdown_drains_in_flight_connection() {
     let port = free_port().await;
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None);
     let shutdown = CancellationToken::new();
 
     let shutdown_clone = shutdown.clone();
@@ -89,7 +89,7 @@ async fn start_with_shutdown_drains_in_flight_connection() {
 #[tokio::test]
 async fn start_without_shutdown_keeps_accepting_connections() {
     let port = free_port().await;
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

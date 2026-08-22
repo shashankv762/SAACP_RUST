@@ -171,3 +171,146 @@ async fn tls_start_with_shutdown_returns_promptly_with_no_connections() {
         result
     );
 }
+
+// ─── S5: mutual TLS (client-cert verification) ───────────────────────────────
+
+/// Test PKI: one self-signed CA, a server cert for `localhost`, and a client
+/// cert — both signed by the CA. `server_config_with_client_ca` trusts the CA
+/// for CLIENT certs; the TLS client trusts the same CA for the SERVER cert.
+fn mtls_pki() -> (
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let client_key = KeyPair::generate().expect("client key");
+    let client_params =
+        CertificateParams::new(vec!["saacp-test-client".to_string()]).expect("client params");
+    let client_cert = client_params
+        .signed_by(&client_key, &ca, &ca_key)
+        .expect("client cert");
+
+    let server_key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+    );
+    let client_key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der()),
+    );
+    (
+        ca.der().clone(),
+        server_key_der,
+        server_cert.der().clone(),
+        client_cert.der().clone(),
+        client_key_der,
+    )
+}
+
+/// S5 regression: a server built with `server_config_with_client_ca` completes
+/// the TLS + SAACP handshakes ONLY with a client presenting a CA-signed cert.
+#[tokio::test]
+async fn s5_mtls_client_cert_required_and_sufficient() {
+    use saacp::transport::tls::{
+        client_config_trusting_roots, client_config_with_client_cert, connect_tls,
+        server_config_with_client_ca,
+    };
+    let (ca_der, server_key_der, server_cert_der, client_cert_der, client_key_der) = mtls_pki();
+
+    let server_config = server_config_with_client_ca(
+        vec![server_cert_der.clone()],
+        server_key_der,
+        vec![ca_der.clone()],
+    )
+    .expect("mTLS server config");
+
+    let port = free_port().await;
+    let daemon = SAACPTlsDaemon::new("127.0.0.1", port, None, server_config);
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let addr = format!("127.0.0.1:{port}");
+
+    // 1. Client WITH a CA-signed cert: TLS handshake + SAACP handshake both
+    //    complete.
+    let client_cfg =
+        client_config_with_client_cert(vec![ca_der.clone()], vec![client_cert_der], client_key_der)
+            .expect("mTLS client config");
+    let mut tls = connect_tls(&addr, "localhost", client_cfg)
+        .await
+        .expect("mTLS client must complete the TLS handshake");
+    let _session_key = saacp::daemon::client_handshake(&mut tls, None)
+        .await
+        .expect("SAACP handshake must succeed over the mutually-authenticated TLS stream");
+
+    // 2. Client WITHOUT any client cert: the server must refuse it. In
+    //    TLS 1.3 the client can consider its side of the handshake complete
+    //    before the server's client-cert rejection surfaces, so the refusal
+    //    may appear either at connect() or on the first I/O — both are a pass;
+    //    what must NEVER happen is a working SAACP handshake.
+    let no_cert_cfg = client_config_trusting_roots(vec![ca_der]).expect("no-client-cert config");
+    match connect_tls(&addr, "localhost", no_cert_cfg).await {
+        Err(_) => { /* refused at the TLS handshake itself */ }
+        Ok(mut tls) => {
+            let mut probe = [0u8; 32];
+            let read_res =
+                tokio::time::timeout(Duration::from_secs(3), tls.read_exact(&mut probe)).await;
+            assert!(
+                read_res.is_err() || read_res.unwrap().is_err(),
+                "a client without a CA-signed cert must be refused (at handshake or first I/O)"
+            );
+        }
+    }
+}
+
+/// S5 regression (plain TCP, `with_server_auth`): the pinned-server handshake
+/// succeeds with the correct verifying key and fails closed on a wrong pin.
+#[tokio::test]
+async fn s5_plain_mode_server_key_pinning() {
+    use saacp::daemon::{client_handshake_with_pinned_server, SAACPNetworkDaemon};
+
+    let server_seed: [u8; 32] = rand::random();
+    let server = ed25519_dalek::SigningKey::from_bytes(&server_seed);
+    let real_vk: [u8; 32] = server.verifying_key().to_bytes();
+
+    let port = free_port().await;
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None)
+        .with_server_auth(server_seed);
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Correct pin: handshake completes and yields a session key.
+    let mut good = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let (key, sid) = client_handshake_with_pinned_server(&mut good, None, Some(real_vk))
+        .await
+        .expect("handshake with the correct pinned key must succeed");
+    assert_eq!(key.len(), 32);
+    assert!(sid.is_none(), "plain mode carries no session id");
+
+    // Wrong pin: fail closed with IdentityMisbinding (never a silent accept).
+    let mut bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect 2");
+    let err = client_handshake_with_pinned_server(&mut bad, None, Some([0x99u8; 32]))
+        .await
+        .expect_err("a wrong pinned key must be rejected");
+    assert_eq!(err.bytecode, saacp::SAACPBytecodes::IdentityMisbinding);
+}

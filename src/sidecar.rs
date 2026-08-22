@@ -912,7 +912,16 @@ pub async fn run_with_shutdown(
 
     let inbox_dropped = Arc::new(AtomicU64::new(0));
     let delivery_dropped = Arc::clone(&inbox_dropped);
-    let daemon = SAACPNetworkDaemon::new(
+    // S2 note: this constructs the permissive daemon ON PURPOSE and then
+    // immediately hardens the parts the sidecar wire protocol uses — the
+    // sidecar's own outbound client (`send_message`, below) performs the
+    // plain-mode ECDH handshake, so enabling the S2 default's authenticated
+    // server response here would desync every peer sidecar still speaking
+    // the v1 plain handshake. Real security on this listener comes from the
+    // AEAD encrypted transport + gateway token verification layered on
+    // immediately after; authenticated handshake for the sidecar mesh lands
+    // with C5 peer-identity work.
+    let daemon = SAACPNetworkDaemon::insecure_for_testing(
         &config.saacp_listen_addr.ip().to_string(),
         config.saacp_listen_addr.port(),
         Some(config.token_issuer_secret.to_vec()),

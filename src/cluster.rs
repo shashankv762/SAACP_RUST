@@ -952,10 +952,11 @@ impl ClusterEngine {
         }
 
         {
-            let mut hw = self
-                .replay_high_water
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            // R-1 / S9: intentionally `.unwrap()` — a poisoned lock here means
+            // a panic tore the replay high-water map mid-update; answering the
+            // replay check from possibly-torn state could wrongly accept a
+            // replayed membership message (fail-open). Fail closed instead.
+            let mut hw = self.replay_high_water.lock().unwrap();
             let incoming = (msg.sender_incarnation, msg.sequence);
             if let Some(prev) = hw.get(&msg.sender_id) {
                 if incoming <= *prev {
@@ -1332,10 +1333,8 @@ impl ClusterEngine {
         };
 
         if !removed.is_empty() {
-            let mut hw = self
-                .replay_high_water
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            // R-1 / S9: fail closed on poison — see the receive-path twin above.
+            let mut hw = self.replay_high_water.lock().unwrap();
             for id in &removed {
                 hw.remove(id);
             }

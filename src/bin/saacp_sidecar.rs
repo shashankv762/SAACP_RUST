@@ -95,33 +95,58 @@ fn parse_token_secret(raw: &str) -> [u8; 32] {
 
 /// `SAACP_TOKEN_SECRET_FILE` (if set) takes precedence over `SAACP_TOKEN_SECRET` — lets an
 /// operator keep the secret out of the process environment entirely.
+///
+/// S8: raw secret strings are held in `Zeroizing` buffers so the intermediate
+/// copy is scrubbed the moment parsing finishes; the env-var fallback prints a
+/// one-time notice because process environments are world-readable to the same
+/// user via `/proc/<pid>/environ` and leak into crash dumps and child
+/// processes. The `_FILE` variants are the recommended production default.
 fn read_token_secret() -> [u8; 32] {
+    use zeroize::Zeroizing;
     if let Ok(path) = std::env::var("SAACP_TOKEN_SECRET_FILE") {
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read SAACP_TOKEN_SECRET_FILE '{path}': {e}"));
+        let raw =
+            Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("failed to read SAACP_TOKEN_SECRET_FILE '{path}': {e}")
+            }));
         return parse_token_secret(raw.trim());
     }
-    let raw = std::env::var("SAACP_TOKEN_SECRET").unwrap_or_else(|_| {
+    eprintln!(
+        "[saacp-sidecar] NOTE: token secret read from the SAACP_TOKEN_SECRET environment \
+         variable — process environments are readable via /proc/<pid>/environ by same-user \
+         processes and can leak into crash dumps and spawned children. Prefer \
+         SAACP_TOKEN_SECRET_FILE for production deployments."
+    );
+    let raw = Zeroizing::new(std::env::var("SAACP_TOKEN_SECRET").unwrap_or_else(|_| {
         panic!(
             "either SAACP_TOKEN_SECRET or SAACP_TOKEN_SECRET_FILE environment variable is required"
         )
-    });
+    }));
     parse_token_secret(&raw)
 }
 
 /// Optional per-peer pairwise secrets — see `sidecar.rs`'s module doc. Absent env var =
 /// empty map = the weaker single-shared-secret mode (see this module's doc).
+///
+/// S8: the file's plaintext JSON (which holds every peer secret in one
+/// string) is held in a `Zeroizing` buffer and scrubbed after parsing.
 fn read_peer_secrets() -> HashMap<String, [u8; 32]> {
+    use zeroize::Zeroizing;
     let Ok(path) = std::env::var("SAACP_PEER_SECRETS_FILE") else {
         return HashMap::new();
     };
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read SAACP_PEER_SECRETS_FILE '{path}': {e}"));
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read SAACP_PEER_SECRETS_FILE '{path}': {e}")),
+    );
     let parsed: HashMap<String, String> = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("SAACP_PEER_SECRETS_FILE '{path}' is not valid JSON: {e}"));
     parsed
         .into_iter()
-        .map(|(agent_id, secret_b64)| (agent_id, parse_token_secret(&secret_b64)))
+        .map(|(agent_id, secret_b64)| {
+            // S8: scrub each plaintext secret string the moment it is parsed.
+            let secret_b64 = Zeroizing::new(secret_b64);
+            (agent_id, parse_token_secret(&secret_b64))
+        })
         .collect()
 }
 
@@ -165,12 +190,24 @@ fn enforce_peer_secret_posture(peer_secrets: &HashMap<String, [u8; 32]>, agent_i
 /// is set. Any surrounding whitespace is trimmed; an empty value is treated as
 /// unset so a blank env var can't silently disable auth with a token that
 /// matches the empty string.
+///
+/// S8: raw token strings are held in `Zeroizing` buffers while parsed; the
+/// returned token necessarily lives on in the sidecar config (it is compared
+/// on every request) — only the intermediates are scrubbed.
 fn read_http_bearer_token() -> Option<String> {
+    use zeroize::Zeroizing;
     let raw = if let Ok(path) = std::env::var("SAACP_HTTP_BEARER_TOKEN_FILE") {
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read SAACP_HTTP_BEARER_TOKEN_FILE '{path}': {e}"))
+        Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("failed to read SAACP_HTTP_BEARER_TOKEN_FILE '{path}': {e}")
+        }))
     } else {
-        std::env::var("SAACP_HTTP_BEARER_TOKEN").unwrap_or_default()
+        eprintln!(
+            "[saacp-sidecar] NOTE: HTTP bearer token read from the SAACP_HTTP_BEARER_TOKEN \
+             environment variable — prefer SAACP_HTTP_BEARER_TOKEN_FILE in production \
+             (process environments are readable via /proc/<pid>/environ by same-user \
+             processes)."
+        );
+        Zeroizing::new(std::env::var("SAACP_HTTP_BEARER_TOKEN").unwrap_or_default())
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -246,40 +283,55 @@ async fn main() {
         );
     }
 
-    // S-5 fix: previously a loopback bind with no token supplied ran the local API
-    // fully unauthenticated, so ANY same-host process could issue messages as this
-    // agent and drain its inbox. When the operator names an output path we now
-    // generate a token and write it there for the co-located agent to read, closing
-    // that gap without breaking the managed-spawn path (sidecar_manager.py supplies
-    // SAACP_HTTP_BEARER_TOKEN_FILE itself, so this branch never fires for it).
-    //
-    // Not unconditional: with no output path there is nowhere to publish the token,
-    // so auto-generating one would lock out every existing hand-started agent with no
-    // way to authenticate. Instead the unauthenticated case warns loudly and remains
-    // opt-out-able, matching opusplan2.md Open Question #3's deprecation-path concern.
+    // S-5/S6 fix: the local HTTP/JSON API can issue outbound messages and
+    // drain this agent's inbox, so it is authenticated BY DEFAULT. When no
+    // token was supplied we generate a fresh random one and publish it
+    // exactly once — to `SAACP_HTTP_TOKEN_OUT_FILE` when given (0600 on
+    // POSIX, for the co-located agent to read), otherwise to stderr with a
+    // machine-scrapable marker line. `SAACP_ALLOW_UNAUTHENTICATED_HTTP=1` is
+    // the explicit, auditable escape hatch for legacy hand-started agents
+    // and prints a loud warning instead.
     if http_bearer_token.is_none() {
         let opted_out = std::env::var("SAACP_ALLOW_UNAUTHENTICATED_HTTP")
             .map(|v| v == "1")
             .unwrap_or(false);
-        match std::env::var("SAACP_HTTP_TOKEN_OUT_FILE") {
-            Ok(path) if !path.trim().is_empty() => {
-                http_bearer_token = Some(generate_and_write_http_token(path.trim()));
-                eprintln!(
-                    "[saacp-sidecar] no bearer token supplied — generated one and wrote it \
-                     to {} (S-5). The co-located agent must send it as `Authorization: Bearer`.",
-                    path.trim()
-                );
+        if opted_out {
+            eprintln!(
+                "[saacp-sidecar] WARNING: SAACP_ALLOW_UNAUTHENTICATED_HTTP=1 — the local \
+                 HTTP API on {http_listen_addr} is running UNAUTHENTICATED. Any process on \
+                 this host can issue messages as '{agent_id}' and drain its inbox. This \
+                 escape hatch exists only for legacy hand-started agents and may be \
+                 removed in a future release."
+            );
+        } else {
+            match std::env::var("SAACP_HTTP_TOKEN_OUT_FILE") {
+                Ok(path) if !path.trim().is_empty() => {
+                    http_bearer_token = Some(generate_and_write_http_token(path.trim()));
+                    eprintln!(
+                        "[saacp-sidecar] no bearer token supplied — generated one and wrote it \
+                         to {} (S-5). The co-located agent must send it as `Authorization: Bearer`.",
+                        path.trim()
+                    );
+                }
+                _ => {
+                    use rand::RngCore;
+                    let mut raw = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut raw);
+                    let token = hex::encode(raw);
+                    eprintln!(
+                        "[saacp-sidecar] no bearer token supplied — generated one (S6). \
+                         Send it as `Authorization: Bearer <token>` on every /send and \
+                         /receive call. It is printed ONCE, here, and never again:"
+                    );
+                    eprintln!("[saacp-sidecar] SAACP_HTTP_BEARER_TOKEN={token}");
+                    eprintln!(
+                        "[saacp-sidecar] (to use a fixed token instead, set \
+                         SAACP_HTTP_BEARER_TOKEN(_FILE); to run unauthenticated for \
+                         legacy migration, set SAACP_ALLOW_UNAUTHENTICATED_HTTP=1)"
+                    );
+                    http_bearer_token = Some(token);
+                }
             }
-            _ if !opted_out => {
-                eprintln!(
-                    "[saacp-sidecar] WARNING: the local HTTP API on {http_listen_addr} is \
-                     running UNAUTHENTICATED — any process on this host can issue messages \
-                     as '{agent_id}' and drain its inbox (opusplan2.md S-5). Set \
-                     SAACP_HTTP_BEARER_TOKEN(_FILE), or SAACP_HTTP_TOKEN_OUT_FILE to have one \
-                     generated. Set SAACP_ALLOW_UNAUTHENTICATED_HTTP=1 to silence this."
-                );
-            }
-            _ => {}
         }
     }
 

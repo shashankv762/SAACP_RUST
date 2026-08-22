@@ -961,18 +961,14 @@ impl DistributedRevocationInfrastructure {
     ///   revocation monotonic: an attacker cannot use flooding to weaken a
     ///   previously-established security condition.
     fn store_record(&self, record: SignedRevocationRecord) -> Result<(), DRIError> {
-        let mut agents = self
-            .revoked_agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut creds = self
-            .revoked_credentials
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut epoch = self
-            .revocation_epoch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // R-1 / S9: intentionally `.unwrap()` — a poisoned lock here means a
+        // panic tore the revocation maps mid-update. Reusing possibly-torn
+        // state (the old `into_inner()` recovery) can silently un-revoke a
+        // compromised agent — fail-open. Failing closed (panicking) stops all
+        // revocation decisions on corrupted state instead.
+        let mut agents = self.revoked_agents.lock().unwrap();
+        let mut creds = self.revoked_credentials.lock().unwrap();
+        let mut epoch = self.revocation_epoch.lock().unwrap();
 
         if agents.len() + creds.len() >= DRI_MAX_RECORDS {
             // Evict from whichever map is currently larger — fixes CRIT-6,
@@ -1046,25 +1042,21 @@ impl DistributedRevocationInfrastructure {
     /// microseconds" — disproportionate to the actual risk. This is the
     /// finding's own stated fallback ("...or accept documented race
     /// window").
-    /// M-38 fix: every lock in this method (and `get_revocation_record`/`epoch`/
-    /// `clear` below) recovers via `into_inner()` on poison rather than
-    /// panicking, matching `store_record`'s existing fix above — DRI is reachable
-    /// through the process-wide `DistributedRevocationInfrastructure::global()`
-    /// singleton, so one poisoning panic must not cascade into every other
-    /// caller losing the ability to check revocation status.
+    /// M-38/S9 fix: every lock in this method (and
+    /// `get_revocation_record`/`epoch`/`clear` below) fails CLOSED on poison
+    /// (`.unwrap()`). A poisoned lock means a panic tore the revocation maps
+    /// mid-update; answering subsequent `is_revoked` queries from possibly-
+    /// torn state can silently un-revoke a compromised agent — exactly the
+    /// fail-open outcome revocation infrastructure must never produce. The
+    /// pre-S9 `into_inner()` recovery traded that correctness away for
+    /// availability; the DRI is a security decision-maker, not a cache.
     pub fn is_revoked(&self, agent_id: &str, credential_fingerprint: &str) -> bool {
-        let agents = self
-            .revoked_agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let agents = self.revoked_agents.lock().unwrap();
         if agents.contains_key(agent_id) {
             return true;
         }
         if !credential_fingerprint.is_empty() {
-            let creds = self
-                .revoked_credentials
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let creds = self.revoked_credentials.lock().unwrap();
             if creds.contains_key(credential_fingerprint) {
                 return true;
             }
@@ -1073,33 +1065,17 @@ impl DistributedRevocationInfrastructure {
     }
 
     pub fn get_revocation_record(&self, agent_id: &str) -> Option<SignedRevocationRecord> {
-        self.revoked_agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(agent_id)
-            .cloned()
+        self.revoked_agents.lock().unwrap().get(agent_id).cloned()
     }
 
     pub fn epoch(&self) -> u64 {
-        *self
-            .revocation_epoch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        *self.revocation_epoch.lock().unwrap()
     }
 
     pub fn clear(&self) {
-        self.revoked_agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.revoked_credentials
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *self
-            .revocation_epoch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = 0;
+        self.revoked_agents.lock().unwrap().clear();
+        self.revoked_credentials.lock().unwrap().clear();
+        *self.revocation_epoch.lock().unwrap() = 0;
     }
 }
 
@@ -2385,5 +2361,23 @@ mod tests {
         // Not yet expired — sweep must not remove live entries.
         assert_eq!(prover.sweep_expired_challenges(), 0);
         assert_eq!(prover.tracked_challenge_count(), 1);
+    }
+
+    /// S9 regression: a poisoned DRI lock (a panic tore the revocation map
+    /// mid-update) must fail CLOSED — the next revocation query panics rather
+    /// than silently answering from possibly-torn state, which could
+    /// un-revoke a compromised agent.
+    #[test]
+    #[should_panic]
+    fn s9_poisoned_dri_lock_is_revoked_panics() {
+        let dri = DistributedRevocationInfrastructure::new();
+        // Poison the map: the guard lives INSIDE the unwinding closure, so it
+        // is dropped mid-panic — that drop-during-unwind is what marks the
+        // mutex poisoned (a guard dropped normally never poisons).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dri.revoked_agents.lock().unwrap();
+            panic!("deliberate poison while holding the DRI lock");
+        }));
+        let _ = dri.is_revoked("any-agent", "");
     }
 }

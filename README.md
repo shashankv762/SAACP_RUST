@@ -617,7 +617,27 @@ packet is dropped, never partially processed.
 | Error-message information leakage | PECF opaque fixed-size wire errors |
 | **Pre-auth replay-state poisoning** (unauthenticated frames consuming PSNs / advancing the replay window / filling the nonce tracker) | **`measc::parse_frame` accepts a PSN only after the AES-GCM tag verifies (read-only `peek` pre-auth); `SAACPFrame::parse_header` inserts nonces only post-auth (`contains_scoped` read-only pre-check)** |
 | Degenerate X25519 handshake keys (identity / low-order points) | Contributory check — all-zero DH shared secrets rejected in both handshake directions |
-| Mis-configured "secure" deployments | `SAACPNetworkDaemon::secure(...)` one-call hardened profile + construction-time suite-policy downgrade guard; legacy builder prints a startup warning enumerating disabled protections |
+| Mis-configured "secure" deployments | `SAACPNetworkDaemon::secure(...)` one-call hardened profile + construction-time suite-policy downgrade guard; **`SAACPNetworkDaemon::new()` is secure-by-default (authenticated handshake + AEAD transport)** — the permissive shape is `insecure_for_testing()` and says so on every use |
+| Unauthenticated-session memory DoS | Session-table cap (4096 default) + idle reaper (never-authed: 60 s, authed: 30 min) + 16-session-per-connection auto-create cap |
+| Whole-frame replay on raw `MEASCFrame` paths | `MEASCFrame::parse_header_with_replay` / `gate_0_crypto_integrity_with_replay` (shared `NonceTracker`, pre-auth read-only check + post-auth insert) |
+| PSK-only compromise (config-file leak) | Opt-in forward-secrecy root ratchet (`SessionEpochManager::with_root_ratchet`): the root is re-derived per rotation mixing the epoch traffic key, which is destroyed at grace expiry |
+| TLS-only deployments | mTLS: `transport::tls::server_config_with_client_ca` requires CA-signed client certs; `client_handshake_with_pinned_server` pins the server key in plain mode |
+| Unauthenticated local sidecar HTTP | Bearer auth ON by default (token generated + printed once, or written 0600 via `SAACP_HTTP_TOKEN_OUT_FILE`); `SAACP_ALLOW_UNAUTHENTICATED_HTTP=1` is the explicit legacy escape |
+
+### Operational security notes (secrets handling)
+
+- **Prefer the `_FILE` variants** for every secret (`SAACP_TOKEN_SECRET_FILE`,
+  `SAACP_HTTP_BEARER_TOKEN_FILE`, `SAACP_DASHBOARD_TOKEN_FILE`,
+  `SAACP_PEER_SECRETS_FILE`). Plain env vars are readable via
+  `/proc/<pid>/environ` by same-user processes and leak into crash dumps and
+  spawned children; every env fallback prints a one-time notice saying so.
+- Secret strings read from env/files are held in `Zeroizing` buffers and
+  scrubbed the moment parsing finishes; key material derives through
+  zeroize-on-drop types end to end.
+- The sidecar's generated HTTP bearer token is printed exactly once at
+  startup (or written to the out-file) and never again — capture it where you
+  start the process.
+
 
 ### Hardening addenda (0.1-beta2 security audit)
 

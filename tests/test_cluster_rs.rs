@@ -609,9 +609,10 @@ async fn inbound_schema_12_packet_reaches_the_wired_cluster_engine() {
         "precondition: the peer is not yet known"
     );
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_cluster_engine(Arc::clone(&daemon_engine));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_cluster_engine(Arc::clone(&daemon_engine));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -686,9 +687,10 @@ async fn forged_cluster_message_over_a_real_connection_changes_nothing() {
     let forged = attacker_engine.build_message(ClusterMessageKind::Heartbeat);
     let (blob, sender, epoch, kind) = ClusterEngine::envelope_fields(&forged);
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_cluster_engine(Arc::clone(&daemon_engine));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_cluster_engine(Arc::clone(&daemon_engine));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -743,9 +745,10 @@ async fn tampered_envelope_routing_fields_are_rejected_over_a_real_connection() 
     let msg = peer_engine.build_message(ClusterMessageKind::Heartbeat);
     let (blob, _sender, epoch, kind) = ClusterEngine::envelope_fields(&msg);
 
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()))
-        .with_cluster_engine(Arc::clone(&daemon_engine));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_cluster_engine(Arc::clone(&daemon_engine));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -799,8 +802,9 @@ async fn daemon_without_a_cluster_engine_ignores_schema_12_packets() {
     let (blob, sender, epoch, kind) = ClusterEngine::envelope_fields(&msg);
 
     // No `.with_cluster_engine(...)` — the opt-in default must be a safe no-op.
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_gateway(Arc::new(ZeroTrustGateway::new()));
+    let daemon =
+        SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
+            .with_gateway(Arc::new(ZeroTrustGateway::new()));
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

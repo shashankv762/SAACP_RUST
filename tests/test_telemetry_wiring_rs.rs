@@ -236,7 +236,7 @@ async fn free_port() -> u16 {
 #[tokio::test]
 async fn tcp_daemon_accept_loop_updates_live_connection_gauge() {
     let port = free_port().await;
-    let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
+    let daemon = SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, None);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

@@ -94,6 +94,155 @@ pub fn server_config_from_cert_and_key(
     Ok(Arc::new(config))
 }
 
+/// S5 (mTLS): build a server config that REQUIRES a client certificate chaining to
+/// one of `client_ca_certs` (mutual TLS), instead of [`server_config_from_cert_and_key`]'s
+/// `with_no_client_auth`. The TLS layer then refuses every connection whose peer cannot
+/// prove possession of a CA-issued cert — an outer, transport-level identity gate in
+/// front of the SAACP handshake.
+///
+/// Use with a client built by [`client_config_with_client_cert`] (this crate) or any
+/// standard rustls client presenting that cert.
+pub fn server_config_with_client_ca(
+    server_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    server_key: rustls::pki_types::PrivateKeyDer<'static>,
+    client_ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> std::io::Result<Arc<rustls::ServerConfig>> {
+    if client_ca_certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "server_config_with_client_ca: at least one client CA certificate is required",
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in client_ca_certs {
+        roots
+            .add(ca)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // builder_with_provider (not ::builder): the plain builder consults the
+    // process-wide default CryptoProvider, which is exactly the global-state
+    // footgun this module avoids (see load_tls_config's doc comment).
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(server_certs, server_key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+/// S5 (mTLS): disk-loading counterpart of [`server_config_with_client_ca`] —
+/// server cert/key PEM files plus a client-CA bundle PEM file.
+pub fn load_tls_config_with_client_ca(
+    cert_path: impl AsRef<std::path::Path>,
+    key_path: impl AsRef<std::path::Path>,
+    client_ca_path: impl AsRef<std::path::Path>,
+) -> std::io::Result<Arc<rustls::ServerConfig>> {
+    fn read_certs(
+        path: &std::path::Path,
+    ) -> std::io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        let f = std::fs::File::open(path)?;
+        let mut r = std::io::BufReader::new(f);
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut r).collect::<Result<Vec<_>, _>>()?;
+        if certs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no certificates found in PEM file",
+            ));
+        }
+        Ok(certs)
+    }
+    let server_certs = read_certs(cert_path.as_ref())?;
+    let client_ca_certs = read_certs(client_ca_path.as_ref())?;
+    let key_file = std::fs::File::open(key_path)?;
+    let mut key_reader = std::io::BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no private key found in key file",
+        )
+    })?;
+    server_config_with_client_ca(server_certs, key, client_ca_certs)
+}
+
+// ─── S5: TLS client helpers ──────────────────────────────────────────────────
+
+/// S5: client `rustls::ClientConfig` that trusts exactly `trusted_certs` as roots
+/// (typically the server's self-signed cert or the deployment's CA) and presents
+/// no client certificate. Use [`client_config_with_client_cert`] against mTLS
+/// servers built by [`server_config_with_client_ca`].
+pub fn client_config_trusting_roots(
+    trusted_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    if trusted_certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_config_trusting_roots: at least one trusted certificate is required",
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for c in trusted_certs {
+        roots
+            .add(c)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// S5 (mTLS client): client config that additionally presents
+/// `client_certs`/`client_key` — the peer side of
+/// [`server_config_with_client_ca`].
+pub fn client_config_with_client_cert(
+    trusted_server_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    client_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    client_key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for c in trusted_server_certs {
+        roots
+            .add(c)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_certs, client_key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+/// S5: connect a TLS session to `addr` presenting SNI `server_name`, returning
+/// the TLS stream — generic transport for the SAACP X25519 handshake, which is
+/// stream-agnostic (`client_handshake` accepts any `AsyncRead + AsyncWrite`).
+pub async fn connect_tls(
+    addr: &str,
+    server_name: &str,
+    config: Arc<rustls::ClientConfig>,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+        .to_owned();
+    connector.connect(name, tcp).await
+}
+
 // ─── SAACPTlsDaemon ──────────────────────────────────────────────────────────
 
 /// TLS-terminated-raw-TCP sibling of `daemon::SAACPNetworkDaemon`.

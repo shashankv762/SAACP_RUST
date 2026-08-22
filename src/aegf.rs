@@ -796,13 +796,29 @@ impl DistributedExecutionGraph {
         // Instrumentation only; this is the authoritative acquisition for
         // the whole check-and-insert critical section, so it's probed once
         // per call rather than also probing the cheap step-0 pre-check above.
+        // R-1 / S9 fix: a poisoned `state` lock means a panic tore the
+        // governance graph mid-update. Deciding from possibly-torn state can
+        // miss cycles / lose path counters and return `Allow` where `Review`
+        // or `Pause` was warranted — fail-open on irreversible actions.
+        // Fail CLOSED instead: return `Pause`. The poison flag never clears
+        // on stable Rust, so governance stays paused until process restart —
+        // deliberate: torn security state must not quietly return to service.
         let mut guard = match self.state.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 crate::telemetry::global_telemetry().record_mutex_contention("deg_state");
-                self.state.lock().unwrap_or_else(|e| e.into_inner())
+                match self.state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        drop(poisoned.into_inner());
+                        return GovernanceDecision::Pause;
+                    }
+                }
             }
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                drop(poisoned.into_inner());
+                return GovernanceDecision::Pause;
+            }
         };
         let DegState { nodes, path_counts } = &mut *guard;
 
@@ -1737,6 +1753,35 @@ mod tests {
         assert_eq!(
             packed_hex, expected,
             "AEGF test vector mismatch — pack() output must match AEGF_TEST_VECTOR_BYTES canonical hex"
+        );
+    }
+
+    /// S9 regression: a poisoned DEG state lock (a panic tore the governance
+    /// graph mid-update) must fail CLOSED — submit_request returns Pause
+    /// instead of deciding from possibly-torn graph state, which could Allow
+    /// an irreversible action that a consistent graph would have flagged.
+    #[test]
+    fn s9_poisoned_deg_state_fails_closed_as_pause() {
+        let gov = AEGFGovernor::new(None);
+        // Poison the DEG's state lock (guard dropped during unwind).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = gov.deg.state.lock().unwrap();
+            panic!("deliberate poison while holding the DEG state lock");
+        }));
+        let meta = AEGFMetadata {
+            rid: "s9-r1".to_string(),
+            prid: "ROOT".to_string(),
+            oaid: "agent".to_string(),
+            hc: 0,
+            ed: 0,
+            ttl: now_epoch_f64() + 3600.0,
+            cid: std::sync::Arc::from("s9-session"),
+            sid: std::sync::Arc::from("s9-scope"),
+        };
+        assert_eq!(
+            gov.submit_request(&meta),
+            GovernanceDecision::Pause,
+            "poisoned governance graph must Pause (fail closed), never Allow"
         );
     }
 }
