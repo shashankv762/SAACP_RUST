@@ -1049,7 +1049,12 @@ pub fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, SAACPHardDrop> {
     use std::io::Read;
 
     let mut dec = ZlibDecoder::new(data);
-    let mut out = Vec::with_capacity(data.len() * 3);
+    // F10 fix: pre-allocating `data.len() * 3` transiently spikes ~3x the
+    // compressed size per in-flight frame under a compression flood (up to
+    // ~30MB for a 10MB compressed frame). Start at a modest 64KB and let the
+    // Vec grow on demand — growth is amortized doubling, bounded above by the
+    // zip-bomb cap in the loop below.
+    let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(64 * 1024));
 
     // Read in chunks with a size cap to detect zip-bombs early.
     let mut buf = [0u8; 65536];

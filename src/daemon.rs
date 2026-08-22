@@ -29,7 +29,15 @@ use crate::pecf::{generate_correlation_id, internal_to_external_raw, SREL};
 pub const MAX_ASSEMBLY_TIME: f64 = 30.0;
 
 /// Maximum seconds to complete the ECDH handshake before DDoS-dropping.
-pub const HANDSHAKE_TIMEOUT_SECS: f64 = 0.1;
+///
+/// F12 fix: was 0.1s — genuinely tight for high-latency links (a single
+/// intercontinental RTT can exceed 150ms; satellite links 600ms+), rejecting
+/// legitimate clients. 2.0s matches the per-packet header timeout and still
+/// bounds a slow-loris connection attempt tightly (the connection semaphore,
+/// per-IP caps, circuit breaker, and 64KB buffer cap do the resource bounding
+/// — this timeout is one layer, not the only one). Per-deployment override:
+/// [`SAACPNetworkDaemon::with_handshake_timeout`].
+pub const HANDSHAKE_TIMEOUT_SECS: f64 = 2.0;
 
 /// Maximum seconds to complete a C-3 identity-bound ECDH handshake (`with_identity_binding`)
 /// before DDoS-dropping. Larger than `HANDSHAKE_TIMEOUT_SECS` because this mode does
@@ -37,7 +45,7 @@ pub const HANDSHAKE_TIMEOUT_SECS: f64 = 0.1;
 /// an Ed25519 CA-signature verification, and an Ed25519 proof-of-possession verification,
 /// versus the plain mode's single fixed-size read. Still tight enough to bound the
 /// resource cost of a slow-loris connection attempt to a small multiple of the plain mode.
-pub const IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS: f64 = 0.5;
+pub const IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS: f64 = 3.0;
 
 /// Maximum distinct IP addresses tracked by the circuit breaker.
 pub const MAX_CIRCUIT_BREAKER_IPS: usize = 10_000;
@@ -356,6 +364,13 @@ pub struct SAACPNetworkDaemon {
     /// Ed25519 signature against the cluster `TrustStore` and enforces roster membership,
     /// freshness, and replay protection before a single field reaches the membership view.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    /// F12: per-deployment override for the plain-mode ECDH handshake timeout
+    /// (seconds). `None` uses [`HANDSHAKE_TIMEOUT_SECS`] (2.0s). Set via
+    /// [`SAACPNetworkDaemon::with_handshake_timeout`] — e.g. 10.0 for
+    /// satellite/high-latency links, 0.5 to tighten slow-loris bounding on a
+    /// LAN. The C-3 identity-bound mode always uses at least
+    /// [`IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS`] regardless of this value.
+    handshake_timeout_secs: Option<f64>,
 }
 
 impl SAACPNetworkDaemon {
@@ -374,7 +389,15 @@ impl SAACPNetworkDaemon {
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
             gossip: None,
             cluster: None,
+            handshake_timeout_secs: None,
         }
+    }
+
+    /// Override the plain-mode ECDH handshake timeout (seconds). See the
+    /// `handshake_timeout_secs` field doc for guidance.
+    pub fn with_handshake_timeout(mut self, secs: f64) -> Self {
+        self.handshake_timeout_secs = Some(secs.max(0.1));
+        self
     }
 
     /// Enable server-side Ed25519 authentication for the ECDH handshake.
@@ -653,6 +676,7 @@ impl SAACPNetworkDaemon {
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip        = self.gossip.clone();
                             let cluster       = self.cluster.clone();
+                            let handshake_timeout_override = self.handshake_timeout_secs;
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -665,6 +689,7 @@ impl SAACPNetworkDaemon {
                                 handle_client(
                                     stream, peer_addr, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
+                                    handshake_timeout_override,
                                 ).await;
                             });
                         }
@@ -752,6 +777,8 @@ pub(crate) async fn handle_client<S>(
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     // Active-Active clustering: see the `cluster` field doc comment on `SAACPNetworkDaemon`.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    // F12: per-deployment handshake-timeout override; `None` = const defaults.
+    handshake_timeout_override: Option<f64>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -802,10 +829,10 @@ pub(crate) async fn handle_client<S>(
     }
 
     // ── Step 1: X25519 ECDH handshake with a DDoS timeout ─────────────────────
-    let handshake_timeout_secs = if server_agent_id.is_some() {
-        IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS
-    } else {
-        HANDSHAKE_TIMEOUT_SECS
+    let handshake_timeout_secs = match handshake_timeout_override {
+        Some(t) if server_agent_id.is_none() => t,
+        _ if server_agent_id.is_some() => IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS,
+        _ => HANDSHAKE_TIMEOUT_SECS,
     };
     let (session_key, verified_identity) = match timeout(
         Duration::from_secs_f64(handshake_timeout_secs),

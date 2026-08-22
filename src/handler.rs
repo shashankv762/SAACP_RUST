@@ -3149,10 +3149,14 @@ fn extract_token_sig_hex(token_b64: &[u8]) -> String {
         return "malformed_token".to_string();
     }
     let json_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    if 4 + json_len > raw.len() {
+    // F6 fix (kimiplan BUG): plain `4 + json_len` wraps on 32-bit targets when
+    // json_len is near u32::MAX, passing the bounds check and panicking on the
+    // slice below. `saturating_add` (the acsvaf.rs:162 idiom) cannot wrap.
+    let json_end = 4usize.saturating_add(json_len);
+    if json_end > raw.len() {
         return "malformed_token".to_string();
     }
-    let sig = &raw[4 + json_len..];
+    let sig = &raw[json_end..];
     if sig.is_empty() {
         return "empty_sig".to_string();
     }
@@ -3174,10 +3178,12 @@ fn extract_token_exp(token_b64: &[u8]) -> f64 {
         return 0.0;
     }
     let json_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    if 4 + json_len > raw.len() {
+    // F6 fix: same 32-bit wrap hazard as `extract_token_sig_hex` above.
+    let json_end = 4usize.saturating_add(json_len);
+    if json_end > raw.len() {
         return 0.0;
     }
-    match serde_json::from_slice::<serde_json::Value>(&raw[4..4 + json_len]) {
+    match serde_json::from_slice::<serde_json::Value>(&raw[4..json_end]) {
         Ok(data) => data.get("exp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         Err(_) => 0.0,
     }
@@ -3190,6 +3196,54 @@ fn extract_token_exp(token_b64: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F6 regression (kimiplan BUG): a token whose 4-byte `json_len` prefix is
+    /// near `u32::MAX` made `4 + json_len` wrap on 32-bit targets, pass the
+    /// bounds check, and panic on the slice. Must be rejected as malformed on
+    /// every pointer width.
+    #[test]
+    fn test_extract_token_sig_hex_rejects_json_len_overflow() {
+        // [u32::MAX json_len][some body bytes][64 "signature" bytes] — the
+        // pre-fix code computed `4 + 0xFFFF_FFFF` which wraps to 3 on 32-bit.
+        let mut raw: Vec<u8> = u32::MAX.to_be_bytes().to_vec();
+        raw.extend_from_slice(b"body-bytes-here");
+        raw.extend_from_slice(&[0xAAu8; 64]);
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert_eq!(
+            extract_token_sig_hex(token.as_bytes()),
+            "malformed_token",
+            "u32::MAX json_len must be rejected, never panic (32-bit wrap)"
+        );
+    }
+
+    /// F6 regression, `exp` extractor: same crafted prefix, same requirement.
+    #[test]
+    fn test_extract_token_exp_rejects_json_len_overflow() {
+        let mut raw: Vec<u8> = u32::MAX.to_be_bytes().to_vec();
+        raw.extend_from_slice(b"{\"exp\":123}");
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert_eq!(
+            extract_token_exp(token.as_bytes()),
+            0.0,
+            "u32::MAX json_len must be rejected, never panic (32-bit wrap)"
+        );
+    }
+
+    /// F6 sanity: a well-formed token still parses on all pointer widths.
+    #[test]
+    fn test_extract_token_helpers_accept_wellformed_token() {
+        let json = br#"{"exp":1700000000}"#;
+        let mut raw: Vec<u8> = (json.len() as u32).to_be_bytes().to_vec();
+        raw.extend_from_slice(json);
+        raw.extend_from_slice(&[0x42u8; 64]);
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert_eq!(extract_token_exp(token.as_bytes()), 1_700_000_000.0);
+        let sig_hex = extract_token_sig_hex(token.as_bytes());
+        assert_eq!(sig_hex.len(), 64, "SHA-256 hex of the 64-byte signature");
+    }
 
     #[test]
     fn test_gate_tier_resolution() {

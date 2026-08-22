@@ -263,6 +263,12 @@ impl ReplayWindow {
         if psn == 0 {
             return (false, "negative_psn");
         }
+        // F7 fix: `accept` stores psn in an i64 `highest_psn`; a psn above
+        // MEASC_PSN_MAX would wrap it negative and corrupt the window state.
+        // Reject here (pre-auth, cheap) so the authoritative path never sees it.
+        if psn > MEASC_PSN_MAX {
+            return (false, "psn_above_max");
+        }
         if self.quarantined {
             return (false, "quarantined");
         }
@@ -351,6 +357,15 @@ impl ReplayWindow {
                 "PSN must be > 0",
             ));
         }
+        // F7 fix: enforce the MEASC_PSN_MAX bound the i64 cast below previously
+        // only assumed. A malicious key-holder sending psn > i64::MAX used to
+        // wrap `highest_psn` negative and silently corrupt the replay window.
+        if psn > MEASC_PSN_MAX {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PsnOutOfWindow,
+                "PSN exceeds MEASC_PSN_MAX",
+            ));
+        }
 
         // highest_psn is i64; checked < 0 then cast to u64 is safe.
         #[allow(clippy::cast_sign_loss)]
@@ -390,7 +405,8 @@ impl ReplayWindow {
                 }
             }
 
-            // psn <= MEASC_PSN_MAX = i64::MAX as u64, so fits in i64.
+            // F7 guarantees psn <= MEASC_PSN_MAX = i64::MAX as u64, so this
+            // cast fits — the bound is now enforced, not merely assumed.
             #[allow(clippy::cast_possible_wrap)]
             {
                 self.highest_psn = psn as i64;
@@ -1592,6 +1608,29 @@ mod tests {
         p.clamp();
         assert!(p.max_advance < 10);
         assert!(p.anomaly_jump_threshold < p.max_advance);
+    }
+
+    /// F7 regression: a psn above `MEASC_PSN_MAX` (i64::MAX) must be rejected
+    /// by both the read-only pre-auth `peek` and the authoritative `accept` —
+    /// pre-fix, `accept`'s `psn as i64` cast wrapped `highest_psn` negative
+    /// and silently corrupted the window state (key-holder-only, but state
+    /// corruption nonetheless).
+    #[test]
+    fn test_replay_window_rejects_psn_above_max() {
+        let mut w = ReplayWindow::with_default_policy();
+        assert!(w.accept(1).is_ok());
+        let over_max = MEASC_PSN_MAX + 1;
+        let (ok, reason) = w.peek(over_max);
+        assert!(!ok, "peek must reject psn > MEASC_PSN_MAX");
+        assert_eq!(reason, "psn_above_max");
+        assert!(
+            w.accept(over_max).is_err(),
+            "accept must reject psn > MEASC_PSN_MAX without corrupting highest_psn"
+        );
+        // Window state must be intact after the rejection.
+        let (ok, _) = w.peek(2);
+        assert!(ok, "window still usable after over-max rejection");
+        assert!(w.accept(2).is_ok());
     }
 
     #[test]

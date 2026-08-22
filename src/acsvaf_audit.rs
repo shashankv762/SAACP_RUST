@@ -89,6 +89,15 @@ impl Default for CapabilityTransparencyLog {
 pub struct ACSVAFAuditLog {
     tlog: Arc<CapabilityTransparencyLog>,
     alog: Option<Arc<ImmutableAuditLog>>,
+    /// F9 fix: this log's HMAC issuer secret for `ImmutableAuditLog`
+    /// entries. Previously these capability lifecycle records were written
+    /// through the deprecated `append()` shim — signed with a publicly-known
+    /// diagnostic constant, i.e. forgeable by anyone with filesystem access.
+    /// A fresh random per-instance key makes the chain entries unforgeable;
+    /// the signed `CapabilityTransparencyLog` remains the authoritative
+    /// cross-restart record. Use [`Self::with_issuer_secret`] when a
+    /// deployment needs a stable key to re-verify the audit chain later.
+    issuer_secret: zeroize::Zeroizing<Vec<u8>>,
 }
 
 impl ACSVAFAuditLog {
@@ -97,9 +106,35 @@ impl ACSVAFAuditLog {
         transparency_log: Arc<CapabilityTransparencyLog>,
         audit_log: Option<Arc<ImmutableAuditLog>>,
     ) -> Self {
+        use rand::RngCore;
+        let mut key = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
         Self {
             tlog: transparency_log,
             alog: audit_log,
+            issuer_secret: zeroize::Zeroizing::new(key),
+        }
+    }
+
+    /// Pin a stable HMAC issuer secret (e.g. loaded via `_FILE` env pattern)
+    /// so the audit chain can be re-verified across restarts.
+    pub fn with_issuer_secret(mut self, secret: Vec<u8>) -> Self {
+        self.issuer_secret = zeroize::Zeroizing::new(secret);
+        self
+    }
+
+    /// Write one capability-lifecycle note into the ImmutableAuditLog with the
+    /// real issuer secret (F9 replacement for the forgeable `append()` shim).
+    fn audit_note(&self, message: String) {
+        if let Some(ref alog) = self.alog {
+            alog.append_event(
+                &self.issuer_secret,
+                "acsvaf",
+                "capability",
+                "",
+                &message,
+                &"0".repeat(48),
+            );
         }
     }
 
@@ -128,15 +163,13 @@ impl ACSVAFAuditLog {
             parent_jti: parent_jti.map(String::from),
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF ISSUED jti={} kid={} iss={} depth={}",
-                &jti[..8.min(jti.len())],
-                kid,
-                iss,
-                delegation_depth
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF ISSUED jti={} kid={} iss={} depth={}",
+            &jti[..8.min(jti.len())],
+            kid,
+            iss,
+            delegation_depth
+        ));
     }
 
     /// Log a capability verification event.
@@ -163,13 +196,11 @@ impl ACSVAFAuditLog {
             parent_jti: parent_jti.map(String::from),
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF VERIFIED jti={} sub={}",
-                &jti[..8.min(jti.len())],
-                sub
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF VERIFIED jti={} sub={}",
+            &jti[..8.min(jti.len())],
+            sub
+        ));
     }
 
     /// Log a rejection event.
@@ -186,13 +217,11 @@ impl ACSVAFAuditLog {
             parent_jti: None,
             reason: Some(reason.into()),
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF REJECTED kid={} reason={}",
-                kid.unwrap_or("none"),
-                reason
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF REJECTED kid={} reason={}",
+            kid.unwrap_or("none"),
+            reason
+        ));
     }
 
     /// Log a delegation event.
@@ -220,14 +249,12 @@ impl ACSVAFAuditLog {
             parent_jti: Some(parent_jti.into()),
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF DELEGATED parent_jti={} child_jti={} depth={}",
-                &parent_jti[..8.min(parent_jti.len())],
-                &child_jti[..8.min(child_jti.len())],
-                child_delegation_depth
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF DELEGATED parent_jti={} child_jti={} depth={}",
+            &parent_jti[..8.min(parent_jti.len())],
+            &child_jti[..8.min(child_jti.len())],
+            child_delegation_depth
+        ));
     }
 
     /// Log a revocation event.
@@ -244,13 +271,11 @@ impl ACSVAFAuditLog {
             parent_jti: None,
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF REVOKED jti={} kid={}",
-                &jti[..8.min(jti.len())],
-                kid
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF REVOKED jti={} kid={}",
+            &jti[..8.min(jti.len())],
+            kid
+        ));
     }
 
     /// Log a key rotation event.
@@ -279,12 +304,10 @@ impl ACSVAFAuditLog {
             parent_jti: None,
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF KEY_ROTATED old={} new={} iss={}",
-                old_kid, new_kid, issuer_id
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF KEY_ROTATED old={} new={} iss={}",
+            old_kid, new_kid, issuer_id
+        ));
     }
 
     /// Log a key compromise event.
@@ -306,12 +329,10 @@ impl ACSVAFAuditLog {
             parent_jti: None,
             reason: None,
         });
-        if let Some(ref alog) = self.alog {
-            alog.append(format!(
-                "ACSVAF KEY_COMPROMISED kid={} affected={} replacement={}",
-                compromised_kid, affected_token_count, replacement_kid
-            ));
-        }
+        self.audit_note(format!(
+            "ACSVAF KEY_COMPROMISED kid={} affected={} replacement={}",
+            compromised_kid, affected_token_count, replacement_kid
+        ));
     }
 }
 

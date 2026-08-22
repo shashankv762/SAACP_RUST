@@ -129,6 +129,8 @@ pub struct SAACPTlsDaemon {
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    handshake_timeout_secs: Option<f64>,
 }
 
 impl SAACPTlsDaemon {
@@ -156,7 +158,14 @@ impl SAACPTlsDaemon {
             server_agent_id: None,
             gossip: None,
             cluster: None,
+            handshake_timeout_secs: None,
         }
+    }
+
+    /// See `SAACPNetworkDaemon::with_handshake_timeout` — identical semantics.
+    pub fn with_handshake_timeout(mut self, secs: f64) -> Self {
+        self.handshake_timeout_secs = Some(secs.max(0.1));
+        self
     }
 
     /// Enable server-side Ed25519 authentication for the ECDH handshake that runs once the
@@ -313,12 +322,14 @@ impl SAACPTlsDaemon {
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip          = self.gossip.clone();
                             let cluster         = self.cluster.clone();
+                            let handshake_timeout_override = self.handshake_timeout_secs;
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
                                 serve_tls_connection(
                                     stream, peer_addr, tls_acceptor, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
+                                    handshake_timeout_override,
                                 ).await;
                             });
                         }
@@ -382,6 +393,7 @@ async fn serve_tls_connection(
     server_agent_id: Option<String>,
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    handshake_timeout_override: Option<f64>,
 ) {
     // H-18-equivalent fix: bound the TLS handshake itself, so a peer that opens the TCP
     // socket and then never completes (or trickles) ClientHello cannot hold a spawned task
@@ -422,6 +434,7 @@ async fn serve_tls_connection(
         server_agent_id,
         gossip,
         cluster,
+        handshake_timeout_override,
     )
     .await;
 }

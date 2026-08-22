@@ -232,6 +232,8 @@ pub struct SAACPWebSocketDaemon {
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
+    handshake_timeout_secs: Option<f64>,
 }
 
 impl SAACPWebSocketDaemon {
@@ -253,7 +255,14 @@ impl SAACPWebSocketDaemon {
             server_agent_id: None,
             gossip: None,
             cluster: None,
+            handshake_timeout_secs: None,
         }
+    }
+
+    /// See `SAACPNetworkDaemon::with_handshake_timeout` — identical semantics.
+    pub fn with_handshake_timeout(mut self, secs: f64) -> Self {
+        self.handshake_timeout_secs = Some(secs.max(0.1));
+        self
     }
 
     /// Enable server-side Ed25519 authentication for the ECDH handshake that
@@ -407,6 +416,7 @@ impl SAACPWebSocketDaemon {
                             let server_agent_id = self.server_agent_id.clone();
                             let gossip          = self.gossip.clone();
                             let cluster         = self.cluster.clone();
+                            let handshake_timeout_override = self.handshake_timeout_secs;
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -418,6 +428,7 @@ impl SAACPWebSocketDaemon {
                                 serve_ws_connection(
                                     stream, peer_addr, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
+                                    handshake_timeout_override,
                                 ).await;
                             });
                         }
@@ -479,6 +490,7 @@ async fn serve_ws_connection(
     server_agent_id: Option<String>,
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    handshake_timeout_override: Option<f64>,
 ) {
     // H-19 fix: cap the incoming WebSocket message/frame size at the same
     // `MAX_PAYLOAD_SIZE` the raw-TCP path already enforces for MEASC payloads (+1024
@@ -531,6 +543,7 @@ async fn serve_ws_connection(
         server_agent_id,
         gossip,
         cluster,
+        handshake_timeout_override,
     )
     .await;
 }

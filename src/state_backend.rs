@@ -437,6 +437,46 @@ const REDIS_DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const REDIS_DEFAULT_MAX_POOL_SIZE: usize = 32;
 
 #[cfg(feature = "redis-backend")]
+/// F11 fix: refuse plaintext `redis://` URLs to non-loopback hosts. Shared
+/// security state (fleet-wide rate-limiter counters, session/revocation
+/// records) traveling unencrypted over a network is a credential-exposure
+/// class the backend must not enable silently. Loopback
+/// (`redis://127.0.0.1`/`localhost`/`[::1]`) stays allowed — a same-host Redis
+/// never crosses a network segment, and local dev/test must not need TLS
+/// certs. Operators who genuinely accept the risk on a private network can
+/// set `SAACP_ALLOW_PLAINTEXT_REDIS=1`.
+fn enforce_redis_tls_policy(redis_url: &str) -> Result<(), BackendError> {
+    let Some(rest) = redis_url.strip_prefix("redis://") else {
+        // rediss:// (or a URL scheme the redis crate will reject itself)
+        return Ok(());
+    };
+    let host = rest
+        .split(['/', ':', '?'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1" | "::");
+    if is_loopback {
+        return Ok(());
+    }
+    let opted_in = std::env::var("SAACP_ALLOW_PLAINTEXT_REDIS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if opted_in {
+        eprintln!(
+            "[SAACP state-backend] WARNING: plaintext redis:// to '{host}' accepted via \
+             SAACP_ALLOW_PLAINTEXT_REDIS — shared security state travels UNENCRYPTED. \
+             Use rediss:// in production."
+        );
+        return Ok(());
+    }
+    Err(BackendError(format!(
+        "refusing plaintext redis:// URL for shared security state (host '{host}'): use \
+         rediss://, target a loopback host, or set SAACP_ALLOW_PLAINTEXT_REDIS=1 to \
+         explicitly accept the risk"
+    )))
+}
+
+#[cfg(feature = "redis-backend")]
 impl RedisBackend {
     /// `redis_url` example: `"redis://127.0.0.1:6379/"`. Uses a 250ms connect
     /// timeout and a 32-connection pool cap; use [`Self::with_timeout`] or
@@ -454,6 +494,7 @@ impl RedisBackend {
         timeout: Duration,
         max_pool_size: usize,
     ) -> BackendResult<Self> {
+        enforce_redis_tls_policy(redis_url)?;
         let client = redis::Client::open(redis_url).map_err(|e| BackendError(e.to_string()))?;
         Ok(Self {
             client,

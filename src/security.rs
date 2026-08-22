@@ -185,7 +185,19 @@ pub const ENV_AUDIT_ARCHIVE_DIR: &str = "SAACP_AUDIT_ARCHIVE_DIR";
 // ===========================================================================
 
 /// Maximum age of a nonce before it is pruned.
-pub const NONCE_MAX_AGE_SECONDS: f64 = 30.0;
+///
+/// F8 hardening: this TTL IS the replay-protection horizon for the legacy
+/// `SAACPFrame` (101-byte Python-parity) path — a captured frame replayed
+/// after every nonce has aged out passes this tracker (the nonce is 64-bit
+/// random, so no monotonic floor exists for it). 30s was too short to call
+/// replay protection with a straight face; 300s (5 minutes) is the new
+/// default, still bounded by `NONCE_MAX_ENTRIES` for memory (capacity
+/// pressure fails CLOSED with `CircuitBreakerOpen`, never silently evicts).
+/// Deployments that need a longer horizon (or tighter memory) should use
+/// [`NonceTracker::with_limits`]. The canonical MEASC path does NOT rely on
+/// this tracker at all — its `ReplayWindow` uses a monotonic-PSN sliding
+/// window with no time-based eviction.
+pub const NONCE_MAX_AGE_SECONDS: f64 = 300.0;
 /// Hard cap to prevent OOM under sustained load.
 pub const NONCE_MAX_ENTRIES: usize = 100_000;
 
@@ -1906,27 +1918,6 @@ impl ImmutableAuditLog {
     /// Alias for `event_count()` used by audit facades.
     pub fn entry_count(&self) -> usize {
         self.event_count() as usize
-    }
-
-    /// Convenience: append a simple text message as an audit event.
-    ///
-    /// # Security Warning
-    /// This method signs the audit entry with the hardcoded key `AUDIT_SENTINEL`.
-    /// Because the key is publicly known, any caller can forge matching entries and
-    /// the chain hash will still verify.  Use `append_event()` with a real secret key
-    /// for any security-critical log entries.  This method is kept only for non-security
-    /// diagnostic messages (e.g. daemon startup banners).
-    #[deprecated(note = "Uses a publicly-known sentinel key. \
-                Call append_event() with a real secret for security-critical entries.")]
-    pub fn append(&self, message: String) {
-        self.append_event(
-            b"SAACP-AUDIT-DIAGNOSTIC-ONLY-NOT-SECRET",
-            "system",
-            "system",
-            "",
-            &message,
-            &"0".repeat(48),
-        );
     }
 
     /// Append an audit event with the `intent` field encrypted at rest
