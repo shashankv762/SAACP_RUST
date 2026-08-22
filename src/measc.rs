@@ -1123,17 +1123,18 @@ impl MEASCFrame {
 
     /// Security pipeline — DO NOT REORDER.
     ///
-    /// 1. Minimum frame length
-    /// 2. Header decode + magic check
-    /// 3. `payload_length` bounds (MTU + buffer)
-    /// 4. Epoch existence + not destroyed
-    /// 5. Replay-window PEEK (read-only — F1 fix: no state mutation pre-auth)
-    /// 6. AES-256-GCM authentication + decryption
-    /// 6.5. Replay-window CHECK-AND-ACCEPT (F1 fix: authoritative, atomic,
-    ///      post-authentication — only key-holders move replay state)
-    /// 7. EASI context_ref_id recovery
-    /// 8. Optional schema validation
-    /// 9. Rotation check
+    /// - **Step 1** — Minimum frame length
+    /// - **Step 2** — Header decode + magic check
+    /// - **Step 3** — `payload_length` bounds (MTU + buffer)
+    /// - **Step 4** — Epoch existence + not destroyed
+    /// - **Step 5** — Replay-window PEEK (read-only — F1 fix: no state
+    ///   mutation pre-auth)
+    /// - **Step 6** — AES-256-GCM authentication + decryption
+    /// - **Step 6.5** — Replay-window CHECK-AND-ACCEPT (F1 fix: authoritative,
+    ///   atomic, post-authentication — only key-holders move replay state)
+    /// - **Step 7** — EASI context_ref_id recovery
+    /// - **Step 8** — Optional schema validation
+    /// - **Step 9** — Rotation check
     pub fn parse_frame(
         buffer: &[u8],
         epoch_manager: &SessionEpochManager,

@@ -446,6 +446,11 @@ impl SAACPNetworkDaemon {
     ///
     /// # Errors
     /// `Err` iff `supported_suites` violates the production policy.
+    ///
+    /// Nine explicit parameters is deliberate for a security-profile
+    /// constructor: every protection-relevant input is named at the call site,
+    /// visible in review, and impossible to inherit silently from a default.
+    #[allow(clippy::too_many_arguments)]
     pub fn secure(
         host: &str,
         port: u16,

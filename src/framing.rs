@@ -393,21 +393,23 @@ impl SAACPFrame {
     /// Parse a complete SAACPFrame wire packet.
     ///
     /// Security gate ordering (MUST NOT be reordered):
-    ///   1. Minimum length check
-    ///   2. Magic bytes validation
-    ///   3. Payload length limit (RGC Gate 1 pre-decryption)
-    ///   4. Nonce replay PRE-CHECK — read-only (F2 fix): an already-recorded
-    ///      nonce is cheaply rejected WITHOUT inserting anything; unauthenticated
-    ///      junk cannot consume tracker capacity
-    ///   5. Adler-32 fast corruption filter
-    ///   6. AES-256-GCM decryption + authentication tag verification
-    ///   6.5. Nonce TRACK (F2 fix): authoritative, state-mutating replay
-    ///      recording — runs ONLY after the AEAD tag verified, so only
-    ///      authenticated frames can fill the tracker (C-2's replay property
-    ///      is preserved: the second occurrence of a nonce is rejected — now
-    ///      at the step-4 pre-check for the recorded case, and at step 6.5 for
-    ///      a concurrent same-nonce race)
-    ///   7. Schema validation (skipped for STREAM_CONTINUATION/END binary frames)
+    ///
+    /// - **Step 1** — Minimum length check
+    /// - **Step 2** — Magic bytes validation
+    /// - **Step 3** — Payload length limit (RGC Gate 1 pre-decryption)
+    /// - **Step 4** — Nonce replay PRE-CHECK, read-only (F2 fix): an
+    ///   already-recorded nonce is cheaply rejected WITHOUT inserting anything;
+    ///   unauthenticated junk cannot consume tracker capacity
+    /// - **Step 5** — Adler-32 fast corruption filter
+    /// - **Step 6** — AES-256-GCM decryption + authentication tag verification
+    /// - **Step 6.5** — Nonce TRACK (F2 fix): authoritative, state-mutating
+    ///   replay recording — runs ONLY after the AEAD tag verified, so only
+    ///   authenticated frames can fill the tracker (C-2's replay property is
+    ///   preserved: the second occurrence of a nonce is rejected — now at the
+    ///   step-4 pre-check for the recorded case, and at step 6.5 for a
+    ///   concurrent same-nonce race)
+    /// - **Step 7** — Schema validation (skipped for STREAM_CONTINUATION/END
+    ///   binary frames)
     pub fn parse_header(
         buffer: &[u8],
         secret_key: &[u8; 32],

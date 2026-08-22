@@ -151,6 +151,11 @@ impl NodeState {
         }
     }
 
+    /// Infallible-ish parser returning `None` on unknown wire strings.
+    ///
+    /// Deliberately an inherent `Option`-returning method (Python-parity shape)
+    /// rather than a `FromStr` impl with a synthetic error type.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "alive" => Some(NodeState::Alive),
@@ -217,6 +222,11 @@ impl ClusterMessageKind {
         }
     }
 
+    /// Infallible-ish parser returning `None` on unknown wire strings.
+    ///
+    /// Deliberately an inherent `Option`-returning method (Python-parity shape)
+    /// rather than a `FromStr` impl with a synthetic error type.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "heartbeat" => Some(ClusterMessageKind::Heartbeat),

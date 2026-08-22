@@ -746,6 +746,15 @@ enum WalMessage {
     /// enqueued before it, so a caller that observes the ack knows every
     /// happened-before `append_event` is durable.
     Flush(std::sync::mpsc::Sender<()>),
+    /// Sent by [`ImmutableAuditLog::reset`]: the worker — the single owner of
+    /// the open file handles — drops its writer, deletes both files, reopens
+    /// empty, re-genesis-es its anchor bookkeeping, then acks. Deleting from
+    /// the caller thread instead raced the worker's `WalWriter::open`: on
+    /// Windows a delete landing after the open unlinks the path
+    /// (FILE_SHARE_DELETE POSIX-style semantics) while the worker keeps
+    /// writing into the doomed handle, so every later append vanished from
+    /// the visible path (the H-6 `initialize_chain` tests flaked exactly here).
+    Reset(std::sync::mpsc::Sender<()>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,8 +1159,8 @@ impl ImmutableAuditLog {
         self.global_seq.store(record_count, Ordering::SeqCst);
         self.anchor_epoch.store(max_anchor_epoch, Ordering::SeqCst);
 
-        for i in 0..AUDIT_SHARDS {
-            let (hash, shard_seq) = match &heads[i] {
+        for (i, head) in heads.iter().enumerate() {
+            let (hash, shard_seq) = match head {
                 Some((h, s)) => (h.clone(), *s),
                 None => (
                     self.migration_seed_hash(i as u16, final_v1_hash.as_deref()),
@@ -1869,12 +1878,29 @@ impl ImmutableAuditLog {
     }
 
     /// Reset the audit log completely (for test isolation).
+    ///
+    /// The log/count files are deleted ON the WAL worker thread, which is the
+    /// single owner of the open file handles (see [`WalMessage::Reset`] for
+    /// the Windows unlinked-handle race this prevents). If the worker is gone
+    /// or does not ack in time, falls back to best-effort direct deletion.
     pub fn reset(&self) {
         self.reset_chain_state_to_genesis();
         self.health_floor
             .store(AuditHealth::Healthy as u8, Ordering::Relaxed);
-        let _ = fs::remove_file(&self.log_file);
-        let _ = fs::remove_file(&self.count_file);
+        let mut reset_on_worker = false;
+        if let Some(ref tx) = self.wal_tx {
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+            if tx.send(WalMessage::Reset(ack_tx)).is_ok() {
+                self.queue_len.fetch_add(1, Ordering::Relaxed);
+                reset_on_worker = ack_rx
+                    .recv_timeout(Duration::from_secs(AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
+                    .is_ok();
+            }
+        }
+        if !reset_on_worker {
+            let _ = fs::remove_file(&self.log_file);
+            let _ = fs::remove_file(&self.count_file);
+        }
     }
 
     /// Alias for `event_count()` used by audit facades.
@@ -2114,6 +2140,19 @@ impl WalWriter {
         })
     }
 
+    /// Test-isolation hard reset: drop the handle, delete both files, reopen
+    /// empty. MUST run on the worker thread — it is the single owner of the
+    /// open file handles (see [`WalMessage::Reset`]).
+    fn hard_reset(&mut self, count_file: &str) -> io::Result<()> {
+        self.writer = None;
+        let _ = fs::remove_file(&self.path);
+        if !count_file.is_empty() {
+            let _ = fs::remove_file(count_file);
+        }
+        *self = Self::open(&self.path, Arc::clone(&self.archival_sink))?;
+        Ok(())
+    }
+
     /// Rotate BEFORE writing the next entry if the file is already oversized
     /// — same pre-write check order as the pre-Fix-1 code. Flushes + syncs +
     /// drops the handle first: required on Windows, where a file can't be
@@ -2311,8 +2350,14 @@ fn run_wal_worker(
     if log_file.is_empty() {
         for msg in wal_rx.iter() {
             queue_len.fetch_sub(1, Ordering::Relaxed);
-            if let WalMessage::Flush(ack_tx) = msg {
-                let _ = ack_tx.send(());
+            match msg {
+                WalMessage::Flush(ack_tx) => {
+                    let _ = ack_tx.send(());
+                }
+                WalMessage::Reset(ack_tx) => {
+                    let _ = ack_tx.send(());
+                }
+                WalMessage::Entry { .. } => {}
             }
         }
         return;
@@ -2412,6 +2457,27 @@ fn run_wal_worker(
                     }
                 }
                 let _ = ack_tx.send(()); // best-effort; caller may have already timed out
+            }
+            WalMessage::Reset(ack_tx) => {
+                // File deletion + reopen on the handle-owning thread. Reopen
+                // failure is FATAL (same posture as the initial open): this
+                // thread returns, the channel disconnects, and every later
+                // `append_event` becomes a counted drop rather than a silent
+                // no-op. The anchor bookkeeping re-genesis-es to match the
+                // caller-side `reset_chain_state_to_genesis` that already ran.
+                if let Err(e) = wal.hard_reset(count_file) {
+                    health.store(AuditHealth::Fatal as u8, Ordering::SeqCst);
+                    eprintln!(
+                        "[SAACP audit] FATAL: WAL worker cannot reopen log file after reset \
+                         '{log_file}': {e} — audit subsystem is BLIND."
+                    );
+                    let _ = ack_tx.send(());
+                    return;
+                }
+                events_since_anchor = 0;
+                last_anchor = Instant::now();
+                prev_root = ANCHOR_GENESIS_ROOT.to_string();
+                let _ = ack_tx.send(());
             }
         }
     }
