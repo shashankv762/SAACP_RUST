@@ -11,13 +11,11 @@
 #![allow(clippy::assertions_on_constants)]
 
 use saacp::{
-    ReplayWindow, ReplayWindowPolicy, AnomalyPolicy,
-    SessionEpochManager, MEASCFrame,
-    MEASC_REPLAY_WINDOW_SIZE, MEASC_MAX_PSN_ADVANCE,
+    AnomalyPolicy, MEASCFrame, ReplayWindow, ReplayWindowPolicy, SessionEpochManager,
+    MEASC_CONTEXT_REF_ID_OFFSET, MEASC_CONTEXT_REF_ID_SIZE, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS, MEASC_HEADER_SIZE, MEASC_MAGIC, MEASC_MAX_PSN_ADVANCE,
     MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD, MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE,
-    MEASC_DEFAULT_EPOCH_TIME_SECONDS, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
-    MEASC_MAGIC, MEASC_HEADER_SIZE,
-    MEASC_CONTEXT_REF_ID_OFFSET, MEASC_CONTEXT_REF_ID_SIZE,
+    MEASC_REPLAY_WINDOW_SIZE,
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -121,7 +119,10 @@ fn test_replay_window_max_advance_rejected() {
 #[test]
 fn test_replay_window_window_size_constant() {
     assert!(MEASC_REPLAY_WINDOW_SIZE >= 64, "Window size must be >= 64");
-    assert!(MEASC_REPLAY_WINDOW_SIZE <= 4096, "Window size must be <= 4096");
+    assert!(
+        MEASC_REPLAY_WINDOW_SIZE <= 4096,
+        "Window size must be <= 4096"
+    );
 }
 
 #[test]
@@ -257,9 +258,14 @@ fn test_grace_period_flag_preserved_across_accepts() {
 fn test_session_epoch_manager_create_and_get() {
     let mgr = SessionEpochManager::new();
     let sid = [0xABu8; 16];
-    mgr.create_session(sid, [0x11u8; 32],
+    mgr.create_session(
+        sid,
+        [0x11u8; 32],
         MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
-        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64, None).unwrap();
+        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        None,
+    )
+    .unwrap();
     assert_eq!(mgr.session_count(), 1);
     assert_eq!(mgr.get_current_epoch_id(&sid), Some(0));
 }
@@ -268,9 +274,11 @@ fn test_session_epoch_manager_create_and_get() {
 fn test_session_epoch_manager_duplicate_rejected() {
     let mgr = SessionEpochManager::new();
     let sid = [0x22u8; 16];
-    mgr.create_session(sid, [0u8; 32], 10_000, 600.0, None).unwrap();
+    mgr.create_session(sid, [0u8; 32], 10_000, 600.0, None)
+        .unwrap();
     assert!(
-        mgr.create_session(sid, [0u8; 32], 10_000, 600.0, None).is_err(),
+        mgr.create_session(sid, [0u8; 32], 10_000, 600.0, None)
+            .is_err(),
         "Duplicate session must be rejected"
     );
 }
@@ -280,11 +288,17 @@ fn test_session_epoch_destroy_clears_key() {
     // Create epoch via the manager, then destroy it and verify key is gone
     let mgr = SessionEpochManager::new();
     let sid = [0xEEu8; 16];
-    mgr.create_session(sid, [1u8; 32],
+    mgr.create_session(
+        sid,
+        [1u8; 32],
         MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
-        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64, None).unwrap();
+        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        None,
+    )
+    .unwrap();
     // Before destroy: traffic key accessible
-    let key_ok = mgr.with_epoch(&sid, 0, |ep| ep.traffic_key().is_ok())
+    let key_ok = mgr
+        .with_epoch(&sid, 0, |ep| ep.traffic_key().is_ok())
         .unwrap_or(false);
     assert!(key_ok, "Traffic key must be accessible before destroy");
     // Destroy session
@@ -293,14 +307,18 @@ fn test_session_epoch_destroy_clears_key() {
     assert_eq!(mgr.session_count(), 0);
     // with_epoch returns None (session destroyed)
     let gone = mgr.with_epoch(&sid, 0, |ep| ep.is_destroyed());
-    assert!(gone.is_none(), "Destroyed session must be removed from manager");
+    assert!(
+        gone.is_none(),
+        "Destroyed session must be removed from manager"
+    );
 }
 
 #[test]
 fn test_session_epoch_manager_destroy() {
     let mgr = SessionEpochManager::new();
     let sid = [0xCCu8; 16];
-    mgr.create_session(sid, [2u8; 32], 10_000, 600.0, None).unwrap();
+    mgr.create_session(sid, [2u8; 32], 10_000, 600.0, None)
+        .unwrap();
     assert_eq!(mgr.session_count(), 1);
     mgr.destroy_session(&sid);
     assert_eq!(mgr.session_count(), 0);
@@ -310,7 +328,8 @@ fn test_session_epoch_manager_destroy() {
 fn test_epoch_snapshot_is_copy() {
     let mgr = SessionEpochManager::new();
     let sid = [0xDDu8; 16];
-    mgr.create_session(sid, [3u8; 32], 10_000, 600.0, None).unwrap();
+    mgr.create_session(sid, [3u8; 32], 10_000, 600.0, None)
+        .unwrap();
     let snap1 = mgr.get_epoch(&sid, 0).unwrap();
     let snap2 = mgr.get_current_epoch(&sid).unwrap();
     assert_eq!(snap1.epoch_id, snap2.epoch_id);
@@ -331,9 +350,14 @@ fn test_measc_frame_roundtrip() {
     // Build a SessionEpoch directly, then use its manager's parse_frame
     let sid = [0x01u8; 16];
     let mgr = SessionEpochManager::new();
-    mgr.create_session(sid, [0x42u8; 32],
+    mgr.create_session(
+        sid,
+        [0x42u8; 32],
         MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
-        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64, None).unwrap();
+        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        None,
+    )
+    .unwrap();
 
     let payload = b"hello SAACP measc";
     let ctx_ref = [0u8; 32];
@@ -343,14 +367,14 @@ fn test_measc_frame_roundtrip() {
     let result = mgr.with_epoch_mut(&sid, 0, |epoch| {
         MEASCFrame::build_frame(
             epoch,
-            0x01,   // schema_id
-            0x00,   // status_code
-            0x00,   // flags
-            0x00,   // action_class
+            0x01, // schema_id
+            0x00, // status_code
+            0x00, // flags
+            0x00, // action_class
             payload,
             &ctx_ref,
             &traceparent,
-            0,      // context_version
+            0, // context_version
         )
     });
     let (frame, _psn) = result
@@ -360,12 +384,15 @@ fn test_measc_frame_roundtrip() {
     // Frame must start with SACP magic
     assert_eq!(&frame[..4], b"SACP");
     // Frame length must exceed header size (auth tag + ciphertext follow)
-    assert!(frame.len() > MEASC_HEADER_SIZE,
-        "frame length {} must exceed header {}", frame.len(), MEASC_HEADER_SIZE);
+    assert!(
+        frame.len() > MEASC_HEADER_SIZE,
+        "frame length {} must exceed header {}",
+        frame.len(),
+        MEASC_HEADER_SIZE
+    );
 
     // Roundtrip parse
-    let parsed = MEASCFrame::parse_frame(&frame, &mgr, true)
-        .expect("parse must succeed");
+    let parsed = MEASCFrame::parse_frame(&frame, &mgr, true).expect("parse must succeed");
     assert_eq!(parsed.payload, payload);
     assert_eq!(parsed.psn, 1);
     assert_eq!(parsed.session_id, sid);
@@ -378,6 +405,9 @@ fn test_measc_replay_window_policy_defaults_are_sane() {
     let p = ReplayWindowPolicy::default();
     assert!(p.window_size >= 64);
     assert!(p.max_advance > 0);
-    assert!(p.max_advance < p.window_size as u64, "max_advance must be < window_size");
+    assert!(
+        p.max_advance < p.window_size as u64,
+        "max_advance must be < window_size"
+    );
     assert!(p.anomaly_jump_threshold < p.max_advance);
 }

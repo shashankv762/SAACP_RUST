@@ -4,9 +4,9 @@
 //! AEGFMetadata, ExecutionStateMachine, DistributedExecutionGraph, AEGFGovernor.
 
 use saacp::{
-    AEGFMetadata, ExecutionState, ExecutionStateMachine,
-    DistributedExecutionGraph, AEGFPolicy, AEGFGovernor, GovernanceDecision,
-    AEGF_META_SIZE, AEGF_META_FORMAT_VERSION, RID_ROOT, CID_NONE,
+    AEGFGovernor, AEGFMetadata, AEGFPolicy, DistributedExecutionGraph, ExecutionState,
+    ExecutionStateMachine, GovernanceDecision, AEGF_META_FORMAT_VERSION, AEGF_META_SIZE, CID_NONE,
+    RID_ROOT,
 };
 
 fn make_meta(oaid: &str, sid: &str) -> AEGFMetadata {
@@ -216,7 +216,8 @@ fn test_esm_valid_transition_created_to_processing() {
 fn test_esm_invalid_transition_completed_to_processing_fails() {
     let esm = ExecutionStateMachine::new();
     esm.create("rid-invalid", "test").unwrap();
-    esm.transition("rid-invalid", ExecutionState::Completed, "done").unwrap();
+    esm.transition("rid-invalid", ExecutionState::Completed, "done")
+        .unwrap();
     let res = esm.transition("rid-invalid", ExecutionState::Processing, "restart");
     assert!(res.is_err(), "Terminal state must not transition");
 }
@@ -295,7 +296,10 @@ fn test_governor_submit_request_root_ok() {
     let gov = AEGFGovernor::new(None);
     let m = make_meta("agent-gov", "session-gov");
     let decision = gov.submit_request(&m);
-    assert!(matches!(decision, GovernanceDecision::Allow | GovernanceDecision::Pause));
+    assert!(matches!(
+        decision,
+        GovernanceDecision::Allow | GovernanceDecision::Pause
+    ));
 }
 
 #[test]

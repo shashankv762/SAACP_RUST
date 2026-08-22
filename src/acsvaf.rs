@@ -159,7 +159,9 @@ impl SignedCapabilityToken {
         // corruption or an attacker-appended payload smuggled past whatever
         // validated the token's length — previously silently ignored (`< `
         // let `decoded.len() > required` through), now rejected fail-closed.
-        let required = WIRE_JSON_LEN_SIZE.saturating_add(json_len).saturating_add(64);
+        let required = WIRE_JSON_LEN_SIZE
+            .saturating_add(json_len)
+            .saturating_add(64);
         if json_len > 10_000_000 || decoded.len() != required {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
@@ -168,8 +170,7 @@ impl SignedCapabilityToken {
         }
 
         let json_bytes = &decoded[WIRE_JSON_LEN_SIZE..WIRE_JSON_LEN_SIZE + json_len];
-        let sig_bytes =
-            &decoded[WIRE_JSON_LEN_SIZE + json_len..WIRE_JSON_LEN_SIZE + json_len + 64];
+        let sig_bytes = &decoded[WIRE_JSON_LEN_SIZE + json_len..WIRE_JSON_LEN_SIZE + json_len + 64];
 
         let claims: Map<String, Value> = serde_json::from_slice(json_bytes).map_err(|_| {
             SAACPHardDrop::new(
@@ -197,23 +198,38 @@ impl SignedCapabilityToken {
     // ── Convenience accessors for common claims ──────────────────────────
 
     pub fn jti(&self) -> String {
-        self.get_claim("jti").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        self.get_claim("jti")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn kid(&self) -> String {
-        self.get_claim("kid").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        self.get_claim("kid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn iss(&self) -> String {
-        self.get_claim("iss").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        self.get_claim("iss")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn sub(&self) -> String {
-        self.get_claim("sub").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        self.get_claim("sub")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn sid(&self) -> String {
-        self.get_claim("sid").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        self.get_claim("sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn actions(&self) -> Vec<String> {
@@ -278,7 +294,9 @@ pub struct CapabilityIssuanceAuthority {
 
 impl CapabilityIssuanceAuthority {
     pub fn new(signing_key: CapabilitySigningKey) -> Self {
-        Self { signing_key: IssuerKeySource::Local(signing_key) }
+        Self {
+            signing_key: IssuerKeySource::Local(signing_key),
+        }
     }
 
     /// Build an authority that signs capability tokens with a hardware-held key.
@@ -406,7 +424,9 @@ pub struct CapabilityVerificationAuthority {
 }
 
 impl Default for CapabilityVerificationAuthority {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CapabilityVerificationAuthority {
@@ -419,10 +439,7 @@ impl CapabilityVerificationAuthority {
 
     /// Register a verification key.
     pub fn register_key(&self, kid: &str, key: VerifyingKey) {
-        self.keys
-            .write()
-            .unwrap()
-            .insert(kid.to_string(), key);
+        self.keys.write().unwrap().insert(kid.to_string(), key);
     }
 
     /// Get a verification key by kid.
@@ -432,10 +449,7 @@ impl CapabilityVerificationAuthority {
 
     /// Revoke a token by JTI.
     pub fn revoke_token(&self, jti: &str) {
-        self.revoked_tokens
-            .write()
-            .unwrap()
-            .insert(jti.to_string());
+        self.revoked_tokens.write().unwrap().insert(jti.to_string());
     }
 
     /// Remove a trusted key (e.g. on compromise).
@@ -468,10 +482,7 @@ impl CapabilityVerificationAuthority {
             .get_claim("kid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SAACPHardDrop::new(
-                    SAACPBytecodes::InvalidSignature,
-                    "Missing kid claim",
-                )
+                SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Missing kid claim")
             })?
             .to_string();
 
@@ -550,10 +561,12 @@ impl CapabilityVerificationAuthority {
                 }
                 d as u32
             }
-            None => return Err(SAACPHardDrop::new(
-                SAACPBytecodes::InvalidSignature,
-                "delegation_depth claim is mandatory and must be a non-negative integer",
-            )),
+            None => {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "delegation_depth claim is mandatory and must be a non-negative integer",
+                ))
+            }
         };
 
         if delegation_depth > ACSVAF_MAX_DELEGATION_DEPTH {
@@ -596,9 +609,7 @@ impl CapabilityVerificationAuthority {
             .unwrap_or("")
             .to_string();
 
-        let remaining_uses = token
-            .get_claim("max_use")
-            .and_then(|v| v.as_u64());
+        let remaining_uses = token.get_claim("max_use").and_then(|v| v.as_u64());
 
         let max_action_class = token
             .get_claim("max_action_class")
@@ -673,8 +684,12 @@ impl KeyManifest {
 
     /// Verify manifest signature.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), SAACPHardDrop> {
-        let content =
-            Self::manifest_content(&self.issuer_id, &self.keys, self.valid_from, self.valid_until);
+        let content = Self::manifest_content(
+            &self.issuer_id,
+            &self.keys,
+            self.valid_from,
+            self.valid_until,
+        );
         let signature = Signature::from_bytes(&self.signature);
         verifying_key.verify(&content, &signature).map_err(|_| {
             SAACPHardDrop::new(
@@ -692,7 +707,10 @@ impl KeyManifest {
         valid_until: f64,
     ) -> Vec<u8> {
         let mut map = serde_json::Map::new();
-        map.insert("issuer_id".to_string(), Value::String(issuer_id.to_string()));
+        map.insert(
+            "issuer_id".to_string(),
+            Value::String(issuer_id.to_string()),
+        );
         map.insert("valid_from".to_string(), json_f64(valid_from));
         map.insert("valid_until".to_string(), json_f64(valid_until));
 
@@ -730,7 +748,7 @@ impl KeyManifest {
 fn json_f64(v: f64) -> Value {
     Value::Number(
         serde_json::Number::from_f64(if v.is_finite() { v } else { 0.0 })
-            .unwrap_or_else(|| serde_json::Number::from(0u64))
+            .unwrap_or_else(|| serde_json::Number::from(0u64)),
     )
 }
 
@@ -757,7 +775,9 @@ fn extract_string_array(value: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn make_authority_pair(issuer_id: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
+    fn make_authority_pair(
+        issuer_id: &str,
+    ) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
         let csk = CapabilitySigningKey::generate(issuer_id, 3600);
         let cva = CapabilityVerificationAuthority::new();
         cva.register_key(&csk.kid, csk.verifying_key);
@@ -772,7 +792,10 @@ mod tests {
         delegation_depth: u32,
         exp: f64,
     ) -> Map<String, Value> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let mut claims = Map::new();
         claims.insert("kid".into(), Value::String(kid.to_string()));
         claims.insert("iss".into(), Value::String(issuer_id.to_string()));
@@ -780,20 +803,29 @@ mod tests {
         claims.insert("jti".into(), Value::String(uuid_hex()));
         claims.insert("nbf".into(), json_f64(now));
         claims.insert("exp".into(), json_f64(exp));
-        claims.insert("delegation_depth".into(), Value::Number(delegation_depth.into()));
-        claims.insert("actions".into(), Value::Array(vec![Value::String("read".into())]));
+        claims.insert(
+            "delegation_depth".into(),
+            Value::Number(delegation_depth.into()),
+        );
+        claims.insert(
+            "actions".into(),
+            Value::Array(vec![Value::String("read".into())]),
+        );
         claims.insert("aud".into(), Value::Array(vec![]));
         claims
     }
 
     fn uuid_hex() -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().to_le_bytes();
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes();
         h.update(t);
         hex::encode(h.finalize()[..16].as_ref())
     }
-
 
     #[test]
     fn test_clear_replay_registry_returns_count() {
@@ -825,7 +857,10 @@ mod tests {
     #[test]
     fn test_acsvaf_delegation_depth_rejected() {
         let (cia, cva) = make_authority_pair("issuer-test");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         // depth=4 > ACSVAF_MAX_DELEGATION_DEPTH (3) — must be rejected on verify
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-x", 4, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
@@ -836,11 +871,17 @@ mod tests {
     #[test]
     fn test_acsvaf_delegation_depth_at_max_allowed() {
         let (cia, cva) = make_authority_pair("issuer-test");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         // depth=ACSVAF_MAX_DELEGATION_DEPTH (3) — exactly at max, must pass
         let claims = make_token_claims(
-            cia.kid(), cia.issuer_id(), "agent-y",
-            ACSVAF_MAX_DELEGATION_DEPTH, now + 300.0,
+            cia.kid(),
+            cia.issuer_id(),
+            "agent-y",
+            ACSVAF_MAX_DELEGATION_DEPTH,
+            now + 300.0,
         );
         let token = cia.issue(claims).expect("issue must succeed");
         assert!(cva.verify(&token).is_ok(), "depth=max must be accepted");
@@ -851,12 +892,16 @@ mod tests {
     #[test]
     fn test_wire_roundtrip_succeeds() {
         let (cia, _cva) = make_authority_pair("issuer-wire");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire", 0, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
 
         let wire = token.to_wire();
-        let recovered = SignedCapabilityToken::from_wire(&wire).expect("exact wire bytes must roundtrip");
+        let recovered =
+            SignedCapabilityToken::from_wire(&wire).expect("exact wire bytes must roundtrip");
         assert_eq!(recovered.claims, token.claims);
         assert_eq!(recovered.signature, token.signature);
     }
@@ -864,7 +909,10 @@ mod tests {
     #[test]
     fn test_from_wire_rejects_trailing_data() {
         let (cia, _cva) = make_authority_pair("issuer-wire-trailer");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire-2", 0, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
 
@@ -877,13 +925,19 @@ mod tests {
         let tampered = BASE64.encode(&decoded).into_bytes();
 
         let result = SignedCapabilityToken::from_wire(&tampered);
-        assert!(result.is_err(), "M-12: trailing bytes after a valid signature must be rejected, not silently ignored");
+        assert!(
+            result.is_err(),
+            "M-12: trailing bytes after a valid signature must be rejected, not silently ignored"
+        );
     }
 
     #[test]
     fn test_from_wire_rejects_truncated_data() {
         let (cia, _cva) = make_authority_pair("issuer-wire-trunc");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-wire-3", 0, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
 
@@ -893,20 +947,30 @@ mod tests {
         let tampered = BASE64.encode(&decoded).into_bytes();
 
         let result = SignedCapabilityToken::from_wire(&tampered);
-        assert!(result.is_err(), "truncated wire data (short by 1 byte) must be rejected");
+        assert!(
+            result.is_err(),
+            "truncated wire data (short by 1 byte) must be rejected"
+        );
     }
 
     #[test]
     fn test_revoke_token_blocks_verification() {
         let (cia, cva) = make_authority_pair("issuer-revo");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let claims = make_token_claims(cia.kid(), cia.issuer_id(), "agent-z", 0, now + 300.0);
         let token = cia.issue(claims).expect("issue must succeed");
         // Initially valid
         let result = cva.verify(&token);
         assert!(result.is_ok(), "token must be valid initially");
         // Revoke then verify again
-        let jti = token.get_claim("jti").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let jti = token
+            .get_claim("jti")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         cva.revoke_token(&jti);
         let result2 = cva.verify(&token);
         assert!(result2.is_err(), "revoked token must be rejected");

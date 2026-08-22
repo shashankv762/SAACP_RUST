@@ -50,9 +50,9 @@ async fn trip_circuit_breaker_via_tcp(port: u16) {
             .await
             .expect("client connect failed");
         drop(stream); // never send the handshake bytes — forces a handshake failure
-        // Give the server's spawned task time to observe the timeout/EOF and call
-        // `record_error` before the next attempt connects (avoids a race where two
-        // attempts land concurrently and only one increments the counter in time).
+                      // Give the server's spawned task time to observe the timeout/EOF and call
+                      // `record_error` before the next attempt connects (avoids a race where two
+                      // attempts land concurrently and only one increments the counter in time).
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -95,7 +95,7 @@ where
             }
             Ok(Some(Ok(_other))) => continue, // ignore Ping/Pong/Text
             Ok(Some(Err(_))) | Ok(None) => return false, // connection closed/errored
-            Err(_) => return false,                       // timed out waiting
+            Err(_) => return false,           // timed out waiting
         }
     }
 }
@@ -110,15 +110,15 @@ async fn tcp_lockout_blocks_subsequent_ws_handshake_when_breakers_are_shared() {
     let shared = new_shared_circuit_breakers();
 
     let tcp_port = free_port().await;
-    let tcp_daemon = SAACPNetworkDaemon::new("127.0.0.1", tcp_port, None)
-        .with_circuit_breakers(shared.clone());
+    let tcp_daemon =
+        SAACPNetworkDaemon::new("127.0.0.1", tcp_port, None).with_circuit_breakers(shared.clone());
     tokio::spawn(async move {
         let _ = tcp_daemon.start().await;
     });
 
     let ws_port = free_port().await;
-    let ws_daemon = SAACPWebSocketDaemon::new("127.0.0.1", ws_port, None)
-        .with_circuit_breakers(shared.clone());
+    let ws_daemon =
+        SAACPWebSocketDaemon::new("127.0.0.1", ws_port, None).with_circuit_breakers(shared.clone());
     tokio::spawn(async move {
         let _ = ws_daemon.start().await;
     });
@@ -148,7 +148,8 @@ async fn tcp_lockout_blocks_subsequent_ws_handshake_when_breakers_are_shared() {
         .await
         .expect("WS upgrade itself must still succeed (lockout is enforced after this point)");
 
-    let got_response = attempt_saacp_handshake_gets_response(&mut ws_stream, Duration::from_secs(3)).await;
+    let got_response =
+        attempt_saacp_handshake_gets_response(&mut ws_stream, Duration::from_secs(3)).await;
     assert!(
         !got_response,
         "expected no SAACP handshake response from a TCP-locked-out IP over the WS transport — \
@@ -189,7 +190,8 @@ async fn tcp_lockout_does_not_block_ws_handshake_when_breakers_are_independent()
         .await
         .expect("WS upgrade must succeed");
 
-    let got_response = attempt_saacp_handshake_gets_response(&mut ws_stream, Duration::from_secs(5)).await;
+    let got_response =
+        attempt_saacp_handshake_gets_response(&mut ws_stream, Duration::from_secs(5)).await;
     assert!(
         got_response,
         "expected a SAACP handshake response when circuit breakers are independent"

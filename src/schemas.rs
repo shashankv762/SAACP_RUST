@@ -2,7 +2,11 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use serde_json::Value;
 
 /// Allowed meta keys that pass through validation without being counted as extra fields.
-const ALLOWED_META_KEYS: &[&str] = &["_capability_token", "_cognitive_constraint", "_secondary_token"];
+const ALLOWED_META_KEYS: &[&str] = &[
+    "_capability_token",
+    "_cognitive_constraint",
+    "_secondary_token",
+];
 
 /// Schema definition holding an ID, human-readable name, required keys, and
 /// an explicit extensibility allowlist.
@@ -25,26 +29,91 @@ struct SchemaDefinition {
 
 /// Static schema registry (IDs 0-12).
 const SCHEMAS: &[SchemaDefinition] = &[
-    SchemaDefinition { id: 0, name: "Raw Binary", required_keys: &[], additional_fields: &[] },
-    SchemaDefinition { id: 1, name: "Task", required_keys: &["task", "priority"], additional_fields: &[] },
-    SchemaDefinition { id: 2, name: "Action", required_keys: &["action", "target", "parameters"], additional_fields: &[] },
-    SchemaDefinition { id: 3, name: "Epistemic", required_keys: &["epistemic_metadata", "data"], additional_fields: &[] },
-    SchemaDefinition { id: 4, name: "Budget Request", required_keys: &["max_token_budget", "task_schema"], additional_fields: &[] },
-    SchemaDefinition { id: 5, name: "Cost Estimate", required_keys: &["estimated_cost", "max_token_budget"], additional_fields: &[] },
-    SchemaDefinition { id: 6, name: "Heartbeat", required_keys: &["agent_id", "heartbeat_seq", "status"], additional_fields: &[] },
-    SchemaDefinition { id: 7, name: "Error", required_keys: &["error_code", "error_detail", "retry_after"], additional_fields: &[] },
-    SchemaDefinition { id: 8, name: "Delegation", required_keys: &["delegation_request", "scope", "ttl"], additional_fields: &[] },
-    SchemaDefinition { id: 9, name: "Audit Query", required_keys: &["audit_query", "from_timestamp", "to_timestamp"], additional_fields: &[] },
+    SchemaDefinition {
+        id: 0,
+        name: "Raw Binary",
+        required_keys: &[],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 1,
+        name: "Task",
+        required_keys: &["task", "priority"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 2,
+        name: "Action",
+        required_keys: &["action", "target", "parameters"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 3,
+        name: "Epistemic",
+        required_keys: &["epistemic_metadata", "data"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 4,
+        name: "Budget Request",
+        required_keys: &["max_token_budget", "task_schema"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 5,
+        name: "Cost Estimate",
+        required_keys: &["estimated_cost", "max_token_budget"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 6,
+        name: "Heartbeat",
+        required_keys: &["agent_id", "heartbeat_seq", "status"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 7,
+        name: "Error",
+        required_keys: &["error_code", "error_detail", "retry_after"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 8,
+        name: "Delegation",
+        required_keys: &["delegation_request", "scope", "ttl"],
+        additional_fields: &[],
+    },
+    SchemaDefinition {
+        id: 9,
+        name: "Audit Query",
+        required_keys: &["audit_query", "from_timestamp", "to_timestamp"],
+        additional_fields: &[],
+    },
     // Execution receipt (Phase 6, item 3 — IEVL, Part 8.1): a signed, after-the-fact
     // report of what an agent actually did, matched against the `IntentDeclaration`
     // `ievl.rs` captured at Gate 1.5 time. `receipt_signature`'s own Ed25519 signature
     // is verified by `ievl::verify_receipt_signature`, not here.
-    SchemaDefinition { id: 10, name: "Execution Receipt", required_keys: &["declaration_ref", "actual_action", "actual_targets", "receipt_signature"], additional_fields: &[] },
+    SchemaDefinition {
+        id: 10,
+        name: "Execution Receipt",
+        required_keys: &[
+            "declaration_ref",
+            "actual_action",
+            "actual_targets",
+            "receipt_signature",
+        ],
+        additional_fields: &[],
+    },
     // Gossip envelope (Phase 5, item 3 — revocation gossip protocol, Part 8.6):
     // carries a pre-signed `SignedRevocationRecord` wire blob rather than free-form
     // JSON, so only the envelope wrapper fields are schema-validated here — the
     // `gossip_record` payload's own signature is verified by `gossip::GossipEngine`.
-    SchemaDefinition { id: 11, name: "Gossip Envelope", required_keys: &["gossip_record", "hop_count", "origin_id", "revocation_id"], additional_fields: &[] },
+    SchemaDefinition {
+        id: 11,
+        name: "Gossip Envelope",
+        required_keys: &["gossip_record", "hop_count", "origin_id", "revocation_id"],
+        additional_fields: &[],
+    },
     // Cluster envelope (Active-Active Clustering & Failover, `cluster.rs`): carries a
     // pre-signed `ClusterMessage` wire blob. Only the envelope wrapper is validated
     // here — the `cluster_message` payload's own Ed25519 signature is verified by
@@ -52,7 +121,17 @@ const SCHEMAS: &[SchemaDefinition] = &[
     // `sender_id`/`leader_epoch`/`message_kind` (duplicated outside the signature so the
     // daemon can route without parsing the blob) agree with the signed body, and rejects
     // the message if they disagree. Mirrors schema 11's signed-blob-in-a-string design.
-    SchemaDefinition { id: 12, name: "Cluster Envelope", required_keys: &["cluster_message", "sender_id", "leader_epoch", "message_kind"], additional_fields: &[] },
+    SchemaDefinition {
+        id: 12,
+        name: "Cluster Envelope",
+        required_keys: &[
+            "cluster_message",
+            "sender_id",
+            "leader_epoch",
+            "message_kind",
+        ],
+        additional_fields: &[],
+    },
 ];
 
 /// Pre-compiled JSON schema validation registry.
@@ -197,7 +276,9 @@ mod tests {
         let payload = json!({"gossip_record": "x", "hop_count": 0, "origin_id": "node-a"});
         let err = PreCompiledSchemas::validate_payload(11, &payload).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::SchemaMismatch);
-        assert!(err.message.contains("Missing required field: revocation_id"));
+        assert!(err
+            .message
+            .contains("Missing required field: revocation_id"));
     }
 
     #[test]
@@ -213,10 +294,13 @@ mod tests {
 
     #[test]
     fn schema_10_missing_field() {
-        let payload = json!({"declaration_ref": "abc123", "actual_action": "x", "actual_targets": []});
+        let payload =
+            json!({"declaration_ref": "abc123", "actual_action": "x", "actual_targets": []});
         let err = PreCompiledSchemas::validate_payload(10, &payload).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::SchemaMismatch);
-        assert!(err.message.contains("Missing required field: receipt_signature"));
+        assert!(err
+            .message
+            .contains("Missing required field: receipt_signature"));
     }
 
     // -- M-14: additional_fields extensibility hook --

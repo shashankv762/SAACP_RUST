@@ -1,4 +1,4 @@
-﻿//! Integration tests for saacp-rs — Phase 7 completion
+//! Integration tests for saacp-rs — Phase 7 completion
 //!
 //! Covers all remaining Phase 7 tasks:
 //!   1. PSKCompromiseRecovery - epoch destruction + callback
@@ -11,20 +11,15 @@
 //!   8. PRODUCTION_POLICY singleton sanity
 //!   9. Handler Gate 0 - garbage packet rejection
 
-use std::sync::Arc;
 use serde_json::{Map, Value};
+use std::sync::Arc;
 
 use saacp::{
-    SessionEpochManager, PSKCompromiseRecovery,
-    ThresholdAuthorityIssuer,
-    CapabilityIssuanceAuthority, CapabilitySigningKey, CapabilityVerificationAuthority,
-    ACSVAF_MAX_DELEGATION_DEPTH,
-    CapabilityTransparencyLog,
-    CryptoTransparencyLedger, CryptoLedgerEntry, PRODUCTION_POLICY,
-    KeyRegistry, KeyLifecycleManager, KeyAlgorithm, KeyCategory,
-    make_kid, make_descriptor,
-    CRYPTO_SUITES, register_suite,
-    SAACPProtocolHandler,
+    make_descriptor, make_kid, register_suite, CapabilityIssuanceAuthority, CapabilitySigningKey,
+    CapabilityTransparencyLog, CapabilityVerificationAuthority, CryptoLedgerEntry,
+    CryptoTransparencyLedger, KeyAlgorithm, KeyCategory, KeyLifecycleManager, KeyRegistry,
+    PSKCompromiseRecovery, SAACPProtocolHandler, SessionEpochManager, ThresholdAuthorityIssuer,
+    ACSVAF_MAX_DELEGATION_DEPTH, CRYPTO_SUITES, PRODUCTION_POLICY,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -35,8 +30,12 @@ use saacp::{
 fn psk_recovery_destroys_all_sessions() {
     let manager = Arc::new(SessionEpochManager::new());
     // create_session(session_id: [u8;16], secret: [u8;32], packet_threshold, time_threshold, transcript_hash)
-    manager.create_session([0x01u8; 16], [0xAAu8; 32], 10_000, 600.0, None).unwrap();
-    manager.create_session([0x02u8; 16], [0xBBu8; 32], 10_000, 600.0, None).unwrap();
+    manager
+        .create_session([0x01u8; 16], [0xAAu8; 32], 10_000, 600.0, None)
+        .unwrap();
+    manager
+        .create_session([0x02u8; 16], [0xBBu8; 32], 10_000, 600.0, None)
+        .unwrap();
     assert_eq!(manager.session_count(), 2);
 
     let recovery = PSKCompromiseRecovery::new(manager.clone(), None);
@@ -60,16 +59,24 @@ fn psk_recovery_empty_is_safe() {
 fn psk_recovery_callback_fires() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let manager = Arc::new(SessionEpochManager::new());
-    manager.create_session([0xFFu8; 16], [0xCCu8; 32], 1000, 60.0, None).unwrap();
+    manager
+        .create_session([0xFFu8; 16], [0xCCu8; 32], 1000, 60.0, None)
+        .unwrap();
 
     let fired = Arc::new(AtomicBool::new(false));
     let clone = fired.clone();
     let recovery = PSKCompromiseRecovery::new(
         manager,
-        Some(Box::new(move || { clone.store(true, Ordering::SeqCst); Ok(()) })),
+        Some(Box::new(move || {
+            clone.store(true, Ordering::SeqCst);
+            Ok(())
+        })),
     );
     recovery.execute(Some(1));
-    assert!(fired.load(Ordering::SeqCst), "gateway callback must fire on recovery");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "gateway callback must fire on recovery"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -93,11 +100,15 @@ fn threshold_2_of_3_happy_path() {
     let req = issuer.create_request(serde_json::json!({"budget": 1000}));
     assert_eq!(issuer.pending_request_count(), 1);
 
-    let state_a = issuer.submit_partial_approval(&req, "A", &make_token_for("A")).unwrap();
+    let state_a = issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .unwrap();
     assert_eq!(state_a.approvals_received, 1);
     assert!(!state_a.is_ready);
 
-    let state_b = issuer.submit_partial_approval(&req, "B", &make_token_for("B")).unwrap();
+    let state_b = issuer
+        .submit_partial_approval(&req, "B", &make_token_for("B"))
+        .unwrap();
     assert_eq!(state_b.approvals_received, 2);
     assert!(state_b.is_ready);
 
@@ -110,26 +121,41 @@ fn threshold_2_of_3_happy_path() {
 
 #[test]
 fn threshold_duplicate_rejected() {
-    let issuer = ThresholdAuthorityIssuer::new(2, vec!["A".to_string(), "B".to_string()], 300.0).unwrap();
+    let issuer =
+        ThresholdAuthorityIssuer::new(2, vec!["A".to_string(), "B".to_string()], 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({}));
-    issuer.submit_partial_approval(&req, "A", &make_token_for("A")).unwrap();
-    assert!(issuer.submit_partial_approval(&req, "A", &make_token_for("A")).is_err());
+    issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .unwrap();
+    assert!(issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .is_err());
 }
 
 #[test]
 fn threshold_rogue_authority_rejected() {
     let issuer = ThresholdAuthorityIssuer::new(1, vec!["legit".to_string()], 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({}));
-    assert!(issuer.submit_partial_approval(&req, "rogue", &make_token_for("rogue")).is_err());
+    assert!(issuer
+        .submit_partial_approval(&req, "rogue", &make_token_for("rogue"))
+        .is_err());
 }
 
 #[test]
 fn threshold_assemble_fails_below_m() {
-    let issuer = ThresholdAuthorityIssuer::new(3,
-        vec!["a".to_string(), "b".to_string(), "c".to_string()], 300.0).unwrap();
+    let issuer = ThresholdAuthorityIssuer::new(
+        3,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        300.0,
+    )
+    .unwrap();
     let req = issuer.create_request(serde_json::json!({}));
-    issuer.submit_partial_approval(&req, "a", &make_token_for("a")).unwrap();
-    issuer.submit_partial_approval(&req, "b", &make_token_for("b")).unwrap();
+    issuer
+        .submit_partial_approval(&req, "a", &make_token_for("a"))
+        .unwrap();
+    issuer
+        .submit_partial_approval(&req, "b", &make_token_for("b"))
+        .unwrap();
     let r = issuer.assemble_threshold_token(&req);
     assert!(r.is_err());
     assert!(r.unwrap_err().contains("2/3"));
@@ -164,7 +190,9 @@ fn make_entry(i: u32) -> CryptoLedgerEntry {
 #[test]
 fn crypto_ledger_chain_holds() {
     let ledger = CryptoTransparencyLedger::new();
-    for i in 0..5 { ledger.append(make_entry(i)); }
+    for i in 0..5 {
+        ledger.append(make_entry(i));
+    }
     // CryptoTransparencyLedger::entries() returns Vec<CryptoLedgerEntry>
     assert_eq!(ledger.entries().len(), 5);
     assert!(ledger.verify_chain());
@@ -187,8 +215,16 @@ fn crypto_ledger_reset_clears() {
 fn klms_register_and_get() {
     let registry = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning,
-        vec![0xAAu8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0xAAu8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     registry.register(desc).unwrap();
     let active = registry.get_active(&kid).unwrap();
     assert_eq!(active.kid, kid);
@@ -199,12 +235,22 @@ fn klms_register_and_get() {
 fn klms_rotate_and_revoke() {
     let registry = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning,
-        vec![0x11u8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0x11u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     registry.register(desc).unwrap();
 
     let mgr = KeyLifecycleManager::new(registry, None);
-    let rotated = mgr.rotate_key(&kid, vec![0x22u8; 32], KeyAlgorithm::Ed25519).unwrap();
+    let rotated = mgr
+        .rotate_key(&kid, vec![0x22u8; 32], KeyAlgorithm::Ed25519)
+        .unwrap();
     assert_eq!(rotated.version, 2);
 
     let record = mgr.revoke_key(&kid, "end-of-life").unwrap();
@@ -218,7 +264,10 @@ fn klms_rotate_and_revoke() {
 
 #[test]
 fn crypto_suites_has_ed25519() {
-    assert!(CRYPTO_SUITES.lock().unwrap().contains(&"ed25519".to_string()));
+    assert!(CRYPTO_SUITES
+        .lock()
+        .unwrap()
+        .contains(&"ed25519".to_string()));
 }
 
 #[test]
@@ -237,7 +286,10 @@ fn register_suite_blocked_in_production() {
 fn register_suite_ok_in_lab() {
     let l = CryptoTransparencyLedger::new();
     assert!(register_suite("test-suite-it-100", "LAB", true, &l).is_ok());
-    assert!(CRYPTO_SUITES.lock().unwrap().contains(&"test-suite-it-100".to_string()));
+    assert!(CRYPTO_SUITES
+        .lock()
+        .unwrap()
+        .contains(&"test-suite-it-100".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -248,12 +300,42 @@ fn register_suite_ok_in_lab() {
 fn cap_log_chain_and_jti_lookup() {
     let log = CapabilityTransparencyLog::new();
     // append(event, issuer, jti, kid, sub, aud: &[&str], actions: &[&str], depth, parent_jti, signing_key)
-    log.append("ISSUED", "iss-1", Some("jti-A"), Some("kid-1"),
-        "sub-1", &["agent-X"], &["read"], 0, None, None);
-    log.append("DELEGATED", "iss-1", Some("jti-A"), Some("kid-1"),
-        "sub-2", &["agent-Y"], &["read"], 1, Some("jti-A"), None);
-    log.append("ISSUED", "iss-2", Some("jti-B"), Some("kid-2"),
-        "sub-3", &["agent-Z"], &["write"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss-1",
+        Some("jti-A"),
+        Some("kid-1"),
+        "sub-1",
+        &["agent-X"],
+        &["read"],
+        0,
+        None,
+        None,
+    );
+    log.append(
+        "DELEGATED",
+        "iss-1",
+        Some("jti-A"),
+        Some("kid-1"),
+        "sub-2",
+        &["agent-Y"],
+        &["read"],
+        1,
+        Some("jti-A"),
+        None,
+    );
+    log.append(
+        "ISSUED",
+        "iss-2",
+        Some("jti-B"),
+        Some("kid-2"),
+        "sub-3",
+        &["agent-Z"],
+        &["write"],
+        0,
+        None,
+        None,
+    );
 
     assert_eq!(log.count(), 3);
     assert!(log.verify_chain_integrity());
@@ -286,11 +368,21 @@ fn acsvaf_issue_verify_roundtrip() {
     claims.insert("sub".into(), Value::String("agent-bob".into()));
     claims.insert("iss".into(), Value::String("issuer-X".into()));
     claims.insert("jti".into(), Value::String("jti-roundtrip".into()));
-    claims.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("actions".into(), Value::Array(vec![
-        Value::String("read".into()), Value::String("write".into()),
-    ]));
+    claims.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
+    claims.insert(
+        "actions".into(),
+        Value::Array(vec![
+            Value::String("read".into()),
+            Value::String("write".into()),
+        ]),
+    );
 
     let token = cia.issue(claims).expect("issue token");
     let result = cva.verify(&token);
@@ -317,12 +409,17 @@ fn production_policy_approves_ed25519() {
 
 #[test]
 fn handler_rejects_garbage() {
-    assert!(SAACPProtocolHandler::intercept_packet(&[0xAAu8; 200], &[0x42u8; 32], "a", false).is_err());
+    assert!(
+        SAACPProtocolHandler::intercept_packet(&[0xAAu8; 200], &[0x42u8; 32], "a", false).is_err()
+    );
 }
 
 #[test]
 fn handler_rejects_wrong_magic() {
     let mut bad = vec![0u8; 120];
-    bad[0] = b'X'; bad[1] = b'X'; bad[2] = b'X'; bad[3] = b'X';
+    bad[0] = b'X';
+    bad[1] = b'X';
+    bad[2] = b'X';
+    bad[3] = b'X';
     assert!(SAACPProtocolHandler::intercept_packet(&bad, &[0u8; 32], "a", false).is_err());
 }

@@ -19,12 +19,13 @@
 //! below with the printed Python hex values.
 
 use saacp::{
-    KeyEvolutionEngine, SessionEpochManager,
-    MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS,
-    MEASCFrame,
+    KeyEvolutionEngine, MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS,
 };
 
-fn hex(b: &[u8]) -> String { hex::encode(b) }
+fn hex(b: &[u8]) -> String {
+    hex::encode(b)
+}
 
 // ── Vector 1: HKDF initial epoch key (epoch 0, no prev_key) ──────────────────
 // Python: HKDF-SHA256(ikm=session_secret, salt=session_id,
@@ -34,7 +35,7 @@ fn hex(b: &[u8]) -> String { hex::encode(b) }
 #[test]
 fn vector_hkdf_epoch_key_initial() {
     let session_secret = [0xAAu8; 32];
-    let session_id     = [0x01u8; 16];
+    let session_id = [0x01u8; 16];
 
     let engine = KeyEvolutionEngine::new(session_secret);
     let key = engine.derive_epoch_key(&session_id, 0, None);
@@ -57,8 +58,8 @@ fn vector_hkdf_epoch_key_initial() {
 #[test]
 fn vector_hkdf_epoch_key_chained() {
     let session_secret = [0xAAu8; 32];
-    let session_id     = [0x01u8; 16];
-    let prev_key       = [0xBBu8; 32];
+    let session_id = [0x01u8; 16];
+    let prev_key = [0xBBu8; 32];
 
     let engine = KeyEvolutionEngine::new(session_secret);
     let key = engine.derive_epoch_key(&session_id, 1, Some(&prev_key));
@@ -84,23 +85,33 @@ fn vector_hkdf_epoch_key_chained() {
 #[test]
 fn vector_measc_build_parse_roundtrip() {
     let session_secret = [0xCCu8; 32];
-    let session_id     = [0x02u8; 16];
+    let session_id = [0x02u8; 16];
     let context_ref_id = [0x03u8; 32];
-    let traceparent    = [0x04u8; 24];
-    let payload        = b"hello saacp cross-language";
+    let traceparent = [0x04u8; 24];
+    let payload = b"hello saacp cross-language";
 
     let mgr = SessionEpochManager::new();
     mgr.create_session(
-        session_id, session_secret,
+        session_id,
+        session_secret,
         MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
         MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
         None,
-    ).expect("create_session");
+    )
+    .expect("create_session");
 
     let (frame_bytes, psn) = mgr
         .with_epoch_mut(&session_id, 0, |ep| {
             MEASCFrame::build_frame(
-                ep, 1u16, 0x00, 0x00, 0, payload, &context_ref_id, &traceparent, 1,
+                ep,
+                1u16,
+                0x00,
+                0x00,
+                0,
+                payload,
+                &context_ref_id,
+                &traceparent,
+                1,
             )
         })
         .expect("epoch 0 exists")
@@ -108,7 +119,11 @@ fn vector_measc_build_parse_roundtrip() {
 
     // PSN 1 is the first packet (sequencer starts at 1)
     assert_eq!(psn, 1, "first packet must use PSN=1");
-    eprintln!("[VECTOR] measc_frame psn={} frame_hex={}", psn, hex(&frame_bytes));
+    eprintln!(
+        "[VECTOR] measc_frame psn={} frame_hex={}",
+        psn,
+        hex(&frame_bytes)
+    );
 
     let parsed = MEASCFrame::parse_frame(&frame_bytes, &mgr, true)
         .expect("parse_frame must succeed on a freshly-built frame");
@@ -122,8 +137,8 @@ fn vector_measc_build_parse_roundtrip() {
 
 #[test]
 fn vector_token_wire_roundtrip() {
+    use ed25519_dalek::{Signer, SigningKey};
     use saacp::acsvaf::SignedCapabilityToken;
-    use ed25519_dalek::{SigningKey, Signer};
     use serde_json::{json, Map, Value};
 
     // Fixed Ed25519 private key seed (32 deterministic bytes)
@@ -158,8 +173,8 @@ fn vector_token_wire_roundtrip() {
     eprintln!("[VECTOR] token_wire wire_hex={}", hex(&wire));
 
     // Verify round-trip
-    let recovered = SignedCapabilityToken::from_wire(&wire)
-        .expect("from_wire must succeed on valid token");
+    let recovered =
+        SignedCapabilityToken::from_wire(&wire).expect("from_wire must succeed on valid token");
     assert_eq!(recovered.signature, token.signature, "signature round-trip");
     assert_eq!(recovered.claims, token.claims, "claims round-trip");
 }
@@ -171,11 +186,14 @@ fn vector_token_wire_roundtrip() {
 
 #[test]
 fn vector_aes256gcm_nist_empty_plaintext() {
-    use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+    use aes_gcm::{
+        aead::{Aead, KeyInit},
+        Aes256Gcm, Key, Nonce,
+    };
     let key = [0u8; 32];
-    let iv  = [0u8; 12];
+    let iv = [0u8; 12];
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-    let nonce  = Nonce::from_slice(&iv);
+    let nonce = Nonce::from_slice(&iv);
     let output = cipher.encrypt(nonce, b"".as_ref()).expect("encrypt empty");
     // 0 bytes ciphertext + 16-byte auth tag
     assert_eq!(output.len(), 16, "empty plaintext → 16-byte tag only");

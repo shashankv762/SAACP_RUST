@@ -5,11 +5,11 @@
 
 #![allow(clippy::assertions_on_constants)]
 
-use serde_json::{Map, Value};
 use saacp::{
-    CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
+    CapabilityIssuanceAuthority, CapabilitySigningKey, CapabilityVerificationAuthority,
     ACSVAF_MAX_DELEGATION_DEPTH,
 };
+use serde_json::{Map, Value};
 
 fn make_pair(issuer_id: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
     let sk = CapabilitySigningKey::generate(issuer_id, 3600);
@@ -26,11 +26,23 @@ fn base_claims(cia: &CapabilityIssuanceAuthority, sub: &str) -> Map<String, Valu
     m.insert("kid".into(), Value::String(cia.kid().to_string()));
     m.insert("iss".into(), Value::String(cia.issuer_id().to_string()));
     m.insert("sub".into(), Value::String(sub.to_string()));
-    m.insert("jti".into(), Value::String(uuid::Uuid::new_v4().to_string()));
+    m.insert(
+        "jti".into(),
+        Value::String(uuid::Uuid::new_v4().to_string()),
+    );
     m.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
-    m.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
-    m.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
-    m.insert("actions".into(), Value::Array(vec![Value::String("read".to_string())]));
+    m.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
+    m.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
+    m.insert(
+        "actions".into(),
+        Value::Array(vec![Value::String("read".to_string())]),
+    );
     m
 }
 
@@ -42,7 +54,9 @@ fn test_tampered_signature_rejected() {
     let claims = base_claims(&cia, "agent-rt-1");
     let mut tok = cia.issue(claims).unwrap();
     // Flip every byte in the signature
-    for b in tok.signature.iter_mut() { *b = b.wrapping_add(1); }
+    for b in tok.signature.iter_mut() {
+        *b = b.wrapping_add(1);
+    }
     let res = cva.verify(&tok);
     assert!(res.is_err(), "Tampered signature must be rejected");
 }
@@ -73,7 +87,8 @@ fn test_modified_sub_claim_rejected() {
     let (cia, cva) = make_pair("iss-rt-4");
     let claims = base_claims(&cia, "agent-legitimate");
     let mut tok = cia.issue(claims).unwrap();
-    tok.claims.insert("sub".into(), Value::String("attacker".to_string()));
+    tok.claims
+        .insert("sub".into(), Value::String("attacker".to_string()));
     let res = cva.verify(&tok);
     assert!(res.is_err(), "Modified sub must invalidate signature");
 }
@@ -86,7 +101,10 @@ fn test_modified_exp_claim_rejected() {
     claims.insert("exp".into(), Value::Number(serde_json::Number::from(1u64))); // expired
     let mut tok = cia.issue(claims).unwrap();
     // Attacker tries to extend expiry after signing
-    tok.claims.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
+    tok.claims.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
     let res = cva.verify(&tok);
     assert!(res.is_err(), "Modified exp must invalidate signature");
 }
@@ -97,12 +115,18 @@ fn test_modified_actions_rejected() {
     let claims = base_claims(&cia, "agent-rt-6");
     let mut tok = cia.issue(claims).unwrap();
     // Escalate actions from ["read"] to ["read", "write", "admin"]
-    tok.claims.insert("actions".into(), Value::Array(vec![
-        Value::String("read".to_string()),
-        Value::String("write".to_string()),
-        Value::String("admin".to_string()),
-    ]));
-    assert!(cva.verify(&tok).is_err(), "Escalated actions must be rejected");
+    tok.claims.insert(
+        "actions".into(),
+        Value::Array(vec![
+            Value::String("read".to_string()),
+            Value::String("write".to_string()),
+            Value::String("admin".to_string()),
+        ]),
+    );
+    assert!(
+        cva.verify(&tok).is_err(),
+        "Escalated actions must be rejected"
+    );
 }
 
 #[test]
@@ -122,7 +146,10 @@ fn test_cross_issuer_token_rejected() {
     let (_, cva_b) = make_pair("iss-B");
     let claims = base_claims(&cia_a, "agent-cross");
     let tok = cia_a.issue(claims).unwrap();
-    assert!(cva_b.verify(&tok).is_err(), "Cross-issuer token must be rejected");
+    assert!(
+        cva_b.verify(&tok).is_err(),
+        "Cross-issuer token must be rejected"
+    );
 }
 
 #[test]
@@ -152,7 +179,8 @@ fn test_revoked_token_cannot_bypass_via_new_jti_claim() {
 
     cva.revoke_token(&jti);
     // Attacker replaces jti claim in the token (breaks signature)
-    tok.claims.insert("jti".into(), Value::String("jti-new-forged".to_string()));
+    tok.claims
+        .insert("jti".into(), Value::String("jti-new-forged".to_string()));
     // Must fail — either signature mismatch or revocation
     assert!(cva.verify(&tok).is_err());
 }
@@ -214,7 +242,10 @@ fn test_replay_after_key_revocation() {
     // Revoke the key
     cva.revoke_trusted_key(cia.kid());
     // Replay with the same valid token fails
-    assert!(cva.verify(&tok).is_err(), "Replay after key revocation must fail");
+    assert!(
+        cva.verify(&tok).is_err(),
+        "Replay after key revocation must fail"
+    );
 }
 
 #[test]
@@ -246,11 +277,23 @@ fn test_register_revoke_re_register_different_key() {
     c2.insert("sub".into(), Value::String("agent-cycle-2".to_string()));
     c2.insert("jti".into(), Value::String("jti-cycle-2".to_string()));
     c2.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
-    c2.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
-    c2.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
-    c2.insert("actions".into(), Value::Array(vec![Value::String("read".to_string())]));
+    c2.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
+    c2.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
+    c2.insert(
+        "actions".into(),
+        Value::Array(vec![Value::String("read".to_string())]),
+    );
     let tok2 = cia2.issue(c2).unwrap();
-    assert!(cva.verify(&tok2).is_ok(), "New key should work after re-registration");
+    assert!(
+        cva.verify(&tok2).is_ok(),
+        "New key should work after re-registration"
+    );
 }
 
 // ─── No Actions Field ────────────────────────────────────────────────────────

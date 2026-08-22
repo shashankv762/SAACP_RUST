@@ -6,9 +6,8 @@
 #![allow(clippy::assertions_on_constants)]
 
 use saacp::{
-    StreamSession, StreamRegistry,
-    STREAM_MAX_TOTAL_BYTES, STREAM_MAX_DURATION_SECONDS, STREAM_MAX_FRAME_GAP_SECONDS,
-    MAX_ACTIVE_STREAMS, MAX_STREAMS_PER_AGENT,
+    StreamRegistry, StreamSession, MAX_ACTIVE_STREAMS, MAX_STREAMS_PER_AGENT,
+    STREAM_MAX_DURATION_SECONDS, STREAM_MAX_FRAME_GAP_SECONDS, STREAM_MAX_TOTAL_BYTES,
 };
 
 fn fresh_session(stream_id: &str, agent_id: &str) -> StreamSession {
@@ -64,7 +63,11 @@ fn test_stream_session_validate_continuation_sequence_ok() {
     let mut s = fresh_session("stream-3", "agent-3");
     // Sequence IDs must be monotonically increasing
     let res = s.validate_continuation(1, 128);
-    assert!(res.is_ok(), "Continuation with seq=1 must succeed: {:?}", res);
+    assert!(
+        res.is_ok(),
+        "Continuation with seq=1 must succeed: {:?}",
+        res
+    );
 }
 
 #[test]
@@ -149,7 +152,7 @@ fn test_stream_registry_abort_stream() {
     let s = fresh_session("stream-abort", "agent-abort");
     reg.register(s).unwrap();
     reg.abort_stream("stream-abort"); // Must not panic
-    // After abort, stream should be gone
+                                      // After abort, stream should be gone
     assert!(reg.get_stream("stream-abort").is_none());
 }
 
@@ -180,9 +183,13 @@ fn test_stream_registry_global_exists() {
 #[test]
 fn test_stream_registry_start_and_end_stream() {
     let reg = StreamRegistry::new();
-    reg.start_stream("stream-se-1", "agent-se-1", "agent-se-1").unwrap();
+    reg.start_stream("stream-se-1", "agent-se-1", "agent-se-1")
+        .unwrap();
     let session = reg.end_stream("stream-se-1");
-    assert!(session.is_some(), "end_stream must return the closed session");
+    assert!(
+        session.is_some(),
+        "end_stream must return the closed session"
+    );
     let ended = session.unwrap();
     assert_eq!(ended.stream_id, "stream-se-1");
 }

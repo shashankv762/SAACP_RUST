@@ -37,7 +37,9 @@ async fn spawn_sidecar_with(
     let http_addr = free_addr().await;
     let mut config = SidecarConfig::new(agent_id, secret, saacp_addr, http_addr);
     customize(&mut config);
-    tokio::spawn(async move { run(config).await; });
+    tokio::spawn(async move {
+        run(config).await;
+    });
     tokio::time::sleep(Duration::from_millis(200)).await;
     (saacp_addr, http_addr)
 }
@@ -215,7 +217,9 @@ async fn sidecar_healthz_reports_degraded_when_protocol_listener_fails() {
     let http_addr = free_addr().await;
 
     let config = SidecarConfig::new("agent-degraded", [0x44u8; 32], saacp_addr, http_addr);
-    tokio::spawn(async move { run(config).await; });
+    tokio::spawn(async move {
+        run(config).await;
+    });
     // Give the daemon time to attempt (and fail) its bind and flip the health flag.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -376,7 +380,8 @@ async fn sidecar_receive_preserves_fifo_order() {
         assert_eq!(resp.status(), 200, "message {i} should have arrived");
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
-            body["task"], format!("task-{i}"),
+            body["task"],
+            format!("task-{i}"),
             "messages must be delivered in strict FIFO order"
         );
     }
@@ -472,9 +477,12 @@ async fn sidecar_send_logs_delegation_edge_with_real_target_agent() {
     // `ImmutableAuditLog::global()` is a process-wide singleton shared with every other
     // test in this binary, several of which run concurrently and log their own
     // delegation entries for their own agent pairs.
-    let delegation = recs.iter()
+    let delegation = recs
+        .iter()
         .find(|r| r.intent.starts_with("[FAITF:DELEGATION]") && r.source == "agent-delegator")
-        .expect("expected a [FAITF:DELEGATION] audit entry for agent-delegator to have been logged");
+        .expect(
+            "expected a [FAITF:DELEGATION] audit entry for agent-delegator to have been logged",
+        );
     assert_eq!(delegation.source, "agent-delegator");
     assert_eq!(delegation.target, "agent-delegate-target");
     assert!(delegation.intent.contains("parent=agent-delegator"));
@@ -611,7 +619,9 @@ async fn run_without_shutdown_token_still_serves_normally() {
     let saacp_addr = free_addr().await;
     let http_addr = free_addr().await;
     let config = SidecarConfig::new("agent-no-shutdown", [0x33u8; 32], saacp_addr, http_addr);
-    tokio::spawn(async move { run(config).await; });
+    tokio::spawn(async move {
+        run(config).await;
+    });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = reqwest::Client::new();

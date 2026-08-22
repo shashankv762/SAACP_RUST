@@ -26,8 +26,8 @@ use tokio_rustls::rustls;
 use tokio_rustls::TlsAcceptor;
 
 use crate::daemon::{
-    PerIpConnectionGuard, SharedCircuitBreakers, MAX_CONNECTIONS,
-    MAX_CONNECTIONS_PER_IP, SHUTDOWN_DRAIN_TIMEOUT_SECS,
+    PerIpConnectionGuard, SharedCircuitBreakers, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
+    SHUTDOWN_DRAIN_TIMEOUT_SECS,
 };
 use crate::handler::ParsedPacket;
 use crate::measc::SessionEpochManager;
@@ -68,7 +68,10 @@ pub fn load_tls_config(
     let key_file = std::fs::File::open(key_path)?;
     let mut key_reader = std::io::BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found in key file")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no private key found in key file",
+        )
     })?;
 
     server_config_from_cert_and_key(certs, key)
@@ -184,10 +187,7 @@ impl SAACPTlsDaemon {
 
     /// Observe every successfully-verified `ParsedPacket`. See
     /// `SAACPNetworkDaemon::with_on_delivered` — identical semantics.
-    pub fn with_on_delivered(
-        mut self,
-        callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>,
-    ) -> Self {
+    pub fn with_on_delivered(mut self, callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>) -> Self {
         self.on_delivered = Some(callback);
         self
     }
@@ -240,20 +240,31 @@ impl SAACPTlsDaemon {
     /// `Result` (propagates a bind failure) instead of panicking, matching
     /// `SAACPNetworkDaemon::start`/`SAACPWebSocketDaemon::start`.
     pub async fn start(&self) -> std::io::Result<()> {
-        self.start_with_shutdown(tokio_util::sync::CancellationToken::new()).await
+        self.start_with_shutdown(tokio_util::sync::CancellationToken::new())
+            .await
     }
 
     /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
     /// `shutdown` is cancelled, then drains in-flight connections (bounded by
     /// `daemon::SHUTDOWN_DRAIN_TIMEOUT_SECS`) before flushing the audit-log WAL (L-10) and
     /// returning. See `daemon::SAACPNetworkDaemon::start_with_shutdown` — identical shape.
-    pub async fn start_with_shutdown(&self, shutdown: tokio_util::sync::CancellationToken) -> std::io::Result<()> {
+    pub async fn start_with_shutdown(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
         let acceptor = TlsAcceptor::from(Arc::clone(&self.tls_config));
 
-        let auth_mode = if self.server_ed25519_seed.is_some() { "authenticated" } else { "unauthenticated" };
-        eprintln!("[SAACP Daemon/TLS] Listening on {} ({} handshake)", addr, auth_mode);
+        let auth_mode = if self.server_ed25519_seed.is_some() {
+            "authenticated"
+        } else {
+            "unauthenticated"
+        };
+        eprintln!(
+            "[SAACP Daemon/TLS] Listening on {} ({} handshake)",
+            addr, auth_mode
+        );
 
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -321,10 +332,11 @@ impl SAACPTlsDaemon {
 
         // Drain: let in-flight connections finish naturally, bounded by
         // SHUTDOWN_DRAIN_TIMEOUT_SECS, then hard-abort whatever's left.
-        let drained = tokio::time::timeout(
-            Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
-            async { while tasks.join_next().await.is_some() {} },
-        ).await;
+        let drained =
+            tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS), async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await;
         if drained.is_err() {
             eprintln!(
                 "[SAACP Daemon/TLS] Drain timeout ({}s) exceeded — aborting {} in-flight connection(s)",
@@ -336,9 +348,12 @@ impl SAACPTlsDaemon {
 
         // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
         let flushed = tokio::task::spawn_blocking(|| {
-            crate::security::ImmutableAuditLog::global()
-                .flush(Duration::from_secs(crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
-        }).await.unwrap_or(false);
+            crate::security::ImmutableAuditLog::global().flush(Duration::from_secs(
+                crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS,
+            ))
+        })
+        .await
+        .unwrap_or(false);
         if !flushed {
             eprintln!("[SAACP Daemon/TLS] WAL flush on shutdown did not confirm in time");
         }
@@ -372,10 +387,18 @@ async fn serve_tls_connection(
     // socket and then never completes (or trickles) ClientHello cannot hold a spawned task
     // / connection-semaphore permit / per-IP slot forever (slow-loris DoS).
     let handshake = acceptor.accept(raw);
-    let tls_stream = match tokio::time::timeout(Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS), handshake).await {
+    let tls_stream = match tokio::time::timeout(
+        Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+        handshake,
+    )
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            eprintln!("[SAACP Daemon/TLS] TLS handshake failed from {}: {}", peer_addr, e);
+            eprintln!(
+                "[SAACP Daemon/TLS] TLS handshake failed from {}: {}",
+                peer_addr, e
+            );
             return;
         }
         Err(_) => {

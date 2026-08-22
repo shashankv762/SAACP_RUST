@@ -4,16 +4,14 @@
 //! DelegationChainValidator, ThresholdAuthorityIssuer, CapabilityTransparencyLog,
 //! RiskAwareAuthorizationEvaluator, PostCompromiseRecovery.
 
-use serde_json::{Map, Value};
 use saacp::{
-    CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
-    DelegationChainValidator,
-    ThresholdAuthorityIssuer, ThresholdCapabilityToken, ThresholdSignatureEntry,
-    CapabilityTransparencyLog,
-    RiskAwareAuthorizationEvaluator, AuthorizationContext,
-    PostCompromiseRecovery, CompromiseRecoveryReport,
-    FilesystemBackend, TransparencyLogBackend,
+    AuthorizationContext, CapabilityIssuanceAuthority, CapabilitySigningKey,
+    CapabilityTransparencyLog, CapabilityVerificationAuthority, CompromiseRecoveryReport,
+    DelegationChainValidator, FilesystemBackend, PostCompromiseRecovery,
+    RiskAwareAuthorizationEvaluator, ThresholdAuthorityIssuer, ThresholdCapabilityToken,
+    ThresholdSignatureEntry, TransparencyLogBackend,
 };
+use serde_json::{Map, Value};
 
 /// Unique scratch file path under the OS temp dir for `FilesystemBackend` tests —
 /// avoids collisions between parallel test threads without adding a `tempfile` dev-dependency.
@@ -39,18 +37,34 @@ fn make_ca_pair(iss: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificati
     (cia, cva)
 }
 
-fn simple_token(cia: &CapabilityIssuanceAuthority, sub: &str, jti: &str) -> saacp::SignedCapabilityToken {
+fn simple_token(
+    cia: &CapabilityIssuanceAuthority,
+    sub: &str,
+    jti: &str,
+) -> saacp::SignedCapabilityToken {
     let mut claims = Map::new();
     claims.insert("kid".into(), Value::String(cia.kid().to_string()));
     claims.insert("iss".into(), Value::String(cia.issuer_id().to_string()));
     claims.insert("sub".into(), Value::String(sub.to_string()));
     claims.insert("jti".into(), Value::String(jti.to_string()));
     claims.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
-    claims.insert("actions".into(), Value::Array(vec![Value::String("read".to_string())]));
+    claims.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
+    claims.insert(
+        "actions".into(),
+        Value::Array(vec![Value::String("read".to_string())]),
+    );
     claims.insert("sid".into(), Value::String("sid-common".to_string()));
-    claims.insert("max_action_class".into(), Value::Number(serde_json::Number::from(1u64)));
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
+    claims.insert(
+        "max_action_class".into(),
+        Value::Number(serde_json::Number::from(1u64)),
+    );
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
     cia.issue(claims).expect("issue token")
 }
 
@@ -62,7 +76,10 @@ fn make_token_for(issuer_id: &str) -> saacp::SignedCapabilityToken {
     claims.insert("sub".into(), Value::String("threshold-sub".into()));
     claims.insert("jti".into(), Value::String(format!("jti-{}", issuer_id)));
     claims.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
+    claims.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
     claims.insert("actions".into(), Value::Array(vec![]));
     cia.issue(claims).expect("issue token")
 }
@@ -82,7 +99,11 @@ fn test_validate_chain_single_token_ok() {
     let (cia, cva) = make_ca_pair("iss-del-2");
     let tok = simple_token(&cia, "sub-1", "jti-single");
     let result = DelegationChainValidator::validate_chain(&[tok], &cva);
-    assert!(result.valid, "Single valid token chain must validate: {:?}", result.violations);
+    assert!(
+        result.valid,
+        "Single valid token chain must validate: {:?}",
+        result.violations
+    );
 }
 
 #[test]
@@ -120,7 +141,10 @@ fn test_validate_chain_unknown_kid_violation() {
     let tok = simple_token(&cia, "sub-1", "jti-unkid");
     let result = DelegationChainValidator::validate_chain(&[tok], &cva_empty);
     assert!(!result.valid);
-    assert!(!result.violations.is_empty(), "Unknown kid must produce violation");
+    assert!(
+        !result.violations.is_empty(),
+        "Unknown kid must produce violation"
+    );
 }
 
 #[test]
@@ -136,7 +160,10 @@ fn test_validate_chain_violations_empty_when_valid() {
     let (cia, cva) = make_ca_pair("iss-del-8");
     let tok = simple_token(&cia, "sub-clean", "jti-clean");
     let result = DelegationChainValidator::validate_chain(&[tok], &cva);
-    assert!(result.violations.is_empty(), "Valid chain must have no violations");
+    assert!(
+        result.violations.is_empty(),
+        "Valid chain must have no violations"
+    );
 }
 
 // ─── ThresholdAuthorityIssuer ─────────────────────────────────────────────────
@@ -166,11 +193,15 @@ fn test_threshold_happy_path_2_of_3() {
     let req = issuer.create_request(serde_json::json!({"budget": 1000}));
     assert_eq!(issuer.pending_request_count(), 1);
 
-    let s1 = issuer.submit_partial_approval(&req, "A", &make_token_for("A")).unwrap();
+    let s1 = issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .unwrap();
     assert_eq!(s1.approvals_received, 1);
     assert!(!s1.is_ready);
 
-    let s2 = issuer.submit_partial_approval(&req, "B", &make_token_for("B")).unwrap();
+    let s2 = issuer
+        .submit_partial_approval(&req, "B", &make_token_for("B"))
+        .unwrap();
     assert_eq!(s2.approvals_received, 2);
     assert!(s2.is_ready, "2 approvals must reach threshold");
 }
@@ -180,7 +211,9 @@ fn test_threshold_unknown_authority_fails() {
     let auths = vec!["A".to_string(), "B".to_string()];
     let issuer = ThresholdAuthorityIssuer::new(2, auths, 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({"x": 1}));
-    assert!(issuer.submit_partial_approval(&req, "UNKNOWN", &make_token_for("UNKNOWN")).is_err());
+    assert!(issuer
+        .submit_partial_approval(&req, "UNKNOWN", &make_token_for("UNKNOWN"))
+        .is_err());
 }
 
 #[test]
@@ -188,9 +221,13 @@ fn test_threshold_duplicate_authority_rejected() {
     let auths = vec!["A".to_string(), "B".to_string()];
     let issuer = ThresholdAuthorityIssuer::new(2, auths, 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({"x": 1}));
-    issuer.submit_partial_approval(&req, "A", &make_token_for("A")).unwrap();
+    issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .unwrap();
     assert!(
-        issuer.submit_partial_approval(&req, "A", &make_token_for("A")).is_err(),
+        issuer
+            .submit_partial_approval(&req, "A", &make_token_for("A"))
+            .is_err(),
         "Duplicate authority must be rejected"
     );
 }
@@ -200,7 +237,9 @@ fn test_threshold_1_of_1_ready_immediately() {
     let auths = vec!["Solo".to_string()];
     let issuer = ThresholdAuthorityIssuer::new(1, auths, 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({}));
-    let s = issuer.submit_partial_approval(&req, "Solo", &make_token_for("Solo")).unwrap();
+    let s = issuer
+        .submit_partial_approval(&req, "Solo", &make_token_for("Solo"))
+        .unwrap();
     assert!(s.is_ready);
 }
 
@@ -209,7 +248,9 @@ fn test_threshold_assemble_token_after_threshold() {
     let auths = vec!["X".to_string(), "Y".to_string()];
     let issuer = ThresholdAuthorityIssuer::new(1, auths, 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({"op": "transfer"}));
-    issuer.submit_partial_approval(&req, "X", &make_token_for("X")).unwrap();
+    issuer
+        .submit_partial_approval(&req, "X", &make_token_for("X"))
+        .unwrap();
     let tok = issuer.assemble_threshold_token(&req).unwrap();
     assert_eq!(tok.request_id, req);
     assert_eq!(tok.threshold_m, 1);
@@ -222,7 +263,9 @@ fn test_threshold_assemble_fails_below_threshold() {
     let issuer = ThresholdAuthorityIssuer::new(2, auths, 300.0).unwrap();
     let req = issuer.create_request(serde_json::json!({}));
     // Only 1 approval submitted, threshold is 2
-    issuer.submit_partial_approval(&req, "A", &make_token_for("A")).unwrap();
+    issuer
+        .submit_partial_approval(&req, "A", &make_token_for("A"))
+        .unwrap();
     assert!(issuer.assemble_threshold_token(&req).is_err());
 }
 
@@ -389,7 +432,10 @@ fn threshold_approval_token(
     let mut claims = Map::new();
     claims.insert("kid".into(), Value::String(kid.into()));
     let sig = sk.sign(sign_over);
-    saacp::SignedCapabilityToken { claims, signature: sig.to_bytes() }
+    saacp::SignedCapabilityToken {
+        claims,
+        signature: sig.to_bytes(),
+    }
 }
 
 #[test]
@@ -455,7 +501,18 @@ fn test_transparency_log_new_empty_integrity() {
 #[test]
 fn test_transparency_log_append_count() {
     let log = CapabilityTransparencyLog::new();
-    log.append("ISSUED", "iss-1", Some("jti-1"), None, "sub-1", &[], &["read"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss-1",
+        Some("jti-1"),
+        None,
+        "sub-1",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
     assert_eq!(log.count(), 1);
 }
 
@@ -465,12 +522,23 @@ fn test_transparency_log_chain_integrity_after_appends() {
     for i in 0..5u32 {
         let jti = format!("jti-{}", i);
         log.append(
-            "ISSUED", "iss-tl", Some(jti.as_str()), None,
-            "sub", &[], &["read"], 0, None, None,
+            "ISSUED",
+            "iss-tl",
+            Some(jti.as_str()),
+            None,
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
         );
     }
     assert_eq!(log.count(), 5);
-    assert!(log.verify_chain_integrity(), "Chain must be intact after sequential appends");
+    assert!(
+        log.verify_chain_integrity(),
+        "Chain must be intact after sequential appends"
+    );
 }
 
 /// M-30 regression: `verify_chain_integrity` caches its result, invalidated
@@ -488,13 +556,24 @@ fn m30_verify_chain_integrity_cache_tracks_current_state_across_interleaved_call
     // Empty log: first call computes and caches; second call (no append in
     // between) must hit the cache and still return the same correct answer.
     assert!(log.verify_chain_integrity());
-    assert!(log.verify_chain_integrity(), "repeated call with no append must stay consistent");
+    assert!(
+        log.verify_chain_integrity(),
+        "repeated call with no append must stay consistent"
+    );
 
     for i in 0..20u32 {
         let jti = format!("jti-interleaved-{}", i);
         log.append(
-            "ISSUED", "iss-tl-interleaved", Some(jti.as_str()), None,
-            "sub", &[], &["read"], 0, None, None,
+            "ISSUED",
+            "iss-tl-interleaved",
+            Some(jti.as_str()),
+            None,
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
         );
         // Immediately after append: cache must be invalidated by the
         // generation bump and recomputed against the new entry.
@@ -523,8 +602,16 @@ fn m30_verify_chain_integrity_cache_correct_across_capacity_eviction() {
     for i in 0..15u32 {
         let jti = format!("jti-cap-{}", i);
         log.append(
-            "ISSUED", "iss-tl-cap", Some(jti.as_str()), None,
-            "sub", &[], &["read"], 0, None, None,
+            "ISSUED",
+            "iss-tl-cap",
+            Some(jti.as_str()),
+            None,
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
         );
         assert!(
             log.verify_chain_integrity(),
@@ -547,8 +634,16 @@ fn h26_transparency_log_bounded_with_verifiable_chain_after_eviction() {
     for i in 0..25u32 {
         let jti = format!("jti-{}", i);
         log.append(
-            "ISSUED", "iss-tl", Some(jti.as_str()), None,
-            "sub", &[], &["read"], 0, None, None,
+            "ISSUED",
+            "iss-tl",
+            Some(jti.as_str()),
+            None,
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
         );
     }
     // Bounded: never exceeds the configured cap despite 25 appends.
@@ -571,8 +666,30 @@ fn h26_transparency_log_bounded_with_verifiable_chain_after_eviction() {
 #[test]
 fn test_transparency_log_get_entries_by_jti() {
     let log = CapabilityTransparencyLog::new();
-    log.append("ISSUED", "iss-q", Some("jti-target"), None, "sub-q", &[], &["write"], 0, None, None);
-    log.append("ISSUED", "iss-q", Some("jti-other"), None, "sub-q", &[], &["read"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss-q",
+        Some("jti-target"),
+        None,
+        "sub-q",
+        &[],
+        &["write"],
+        0,
+        None,
+        None,
+    );
+    log.append(
+        "ISSUED",
+        "iss-q",
+        Some("jti-other"),
+        None,
+        "sub-q",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
     let entries = log.get_entries_by_jti("jti-target");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].jti.as_deref(), Some("jti-target"));
@@ -581,29 +698,84 @@ fn test_transparency_log_get_entries_by_jti() {
 #[test]
 fn test_transparency_log_get_entries_by_jti_empty_for_unknown() {
     let log = CapabilityTransparencyLog::new();
-    log.append("ISSUED", "iss", Some("jti-x"), None, "sub", &[], &[], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss",
+        Some("jti-x"),
+        None,
+        "sub",
+        &[],
+        &[],
+        0,
+        None,
+        None,
+    );
     assert!(log.get_entries_by_jti("nonexistent-jti").is_empty());
 }
 
 #[test]
 fn test_transparency_log_append_returns_chain_hash() {
     let log = CapabilityTransparencyLog::new();
-    let hash = log.append("ISSUED", "iss", Some("jti-h"), None, "sub", &[], &[], 0, None, None);
+    let hash = log.append(
+        "ISSUED",
+        "iss",
+        Some("jti-h"),
+        None,
+        "sub",
+        &[],
+        &[],
+        0,
+        None,
+        None,
+    );
     assert_eq!(hash.len(), 64, "chain_hash must be 64-char hex (SHA-256)");
 }
 
 #[test]
 fn test_transparency_log_chain_hashes_are_different() {
     let log = CapabilityTransparencyLog::new();
-    let h1 = log.append("ISSUED", "iss", Some("j1"), None, "s", &[], &[], 0, None, None);
-    let h2 = log.append("ISSUED", "iss", Some("j2"), None, "s", &[], &[], 0, None, None);
+    let h1 = log.append(
+        "ISSUED",
+        "iss",
+        Some("j1"),
+        None,
+        "s",
+        &[],
+        &[],
+        0,
+        None,
+        None,
+    );
+    let h2 = log.append(
+        "ISSUED",
+        "iss",
+        Some("j2"),
+        None,
+        "s",
+        &[],
+        &[],
+        0,
+        None,
+        None,
+    );
     assert_ne!(h1, h2, "Sequential chain hashes must differ");
 }
 
 #[test]
 fn test_transparency_log_delegation_depth_recorded() {
     let log = CapabilityTransparencyLog::new();
-    log.append("DELEGATED", "iss", Some("jti-del"), None, "sub", &[], &["read"], 2, Some("parent-jti"), None);
+    log.append(
+        "DELEGATED",
+        "iss",
+        Some("jti-del"),
+        None,
+        "sub",
+        &[],
+        &["read"],
+        2,
+        Some("parent-jti"),
+        None,
+    );
     let entries = log.get_entries_by_jti("jti-del");
     assert_eq!(entries[0].delegation_depth, 2);
     assert!(entries[0].parent_jti_hash.is_some());
@@ -612,7 +784,18 @@ fn test_transparency_log_delegation_depth_recorded() {
 #[test]
 fn test_transparency_log_export_audit_bundle_valid() {
     let log = CapabilityTransparencyLog::new();
-    log.append("ISSUED", "iss-ab", Some("jti-ab"), None, "sub-ab", &[], &["read"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss-ab",
+        Some("jti-ab"),
+        None,
+        "sub-ab",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
     let bundle = log.export_audit_bundle(None);
     assert_eq!(bundle["entry_count"].as_u64().unwrap(), 1);
     assert!(bundle["chain_valid"].as_bool().unwrap());
@@ -669,7 +852,10 @@ fn test_risk_evaluator_low_risk_approves() {
 fn test_risk_evaluator_high_risk_rejects() {
     let eval = RiskAwareAuthorizationEvaluator::new();
     let result = eval.evaluate(&high_risk_ctx());
-    assert_ne!(result.decision, "APPROVE", "High-risk context must not be approved");
+    assert_ne!(
+        result.decision, "APPROVE",
+        "High-risk context must not be approved"
+    );
 }
 
 #[test]
@@ -713,7 +899,10 @@ fn test_risk_evaluator_risk_score_0_to_1() {
 fn test_risk_evaluator_factors_not_empty_for_high_risk() {
     let eval = RiskAwareAuthorizationEvaluator::new();
     let r = eval.evaluate(&high_risk_ctx());
-    assert!(!r.factors.is_empty(), "High risk context must produce at least one factor");
+    assert!(
+        !r.factors.is_empty(),
+        "High risk context must produce at least one factor"
+    );
 }
 
 #[test]
@@ -746,8 +935,30 @@ fn test_post_compromise_get_affected_tokens_empty_log() {
 #[test]
 fn test_post_compromise_get_affected_tokens_finds_matching() {
     let log = CapabilityTransparencyLog::new();
-    log.append("ISSUED", "iss", Some("jti-match"), Some("kid-compromised"), "sub", &[], &["read"], 0, None, None);
-    log.append("ISSUED", "iss", Some("jti-other"), Some("kid-safe"), "sub", &[], &["read"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss",
+        Some("jti-match"),
+        Some("kid-compromised"),
+        "sub",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
+    log.append(
+        "ISSUED",
+        "iss",
+        Some("jti-other"),
+        Some("kid-safe"),
+        "sub",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
     let affected = PostCompromiseRecovery::get_affected_tokens("kid-compromised", &log);
     assert_eq!(affected.len(), 1);
     assert_eq!(affected[0], "jti-match");
@@ -776,8 +987,10 @@ fn test_post_compromise_validate_recovery_same_kid_fails() {
         recovery_timestamp: 0.0,
         recovery_complete: true,
     };
-    assert!(!PostCompromiseRecovery::validate_recovery_complete(&report),
-        "Recovery with same kid must not be valid");
+    assert!(
+        !PostCompromiseRecovery::validate_recovery_complete(&report),
+        "Recovery with same kid must not be valid"
+    );
 }
 
 #[test]
@@ -799,11 +1012,37 @@ fn test_post_compromise_declare_key_compromise_logs_events() {
     let log = CapabilityTransparencyLog::new();
 
     // Log some tokens for the compromised key
-    log.append("ISSUED", "iss-pcr", Some("jti-tok1"), Some(cia.kid()), "sub", &[], &["read"], 0, None, None);
-    log.append("ISSUED", "iss-pcr", Some("jti-tok2"), Some(cia.kid()), "sub", &[], &["read"], 0, None, None);
+    log.append(
+        "ISSUED",
+        "iss-pcr",
+        Some("jti-tok1"),
+        Some(cia.kid()),
+        "sub",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
+    log.append(
+        "ISSUED",
+        "iss-pcr",
+        Some("jti-tok2"),
+        Some(cia.kid()),
+        "sub",
+        &[],
+        &["read"],
+        0,
+        None,
+        None,
+    );
 
     let report = PostCompromiseRecovery::declare_key_compromise(
-        cia.kid(), "new-kid-replacement", "iss-pcr", &cva, &log,
+        cia.kid(),
+        "new-kid-replacement",
+        "iss-pcr",
+        &cva,
+        &log,
     );
 
     assert!(report.recovery_complete);
@@ -824,7 +1063,10 @@ fn test_post_compromise_revokes_key_in_cva() {
     assert!(cva.verify(&tok).is_ok());
 
     PostCompromiseRecovery::declare_key_compromise(cia.kid(), "new-kid", "iss-rev", &cva, &log);
-    assert!(cva.verify(&tok).is_err(), "Token must be invalid after key compromise declared");
+    assert!(
+        cva.verify(&tok).is_err(),
+        "Token must be invalid after key compromise declared"
+    );
 }
 
 // ─── FilesystemBackend persistence (Phase 5, item 2) ───────────────────────────
@@ -838,9 +1080,42 @@ fn test_filesystem_backend_round_trip_write_reopen_verify() {
         let log = CapabilityTransparencyLog::with_backend(Box::new(
             FilesystemBackend::open(&path).unwrap(),
         ));
-        log.append("ISSUED", "iss-fs", Some("jti-1"), Some("kid-1"), "sub", &[], &["read"], 0, None, None);
-        log.append("DELEGATED", "iss-fs", Some("jti-2"), Some("kid-1"), "sub", &[], &["write"], 1, Some("jti-1"), None);
-        log.append("REVOKED", "iss-fs", Some("jti-2"), Some("kid-1"), "sub", &[], &[], 1, None, None);
+        log.append(
+            "ISSUED",
+            "iss-fs",
+            Some("jti-1"),
+            Some("kid-1"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
+        log.append(
+            "DELEGATED",
+            "iss-fs",
+            Some("jti-2"),
+            Some("kid-1"),
+            "sub",
+            &[],
+            &["write"],
+            1,
+            Some("jti-1"),
+            None,
+        );
+        log.append(
+            "REVOKED",
+            "iss-fs",
+            Some("jti-2"),
+            Some("kid-1"),
+            "sub",
+            &[],
+            &[],
+            1,
+            None,
+            None,
+        );
         assert!(log.verify_chain_integrity());
         assert_eq!(log.count(), 3);
     } // log (and its FilesystemBackend's file handle) dropped here
@@ -866,8 +1141,30 @@ fn test_filesystem_backend_truncated_file_rejected() {
         let log = CapabilityTransparencyLog::with_backend(Box::new(
             FilesystemBackend::open(&path).unwrap(),
         ));
-        log.append("ISSUED", "iss-trunc", Some("jti-a"), Some("kid-a"), "sub", &[], &["read"], 0, None, None);
-        log.append("ISSUED", "iss-trunc", Some("jti-b"), Some("kid-a"), "sub", &[], &["read"], 0, None, None);
+        log.append(
+            "ISSUED",
+            "iss-trunc",
+            Some("jti-a"),
+            Some("kid-a"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
+        log.append(
+            "ISSUED",
+            "iss-trunc",
+            Some("jti-b"),
+            Some("kid-a"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
     }
 
     // Corrupt the file: flip a byte inside the JSON so it still parses as a
@@ -877,7 +1174,10 @@ fn test_filesystem_backend_truncated_file_rejected() {
     std::fs::write(&path, corrupted).unwrap();
 
     let result = FilesystemBackend::open(&path);
-    assert!(result.is_err(), "Tampered transparency log file must fail to open, not silently reset to empty");
+    assert!(
+        result.is_err(),
+        "Tampered transparency log file must fail to open, not silently reset to empty"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -891,8 +1191,30 @@ fn test_filesystem_backend_truncated_last_line_rejected() {
         let log = CapabilityTransparencyLog::with_backend(Box::new(
             FilesystemBackend::open(&path).unwrap(),
         ));
-        log.append("ISSUED", "iss-tl", Some("jti-c"), Some("kid-c"), "sub", &[], &["read"], 0, None, None);
-        log.append("ISSUED", "iss-tl", Some("jti-d"), Some("kid-c"), "sub", &[], &["read"], 0, None, None);
+        log.append(
+            "ISSUED",
+            "iss-tl",
+            Some("jti-c"),
+            Some("kid-c"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
+        log.append(
+            "ISSUED",
+            "iss-tl",
+            Some("jti-d"),
+            Some("kid-c"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
     }
 
     // Truncate mid-way through the last line so it's no longer valid JSON.
@@ -901,7 +1223,10 @@ fn test_filesystem_backend_truncated_last_line_rejected() {
     std::fs::write(&path, &contents[..cut]).unwrap();
 
     let result = FilesystemBackend::open(&path);
-    assert!(result.is_err(), "A truncated final line must fail to open, not silently drop the partial entry");
+    assert!(
+        result.is_err(),
+        "A truncated final line must fail to open, not silently drop the partial entry"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -931,7 +1256,18 @@ fn test_filesystem_backend_persists_across_multiple_reopens() {
         let backend = FilesystemBackend::open(&path).unwrap();
         let log = CapabilityTransparencyLog::with_backend(Box::new(backend));
         assert_eq!(log.count(), i);
-        log.append("ISSUED", "iss-multi", Some(&format!("jti-{i}")), Some("kid-multi"), "sub", &[], &["read"], 0, None, None);
+        log.append(
+            "ISSUED",
+            "iss-multi",
+            Some(&format!("jti-{i}")),
+            Some("kid-multi"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
         assert!(log.verify_chain_integrity());
     }
 
@@ -950,16 +1286,35 @@ fn test_filesystem_backend_rotation_produces_bak_file() {
     let backend = FilesystemBackend::open_with_max_file_size(&path, 256).unwrap();
     let log = CapabilityTransparencyLog::with_backend(Box::new(backend));
     for i in 0..20 {
-        log.append("ISSUED", "iss-rot", Some(&format!("jti-rot-{i}")), Some("kid-rot"), "sub", &[], &["read"], 0, None, None);
+        log.append(
+            "ISSUED",
+            "iss-rot",
+            Some(&format!("jti-rot-{i}")),
+            Some("kid-rot"),
+            "sub",
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
     }
-    assert_eq!(log.count(), 20, "in-memory mirror must retain all entries regardless of on-disk rotation");
+    assert_eq!(
+        log.count(),
+        20,
+        "in-memory mirror must retain all entries regardless of on-disk rotation"
+    );
     assert!(log.verify_chain_integrity());
 
     // At least one rotated `.bak` file must have been produced given the tiny threshold
     // (same rotation contract as `security::WalWriter` — rotated-out entries live in the
     // `.bak` sibling, not the active file; only the active file is replayed on reopen).
     let dir = std::path::Path::new(&path).parent().unwrap();
-    let file_name = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let bak_files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -968,7 +1323,10 @@ fn test_filesystem_backend_rotation_produces_bak_file() {
             name.starts_with(&file_name) && name.ends_with(".bak")
         })
         .collect();
-    assert!(!bak_files.is_empty(), "expected at least one rotated .bak file given a 256-byte threshold and 20 entries");
+    assert!(
+        !bak_files.is_empty(),
+        "expected at least one rotated .bak file given a 256-byte threshold and 20 entries"
+    );
 
     // Clean up the primary file, its .floor sidecar, and any .bak siblings it produced.
     for e in bak_files {

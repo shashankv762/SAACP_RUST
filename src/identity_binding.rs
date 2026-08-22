@@ -18,7 +18,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -154,14 +154,32 @@ impl AgentIdentityCertificate {
     /// certificate body — a fail-open bug, not a fail-closed one.
     pub fn body_bytes(&self) -> Result<Vec<u8>, String> {
         let mut map = serde_json::Map::new();
-        map.insert("agent_id".into(), serde_json::Value::String(self.agent_id.clone()));
-        map.insert("algorithm".into(), serde_json::Value::String(self.algorithm.clone()));
-        map.insert("ca_kid".into(), serde_json::Value::String(self.ca_kid.clone()));
-        map.insert("cert_id".into(), serde_json::Value::String(self.cert_id.clone()));
+        map.insert(
+            "agent_id".into(),
+            serde_json::Value::String(self.agent_id.clone()),
+        );
+        map.insert(
+            "algorithm".into(),
+            serde_json::Value::String(self.algorithm.clone()),
+        );
+        map.insert(
+            "ca_kid".into(),
+            serde_json::Value::String(self.ca_kid.clone()),
+        );
+        map.insert(
+            "cert_id".into(),
+            serde_json::Value::String(self.cert_id.clone()),
+        );
         map.insert("expires_at".into(), serde_json::json!(self.expires_at));
         map.insert("issued_at".into(), serde_json::json!(self.issued_at));
-        map.insert("issuer_id".into(), serde_json::Value::String(self.issuer_id.clone()));
-        map.insert("public_key_hex".into(), serde_json::Value::String(self.public_key_hex.clone()));
+        map.insert(
+            "issuer_id".into(),
+            serde_json::Value::String(self.issuer_id.clone()),
+        );
+        map.insert(
+            "public_key_hex".into(),
+            serde_json::Value::String(self.public_key_hex.clone()),
+        );
         let body = serde_json::Value::Object(map);
         serde_json::to_string(&body)
             .map(|s| s.into_bytes())
@@ -171,35 +189,58 @@ impl AgentIdentityCertificate {
     /// Serialize to JSON string.
     pub fn to_json(&self) -> String {
         let mut map = serde_json::Map::new();
-        map.insert("agent_id".into(), serde_json::Value::String(self.agent_id.clone()));
-        map.insert("algorithm".into(), serde_json::Value::String(self.algorithm.clone()));
-        map.insert("ca_kid".into(), serde_json::Value::String(self.ca_kid.clone()));
-        map.insert("cert_id".into(), serde_json::Value::String(self.cert_id.clone()));
-        map.insert("cert_signature".into(), serde_json::Value::String(hex::encode(&self.cert_signature)));
+        map.insert(
+            "agent_id".into(),
+            serde_json::Value::String(self.agent_id.clone()),
+        );
+        map.insert(
+            "algorithm".into(),
+            serde_json::Value::String(self.algorithm.clone()),
+        );
+        map.insert(
+            "ca_kid".into(),
+            serde_json::Value::String(self.ca_kid.clone()),
+        );
+        map.insert(
+            "cert_id".into(),
+            serde_json::Value::String(self.cert_id.clone()),
+        );
+        map.insert(
+            "cert_signature".into(),
+            serde_json::Value::String(hex::encode(&self.cert_signature)),
+        );
         map.insert("expires_at".into(), serde_json::json!(self.expires_at));
         map.insert("issued_at".into(), serde_json::json!(self.issued_at));
-        map.insert("issuer_id".into(), serde_json::Value::String(self.issuer_id.clone()));
-        map.insert("public_key_hex".into(), serde_json::Value::String(self.public_key_hex.clone()));
+        map.insert(
+            "issuer_id".into(),
+            serde_json::Value::String(self.issuer_id.clone()),
+        );
+        map.insert(
+            "public_key_hex".into(),
+            serde_json::Value::String(self.public_key_hex.clone()),
+        );
         serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
     }
 
     /// Deserialize from JSON string.
     pub fn from_json(json_str: &str) -> Result<Self, String> {
-        let d: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| format!("JSON parse error: {e}"))?;
+        let d: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {e}"))?;
         let obj = d.as_object().ok_or("expected JSON object")?;
         Ok(Self {
             cert_id: obj["cert_id"].as_str().unwrap_or_default().to_string(),
             agent_id: obj["agent_id"].as_str().unwrap_or_default().to_string(),
-            public_key_hex: obj["public_key_hex"].as_str().unwrap_or_default().to_string(),
+            public_key_hex: obj["public_key_hex"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             algorithm: obj["algorithm"].as_str().unwrap_or_default().to_string(),
             issued_at: obj["issued_at"].as_f64().unwrap_or(0.0),
             expires_at: obj["expires_at"].as_f64().unwrap_or(0.0),
             ca_kid: obj["ca_kid"].as_str().unwrap_or_default().to_string(),
             issuer_id: obj["issuer_id"].as_str().unwrap_or_default().to_string(),
-            cert_signature: hex::decode(
-                obj["cert_signature"].as_str().unwrap_or_default()
-            ).map_err(|e| format!("hex decode error: {e}"))?,
+            cert_signature: hex::decode(obj["cert_signature"].as_str().unwrap_or_default())
+                .map_err(|e| format!("hex decode error: {e}"))?,
         })
     }
 
@@ -449,10 +490,13 @@ impl IdentityVerifier {
     /// into every other in-flight session's identity-binding checks.
     pub fn register_ca_key(&self, ca_kid: &str, verifying_key: VerifyingKey) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.ca_keys.insert(ca_kid.to_string(), CAKeyRecord {
-            verifying_key,
-            _kid: ca_kid.to_string(),
-        });
+        inner.ca_keys.insert(
+            ca_kid.to_string(),
+            CAKeyRecord {
+                verifying_key,
+                _kid: ca_kid.to_string(),
+            },
+        );
     }
 
     /// Mark a certificate as revoked.
@@ -464,7 +508,9 @@ impl IdentityVerifier {
     pub fn revoke_certificate(&self, cert_id: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.revoked_certs.insert(cert_id.to_string());
-        inner.verified.retain(|_, verified_cert_id| verified_cert_id != cert_id);
+        inner
+            .verified
+            .retain(|_, verified_cert_id| verified_cert_id != cert_id);
     }
 
     /// Verify an AgentIdentityCertificate.
@@ -485,26 +531,39 @@ impl IdentityVerifier {
         if revoked {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::KeyRevoked,
-                format!("C-3: Identity certificate '{}' for agent '{}' has been revoked.",
-                    cert.cert_id, cert.agent_id),
+                format!(
+                    "C-3: Identity certificate '{}' for agent '{}' has been revoked.",
+                    cert.cert_id, cert.agent_id
+                ),
             ));
         }
         if cert.is_expired() {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TokenExpired,
-                format!("C-3: Identity certificate for agent '{}' has expired.", cert.agent_id),
+                format!(
+                    "C-3: Identity certificate for agent '{}' has expired.",
+                    cert.agent_id
+                ),
             ));
         }
-        let ca_pub = ca_verifying_key.ok_or_else(|| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityBindingMissing,
-            format!("C-3: CA key '{}' not registered in IdentityVerifier.", cert.ca_kid),
-        ))?;
+        let ca_pub = ca_verifying_key.ok_or_else(|| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                format!(
+                    "C-3: CA key '{}' not registered in IdentityVerifier.",
+                    cert.ca_kid
+                ),
+            )
+        })?;
 
         // Verify signature
         if cert.cert_signature.len() != 64 {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::IdentityMisbinding,
-                format!("C-3: Identity certificate signature invalid length for agent '{}'.", cert.agent_id),
+                format!(
+                    "C-3: Identity certificate signature invalid length for agent '{}'.",
+                    cert.agent_id
+                ),
             ));
         }
         let sig_bytes: [u8; 64] = cert.cert_signature[..].try_into().unwrap();
@@ -512,19 +571,29 @@ impl IdentityVerifier {
         // L-3 fix: propagate a hypothetical canonicalization failure as a rejected
         // certificate (fail closed) instead of silently verifying against an empty
         // body (fail open).
-        let body = cert.body_bytes().map_err(|e| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityMisbinding,
-            format!("C-3: failed to canonicalize identity certificate body for agent '{}': {e}", cert.agent_id),
-        ))?;
+        let body = cert.body_bytes().map_err(|e| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                format!(
+                    "C-3: failed to canonicalize identity certificate body for agent '{}': {e}",
+                    cert.agent_id
+                ),
+            )
+        })?;
         if ca_pub.verify(&body, &sig).is_err() {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::IdentityMisbinding,
-                format!("C-3: Identity certificate signature invalid for agent '{}'.", cert.agent_id),
+                format!(
+                    "C-3: Identity certificate signature invalid for agent '{}'.",
+                    cert.agent_id
+                ),
             ));
         }
 
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.verified.insert(cert.agent_id.clone(), cert.cert_id.clone());
+        inner
+            .verified
+            .insert(cert.agent_id.clone(), cert.cert_id.clone());
         Ok(())
     }
 
@@ -564,9 +633,11 @@ impl IdentityVerifier {
         if agent_id != transcript_agent {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SessionSpliceDetected,
-                format!("C-3: Agent identity '{}' does not match transcript {} agent '{}'. \
+                format!(
+                    "C-3: Agent identity '{}' does not match transcript {} agent '{}'. \
                     Identity substitution or session-splice detected.",
-                    agent_id, role, transcript_agent),
+                    agent_id, role, transcript_agent
+                ),
             ));
         }
 
@@ -589,9 +660,12 @@ impl IdentityVerifier {
             let thash_prefix: String = session.thash.chars().take(16).collect();
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TranscriptHashMismatch,
-                format!("C-3: Capability token thash '{}'…' does not match \
+                format!(
+                    "C-3: Capability token thash '{}'…' does not match \
                     session transcript thash '{}'…'. Cross-session replay or transcript \
-                    tampering detected.", cap_prefix, thash_prefix),
+                    tampering detected.",
+                    cap_prefix, thash_prefix
+                ),
             ));
         }
         Ok(())
@@ -613,18 +687,29 @@ impl IdentityVerifier {
 
     /// Gate: raise SAACPHardDrop if agent_id has not completed identity verification, or if
     /// the certificate it was verified against has since been revoked.
-    pub fn require_identity_verified(&self, agent_id: &str, operation: &str) -> Result<(), SAACPHardDrop> {
+    pub fn require_identity_verified(
+        &self,
+        agent_id: &str,
+        operation: &str,
+    ) -> Result<(), SAACPHardDrop> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let cert_id = inner.verified.get(agent_id).ok_or_else(|| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityNotVerified,
-            format!("C-3: Identity verification for agent '{}' must be completed before {}.",
-                agent_id, operation),
-        ))?;
+        let cert_id = inner.verified.get(agent_id).ok_or_else(|| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityNotVerified,
+                format!(
+                    "C-3: Identity verification for agent '{}' must be completed before {}.",
+                    agent_id, operation
+                ),
+            )
+        })?;
         if inner.revoked_certs.contains(cert_id) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::KeyRevoked,
-                format!("C-3: Identity certificate for agent '{}' has been revoked; \
-                    re-verification is required before {}.", agent_id, operation),
+                format!(
+                    "C-3: Identity certificate for agent '{}' has been revoked; \
+                    re-verification is required before {}.",
+                    agent_id, operation
+                ),
             ));
         }
         Ok(())
@@ -748,7 +833,12 @@ impl IdentityGate {
     }
 
     /// Require that all phases up to and including `phase` have been completed.
-    pub fn require_phase(&self, agent_id: &str, sid: &str, phase: &str) -> Result<(), SAACPHardDrop> {
+    pub fn require_phase(
+        &self,
+        agent_id: &str,
+        sid: &str,
+        phase: &str,
+    ) -> Result<(), SAACPHardDrop> {
         let idx = Self::phase_index(phase).ok_or_else(|| {
             SAACPHardDrop::new(
                 SAACPBytecodes::IdentityNotVerified,
@@ -758,7 +848,11 @@ impl IdentityGate {
         let key = (agent_id.to_string(), sid.to_string());
         let completed = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.progress.get(&key).map(|p| p.phases.clone()).unwrap_or_default()
+            inner
+                .progress
+                .get(&key)
+                .map(|p| p.phases.clone())
+                .unwrap_or_default()
         };
 
         // Every phase with index <= idx must be completed
@@ -825,7 +919,9 @@ impl SessionIdentityRegistry {
             && !inner.sessions.contains_key(&session.thash)
         {
             let evict_count = inner.sessions.len() + 1 - SESSION_IDENTITY_REGISTRY_MAX_ENTRIES;
-            let mut by_age: Vec<(String, f64)> = inner.sessions.iter()
+            let mut by_age: Vec<(String, f64)> = inner
+                .sessions
+                .iter()
                 .map(|(k, v)| (k.clone(), v.established_at))
                 .collect();
             by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -885,13 +981,15 @@ impl Default for SessionIdentityRegistry {
 }
 
 /// Process-wide default identity verifier.
-pub static DEFAULT_IDENTITY_VERIFIER: LazyLock<IdentityVerifier> = LazyLock::new(IdentityVerifier::new);
+pub static DEFAULT_IDENTITY_VERIFIER: LazyLock<IdentityVerifier> =
+    LazyLock::new(IdentityVerifier::new);
 
 /// Process-wide default identity gate.
 pub static DEFAULT_IDENTITY_GATE: LazyLock<IdentityGate> = LazyLock::new(IdentityGate::new);
 
 /// Process-wide default session identity registry.
-pub static DEFAULT_IDENTITY_REGISTRY: LazyLock<SessionIdentityRegistry> = LazyLock::new(SessionIdentityRegistry::new);
+pub static DEFAULT_IDENTITY_REGISTRY: LazyLock<SessionIdentityRegistry> =
+    LazyLock::new(SessionIdentityRegistry::new);
 
 pub static GLOBAL_IDENTITY_GATE: LazyLock<IdentityGate> = LazyLock::new(IdentityGate::new);
 
@@ -1007,12 +1105,28 @@ mod tests {
     fn test_thash_deterministic() {
         let sid = vec![0xAB; 16];
         let s1 = TranscriptBoundSession::establish(
-            sid.clone(), "c", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid.clone(),
+            "c",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let s2 = TranscriptBoundSession::establish(
-            sid, "c", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid,
+            "c",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         assert_eq!(s1.thash, s2.thash);
     }
@@ -1021,12 +1135,28 @@ mod tests {
     fn test_thash_different_params() {
         let sid = vec![0xAB; 16];
         let s1 = TranscriptBoundSession::establish(
-            sid.clone(), "c1", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid.clone(),
+            "c1",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let s2 = TranscriptBoundSession::establish(
-            sid, "c2", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid,
+            "c2",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         assert_ne!(s1.thash, s2.thash);
     }
@@ -1038,7 +1168,13 @@ mod tests {
         let agent_pk_hex = hex::encode(agent_vk.as_bytes());
 
         let cert = AgentIdentityCertificate::issue(
-            "agent-ok", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+            "agent-ok",
+            &agent_pk_hex,
+            &ca_sk,
+            "ca-01",
+            "root",
+            86400.0,
+            "ed25519",
         );
 
         let verifier = IdentityVerifier::new();
@@ -1054,7 +1190,13 @@ mod tests {
         let agent_pk_hex = hex::encode(agent_vk.as_bytes());
 
         let cert = AgentIdentityCertificate::issue(
-            "agent-rev", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+            "agent-rev",
+            &agent_pk_hex,
+            &ca_sk,
+            "ca-01",
+            "root",
+            86400.0,
+            "ed25519",
         );
 
         let verifier = IdentityVerifier::new();
@@ -1074,7 +1216,13 @@ mod tests {
         let agent_pk_hex = hex::encode(agent_vk.as_bytes());
 
         let cert = AgentIdentityCertificate::issue(
-            "agent-cached", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+            "agent-cached",
+            &agent_pk_hex,
+            &ca_sk,
+            "ca-01",
+            "root",
+            86400.0,
+            "ed25519",
         );
 
         let verifier = IdentityVerifier::new();
@@ -1083,7 +1231,9 @@ mod tests {
         // Agent completes identity verification — cached as verified.
         assert!(verifier.verify_certificate(&cert).is_ok());
         assert!(verifier.is_identity_verified("agent-cached"));
-        assert!(verifier.require_identity_verified("agent-cached", "test op").is_ok());
+        assert!(verifier
+            .require_identity_verified("agent-cached", "test op")
+            .is_ok());
 
         // Certificate is revoked (e.g. compromise detected) AFTER caching.
         verifier.revoke_certificate(&cert.cert_id);
@@ -1096,9 +1246,12 @@ mod tests {
             !verifier.is_identity_verified("agent-cached"),
             "CRIT-8: revocation must invalidate the cached verified status"
         );
-        let err = verifier.require_identity_verified("agent-cached", "test op").unwrap_err();
+        let err = verifier
+            .require_identity_verified("agent-cached", "test op")
+            .unwrap_err();
         assert_eq!(
-            err.bytecode, SAACPBytecodes::IdentityNotVerified,
+            err.bytecode,
+            SAACPBytecodes::IdentityNotVerified,
             "CRIT-8: eager purge removes the cache entry entirely, so re-verification is required"
         );
     }
@@ -1113,7 +1266,13 @@ mod tests {
         let agent_pk_hex = hex::encode(agent_vk.as_bytes());
 
         let cert = AgentIdentityCertificate::issue(
-            "agent-defense", &agent_pk_hex, &ca_sk, "ca-01", "root", 86400.0, "ed25519",
+            "agent-defense",
+            &agent_pk_hex,
+            &ca_sk,
+            "ca-01",
+            "root",
+            86400.0,
+            "ed25519",
         );
 
         let verifier = IdentityVerifier::new();
@@ -1132,9 +1291,12 @@ mod tests {
             !verifier.is_identity_verified("agent-defense"),
             "CRIT-8: read-time recheck must catch a revoked cert_id even without eager purge"
         );
-        let err = verifier.require_identity_verified("agent-defense", "test op").unwrap_err();
+        let err = verifier
+            .require_identity_verified("agent-defense", "test op")
+            .unwrap_err();
         assert_eq!(
-            err.bytecode, SAACPBytecodes::KeyRevoked,
+            err.bytecode,
+            SAACPBytecodes::KeyRevoked,
             "CRIT-8: require_identity_verified must report KeyRevoked when the cached \
                 cert_id is present in revoked_certs"
         );
@@ -1147,7 +1309,13 @@ mod tests {
         let agent_pk_hex = hex::encode(agent_vk.as_bytes());
 
         let cert = AgentIdentityCertificate::issue(
-            "agent-x", &agent_pk_hex, &ca_sk, "ca-unknown", "root", 86400.0, "ed25519",
+            "agent-x",
+            &agent_pk_hex,
+            &ca_sk,
+            "ca-unknown",
+            "root",
+            86400.0,
+            "ed25519",
         );
 
         let verifier = IdentityVerifier::new();
@@ -1161,27 +1329,45 @@ mod tests {
         let client_pk = "aa".repeat(32);
         let server_pk = "bb".repeat(32);
         let session = TranscriptBoundSession::establish(
-            sid, "client-a", "server-b",
-            &client_pk, &server_pk,
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "client-a",
+            "server-b",
+            &client_pk,
+            &server_pk,
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let verifier = IdentityVerifier::new();
-        assert!(verifier.verify_transcript_binding(&session, "client-a", &client_pk, "client").is_ok());
-        assert!(verifier.verify_transcript_binding(&session, "server-b", &server_pk, "server").is_ok());
+        assert!(verifier
+            .verify_transcript_binding(&session, "client-a", &client_pk, "client")
+            .is_ok());
+        assert!(verifier
+            .verify_transcript_binding(&session, "server-b", &server_pk, "server")
+            .is_ok());
     }
 
     #[test]
     fn test_verify_transcript_binding_key_swap() {
         let sid = vec![0xAB; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "client-a", "server-b",
-            &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "client-a",
+            "server-b",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let verifier = IdentityVerifier::new();
-        let err = verifier.verify_transcript_binding(&session, "client-a", &"ff".repeat(32), "client").unwrap_err();
+        let err = verifier
+            .verify_transcript_binding(&session, "client-a", &"ff".repeat(32), "client")
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
     }
 
@@ -1196,26 +1382,38 @@ mod tests {
         let sid = vec![0xAB; 16];
         let client_pk = "aa".repeat(32);
         let session = TranscriptBoundSession::establish(
-            sid, "client-a", "server-b",
-            &client_pk, &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "client-a",
+            "server-b",
+            &client_pk,
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let verifier = IdentityVerifier::new();
 
         // Exact match still succeeds.
-        assert!(verifier.verify_transcript_binding(&session, "client-a", &client_pk, "client").is_ok());
+        assert!(verifier
+            .verify_transcript_binding(&session, "client-a", &client_pk, "client")
+            .is_ok());
 
         // Well-formed hex, same length, differing only in the final byte.
         let mut tampered = client_pk.clone();
         let last = tampered.pop().unwrap();
         let flipped = if last == 'a' { 'b' } else { 'a' };
         tampered.push(flipped);
-        let err = verifier.verify_transcript_binding(&session, "client-a", &tampered, "client").unwrap_err();
+        let err = verifier
+            .verify_transcript_binding(&session, "client-a", &tampered, "client")
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
 
         // Malformed non-hex input must be rejected (fail-closed), not panic.
-        let err = verifier.verify_transcript_binding(&session, "client-a", "not-valid-hex!!", "client").unwrap_err();
+        let err = verifier
+            .verify_transcript_binding(&session, "client-a", "not-valid-hex!!", "client")
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::IdentityMisbinding);
     }
 
@@ -1223,12 +1421,24 @@ mod tests {
     fn test_verify_thash_matches_capability() {
         let sid = vec![0xAB; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "c", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid,
+            "c",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let verifier = IdentityVerifier::new();
-        assert!(verifier.verify_thash_matches_capability(&session, &session.thash).is_ok());
-        let err = verifier.verify_thash_matches_capability(&session, "wrong_hash").unwrap_err();
+        assert!(verifier
+            .verify_thash_matches_capability(&session, &session.thash)
+            .is_ok());
+        let err = verifier
+            .verify_thash_matches_capability(&session, "wrong_hash")
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
     }
 
@@ -1243,24 +1453,38 @@ mod tests {
     fn test_verify_thash_matches_capability_constant_time() {
         let sid = vec![0xAB; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "c", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid,
+            "c",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let verifier = IdentityVerifier::new();
 
         // Exact match still succeeds.
-        assert!(verifier.verify_thash_matches_capability(&session, &session.thash).is_ok());
+        assert!(verifier
+            .verify_thash_matches_capability(&session, &session.thash)
+            .is_ok());
 
         // Well-formed hex, same length, differing only in the final byte.
         let mut tampered = session.thash.clone();
         let last = tampered.pop().unwrap();
         let flipped = if last == '0' { '1' } else { '0' };
         tampered.push(flipped);
-        let err = verifier.verify_thash_matches_capability(&session, &tampered).unwrap_err();
+        let err = verifier
+            .verify_thash_matches_capability(&session, &tampered)
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
 
         // Malformed non-hex input must be rejected (fail-closed), not panic.
-        let err = verifier.verify_thash_matches_capability(&session, "not-valid-hex!!").unwrap_err();
+        let err = verifier
+            .verify_thash_matches_capability(&session, "not-valid-hex!!")
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::TranscriptHashMismatch);
     }
 
@@ -1311,14 +1535,21 @@ mod tests {
                 let last_touched = (IDENTITY_GATE_MAX_ENTRIES - i) as f64;
                 inner.progress.insert(
                     (format!("agent-{i:06}"), "sess".to_string()),
-                    GateProgress { phases: HashSet::new(), last_touched },
+                    GateProgress {
+                        phases: HashSet::new(),
+                        last_touched,
+                    },
                 );
             }
         }
-        assert_eq!(gate.inner.lock().unwrap().progress.len(), IDENTITY_GATE_MAX_ENTRIES);
+        assert_eq!(
+            gate.inner.lock().unwrap().progress.len(),
+            IDENTITY_GATE_MAX_ENTRIES
+        );
 
         // One more distinct key must trigger eviction, not grow past the cap.
-        gate.advance("brand-new-agent", "sess", "IDENTITY_VERIFIED").unwrap();
+        gate.advance("brand-new-agent", "sess", "IDENTITY_VERIFIED")
+            .unwrap();
         let inner = gate.inner.lock().unwrap();
         assert!(
             inner.progress.len() <= IDENTITY_GATE_MAX_ENTRIES,
@@ -1327,14 +1558,18 @@ mod tests {
 
         // The newly-advanced entry (freshest last_touched) must survive.
         assert!(
-            inner.progress.contains_key(&("brand-new-agent".to_string(), "sess".to_string())),
+            inner
+                .progress
+                .contains_key(&("brand-new-agent".to_string(), "sess".to_string())),
             "the just-advanced entry must not be evicted"
         );
         // Every surviving pre-existing entry must have a last_touched
         // STRICTLY GREATER than the smallest possible value (1.0) — i.e.
         // the genuinely oldest entries (last_touched near 1..few) were
         // evicted first, not entries chosen by key/hash order.
-        let min_surviving_prefilled = inner.progress.iter()
+        let min_surviving_prefilled = inner
+            .progress
+            .iter()
             .filter(|(k, _)| k.0 != "brand-new-agent")
             .map(|(_, v)| v.last_touched)
             .fold(f64::INFINITY, f64::min);
@@ -1358,20 +1593,25 @@ mod tests {
                 phases.insert("IDENTITY_VERIFIED".to_string());
                 inner.progress.insert(
                     (format!("agent-{i:06}"), "sess".to_string()),
-                    GateProgress { phases, last_touched: i as f64 },
+                    GateProgress {
+                        phases,
+                        last_touched: i as f64,
+                    },
                 );
             }
         }
         // Before eviction: agent-000000 already completed IDENTITY_VERIFIED,
         // so requiring exactly that phase must currently succeed.
         assert!(
-            gate.require_phase("agent-000000", "sess", "IDENTITY_VERIFIED").is_ok(),
+            gate.require_phase("agent-000000", "sess", "IDENTITY_VERIFIED")
+                .is_ok(),
             "test setup: agent-000000 must start with IDENTITY_VERIFIED completed"
         );
 
         // Force eviction of the very oldest entry (last_touched == 0.0, i.e.
         // agent-000000 specifically).
-        gate.advance("forcing-eviction-agent", "sess", "IDENTITY_VERIFIED").unwrap();
+        gate.advance("forcing-eviction-agent", "sess", "IDENTITY_VERIFIED")
+            .unwrap();
 
         // agent-000000 had the smallest last_touched (0.0) and must now have
         // been evicted — requiring the SAME phase it had already completed
@@ -1393,16 +1633,28 @@ mod tests {
 
         let sid = vec![0xAB; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "c", "s", &"aa".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16), "v1", "cs1", None,
+            sid,
+            "c",
+            "s",
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let thash = session.thash.clone();
         let sid_hex = session.session_id_hex();
 
         reg.register(session);
         assert_eq!(reg.count(), 1);
-        assert!(reg.get_by_thash(&thash, |s| s.client_agent_id.clone()).is_some());
-        assert!(reg.get_by_session_id(&sid_hex, |s| s.server_agent_id.clone()).is_some());
+        assert!(reg
+            .get_by_thash(&thash, |s| s.client_agent_id.clone())
+            .is_some());
+        assert!(reg
+            .get_by_session_id(&sid_hex, |s| s.server_agent_id.clone())
+            .is_some());
 
         reg.remove(&thash);
         assert_eq!(reg.count(), 0);
@@ -1461,7 +1713,9 @@ mod tests {
         );
 
         let inner = reg.inner.lock().unwrap();
-        let min_surviving_established_at = inner.sessions.values()
+        let min_surviving_established_at = inner
+            .sessions
+            .values()
             .map(|s| s.established_at)
             .filter(|&t| t < 999_999.0)
             .fold(f64::INFINITY, f64::min);
@@ -1475,7 +1729,9 @@ mod tests {
     #[test]
     fn test_default_statics() {
         assert!(!DEFAULT_IDENTITY_VERIFIER.is_identity_verified("nobody"));
-        assert!(DEFAULT_IDENTITY_GATE.require_phase("a", "s", "IDENTITY_VERIFIED").is_err());
+        assert!(DEFAULT_IDENTITY_GATE
+            .require_phase("a", "s", "IDENTITY_VERIFIED")
+            .is_err());
         assert_eq!(DEFAULT_IDENTITY_REGISTRY.count(), 0);
     }
 }

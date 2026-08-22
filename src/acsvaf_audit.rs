@@ -288,7 +288,12 @@ impl ACSVAFAuditLog {
     }
 
     /// Log a key compromise event.
-    pub fn log_compromise(&self, compromised_kid: &str, affected_token_count: usize, replacement_kid: &str) {
+    pub fn log_compromise(
+        &self,
+        compromised_kid: &str,
+        affected_token_count: usize,
+        replacement_kid: &str,
+    ) {
         self.tlog.append(CapabilityAuditEntry {
             event_type: EVENT_KEY_COMPROMISED.into(),
             issuer_id: "recovery".into(),
@@ -341,8 +346,14 @@ mod tests {
         let tlog = Arc::new(CapabilityTransparencyLog::new());
         let audit = ACSVAFAuditLog::new(tlog.clone(), None);
         audit.log_issuance(
-            "jti-12345678", "kid-abc", "issuer-1", "sub-1",
-            &["aud-1".into()], &["read".into()], 0, None,
+            "jti-12345678",
+            "kid-abc",
+            "issuer-1",
+            "sub-1",
+            &["aud-1".into()],
+            &["read".into()],
+            0,
+            None,
         );
         assert_eq!(tlog.entry_count(), 1);
         let entries = tlog.entries();
@@ -354,8 +365,13 @@ mod tests {
         let tlog = Arc::new(CapabilityTransparencyLog::new());
         let audit = ACSVAFAuditLog::new(tlog.clone(), None);
         audit.log_verification(
-            "issuer-1", "jti-12345678", "sub-1",
-            &["aud-1".into()], &["read".into()], 0, None,
+            "issuer-1",
+            "jti-12345678",
+            "sub-1",
+            &["aud-1".into()],
+            &["read".into()],
+            0,
+            None,
         );
         assert_eq!(tlog.entry_count(), 1);
     }
@@ -375,9 +391,14 @@ mod tests {
         let tlog = Arc::new(CapabilityTransparencyLog::new());
         let audit = ACSVAFAuditLog::new(tlog.clone(), None);
         audit.log_delegation(
-            "parent-jti-12345", "child-jti-12345",
-            "child-iss", "child-kid", "child-sub",
-            &["aud".into()], &["write".into()], 1,
+            "parent-jti-12345",
+            "child-jti-12345",
+            "child-iss",
+            "child-kid",
+            "child-sub",
+            &["aud".into()],
+            &["write".into()],
+            1,
         );
         assert_eq!(tlog.entry_count(), 1);
     }

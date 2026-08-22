@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde_json;
@@ -343,13 +343,26 @@ impl AgentCredential {
     }
 
     pub fn is_expired(&self) -> bool {
-        now_f64() > self.payload.get("not_after").and_then(|v| v.as_f64()).unwrap_or(0.0)
+        now_f64()
+            > self
+                .payload
+                .get("not_after")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
     }
 
     pub fn is_active(&self) -> bool {
         let now = now_f64();
-        let nb = self.payload.get("not_before").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let na = self.payload.get("not_after").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let nb = self
+            .payload
+            .get("not_before")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let na = self
+            .payload
+            .get("not_after")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         nb <= now && now <= na
     }
 
@@ -459,7 +472,10 @@ impl TrustStore {
     pub fn register_anchor(&self, anchor: TrustAnchor) {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut anchors = self.anchors.lock().unwrap();
-        let mut epoch = self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut epoch = self
+            .verification_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         anchors.insert(anchor.anchor_id.clone(), anchor);
         *epoch += 1;
     }
@@ -469,7 +485,10 @@ impl TrustStore {
         let mut anchors = self.anchors.lock().unwrap();
         let existed = anchors.remove(anchor_id).is_some();
         if existed {
-            *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            *self
+                .verification_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) += 1;
         }
         existed
     }
@@ -501,14 +520,20 @@ impl TrustStore {
         let fp = pub_key_fingerprint(&public_key);
         pinned.insert(agent_id.to_string(), public_key);
         by_fp.insert(fp, public_key);
-        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .verification_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     pub fn register_key_by_fingerprint(&self, fingerprint: &str, public_key: VerifyingKey) {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut by_fp = self.keys_by_fp.lock().unwrap();
         by_fp.insert(fingerprint.to_string(), public_key);
-        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .verification_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     pub fn get_pinned_key(&self, agent_id: &str) -> Option<VerifyingKey> {
@@ -580,7 +605,10 @@ impl TrustStore {
     }
 
     pub fn epoch(&self) -> u64 {
-        *self.verification_epoch.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .verification_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -854,7 +882,12 @@ impl DistributedRevocationInfrastructure {
         record.revoker_signature = sign_data(&revoker_identity.signing_key, &record.body_bytes());
         self.store_record(record.clone())?;
 
-        if let Some(engine) = self.gossip.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(engine) = self
+            .gossip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
             engine.broadcast(record.clone());
         }
 
@@ -914,7 +947,10 @@ impl DistributedRevocationInfrastructure {
     ///   revocation monotonic: an attacker cannot use flooding to weaken a
     ///   previously-established security condition.
     fn store_record(&self, record: SignedRevocationRecord) -> Result<(), DRIError> {
-        let mut agents = self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut agents = self
+            .revoked_agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut creds = self
             .revoked_credentials
             .lock()
@@ -960,9 +996,7 @@ impl DistributedRevocationInfrastructure {
     fn evict_stale_low_severity(map: &mut HashMap<String, SignedRevocationRecord>) -> usize {
         let mut candidates: Vec<(String, f64)> = map
             .iter()
-            .filter(|(_, r)| {
-                r.age_days() > REVOCATION_RETENTION_DAYS && !r.is_high_severity()
-            })
+            .filter(|(_, r)| r.age_days() > REVOCATION_RETENTION_DAYS && !r.is_high_severity())
             .map(|(k, r)| (k.clone(), r.revoked_at))
             .collect();
 
@@ -1005,12 +1039,18 @@ impl DistributedRevocationInfrastructure {
     /// singleton, so one poisoning panic must not cascade into every other
     /// caller losing the ability to check revocation status.
     pub fn is_revoked(&self, agent_id: &str, credential_fingerprint: &str) -> bool {
-        let agents = self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner());
+        let agents = self
+            .revoked_agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if agents.contains_key(agent_id) {
             return true;
         }
         if !credential_fingerprint.is_empty() {
-            let creds = self.revoked_credentials.lock().unwrap_or_else(|e| e.into_inner());
+            let creds = self
+                .revoked_credentials
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if creds.contains_key(credential_fingerprint) {
                 return true;
             }
@@ -1019,17 +1059,33 @@ impl DistributedRevocationInfrastructure {
     }
 
     pub fn get_revocation_record(&self, agent_id: &str) -> Option<SignedRevocationRecord> {
-        self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner()).get(agent_id).cloned()
+        self.revoked_agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent_id)
+            .cloned()
     }
 
     pub fn epoch(&self) -> u64 {
-        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .revocation_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn clear(&self) {
-        self.revoked_agents.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.revoked_credentials.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.revocation_epoch.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        self.revoked_agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.revoked_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .revocation_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
     }
 }
 
@@ -1161,7 +1217,10 @@ impl TrustMeshFederation {
         };
 
         if !source_anchor.verify_credential(source_cred) {
-            return (false, "credential_not_verified_by_source_anchor".to_string());
+            return (
+                false,
+                "credential_not_verified_by_source_anchor".to_string(),
+            );
         }
 
         for ag in agreements.values() {
@@ -1170,9 +1229,13 @@ impl TrustMeshFederation {
             }
             if ag.members.iter().any(|m| m == source_domain)
                 && ag.members.iter().any(|m| m == target_domain)
-                && ag.allowed_scopes.iter().any(|s| s == requested_scope || s == "*") {
-                    return (true, String::new());
-                }
+                && ag
+                    .allowed_scopes
+                    .iter()
+                    .any(|s| s == requested_scope || s == "*")
+            {
+                return (true, String::new());
+            }
         }
 
         (false, "no_valid_federation_agreement".to_string())
@@ -1278,10 +1341,12 @@ impl IdentityProver {
                 && !challenges.contains_key(challenge)
             {
                 let evict_count = challenges.len() + 1 - IDENTITY_PROVER_MAX_CHALLENGES;
-                let mut by_expiry: Vec<(Vec<u8>, f64)> = challenges.iter()
+                let mut by_expiry: Vec<(Vec<u8>, f64)> = challenges
+                    .iter()
                     .map(|(k, exp)| (k.clone(), *exp))
                     .collect();
-                by_expiry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                by_expiry
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (k, _) in by_expiry.into_iter().take(evict_count) {
                     challenges.remove(&k);
                 }
@@ -1435,10 +1500,7 @@ impl DelegationChain {
 
     /// Verify a full delegation chain.
     /// chain[0] must be verifiable by a trust anchor.
-    pub fn verify_chain(
-        chain: &[AgentCredential],
-        trust_store: &TrustStore,
-    ) -> (bool, String) {
+    pub fn verify_chain(chain: &[AgentCredential], trust_store: &TrustStore) -> (bool, String) {
         if chain.is_empty() {
             return (false, "empty_delegation_chain".to_string());
         }
@@ -1451,7 +1513,10 @@ impl DelegationChain {
         for cred in chain {
             let aid = cred.agent_id();
             if !seen_ids.insert(aid) {
-                return (false, format!("circular_delegation_detected:{}", cred.agent_id()));
+                return (
+                    false,
+                    format!("circular_delegation_detected:{}", cred.agent_id()),
+                );
             }
         }
 
@@ -1480,10 +1545,7 @@ impl DelegationChain {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             if depth > FAITF_MAX_DELEGATION_DEPTH {
-                return (
-                    false,
-                    format!("delegation_depth_{depth}_exceeds_max"),
-                );
+                return (false, format!("delegation_depth_{depth}_exceeds_max"));
             }
 
             let parent_pub = match parent_cred.agent_public_key() {
@@ -1513,7 +1575,10 @@ impl DelegationChain {
                 return (false, format!("delegated_credential_expired_at_index_{i}"));
             }
             if !child_cred.is_active() {
-                return (false, format!("delegated_credential_not_active_at_index_{i}"));
+                return (
+                    false,
+                    format!("delegated_credential_not_active_at_index_{i}"),
+                );
             }
             if DistributedRevocationInfrastructure::global()
                 .is_revoked(&child_cred.agent_id(), &child_cred.fingerprint())
@@ -1753,16 +1818,15 @@ mod tests {
 
     /// Helper: create issuer (AgentIdentity + signed AgentCredential + TrustAnchor).
     fn make_issuer(id: &str) -> (AgentIdentity, AgentCredential, TrustAnchor) {
-        let (sk, anchor) = provision_issuer(
-            id, &[id], FAITF_MAX_DELEGATION_DEPTH, 1, TrustModel::Direct,
-        );
+        let (sk, anchor) =
+            provision_issuer(id, &[id], FAITF_MAX_DELEGATION_DEPTH, 1, TrustModel::Direct);
         let identity = AgentIdentity::generate(
-            id,           // agent_id
-            id,           // issuer_id (self-issued)
-            3600,         // ttl_seconds
-            None,         // trust_policy
-            None,         // capability_constraints
-            "",           // revocation_info
+            id,   // agent_id
+            id,   // issuer_id (self-issued)
+            3600, // ttl_seconds
+            None, // trust_policy
+            None, // capability_constraints
+            "",   // revocation_info
             AttestationType::None,
         );
         let cred = AgentCredential::issue(&identity, &sk, &anchor.verifying_key);
@@ -1786,7 +1850,11 @@ mod tests {
             let child_identity = AgentIdentity::generate(
                 &format!("agent-{depth}"),
                 &parent_identity.agent_id,
-                3600, None, None, "", AttestationType::None,
+                3600,
+                None,
+                None,
+                "",
+                AttestationType::None,
             );
             let result = DelegationChain::issue_delegated(
                 &parent_identity,
@@ -1828,8 +1896,13 @@ mod tests {
         }
 
         let child_identity = AgentIdentity::generate(
-            "child-amp", &parent_identity.agent_id,
-            3600, None, None, "", AttestationType::None,
+            "child-amp",
+            &parent_identity.agent_id,
+            3600,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
 
         // Child claims max_action_class=2 — more than parent's 1
@@ -1846,7 +1919,9 @@ mod tests {
         assert!(result.is_err(), "privilege amplification must be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.contains("amplification") || err.contains("Privilege") || err.contains("max_action_class"),
+            err.contains("amplification")
+                || err.contains("Privilege")
+                || err.contains("max_action_class"),
             "error must mention privilege amplification: got '{err}'"
         );
     }
@@ -1888,8 +1963,13 @@ mod tests {
         // with any other test's revocations.
         let child_agent_id = "delegated-child-revoke-unique-xyz";
         let child_identity = AgentIdentity::generate(
-            child_agent_id, &issuer_identity.agent_id,
-            3600, None, None, "", AttestationType::None,
+            child_agent_id,
+            &issuer_identity.agent_id,
+            3600,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
         let constraints = serde_json::json!({"max_action_class": 0});
         let delegated = DelegationChain::issue_delegated(
@@ -1900,7 +1980,8 @@ mod tests {
             constraints,
             3600,
             1,
-        ).expect("depth-1 delegation must succeed");
+        )
+        .expect("depth-1 delegation must succeed");
 
         let chain = vec![issuer_cred.clone(), delegated.credential.clone()];
 
@@ -1914,7 +1995,10 @@ mod tests {
             .expect("revoke must succeed");
 
         let (ok, reason) = DelegationChain::verify_chain(&chain, &store);
-        assert!(!ok, "chain with a revoked delegated credential must be rejected");
+        assert!(
+            !ok,
+            "chain with a revoked delegated credential must be rejected"
+        );
         assert!(
             reason.contains("revoked"),
             "reason must indicate revocation: got '{reason}'"
@@ -1952,13 +2036,20 @@ mod tests {
             // (evictable) records...
             for i in 0..DRI_MAX_RECORDS - 1 {
                 let id = format!("stale-agent-{i}");
-                agents.insert(id.clone(), synthetic_record(&id, "routine cleanup", stale_ts));
+                agents.insert(
+                    id.clone(),
+                    synthetic_record(&id, "routine cleanup", stale_ts),
+                );
             }
             // ...plus one stale but HIGH-SEVERITY record, which must be
             // protected from eviction regardless of its age.
             agents.insert(
                 "compromised-agent".to_string(),
-                synthetic_record("compromised-agent", "agent compromised - key exfiltration", stale_ts),
+                synthetic_record(
+                    "compromised-agent",
+                    "agent compromised - key exfiltration",
+                    stale_ts,
+                ),
             );
         }
         assert_eq!(dri.revoked_agents.lock().unwrap().len(), DRI_MAX_RECORDS);
@@ -1966,14 +2057,20 @@ mod tests {
         // One more insert triggers capacity-driven eviction.
         let new_record = synthetic_record("new-agent", "test reason", now_f64());
         let result = dri.store_record(new_record);
-        assert!(result.is_ok(), "insert must succeed by evicting stale low-severity entries");
+        assert!(
+            result.is_ok(),
+            "insert must succeed by evicting stale low-severity entries"
+        );
 
         let agents = dri.revoked_agents.lock().unwrap();
         assert!(
             agents.contains_key("compromised-agent"),
             "CRIT-5: high-severity revocation must survive capacity-driven eviction"
         );
-        assert!(agents.contains_key("new-agent"), "new record must have been stored");
+        assert!(
+            agents.contains_key("new-agent"),
+            "new record must have been stored"
+        );
     }
 
     /// CRIT-5: if every record in the target map is protected (high-severity
@@ -1990,7 +2087,10 @@ mod tests {
             for i in 0..DRI_MAX_RECORDS {
                 let id = format!("critical-agent-{i}");
                 // High-severity AND stale — still must never be evicted.
-                agents.insert(id.clone(), synthetic_record(&id, "collusion_detected", stale_ts));
+                agents.insert(
+                    id.clone(),
+                    synthetic_record(&id, "collusion_detected", stale_ts),
+                );
             }
         }
 
@@ -2017,12 +2117,21 @@ mod tests {
             let mut agents = dri.revoked_agents.lock().unwrap();
             for i in 0..DRI_MAX_RECORDS {
                 let id = format!("critical-agent-{i}");
-                agents.insert(id.clone(), synthetic_record(&id, "collusion_detected", stale_ts));
+                agents.insert(
+                    id.clone(),
+                    synthetic_record(&id, "collusion_detected", stale_ts),
+                );
             }
         }
 
         let revoker = AgentIdentity::generate(
-            "revoker-full", "iss-full", 3600, None, None, "", AttestationType::None,
+            "revoker-full",
+            "iss-full",
+            3600,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
         let result = dri.revoke("agent-overflow", "test reason", &revoker, "");
         assert_eq!(result.unwrap_err(), DRIError::AtCapacity);
@@ -2054,14 +2163,24 @@ mod tests {
         }
 
         let anchor = AgentIdentity::generate(
-            "anchor-gossip-wire", "iss-gw", 86_400, None, None, "", AttestationType::None,
+            "anchor-gossip-wire",
+            "iss-gw",
+            86_400,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
         let trust_store = Arc::new(TrustStore::new());
         trust_store.register_anchor(TrustAnchor::new(&anchor.agent_id, anchor.verifying_key));
 
         let dri = Arc::new(DistributedRevocationInfrastructure::new());
         let transport = Arc::new(RecordingTransport {
-            peers: vec!["peer-1".to_string(), "peer-2".to_string(), "peer-3".to_string()],
+            peers: vec![
+                "peer-1".to_string(),
+                "peer-2".to_string(),
+                "peer-3".to_string(),
+            ],
             sends: StdMutex::new(0),
         });
         let engine = Arc::new(GossipEngine::new(
@@ -2073,7 +2192,13 @@ mod tests {
         dri.set_gossip_engine(engine);
 
         let revoker = AgentIdentity::generate(
-            "revoker-gw", "iss-gw", 3600, None, None, "", AttestationType::None,
+            "revoker-gw",
+            "iss-gw",
+            3600,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
         dri.revoke("agent-gossip-target", "test-broadcast", &revoker, "fp-gw")
             .expect("revoke must succeed under normal capacity");
@@ -2092,7 +2217,13 @@ mod tests {
     fn revoke_without_wired_gossip_engine_is_unaffected() {
         let dri = DistributedRevocationInfrastructure::new();
         let revoker = AgentIdentity::generate(
-            "revoker-no-gossip", "iss-ng", 3600, None, None, "", AttestationType::None,
+            "revoker-no-gossip",
+            "iss-ng",
+            3600,
+            None,
+            None,
+            "",
+            AttestationType::None,
         );
         let result = dri.revoke("agent-no-gossip", "test", &revoker, "fp-ng");
         assert!(result.is_ok());
@@ -2114,18 +2245,25 @@ mod tests {
             let mut agents = dri.revoked_agents.lock().unwrap();
             for i in 0..SMALL_MAP_SIZE {
                 let id = format!("small-agent-{i}");
-                agents.insert(id.clone(), synthetic_record(&id, "routine cleanup", stale_ts));
+                agents.insert(
+                    id.clone(),
+                    synthetic_record(&id, "routine cleanup", stale_ts),
+                );
             }
         }
         {
             let mut creds = dri.revoked_credentials.lock().unwrap();
             for i in 0..large_map_size {
                 let fp = format!("stale-cred-{i}");
-                creds.insert(fp.clone(), synthetic_record(&fp, "routine cleanup", stale_ts));
+                creds.insert(
+                    fp.clone(),
+                    synthetic_record(&fp, "routine cleanup", stale_ts),
+                );
             }
         }
         assert_eq!(
-            dri.revoked_agents.lock().unwrap().len() + dri.revoked_credentials.lock().unwrap().len(),
+            dri.revoked_agents.lock().unwrap().len()
+                + dri.revoked_credentials.lock().unwrap().len(),
             DRI_MAX_RECORDS
         );
 
@@ -2173,7 +2311,11 @@ mod tests {
         assert!((day_old.age_days() - 1.0).abs() < 0.01);
 
         let future = synthetic_record("a", "x", now + 3600.0);
-        assert_eq!(future.age_days(), 0.0, "future timestamps must clamp to age 0, not negative");
+        assert_eq!(
+            future.age_days(),
+            0.0,
+            "future timestamps must clamp to age 0, not negative"
+        );
     }
 
     // ── IdentityProver::used_challenges bounded growth (H-28) ──────────────────
@@ -2215,7 +2357,11 @@ mod tests {
         // requiring a `verify_proof` call in between — the actual
         // expiry-based removal logic is already covered by the existing
         // `evict_expired_challenges` behavior exercised inside `verify_proof`.
-        assert_eq!(prover.sweep_expired_challenges(), 0, "nothing tracked yet, nothing to sweep");
+        assert_eq!(
+            prover.sweep_expired_challenges(),
+            0,
+            "nothing tracked yet, nothing to sweep"
+        );
 
         let challenge = IdentityProver::generate_challenge();
         let bogus_proof = vec![0u8; 64];

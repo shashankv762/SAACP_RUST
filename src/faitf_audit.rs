@@ -9,8 +9,6 @@
 //! - Federation events (agreement registration, cross-domain auth)
 //! - Delegation events (chain issuance, depth, constraint summary)
 
-
-
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
@@ -162,7 +160,10 @@ impl FAITFAuditLog {
         let revoker_id_s = sanitize_for_audit(revoker_id);
         let reason_s = sanitize_for_audit(reason);
         let scope = if !credential_fingerprint.is_empty() {
-            format!("cred={}...", &credential_fingerprint[..16.min(credential_fingerprint.len())])
+            format!(
+                "cred={}...",
+                &credential_fingerprint[..16.min(credential_fingerprint.len())]
+            )
         } else {
             "agent-wide".to_string()
         };
@@ -176,14 +177,7 @@ impl FAITFAuditLog {
             "agent-wide"
         };
         let key = session_key.unwrap_or(FAITF_AUDIT_KEY.as_slice());
-        audit_log.append_signed(
-            key,
-            revoker_id,
-            agent_id,
-            token_sig,
-            &intent,
-            traceparent,
-        );
+        audit_log.append_signed(key, revoker_id, agent_id, token_sig, &intent, traceparent);
     }
 
     /// Record a key rotation / credential renewal event.
@@ -246,7 +240,11 @@ impl FAITFAuditLog {
             event_type_s,
             source_domain_s,
             target_domain_s,
-            if agreement_id.is_empty() { "no_agreement" } else { agreement_id_s.as_ref() },
+            if agreement_id.is_empty() {
+                "no_agreement"
+            } else {
+                agreement_id_s.as_ref()
+            },
             result_s
         );
         let token_sig = if agreement_id.is_empty() {
@@ -410,7 +408,13 @@ mod tests {
     fn test_log_revocation_agent_wide() {
         let log = test_log();
         FAITFAuditLog::log_revocation(
-            &log, "agent-1", "revoker-1", "policy-violation", "", None, &"0".repeat(48),
+            &log,
+            "agent-1",
+            "revoker-1",
+            "policy-violation",
+            "",
+            None,
+            &"0".repeat(48),
         );
         assert!(log.entry_count() > 0);
     }
@@ -500,7 +504,10 @@ mod tests {
     #[test]
     fn test_sanitize_for_audit_strips_control_chars() {
         assert_eq!(sanitize_for_audit("clean"), "clean");
-        assert_eq!(sanitize_for_audit("line1\nline2\r\nline3"), "line1line2line3");
+        assert_eq!(
+            sanitize_for_audit("line1\nline2\r\nline3"),
+            "line1line2line3"
+        );
         assert_eq!(sanitize_for_audit("tab\tbell\x07end"), "tabbellend");
     }
 

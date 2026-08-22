@@ -39,7 +39,11 @@ async fn start_with_shutdown_returns_promptly_with_no_connections() {
         .await
         .expect("start_with_shutdown did not return within 10s")
         .expect("daemon task panicked");
-    assert!(result.is_ok(), "start_with_shutdown returned an error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "start_with_shutdown returned an error: {:?}",
+        result
+    );
 }
 
 /// A real client connection is open when shutdown is signalled — `start_with_shutdown`
@@ -72,7 +76,11 @@ async fn start_with_shutdown_drains_in_flight_connection() {
         .await
         .expect("start_with_shutdown did not return within 20s")
         .expect("daemon task panicked");
-    assert!(result.is_ok(), "start_with_shutdown returned an error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "start_with_shutdown returned an error: {:?}",
+        result
+    );
 }
 
 /// `start()` (the zero-arg wrapper) must still behave exactly as before for any caller
@@ -88,5 +96,8 @@ async fn start_without_shutdown_keeps_accepting_connections() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let stream = TcpStream::connect(("127.0.0.1", port)).await;
-    assert!(stream.is_ok(), "daemon should still be accepting connections");
+    assert!(
+        stream.is_ok(),
+        "daemon should still be accepting connections"
+    );
 }

@@ -114,11 +114,7 @@ pub struct PinnedConnection {
 
 impl PinnedConnection {
     /// Create a new pinned connection.
-    pub fn new(
-        source_agent: String,
-        target_agent: String,
-        token_fingerprint: String,
-    ) -> Self {
+    pub fn new(source_agent: String, target_agent: String, token_fingerprint: String) -> Self {
         let now = Instant::now();
         Self {
             source_agent,
@@ -595,7 +591,8 @@ mod tests {
 
         // Fill to 90% of the (shrunk) target so the pool reads as "nearly full".
         for i in 0..18 {
-            pool.release(make_conn(&format!("s{}", i), &format!("t{}", i))).unwrap();
+            pool.release(make_conn(&format!("s{}", i), &format!("t{}", i)))
+                .unwrap();
         }
         // Drive a high miss rate against keys that were never released.
         for i in 0..10 {
@@ -603,7 +600,11 @@ mod tests {
         }
 
         pool.tune();
-        assert!(pool.target_size() > 20, "expected growth, got {}", pool.target_size());
+        assert!(
+            pool.target_size() > 20,
+            "expected growth, got {}",
+            pool.target_size()
+        );
         assert!(pool.target_size() <= MAX_POOL_SIZE);
     }
 
@@ -621,7 +622,11 @@ mod tests {
         }
 
         pool.tune();
-        assert!(pool.target_size() < 40, "expected shrink, got {}", pool.target_size());
+        assert!(
+            pool.target_size() < 40,
+            "expected shrink, got {}",
+            pool.target_size()
+        );
         assert!(pool.target_size() >= MIN_POOL_SIZE);
     }
 
@@ -632,7 +637,8 @@ mod tests {
         // Already at ceiling: growth pressure must not push past MAX_POOL_SIZE.
         pool.target_size.store(MAX_POOL_SIZE, Ordering::Relaxed);
         for i in 0..MAX_POOL_SIZE {
-            pool.release(make_conn(&format!("s{}", i), &format!("t{}", i))).unwrap();
+            pool.release(make_conn(&format!("s{}", i), &format!("t{}", i)))
+                .unwrap();
         }
         for i in 0..5 {
             assert!(pool.acquire(&format!("miss{}", i), "x", 0.0).is_none());

@@ -10,7 +10,14 @@ use saacp::{AgentRateLimiter, SAACPProtocolHandler};
 
 /// See `test_telemetry_wiring_rs.rs::build_frame` for why `framing::MEASCFrame` (not
 /// `measc::MEASCFrame`) is used here.
-fn build_frame(session: [u8; 16], secret: &[u8], payload: &[u8], schema: u16, status_code: u8, action_class: u8) -> Vec<u8> {
+fn build_frame(
+    session: [u8; 16],
+    secret: &[u8],
+    payload: &[u8],
+    schema: u16,
+    status_code: u8,
+    action_class: u8,
+) -> Vec<u8> {
     let frame = StructuralFrame {
         schema_id: schema,
         status_code,
@@ -24,7 +31,9 @@ fn build_frame(session: [u8; 16], secret: &[u8], payload: &[u8], schema: u16, st
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    frame.encode_encrypted(payload, secret).expect("encode_encrypted must succeed")
+    frame
+        .encode_encrypted(payload, secret)
+        .expect("encode_encrypted must succeed")
 }
 
 #[test]
@@ -43,7 +52,10 @@ fn clean_pipeline_pass_rewards_trust_score() {
     // only way to observe the reward path through the real pipeline.
     TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
     let after_penalty = TrustDecayEngine::global().score(&trust_key);
-    assert!(after_penalty < 1.0, "penalize must have lowered the score below the initial ceiling");
+    assert!(
+        after_penalty < 1.0,
+        "penalize must have lowered the score below the initial ceiling"
+    );
 
     // A clean, structurally-valid, non-injection packet. Schema 1 ("Task") requires
     // both `task` and `priority`. `action_class: 0` (READ_ONLY) — not the IRREVERSIBLE
@@ -52,14 +64,26 @@ fn clean_pipeline_pass_rewards_trust_score() {
         "task": "summarize the quarterly report",
         "priority": 1,
         "_capability_token": "structural-test-token",
-    }).to_string();
+    })
+    .to_string();
     let frame = build_frame(session, &secret, clean_payload.as_bytes(), 1, 0x10, 0);
 
     let rl = AgentRateLimiter::new();
     let result = SAACPProtocolHandler::intercept_packet_full(
-        &frame, &secret, agent_id, false, None, Some(&rl), None, None, None,
+        &frame,
+        &secret,
+        agent_id,
+        false,
+        None,
+        Some(&rl),
+        None,
+        None,
+        None,
     );
-    assert!(result.is_ok(), "clean packet must pass the full pipeline: {result:?}");
+    assert!(
+        result.is_ok(),
+        "clean packet must pass the full pipeline: {result:?}"
+    );
 
     let after_clean_pass = TrustDecayEngine::global().score(&trust_key);
     assert!(

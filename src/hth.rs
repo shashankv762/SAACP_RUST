@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
-use sha2::{Sha256, Digest};
 use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -294,7 +294,9 @@ impl TranscriptSession {
         if !transcript.is_finalized() {
             transcript.finalize()?;
         }
-        let hth = transcript.hth().ok_or("transcript finalized but hth is None")?;
+        let hth = transcript
+            .hth()
+            .ok_or("transcript finalized but hth is None")?;
         let established_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -332,12 +334,15 @@ impl std::fmt::Debug for TranscriptSession {
 ///
 /// # Errors
 /// Returns `Err` if `hth` is not exactly 32 bytes.
-pub fn bind_capability(hth: &[u8], capability_token_bytes: &[u8], secret: &[u8]) -> Result<Vec<u8>, String> {
+pub fn bind_capability(
+    hth: &[u8],
+    capability_token_bytes: &[u8],
+    secret: &[u8],
+) -> Result<Vec<u8>, String> {
     if hth.len() != 32 {
         return Err(format!("hth must be exactly 32 bytes, got {}", hth.len()));
     }
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .map_err(|e| format!("HMAC key error: {e}"))?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|e| format!("HMAC key error: {e}"))?;
     mac.update(hth);
     mac.update(capability_token_bytes);
     Ok(mac.finalize().into_bytes().to_vec())
@@ -414,7 +419,8 @@ impl TranscriptRegistry {
             && !sessions.contains_key(&session.session_id)
         {
             let evict_count = sessions.len() + 1 - TRANSCRIPT_REGISTRY_MAX_SESSIONS;
-            let mut by_age: Vec<(Vec<u8>, f64)> = sessions.iter()
+            let mut by_age: Vec<(Vec<u8>, f64)> = sessions
+                .iter()
                 .map(|(k, v)| (k.clone(), v.established_at))
                 .collect();
             by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -479,8 +485,10 @@ mod tests {
     use super::*;
 
     fn test_session_id() -> Vec<u8> {
-        vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]
+        vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ]
     }
 
     #[test]
@@ -495,17 +503,21 @@ mod tests {
     fn test_append_and_count() {
         let ht = HandshakeTranscript::new(&test_session_id()).unwrap();
         assert_eq!(ht.element_count(), 0);
-        ht.append(TranscriptElementType::ClientHello, b"hello").unwrap();
+        ht.append(TranscriptElementType::ClientHello, b"hello")
+            .unwrap();
         assert_eq!(ht.element_count(), 1);
-        ht.append(TranscriptElementType::ServerHello, b"world").unwrap();
+        ht.append(TranscriptElementType::ServerHello, b"world")
+            .unwrap();
         assert_eq!(ht.element_count(), 2);
     }
 
     #[test]
     fn test_finalize_produces_32_bytes() {
         let ht = HandshakeTranscript::new(&test_session_id()).unwrap();
-        ht.append(TranscriptElementType::ClientHello, b"client").unwrap();
-        ht.append(TranscriptElementType::ServerHello, b"server").unwrap();
+        ht.append(TranscriptElementType::ClientHello, b"client")
+            .unwrap();
+        ht.append(TranscriptElementType::ServerHello, b"server")
+            .unwrap();
         let hth = ht.finalize().unwrap();
         assert_eq!(hth.len(), 32);
         assert!(ht.is_finalized());
@@ -517,11 +529,13 @@ mod tests {
     fn test_finalize_deterministic() {
         let sid = test_session_id();
         let ht1 = HandshakeTranscript::new(&sid).unwrap();
-        ht1.append(TranscriptElementType::ClientHello, b"data").unwrap();
+        ht1.append(TranscriptElementType::ClientHello, b"data")
+            .unwrap();
         let hth1 = ht1.finalize().unwrap();
 
         let ht2 = HandshakeTranscript::new(&sid).unwrap();
-        ht2.append(TranscriptElementType::ClientHello, b"data").unwrap();
+        ht2.append(TranscriptElementType::ClientHello, b"data")
+            .unwrap();
         let hth2 = ht2.finalize().unwrap();
 
         assert_eq!(hth1, hth2);
@@ -531,11 +545,13 @@ mod tests {
     fn test_different_data_different_hth() {
         let sid = test_session_id();
         let ht1 = HandshakeTranscript::new(&sid).unwrap();
-        ht1.append(TranscriptElementType::ClientHello, b"data_a").unwrap();
+        ht1.append(TranscriptElementType::ClientHello, b"data_a")
+            .unwrap();
         let hth1 = ht1.finalize().unwrap();
 
         let ht2 = HandshakeTranscript::new(&sid).unwrap();
-        ht2.append(TranscriptElementType::ClientHello, b"data_b").unwrap();
+        ht2.append(TranscriptElementType::ClientHello, b"data_b")
+            .unwrap();
         let hth2 = ht2.finalize().unwrap();
 
         assert_ne!(hth1, hth2);
@@ -559,7 +575,8 @@ mod tests {
     fn test_transcript_session_create() {
         let sid = test_session_id();
         let ht = HandshakeTranscript::new(&sid).unwrap();
-        ht.append(TranscriptElementType::SessionParams, b"params").unwrap();
+        ht.append(TranscriptElementType::SessionParams, b"params")
+            .unwrap();
         let session = TranscriptSession::create(&sid, 1, "cid-001", ht).unwrap();
         assert_eq!(session.hth.len(), 32);
         assert_eq!(session.epoch_id, 1);
@@ -570,7 +587,8 @@ mod tests {
     fn test_transcript_session_create_already_finalized() {
         let sid = test_session_id();
         let ht = HandshakeTranscript::new(&sid).unwrap();
-        ht.append(TranscriptElementType::EpochInit, b"epoch").unwrap();
+        ht.append(TranscriptElementType::EpochInit, b"epoch")
+            .unwrap();
         ht.finalize().unwrap();
         let session = TranscriptSession::create(&sid, 2, "cid-002", ht).unwrap();
         assert_eq!(session.hth.len(), 32);
@@ -618,7 +636,8 @@ mod tests {
 
         let sid = test_session_id();
         let ht = HandshakeTranscript::new(&sid).unwrap();
-        ht.append(TranscriptElementType::ClientHello, b"hello").unwrap();
+        ht.append(TranscriptElementType::ClientHello, b"hello")
+            .unwrap();
         let session = TranscriptSession::create(&sid, 1, "cid", ht).unwrap();
         let hth_val = session.hth.clone();
 

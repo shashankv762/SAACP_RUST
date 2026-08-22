@@ -8,11 +8,9 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use saacp::{
-    AgentIdentity, AgentCredential, TrustAnchor, TrustStore,
-    DistributedRevocationInfrastructure,
-    IdentityProver, AttestationType, TrustModel,
-    FAITF_VERSION, FAITF_MAX_DELEGATION_DEPTH, IDENTITY_PROOF_TTL, MAX_CLOCK_SKEW,
-    provision_issuer,
+    provision_issuer, AgentCredential, AgentIdentity, AttestationType,
+    DistributedRevocationInfrastructure, IdentityProver, TrustAnchor, TrustModel, TrustStore,
+    FAITF_MAX_DELEGATION_DEPTH, FAITF_VERSION, IDENTITY_PROOF_TTL, MAX_CLOCK_SKEW,
 };
 
 fn generate_issuer_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
@@ -22,7 +20,15 @@ fn generate_issuer_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
 }
 
 fn make_identity(agent_id: &str, issuer_id: &str, ttl: u64) -> AgentIdentity {
-    AgentIdentity::generate(agent_id, issuer_id, ttl, None, None, "", AttestationType::None)
+    AgentIdentity::generate(
+        agent_id,
+        issuer_id,
+        ttl,
+        None,
+        None,
+        "",
+        AttestationType::None,
+    )
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -66,7 +72,7 @@ fn test_agent_identity_is_valid_now() {
 #[test]
 fn test_agent_identity_expired() {
     let id = make_identity("agent-c", "issuer-1", 0); // ttl = 0 means expires immediately
-    // is_valid_now may still be true at t=0; just check no panic
+                                                      // is_valid_now may still be true at t=0; just check no panic
     let _ = id.is_valid_now();
 }
 
@@ -273,7 +279,8 @@ fn test_trust_store_pin_identity() {
 fn test_dri_revoke_and_check() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-1", "iss-rev", 3600);
-    dri.revoke("agent-rev", "test reason", &revoker, "cred-fp-1").unwrap();
+    dri.revoke("agent-rev", "test reason", &revoker, "cred-fp-1")
+        .unwrap();
     assert!(dri.is_revoked("agent-rev", "cred-fp-1"));
 }
 
@@ -288,7 +295,8 @@ fn test_dri_epoch_increments_on_revocation() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-2", "iss-rev", 3600);
     let e0 = dri.epoch();
-    dri.revoke("agent-epoch", "test reason", &revoker, "fp-epoch").unwrap();
+    dri.revoke("agent-epoch", "test reason", &revoker, "fp-epoch")
+        .unwrap();
     let e1 = dri.epoch();
     assert!(e1 > e0, "Epoch must increment on revocation");
 }
@@ -297,10 +305,14 @@ fn test_dri_epoch_increments_on_revocation() {
 fn test_dri_clear() {
     let dri = DistributedRevocationInfrastructure::new();
     let revoker = make_identity("revoker-3", "iss-rev", 3600);
-    dri.revoke("agent-clear", "test reason", &revoker, "fp-clear").unwrap();
+    dri.revoke("agent-clear", "test reason", &revoker, "fp-clear")
+        .unwrap();
     assert!(dri.is_revoked("agent-clear", "fp-clear"));
     dri.clear();
-    assert!(!dri.is_revoked("agent-clear", "fp-clear"), "DRI must be empty after clear");
+    assert!(
+        !dri.is_revoked("agent-clear", "fp-clear"),
+        "DRI must be empty after clear"
+    );
 }
 
 // ─── IdentityProver ───────────────────────────────────────────────────────────

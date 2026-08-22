@@ -23,7 +23,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use saacp::{FLAG_COVER_TRAFFIC, MEASCFrame, SAACPNetworkDaemon, SessionEpochManager, ZeroTrustGateway};
+use saacp::{
+    MEASCFrame, SAACPNetworkDaemon, SessionEpochManager, ZeroTrustGateway, FLAG_COVER_TRAFFIC,
+};
 
 /// Bind to an ephemeral port, read back the assigned port, then drop the listener so the
 /// daemon can bind it. Small TOCTOU window is acceptable for a local single-process test.
@@ -48,13 +50,17 @@ async fn tcp_client_handshake(stream: &mut TcpStream) -> [u8; 32] {
     stream.write_all(&client_msg).await.expect("send handshake");
 
     let mut server_pub_bytes = [0u8; 32];
-    stream.read_exact(&mut server_pub_bytes).await.expect("read server pubkey");
+    stream
+        .read_exact(&mut server_pub_bytes)
+        .await
+        .expect("read server pubkey");
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
     let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
-    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key).expect("HKDF expand");
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .expect("HKDF expand");
     session_key
 }
 
@@ -75,13 +81,22 @@ fn build_task_frame(
         "task": task,
         "priority": 1,
         "_capability_token": cap_token_b64,
-    }).to_string();
+    })
+    .to_string();
     let (mut frame, _psn) = mgr
         .with_epoch_mut(&session_id, eid, |epoch| {
             MEASCFrame::build_frame(
-                epoch, 1, 0x10, 0, 0,
-                payload.as_bytes(), &[0u8; 32], &[0u8; 24], 0,
-            ).expect("build_frame")
+                epoch,
+                1,
+                0x10,
+                0,
+                0,
+                payload.as_bytes(),
+                &[0u8; 32],
+                &[0u8; 24],
+                0,
+            )
+            .expect("build_frame")
         })
         .expect("with_epoch_mut");
     if corrupt_ciphertext {
@@ -94,7 +109,8 @@ fn build_task_frame(
 
 fn issue_token(secret: &[u8], issuer: &str, allow: &[&str], max_action_class: u8) -> String {
     let gw = ZeroTrustGateway::new();
-    let token = gw.issue_capability_token(secret, issuer, allow, &[], 60, None, max_action_class, None);
+    let token =
+        gw.issue_capability_token(secret, issuer, allow, &[], 60, None, max_action_class, None);
     String::from_utf8(token).expect("token is valid utf8")
 }
 
@@ -124,18 +140,31 @@ async fn daemon_encrypted_valid_signed_token_accepted_and_decodes() {
                 delivered_cb.lock().unwrap().push(task.clone());
             }
         }));
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let session_key = tcp_client_handshake(&mut stream).await;
 
     let token = issue_token(&mesh_secret, "client-agent", &["unknown"], 0);
-    let frame = build_task_frame(session_key, [0xAAu8; 16], "do the real thing", &token, false);
+    let frame = build_task_frame(
+        session_key,
+        [0xAAu8; 16],
+        "do the real thing",
+        &token,
+        false,
+    );
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS", "validly-signed encrypted frame must be accepted");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "validly-signed encrypted frame must be accepted"
+    );
 
     // Give the (already-awaited-response) on_delivered callback a moment — it runs
     // synchronously before the ack is written, so this is just defensive.
@@ -155,10 +184,14 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let session_key = tcp_client_handshake(&mut stream).await;
 
     let token = issue_token(&mesh_secret, "client-agent", &["unknown"], 0);
@@ -166,7 +199,10 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_ne!(&response, b"SUCCESS", "AES-GCM auth failure must not be silently accepted");
+    assert_ne!(
+        &response, b"SUCCESS",
+        "AES-GCM auth failure must not be silently accepted"
+    );
 }
 
 #[tokio::test]
@@ -178,10 +214,14 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let session_key = tcp_client_handshake(&mut stream).await;
 
     // Token is well-formed and correctly encrypted, but signed with a secret the daemon
@@ -191,7 +231,10 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_ne!(&response, b"SUCCESS", "a token signed with the wrong secret must be rejected");
+    assert_ne!(
+        &response, b"SUCCESS",
+        "a token signed with the wrong secret must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -215,10 +258,14 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     // now fails AES-GCM authentication unconditionally.
     let port = free_port().await;
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, None);
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let session_key = tcp_client_handshake(&mut stream).await;
 
     let header = saacp::framing::MEASCFrame {
@@ -234,11 +281,16 @@ async fn daemon_plain_new_default_behavior_unchanged() {
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    let frame = header.encode_encrypted(b"", &session_key).expect("encode_encrypted");
+    let frame = header
+        .encode_encrypted(b"", &session_key)
+        .expect("encode_encrypted");
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS", "default daemon behavior (no builders) must be unchanged");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "default daemon behavior (no builders) must be unchanged"
+    );
 }
 
 /// Sanity check that the two-frame-per-connection sequencing used above doesn't leak
@@ -256,19 +308,33 @@ async fn daemon_encrypted_two_independent_sessions() {
         .with_on_delivered(Arc::new(move |_parsed| {
             count_cb.fetch_add(1, Ordering::SeqCst);
         }));
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     for (i, sid_byte) in [0xE0u8, 0xE1u8].into_iter().enumerate() {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
         let session_key = tcp_client_handshake(&mut stream).await;
         let token = issue_token(&mesh_secret, "client-agent", &["unknown"], 0);
-        let frame = build_task_frame(session_key, [sid_byte; 16], &format!("task-{i}"), &token, false);
+        let frame = build_task_frame(
+            session_key,
+            [sid_byte; 16],
+            &format!("task-{i}"),
+            &token,
+            false,
+        );
         stream.write_all(&frame).await.expect("send frame");
         let response = read_response(&mut stream, 128).await;
         assert_eq!(&response, b"SUCCESS");
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(count.load(Ordering::SeqCst), 2, "both independent sessions must be delivered");
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "both independent sessions must be delivered"
+    );
 }

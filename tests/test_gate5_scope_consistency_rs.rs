@@ -14,8 +14,8 @@
 //! substitute for scope authorization. Deliberately additive: it does not
 //! touch `gate_5_0_epistemic_cb`'s own signature or behavior.
 
+use saacp::{JsonValue, SAACPProtocolHandler};
 use std::collections::HashMap;
-use saacp::{SAACPProtocolHandler, JsonValue};
 
 const ROOT_INTENT: &str = "analyze quarterly financial report for board review";
 

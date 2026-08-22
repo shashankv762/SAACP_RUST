@@ -21,7 +21,7 @@
 //!     Raw TCP+TLS only, not WebSocket-over-TLS (`wss://`) — see [`tls`]'s
 //!     module doc for why.
 
-#[cfg(feature = "transport-ws")]
-pub mod ws;
 #[cfg(feature = "transport-tls")]
 pub mod tls;
+#[cfg(feature = "transport-ws")]
+pub mod ws;

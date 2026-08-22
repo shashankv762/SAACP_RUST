@@ -205,19 +205,28 @@ impl AuthorityRegistry {
     /// Get whether an issuer may self-issue.
     pub fn may_self_issue(&self, issuer_id: &str) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.policies.get(issuer_id).is_some_and(|p| p.may_self_issue())
+        inner
+            .policies
+            .get(issuer_id)
+            .is_some_and(|p| p.may_self_issue())
     }
 
     /// Check if an issuer may issue to a given subject class.
     pub fn may_issue_to(&self, issuer_id: &str, sub_class: AuthorityClass) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.policies.get(issuer_id).is_some_and(|p| p.may_issue_to(sub_class))
+        inner
+            .policies
+            .get(issuer_id)
+            .is_some_and(|p| p.may_issue_to(sub_class))
     }
 
     /// Check if an issuer is a terminal class.
     pub fn is_terminal(&self, issuer_id: &str) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.policies.get(issuer_id).is_some_and(|p| terminal_classes().contains(&p.authority_class))
+        inner
+            .policies
+            .get(issuer_id)
+            .is_some_and(|p| terminal_classes().contains(&p.authority_class))
     }
 
     /// List all registered issuer IDs.
@@ -238,14 +247,21 @@ impl AuthorityRegistry {
         let policy = inner.policies.get_mut(issuer_id).ok_or_else(|| {
             SAACPHardDrop::new(
                 SAACPBytecodes::FederationRootRequired,
-                format!("Issuer '{}' not registered in AuthorityRegistry.", issuer_id),
+                format!(
+                    "Issuer '{}' not registered in AuthorityRegistry.",
+                    issuer_id
+                ),
             )
         })?;
         if policy.authority_class != AuthorityClass::RootAuthority {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::FederationRootRequired,
-                format!("Only ROOT_AUTHORITY issuers may hold federation-root status; \
-                    '{}' is {}.", issuer_id, policy.authority_class.as_str()),
+                format!(
+                    "Only ROOT_AUTHORITY issuers may hold federation-root status; \
+                    '{}' is {}.",
+                    issuer_id,
+                    policy.authority_class.as_str()
+                ),
             ));
         }
         policy.is_federation_root = is_root;
@@ -290,38 +306,46 @@ pub fn enforce_issuance_policy(
     }
 
     // 2. Self-issuance prohibition
-    if issuer_id == sub
-        && !registry.may_self_issue(issuer_id) {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::SelfIssuedCapability,
-                format!("C-2: Self-issued capability rejected — iss == sub == '{}'. \
-                    Only federation-root authorities may self-issue.", issuer_id),
-            ));
-        }
+    if issuer_id == sub && !registry.may_self_issue(issuer_id) {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::SelfIssuedCapability,
+            format!(
+                "C-2: Self-issued capability rejected — iss == sub == '{}'. \
+                    Only federation-root authorities may self-issue.",
+                issuer_id
+            ),
+        ));
+    }
 
     // 3. Authority class scope (if sub class is known)
     if let Some(sub_class) = sub_authority_class {
         if !registry.may_issue_to(issuer_id, sub_class) {
-            let issuer_class = registry.get_authority_class(issuer_id)
+            let issuer_class = registry
+                .get_authority_class(issuer_id)
                 .map(|c| c.as_str().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AuthorityClassViolation,
-                format!("C-2: Issuer class '{}' may not grant capabilities to subject class '{}'.",
-                    issuer_class, sub_class.as_str()),
+                format!(
+                    "C-2: Issuer class '{}' may not grant capabilities to subject class '{}'.",
+                    issuer_class,
+                    sub_class.as_str()
+                ),
             ));
         }
     }
 
     // 4. Delegated token metadata completeness
-    if delegation_depth > 0
-        && (parent_jti.is_none() || parent_iss.is_none()) {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::DelegationMetadataIncomplete,
-                format!("C-2: Delegated capability (depth={}) must carry both parent_jti and parent_iss. \
-                    One or both are missing.", delegation_depth),
-            ));
-        }
+    if delegation_depth > 0 && (parent_jti.is_none() || parent_iss.is_none()) {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::DelegationMetadataIncomplete,
+            format!(
+                "C-2: Delegated capability (depth={}) must carry both parent_jti and parent_iss. \
+                    One or both are missing.",
+                delegation_depth
+            ),
+        ));
+    }
 
     Ok(())
 }
@@ -349,29 +373,31 @@ pub fn enforce_verification_policy(
     }
 
     // Self-issuance prohibition
-    if issuer_id == sub
-        && !registry.may_self_issue(issuer_id) {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::SelfIssuedCapability,
-                format!("C-2: Self-issued token rejected at verification — iss == sub == '{}'.", issuer_id),
-            ));
-        }
+    if issuer_id == sub && !registry.may_self_issue(issuer_id) {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::SelfIssuedCapability,
+            format!(
+                "C-2: Self-issued token rejected at verification — iss == sub == '{}'.",
+                issuer_id
+            ),
+        ));
+    }
 
     // Delegation metadata completeness
-    if delegation_depth > 0
-        && (parent_jti.is_none() || parent_iss.is_none()) {
-            return Err(SAACPHardDrop::new(
+    if delegation_depth > 0 && (parent_jti.is_none() || parent_iss.is_none()) {
+        return Err(SAACPHardDrop::new(
                 SAACPBytecodes::DelegationMetadataIncomplete,
                 format!("C-2: Delegated token (depth={}) is missing parent_jti or parent_iss delegation metadata.",
                     delegation_depth),
             ));
-        }
+    }
 
     Ok(())
 }
 
 /// Process-wide default authority registry.
-pub static DEFAULT_AUTHORITY_REGISTRY: LazyLock<AuthorityRegistry> = LazyLock::new(AuthorityRegistry::new);
+pub static DEFAULT_AUTHORITY_REGISTRY: LazyLock<AuthorityRegistry> =
+    LazyLock::new(AuthorityRegistry::new);
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -420,7 +446,10 @@ mod tests {
         reg.register(policy);
         assert_eq!(reg.count(), 1);
         assert!(reg.contains("issuer-1"));
-        assert_eq!(reg.get_authority_class("issuer-1"), Some(AuthorityClass::ServiceAuthority));
+        assert_eq!(
+            reg.get_authority_class("issuer-1"),
+            Some(AuthorityClass::ServiceAuthority)
+        );
 
         assert!(reg.deregister("issuer-1"));
         assert_eq!(reg.count(), 0);
@@ -456,9 +485,8 @@ mod tests {
         let policy = AuthorityPolicy::new("exec-1", AuthorityClass::ExecutionAgent);
         reg.register(policy);
 
-        let err = enforce_issuance_policy(
-            "exec-1", "someone", 0, None, None, None, &reg,
-        ).unwrap_err();
+        let err =
+            enforce_issuance_policy("exec-1", "someone", 0, None, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::UnauthorizedIssuerClass);
     }
 
@@ -468,9 +496,7 @@ mod tests {
         let policy = AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority);
         reg.register(policy);
 
-        let err = enforce_issuance_policy(
-            "svc-1", "svc-1", 0, None, None, None, &reg,
-        ).unwrap_err();
+        let err = enforce_issuance_policy("svc-1", "svc-1", 0, None, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::SelfIssuedCapability);
     }
 
@@ -481,9 +507,7 @@ mod tests {
         policy.is_federation_root = true;
         reg.register(policy);
 
-        assert!(enforce_issuance_policy(
-            "root-1", "root-1", 0, None, None, None, &reg,
-        ).is_ok());
+        assert!(enforce_issuance_policy("root-1", "root-1", 0, None, None, None, &reg,).is_ok());
     }
 
     #[test]
@@ -493,9 +517,15 @@ mod tests {
         reg.register(policy);
 
         let err = enforce_issuance_policy(
-            "del-1", "svc-1", 0, None, None,
-            Some(AuthorityClass::ServiceAuthority), &reg,
-        ).unwrap_err();
+            "del-1",
+            "svc-1",
+            0,
+            None,
+            None,
+            Some(AuthorityClass::ServiceAuthority),
+            &reg,
+        )
+        .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::AuthorityClassViolation);
     }
 
@@ -506,8 +536,15 @@ mod tests {
         reg.register(policy);
 
         assert!(enforce_issuance_policy(
-            "root-1", "agent-1", 1, Some("parent-jti"), Some("parent-iss"), None, &reg,
-        ).is_ok());
+            "root-1",
+            "agent-1",
+            1,
+            Some("parent-jti"),
+            Some("parent-iss"),
+            None,
+            &reg,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -516,9 +553,8 @@ mod tests {
         let policy = AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority);
         reg.register(policy);
 
-        let err = enforce_issuance_policy(
-            "root-1", "agent-1", 1, None, None, None, &reg,
-        ).unwrap_err();
+        let err =
+            enforce_issuance_policy("root-1", "agent-1", 1, None, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::DelegationMetadataIncomplete);
     }
 
@@ -528,9 +564,8 @@ mod tests {
         let policy = AuthorityPolicy::new("exec-1", AuthorityClass::ExecutionAgent);
         reg.register(policy);
 
-        let err = enforce_verification_policy(
-            "exec-1", "someone", 0, None, None, &reg,
-        ).unwrap_err();
+        let err =
+            enforce_verification_policy("exec-1", "someone", 0, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::UnauthorizedIssuerClass);
     }
 
@@ -540,9 +575,7 @@ mod tests {
         let policy = AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority);
         reg.register(policy);
 
-        let err = enforce_verification_policy(
-            "svc-1", "svc-1", 0, None, None, &reg,
-        ).unwrap_err();
+        let err = enforce_verification_policy("svc-1", "svc-1", 0, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::SelfIssuedCapability);
     }
 
@@ -552,9 +585,8 @@ mod tests {
         let policy = AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority);
         reg.register(policy);
 
-        let err = enforce_verification_policy(
-            "root-1", "agent-1", 2, None, None, &reg,
-        ).unwrap_err();
+        let err =
+            enforce_verification_policy("root-1", "agent-1", 2, None, None, &reg).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::DelegationMetadataIncomplete);
     }
 
@@ -564,9 +596,7 @@ mod tests {
         let policy = AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority);
         reg.register(policy);
 
-        assert!(enforce_verification_policy(
-            "root-1", "agent-1", 0, None, None, &reg,
-        ).is_ok());
+        assert!(enforce_verification_policy("root-1", "agent-1", 0, None, None, &reg,).is_ok());
     }
 
     #[test]

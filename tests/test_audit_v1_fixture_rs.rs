@@ -27,12 +27,16 @@ fn fixture_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 
 /// Copy the pinned fixture into a scratch dir so a test never mutates the
 /// checked-in file, optionally applying `mutate` to the log contents first.
-fn staged_copy(tag: &str, mutate: impl FnOnce(String) -> String) -> (std::path::PathBuf, std::path::PathBuf) {
+fn staged_copy(
+    tag: &str,
+    mutate: impl FnOnce(String) -> String,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let (src_log, src_sentinel) = fixture_paths();
     let content = std::fs::read_to_string(&src_log).expect("pinned fixture must exist");
     let sentinel = std::fs::read_to_string(&src_sentinel).expect("pinned sentinel must exist");
 
-    let scratch = std::env::temp_dir().join(format!("saacp_v1_fixture_{tag}_{}", std::process::id()));
+    let scratch =
+        std::env::temp_dir().join(format!("saacp_v1_fixture_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let log = scratch.join("audit.jsonl");
     let sent = scratch.join("audit.sentinel");
@@ -85,7 +89,9 @@ fn pinned_v1_log_loads_through_initialize_chain() {
 fn tampered_pinned_v1_log_is_rejected() {
     // Flip one character inside the first record's intent. The HMAC covers it,
     // so the recomputed chain_hash must no longer match.
-    let (log, sentinel) = staged_copy("tampered", |c| c.replacen("intent-number-0", "intent-number-9", 1));
+    let (log, sentinel) = staged_copy("tampered", |c| {
+        c.replacen("intent-number-0", "intent-number-9", 1)
+    });
     let audit = saacp::security::ImmutableAuditLog::with_paths(
         log.to_str().unwrap(),
         sentinel.to_str().unwrap(),
@@ -139,7 +145,9 @@ fn appending_to_a_loaded_v1_log_keeps_the_whole_file_verifiable() {
         log.to_str().unwrap(),
         sentinel.to_str().unwrap(),
     );
-    audit.initialize_chain(FIXTURE_SECRET).expect("v1 log must load");
+    audit
+        .initialize_chain(FIXTURE_SECRET)
+        .expect("v1 log must load");
 
     for i in 0..25u32 {
         audit.append_event(

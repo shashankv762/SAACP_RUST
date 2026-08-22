@@ -58,9 +58,7 @@ use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHan
 use cryptoki::session::{Session, UserType};
 use cryptoki::types::AuthPin;
 
-use super::{
-    check_signature_len, HardwareKeyStore, HrtError, ED25519_PUBLIC_KEY_LEN,
-};
+use super::{check_signature_len, HardwareKeyStore, HrtError, ED25519_PUBLIC_KEY_LEN};
 
 /// Backend label used in [`HrtError`] values from this module.
 const BACKEND: &str = "PKCS#11";
@@ -127,9 +125,12 @@ impl Pkcs11KeyStore {
                 HrtError::Configuration(format!("could not initialize the {BACKEND} module: {e}"))
             })?;
 
-        let slots = context.get_slots_with_token().map_err(|e| {
-            HrtError::Backend { backend: BACKEND, detail: format!("could not enumerate slots: {e}") }
-        })?;
+        let slots = context
+            .get_slots_with_token()
+            .map_err(|e| HrtError::Backend {
+                backend: BACKEND,
+                detail: format!("could not enumerate slots: {e}"),
+            })?;
 
         // Find the slot whose token carries `token_label`. Tokens pad their label field
         // with spaces to 32 bytes, so compare trimmed.
@@ -151,12 +152,12 @@ impl Pkcs11KeyStore {
 
         // RW session: signing itself needs only RO, but a RW session is what allows an
         // operator to provision a key through the same handle, and costs nothing extra.
-        let session = context.open_rw_session(slot).map_err(|e| {
-            HrtError::Backend {
+        let session = context
+            .open_rw_session(slot)
+            .map_err(|e| HrtError::Backend {
                 backend: BACKEND,
                 detail: format!("could not open a session on token '{token_label}': {e}"),
-            }
-        })?;
+            })?;
 
         session
             .login(UserType::User, Some(&AuthPin::new(pin.into())))
@@ -194,9 +195,13 @@ impl Pkcs11KeyStore {
             Attribute::KeyType(KeyType::EC_EDWARDS),
             Attribute::Label(key_id.as_bytes().to_vec()),
         ];
-        let private_handles = session.find_objects(&private_template).map_err(|e| {
-            HrtError::Backend { backend: BACKEND, detail: format!("private key search failed: {e}") }
-        })?;
+        let private_handles =
+            session
+                .find_objects(&private_template)
+                .map_err(|e| HrtError::Backend {
+                    backend: BACKEND,
+                    detail: format!("private key search failed: {e}"),
+                })?;
 
         let private_handle = match private_handles.len() {
             0 => return Err(HrtError::UnknownKey(key_id.to_string())),
@@ -215,9 +220,13 @@ impl Pkcs11KeyStore {
             Attribute::KeyType(KeyType::EC_EDWARDS),
             Attribute::Label(key_id.as_bytes().to_vec()),
         ];
-        let public_handles = session.find_objects(&public_template).map_err(|e| {
-            HrtError::Backend { backend: BACKEND, detail: format!("public key search failed: {e}") }
-        })?;
+        let public_handles =
+            session
+                .find_objects(&public_template)
+                .map_err(|e| HrtError::Backend {
+                    backend: BACKEND,
+                    detail: format!("public key search failed: {e}"),
+                })?;
         let public_handle = match public_handles.len() {
             0 => {
                 return Err(HrtError::Configuration(format!(
@@ -253,7 +262,10 @@ impl Pkcs11KeyStore {
 
         let public_key = ed25519_point_from_cka_ec_point(&ec_point)?;
 
-        let entry = CachedKey { private_handle, public_key };
+        let entry = CachedKey {
+            private_handle,
+            public_key,
+        };
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -320,7 +332,9 @@ impl HardwareKeyStore for Pkcs11KeyStore {
 impl std::fmt::Debug for Pkcs11KeyStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never renders the session or any key material.
-        f.debug_struct("Pkcs11KeyStore").field("backend", &BACKEND).finish_non_exhaustive()
+        f.debug_struct("Pkcs11KeyStore")
+            .field("backend", &BACKEND)
+            .finish_non_exhaustive()
     }
 }
 

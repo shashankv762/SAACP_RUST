@@ -60,9 +60,7 @@ use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
 use aws_sdk_kms::Client;
 
 use super::remote::{RemoteSignerRuntime, DEFAULT_REMOTE_TIMEOUT};
-use super::{
-    check_signature_len, ed25519_public_key_from_spki, HardwareKeyStore, HrtError,
-};
+use super::{check_signature_len, ed25519_public_key_from_spki, HardwareKeyStore, HrtError};
 
 const BACKEND: &str = "AWS KMS";
 
@@ -223,12 +221,17 @@ fn map_sdk_error<E: std::fmt::Debug, R: std::fmt::Debug>(
     if detail.contains("NotFoundException") {
         return HrtError::UnknownKey(key_id.to_string());
     }
-    HrtError::Backend { backend: BACKEND, detail }
+    HrtError::Backend {
+        backend: BACKEND,
+        detail,
+    }
 }
 
 impl std::fmt::Debug for AwsKmsKeyStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AwsKmsKeyStore").field("backend", &BACKEND).finish_non_exhaustive()
+        f.debug_struct("AwsKmsKeyStore")
+            .field("backend", &BACKEND)
+            .finish_non_exhaustive()
     }
 }
 
@@ -247,7 +250,10 @@ mod tests {
         // directly: it must reject before any network call is attempted.
         assert!(check_message_size(KMS_MAX_RAW_MESSAGE).is_ok());
         assert!(
-            matches!(check_message_size(KMS_MAX_RAW_MESSAGE + 1), Err(HrtError::Backend { .. })),
+            matches!(
+                check_message_size(KMS_MAX_RAW_MESSAGE + 1),
+                Err(HrtError::Backend { .. })
+            ),
             "an over-limit message must be caught before it reaches kms:Sign"
         );
     }
@@ -257,14 +263,19 @@ mod tests {
         // Exactly what kms:GetPublicKey returns for an ECC_NIST_EDWARDS25519 key.
         let mut spki = super::super::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(&[0xABu8; 32]);
-        assert_eq!(ed25519_public_key_from_spki(&spki, BACKEND).unwrap(), vec![0xABu8; 32]);
+        assert_eq!(
+            ed25519_public_key_from_spki(&spki, BACKEND).unwrap(),
+            vec![0xABu8; 32]
+        );
     }
 
     #[test]
     fn a_non_ed25519_spki_is_rejected_rather_than_tail_sliced() {
         // An operator pointing at an ECC_NIST_P256 key by mistake. The last 32 bytes
         // would look like a plausible key; it must be refused instead.
-        let mut wrong = vec![0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2A, 0x86, 0x48, 0x03, 0x21, 0x00];
+        let mut wrong = vec![
+            0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2A, 0x86, 0x48, 0x03, 0x21, 0x00,
+        ];
         wrong.extend_from_slice(&[0xCDu8; 32]);
         assert!(ed25519_public_key_from_spki(&wrong, BACKEND).is_err());
     }

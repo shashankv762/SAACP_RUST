@@ -74,13 +74,29 @@ mod tests {
 
         let corpora: [(&str, Vec<String>); 4] = [
             // The shape that fully collapsed under a single-byte hash.
-            ("prefixed agent ids", (0..N).map(|i| format!("agent-{i:04}")).collect()),
+            (
+                "prefixed agent ids",
+                (0..N).map(|i| format!("agent-{i:04}")).collect(),
+            ),
             // Hex ids: shards 10-15 were unreachable under a single-byte hash.
-            ("hex session ids", (0..N).map(|i| format!("{:016x}", (i as u64).wrapping_mul(2_654_435_761))).collect()),
+            (
+                "hex session ids",
+                (0..N)
+                    .map(|i| format!("{:016x}", (i as u64).wrapping_mul(2_654_435_761)))
+                    .collect(),
+            ),
             // Namespaced trust keys (`trust_decay`), where the prefix is constant.
-            ("namespaced pk: keys", (0..N).map(|i| format!("pk:{i:08x}")).collect()),
+            (
+                "namespaced pk: keys",
+                (0..N).map(|i| format!("pk:{i:08x}")).collect(),
+            ),
             // Long shared prefix, differing only in the final characters.
-            ("long common prefix", (0..N).map(|i| format!("saacp-production-tenant-alpha-worker-{i}")).collect()),
+            (
+                "long common prefix",
+                (0..N)
+                    .map(|i| format!("saacp-production-tenant-alpha-worker-{i}"))
+                    .collect(),
+            ),
         ];
 
         for (label, keys) in corpora {

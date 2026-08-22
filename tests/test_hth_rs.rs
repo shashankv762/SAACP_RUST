@@ -4,14 +4,15 @@
 //! HandshakeTranscript, TranscriptElementType, bind_capability, TranscriptRegistry.
 
 use saacp::{
-    HandshakeTranscript, TranscriptElementType,
-    bind_capability, verify_capability_binding,
+    bind_capability, verify_capability_binding, HandshakeTranscript, TranscriptElementType,
     TranscriptRegistry, TranscriptSession,
 };
 
 fn make_session_id() -> Vec<u8> {
-    vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-         0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]
+    vec![
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
+    ]
 }
 
 // ─── HandshakeTranscript::new ─────────────────────────────────────────────────
@@ -26,18 +27,27 @@ fn test_new_with_16_bytes_ok() {
 #[test]
 fn test_new_with_15_bytes_fails() {
     let sid = vec![0u8; 15];
-    assert!(HandshakeTranscript::new(&sid).is_err(), "15-byte session_id must fail");
+    assert!(
+        HandshakeTranscript::new(&sid).is_err(),
+        "15-byte session_id must fail"
+    );
 }
 
 #[test]
 fn test_new_with_17_bytes_fails() {
     let sid = vec![0u8; 17];
-    assert!(HandshakeTranscript::new(&sid).is_err(), "17-byte session_id must fail");
+    assert!(
+        HandshakeTranscript::new(&sid).is_err(),
+        "17-byte session_id must fail"
+    );
 }
 
 #[test]
 fn test_new_with_empty_fails() {
-    assert!(HandshakeTranscript::new(&[]).is_err(), "Empty session_id must fail");
+    assert!(
+        HandshakeTranscript::new(&[]).is_err(),
+        "Empty session_id must fail"
+    );
 }
 
 // ─── Element count ────────────────────────────────────────────────────────────
@@ -51,9 +61,11 @@ fn test_element_count_zero_initially() {
 #[test]
 fn test_element_count_increments_on_append() {
     let ht = HandshakeTranscript::new(&make_session_id()).unwrap();
-    ht.append(TranscriptElementType::ClientHello, b"hello").unwrap();
+    ht.append(TranscriptElementType::ClientHello, b"hello")
+        .unwrap();
     assert_eq!(ht.element_count(), 1);
-    ht.append(TranscriptElementType::ServerHello, b"world").unwrap();
+    ht.append(TranscriptElementType::ServerHello, b"world")
+        .unwrap();
     assert_eq!(ht.element_count(), 2);
 }
 
@@ -62,21 +74,29 @@ fn test_element_count_increments_on_append() {
 #[test]
 fn test_append_all_element_types() {
     let ht = HandshakeTranscript::new(&make_session_id()).unwrap();
-    ht.append(TranscriptElementType::ClientHello, b"ch").unwrap();
-    ht.append(TranscriptElementType::ServerHello, b"sh").unwrap();
-    ht.append(TranscriptElementType::IdentityProof, b"ip").unwrap();
-    ht.append(TranscriptElementType::KeyExchangeShare, b"ks").unwrap();
+    ht.append(TranscriptElementType::ClientHello, b"ch")
+        .unwrap();
+    ht.append(TranscriptElementType::ServerHello, b"sh")
+        .unwrap();
+    ht.append(TranscriptElementType::IdentityProof, b"ip")
+        .unwrap();
+    ht.append(TranscriptElementType::KeyExchangeShare, b"ks")
+        .unwrap();
     ht.append(TranscriptElementType::EpochInit, b"ei").unwrap();
-    ht.append(TranscriptElementType::PolicyCommitment, b"pc").unwrap();
-    ht.append(TranscriptElementType::CapabilityBinding, b"cb").unwrap();
-    ht.append(TranscriptElementType::SessionParams, b"sp").unwrap();
+    ht.append(TranscriptElementType::PolicyCommitment, b"pc")
+        .unwrap();
+    ht.append(TranscriptElementType::CapabilityBinding, b"cb")
+        .unwrap();
+    ht.append(TranscriptElementType::SessionParams, b"sp")
+        .unwrap();
     assert_eq!(ht.element_count(), 8);
 }
 
 #[test]
 fn test_finalize_produces_32_bytes() {
     let ht = HandshakeTranscript::new(&make_session_id()).unwrap();
-    ht.append(TranscriptElementType::ClientHello, b"client_data").unwrap();
+    ht.append(TranscriptElementType::ClientHello, b"client_data")
+        .unwrap();
     let hth = ht.finalize().unwrap();
     assert_eq!(hth.len(), 32, "HTH must be 32 bytes (SHA-256)");
 }
@@ -91,7 +111,8 @@ fn test_finalize_marks_finalized() {
 #[test]
 fn test_hth_accessible_after_finalize() {
     let ht = HandshakeTranscript::new(&make_session_id()).unwrap();
-    ht.append(TranscriptElementType::EpochInit, b"epoch").unwrap();
+    ht.append(TranscriptElementType::EpochInit, b"epoch")
+        .unwrap();
     ht.finalize().unwrap();
     assert!(ht.hth().is_some());
     assert!(ht.hth_hex().is_some());
@@ -112,11 +133,13 @@ fn test_hth_hex_is_64_chars() {
 fn test_finalize_deterministic_same_data() {
     let sid = make_session_id();
     let ht1 = HandshakeTranscript::new(&sid).unwrap();
-    ht1.append(TranscriptElementType::ClientHello, b"data").unwrap();
+    ht1.append(TranscriptElementType::ClientHello, b"data")
+        .unwrap();
     let hth1 = ht1.finalize().unwrap();
 
     let ht2 = HandshakeTranscript::new(&sid).unwrap();
-    ht2.append(TranscriptElementType::ClientHello, b"data").unwrap();
+    ht2.append(TranscriptElementType::ClientHello, b"data")
+        .unwrap();
     let hth2 = ht2.finalize().unwrap();
 
     assert_eq!(hth1, hth2, "Same inputs must produce same HTH");
@@ -126,11 +149,13 @@ fn test_finalize_deterministic_same_data() {
 fn test_different_data_yields_different_hth() {
     let sid = make_session_id();
     let ht1 = HandshakeTranscript::new(&sid).unwrap();
-    ht1.append(TranscriptElementType::ClientHello, b"data_A").unwrap();
+    ht1.append(TranscriptElementType::ClientHello, b"data_A")
+        .unwrap();
     let hth1 = ht1.finalize().unwrap();
 
     let ht2 = HandshakeTranscript::new(&sid).unwrap();
-    ht2.append(TranscriptElementType::ClientHello, b"data_B").unwrap();
+    ht2.append(TranscriptElementType::ClientHello, b"data_B")
+        .unwrap();
     let hth2 = ht2.finalize().unwrap();
 
     assert_ne!(hth1, hth2, "Different data must yield different HTH");
@@ -139,14 +164,19 @@ fn test_different_data_yields_different_hth() {
 #[test]
 fn test_different_session_id_yields_different_hth() {
     let ht1 = HandshakeTranscript::new(&[0x01u8; 16]).unwrap();
-    ht1.append(TranscriptElementType::ClientHello, b"same").unwrap();
+    ht1.append(TranscriptElementType::ClientHello, b"same")
+        .unwrap();
     let hth1 = ht1.finalize().unwrap();
 
     let ht2 = HandshakeTranscript::new(&[0x02u8; 16]).unwrap();
-    ht2.append(TranscriptElementType::ClientHello, b"same").unwrap();
+    ht2.append(TranscriptElementType::ClientHello, b"same")
+        .unwrap();
     let hth2 = ht2.finalize().unwrap();
 
-    assert_ne!(hth1, hth2, "Different session_id must produce different HTH");
+    assert_ne!(
+        hth1, hth2,
+        "Different session_id must produce different HTH"
+    );
 }
 
 // ─── Error paths ──────────────────────────────────────────────────────────────
@@ -179,7 +209,8 @@ fn test_hth_none_before_finalize() {
 fn test_transcript_session_create_ok() {
     let sid = make_session_id();
     let ht = HandshakeTranscript::new(&sid).unwrap();
-    ht.append(TranscriptElementType::SessionParams, b"params").unwrap();
+    ht.append(TranscriptElementType::SessionParams, b"params")
+        .unwrap();
     let session = TranscriptSession::create(&sid, 1, "cid-001", ht).unwrap();
     assert_eq!(session.hth.len(), 32);
     assert_eq!(session.epoch_id, 1);
@@ -190,7 +221,8 @@ fn test_transcript_session_create_ok() {
 fn test_transcript_session_already_finalized_ok() {
     let sid = make_session_id();
     let ht = HandshakeTranscript::new(&sid).unwrap();
-    ht.append(TranscriptElementType::EpochInit, b"epoch").unwrap();
+    ht.append(TranscriptElementType::EpochInit, b"epoch")
+        .unwrap();
     ht.finalize().unwrap();
     let session = TranscriptSession::create(&sid, 2, "cid-002", ht).unwrap();
     assert_eq!(session.hth.len(), 32);
@@ -283,7 +315,8 @@ fn test_registry_count_zero_initially() {
 fn test_registry_register_and_contains() {
     let sid = make_session_id();
     let ht = HandshakeTranscript::new(&sid).unwrap();
-    ht.append(TranscriptElementType::ClientHello, b"hello").unwrap();
+    ht.append(TranscriptElementType::ClientHello, b"hello")
+        .unwrap();
     let session = TranscriptSession::create(&sid, 1, "cid", ht).unwrap();
 
     let reg = TranscriptRegistry::new();
@@ -296,7 +329,8 @@ fn test_registry_register_and_contains() {
 fn test_registry_get_session_hth() {
     let sid = make_session_id();
     let ht = HandshakeTranscript::new(&sid).unwrap();
-    ht.append(TranscriptElementType::KeyExchangeShare, b"key").unwrap();
+    ht.append(TranscriptElementType::KeyExchangeShare, b"key")
+        .unwrap();
     let session = TranscriptSession::create(&sid, 5, "cid-5", ht).unwrap();
     let hth_val = session.hth.clone();
 

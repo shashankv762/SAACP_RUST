@@ -21,7 +21,7 @@
 //! `SAACPBytecodes::AuditSubsystemDegraded` rejection). This file focuses on
 //! the WAL/health mechanics themselves from the public API.
 
-use saacp::{ImmutableAuditLog, AuditHealth, AUDIT_WAL_FLUSH_EVERY_N_ENTRIES};
+use saacp::{AuditHealth, ImmutableAuditLog, AUDIT_WAL_FLUSH_EVERY_N_ENTRIES};
 use std::time::Duration;
 
 /// Fix 1: a burst that would have saturated the pre-fix per-event
@@ -60,17 +60,20 @@ fn wal_saturation_stress() {
     }
 
     assert_eq!(
-        log.dropped_audit_count(), 0,
+        log.dropped_audit_count(),
+        0,
         "Fix 1's buffered WAL writer must keep up with a {N}-event burst on a real \
          disk path — any drop here means the queue saturated, exactly the pre-fix \
          failure mode this repair targets."
     );
     assert_eq!(
-        log.wal_write_failure_count(), 0,
+        log.wal_write_failure_count(),
+        0,
         "No genuine disk write failures expected against a valid temp-dir path."
     );
     assert_eq!(
-        log.health(), AuditHealth::Healthy,
+        log.health(),
+        AuditHealth::Healthy,
         "Queue should have fully drained back to Healthy once the burst is absorbed."
     );
 
@@ -85,7 +88,8 @@ fn wal_saturation_stress() {
 #[test]
 fn wal_open_failure_is_fatal_not_silent() {
     let bad_dir = std::env::temp_dir().join(format!(
-        "saacp_no_such_dir_{}_open_fail", std::process::id()
+        "saacp_no_such_dir_{}_open_fail",
+        std::process::id()
     ));
     let log_file = bad_dir.join("audit.log");
     let log = ImmutableAuditLog::with_paths(
@@ -99,7 +103,8 @@ fn wal_open_failure_is_fatal_not_silent() {
         waited += Duration::from_millis(5);
     }
     assert_eq!(
-        log.health(), AuditHealth::Fatal,
+        log.health(),
+        AuditHealth::Fatal,
         "A WAL worker that cannot open its log file must become visibly Fatal, \
          not silently no-op forever."
     );
@@ -108,7 +113,8 @@ fn wal_open_failure_is_fatal_not_silent() {
     // `try_send` fails synchronously and must be counted immediately.
     log.append_event(b"secret", "a", "b", "sig", "intent", "trace");
     assert_eq!(
-        log.dropped_audit_count(), 1,
+        log.dropped_audit_count(),
+        1,
         "Appends after a Fatal WAL worker must be counted as dropped, never \
          silently lost with zero signal anywhere."
     );
@@ -130,7 +136,8 @@ fn dropped_audit_pins_health_until_acknowledged() {
     // drop path, no test-only backdoor, and one that leaves the queue empty
     // (which is exactly the condition that used to reset health to Healthy).
     let bad_dir = std::env::temp_dir().join(format!(
-        "saacp_no_such_dir_{}_sticky_drop", std::process::id()
+        "saacp_no_such_dir_{}_sticky_drop",
+        std::process::id()
     ));
     let log_file = bad_dir.join("audit.log");
     let log = ImmutableAuditLog::with_paths(
@@ -145,8 +152,15 @@ fn dropped_audit_pins_health_until_acknowledged() {
     }
 
     log.append_event(b"secret", "a", "b", "sig", "intent", "trace");
-    assert!(log.dropped_audit_count() >= 1, "the append must have been dropped");
-    assert_eq!(log.queue_len(), 0, "queue is empty — the pre-fix reset condition");
+    assert!(
+        log.dropped_audit_count() >= 1,
+        "the append must have been dropped"
+    );
+    assert_eq!(
+        log.queue_len(),
+        0,
+        "queue is empty — the pre-fix reset condition"
+    );
 
     // Fatal is sticky on its own, so assert the floor mechanism directly: after
     // acknowledging, health must fall back to the live (Fatal) state rather than
@@ -157,9 +171,13 @@ fn dropped_audit_pins_health_until_acknowledged() {
          stays fail-closed, even with a fully drained queue"
     );
     let acked = log.acknowledge_dropped_audits();
-    assert!(acked >= 1, "acknowledge must report the dropped count, got {acked}");
+    assert!(
+        acked >= 1,
+        "acknowledge must report the dropped count, got {acked}"
+    );
     assert_eq!(
-        log.health(), AuditHealth::Fatal,
+        log.health(),
+        AuditHealth::Fatal,
         "acknowledging the drop floor must not clear a genuine Fatal write state"
     );
 }
@@ -179,7 +197,8 @@ fn acknowledged_drop_floor_returns_log_to_healthy() {
     log.append_event(b"secret", "a", "b", "sig", "intent", "trace");
     assert!(log.flush(Duration::from_secs(2)));
     assert_eq!(
-        log.health(), AuditHealth::Healthy,
+        log.health(),
+        AuditHealth::Healthy,
         "a log with no drops and a drained queue is Healthy"
     );
 
@@ -205,7 +224,11 @@ fn wal_crash_child() {
     // to disk yet when we hard-abort below.
     for i in 0..50u64 {
         log.append_event(
-            secret, "src", "dst", &format!("sig-{i}"), "intent",
+            secret,
+            "src",
+            "dst",
+            &format!("sig-{i}"),
+            "intent",
             "trace-crashtest0000000001",
         );
     }
@@ -236,13 +259,19 @@ fn wal_unclean_shutdown_data_loss_bound() {
         .env("SAACP_WAL_CRASH_LOGFILE", log_file.to_str().unwrap())
         .status()
         .expect("failed to spawn crash-test child process");
-    assert!(!status.success(), "child must hard-exit(1), not complete gracefully");
+    assert!(
+        !status.success(),
+        "child must hard-exit(1), not complete gracefully"
+    );
 
     // Recovery: read whatever actually made it to disk before the hard kill.
     let content = std::fs::read_to_string(&log_file).unwrap_or_default();
     let disk_count = content.lines().filter(|l| !l.is_empty()).count() as u64;
 
-    assert!(disk_count <= 50, "cannot have more entries on disk than were ever sent");
+    assert!(
+        disk_count <= 50,
+        "cannot have more entries on disk than were ever sent"
+    );
     let lost = 50 - disk_count;
     assert!(
         lost <= AUDIT_WAL_FLUSH_EVERY_N_ENTRIES,

@@ -9,40 +9,39 @@
 #![allow(unused_imports, dead_code, unused_variables)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use saacp::{
-    SAACPProtocolHandler, JsonValue, AgentRateLimiter,
-    MEASCFrame, SessionEpochManager, ParsedMEASCFrame,
-    ReplayWindow, ReplayWindowPolicy,
-    CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
-    ImmutableAuditLog, NonceTracker,
-    StreamRegistry, DeadMansSwitch,
-    AEGFGovernor, AEGFMetadata, AEGFPolicy, GovernanceDecision, GLOBAL_AEGF_GOVERNOR,
-    CSCSLoopDetector, GLOBAL_DAEG,
-    PSKCompromiseRecovery,
-    TrustMeshFederation, SignedFederationAgreement, TrustAnchor,
-    AgentIdentity, DistributedRevocationInfrastructure, IdentityProver,
-    AttestationType,
-    MEASC_MAX_PSN_ADVANCE, MEASC_HEADER_SIZE, MEASC_AUTH_TAG_SIZE,
-    SAACPBytecodes, SAACPHardDrop,
-    MAX_STREAMS_PER_AGENT, MAX_ACTIVE_STREAMS,
-    AUDIT_WAL_QUEUE_CAPACITY, NONCE_MAX_ENTRIES,
-    CSCS_MAX_OSCILLATION_COUNT, RID_ROOT, CID_NONE,
+    AEGFGovernor, AEGFMetadata, AEGFPolicy, AgentIdentity, AgentRateLimiter, AttestationType,
+    CSCSLoopDetector, CapabilityIssuanceAuthority, CapabilitySigningKey,
+    CapabilityVerificationAuthority, DeadMansSwitch, DistributedRevocationInfrastructure,
+    GovernanceDecision, IdentityProver, ImmutableAuditLog, JsonValue, MEASCFrame, NonceTracker,
+    PSKCompromiseRecovery, ParsedMEASCFrame, ReplayWindow, ReplayWindowPolicy, SAACPBytecodes,
+    SAACPHardDrop, SAACPProtocolHandler, SessionEpochManager, SignedFederationAgreement,
+    StreamRegistry, TrustAnchor, TrustMeshFederation, AUDIT_WAL_QUEUE_CAPACITY, CID_NONE,
+    CSCS_MAX_OSCILLATION_COUNT, GLOBAL_AEGF_GOVERNOR, GLOBAL_DAEG, MAX_ACTIVE_STREAMS,
+    MAX_STREAMS_PER_AGENT, MEASC_AUTH_TAG_SIZE, MEASC_HEADER_SIZE, MEASC_MAX_PSN_ADVANCE,
+    NONCE_MAX_ENTRIES, RID_ROOT,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn now_f64() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
 }
 
 fn make_pair(iss: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
-    let sk  = CapabilitySigningKey::generate(iss, 3600);
+    let sk = CapabilitySigningKey::generate(iss, 3600);
     let kid = sk.kid.clone();
-    let vk  = sk.verifying_key;
+    let vk = sk.verifying_key;
     let cia = CapabilityIssuanceAuthority::new(sk);
     let cva = CapabilityVerificationAuthority::new();
     cva.register_key(&kid, vk);
@@ -56,25 +55,30 @@ fn build_measc(
 ) -> (Vec<u8>, u64, SessionEpochManager) {
     let sid = [0xBBu8; 16];
     let mgr = SessionEpochManager::new();
-    mgr.create_session(sid, *secret, 1_000_000, 3600.0, None).unwrap();
+    mgr.create_session(sid, *secret, 1_000_000, 3600.0, None)
+        .unwrap();
     let eid = mgr.get_current_epoch_id(&sid).unwrap();
-    let (frame, psn) = mgr.with_epoch_mut(&sid, eid, |epoch| {
-        MEASCFrame::build_frame(epoch, schema_id, 0x10, 0x00, 0x00,
-            payload, &[0u8; 32], &[0u8; 24], 0).unwrap()
-    }).unwrap();
+    let (frame, psn) = mgr
+        .with_epoch_mut(&sid, eid, |epoch| {
+            MEASCFrame::build_frame(
+                epoch, schema_id, 0x10, 0x00, 0x00, payload, &[0u8; 32], &[0u8; 24], 0,
+            )
+            .unwrap()
+        })
+        .unwrap();
     (frame, psn, mgr)
 }
 
 fn make_meta(oaid: &str, cid: &str, rid: &str, ttl_extra: f64) -> AEGFMetadata {
     AEGFMetadata {
-        cid:  Arc::from(cid),
-        rid:  rid.to_string(),
+        cid: Arc::from(cid),
+        rid: rid.to_string(),
         prid: RID_ROOT.to_string(),
-        sid:  Arc::from("test-session-000000000000000000000000000"),
+        sid: Arc::from("test-session-000000000000000000000000000"),
         oaid: oaid.to_string(),
-        hc:   1,
-        ed:   0,
-        ttl:  now_f64() + ttl_extra,
+        hc: 1,
+        ed: 0,
+        ttl: now_f64() + ttl_extra,
     }
 }
 
@@ -102,7 +106,10 @@ fn blackhat_3b_double_stream_end_no_panic() {
     let r1 = StreamRegistry::global().close(&sid);
     assert!(r1.is_ok(), "First close must succeed");
     let r2 = StreamRegistry::global().close(&sid);
-    assert!(r2.is_err(), "Second close on removed stream must return Err, not panic");
+    assert!(
+        r2.is_err(),
+        "Second close on removed stream must return Err, not panic"
+    );
 }
 
 /// 3c: Re-open a stream after it was closed — must not panic.
@@ -114,7 +121,7 @@ fn blackhat_3c_reopen_stream_after_close_no_panic() {
     // Re-open — OK or Err (per-agent limit), must not panic.
     let r2 = StreamRegistry::global().start_stream(&sid, "src-3c", "agent-3c");
     match r2 {
-        Ok(_)  => println!("3c: Re-open after close OK."),
+        Ok(_) => println!("3c: Re-open after close OK."),
         Err(e) => println!("3c: Re-open after close Err: {}", e),
     }
     let _ = StreamRegistry::global().close(&sid);
@@ -123,7 +130,7 @@ fn blackhat_3c_reopen_stream_after_close_no_panic() {
 /// 3d: Concurrent START + CONTINUATION race — Mutex must prevent corruption.
 #[test]
 fn blackhat_3d_concurrent_stream_start_continuation_no_corruption() {
-    let sid  = test_stream("3d-race");
+    let sid = test_stream("3d-race");
     let sid2 = sid.clone();
     let ready = Arc::new(AtomicUsize::new(0));
     let ready2 = ready.clone();
@@ -132,7 +139,9 @@ fn blackhat_3d_concurrent_stream_start_continuation_no_corruption() {
         let _ = StreamRegistry::global().start_stream(&sid2, "src-3d", "agent-3d");
         ready2.fetch_add(1, Ordering::SeqCst);
     });
-    while ready.load(Ordering::SeqCst) == 0 { thread::yield_now(); }
+    while ready.load(Ordering::SeqCst) == 0 {
+        thread::yield_now();
+    }
     let _ = StreamRegistry::global().validate_frame(&sid, 1, 50);
     opener.join().expect("thread must not panic");
     assert!(StreamRegistry::global().agent_stream_count("agent-3d") <= 1);
@@ -145,11 +154,12 @@ fn blackhat_3e_psk_recovery_callback_can_close_streams() {
     let sid_stream = test_stream("3e-psk-stream");
     let secret: [u8; 32] = [0x3Eu8; 32];
     let mgr = Arc::new(SessionEpochManager::new());
-    mgr.create_session([0x3Eu8; 16], secret, 1_000_000, 3600.0, None).unwrap();
+    mgr.create_session([0x3Eu8; 16], secret, 1_000_000, 3600.0, None)
+        .unwrap();
     let _ = StreamRegistry::global().start_stream(&sid_stream, "src-3e", "agent-3e");
 
     let fired = Arc::new(AtomicUsize::new(0));
-    let f2    = fired.clone();
+    let f2 = fired.clone();
     let sid_c = sid_stream.clone();
 
     let r = PSKCompromiseRecovery::new(
@@ -159,7 +169,8 @@ fn blackhat_3e_psk_recovery_callback_can_close_streams() {
             f2.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })),
-    ).execute(None);
+    )
+    .execute(None);
 
     assert!(r.recovery_complete);
     assert_eq!(mgr.session_count(), 0);
@@ -185,10 +196,14 @@ fn blackhat_3f_epoch_boundary_psn_isolation() {
     let mut last_frame: Option<Vec<u8>> = None;
     for _ in 0..3 {
         let eid = mgr.get_current_epoch_id(&sid).unwrap();
-        let (f, _) = mgr.with_epoch_mut(&sid, eid, |epoch| {
-            MEASCFrame::build_frame(epoch, 1, 0x10, 0x00, 0x00,
-                b"{}", &[0u8; 32], &[0u8; 24], 0).unwrap()
-        }).unwrap();
+        let (f, _) = mgr
+            .with_epoch_mut(&sid, eid, |epoch| {
+                MEASCFrame::build_frame(
+                    epoch, 1, 0x10, 0x00, 0x00, b"{}", &[0u8; 32], &[0u8; 24], 0,
+                )
+                .unwrap()
+            })
+            .unwrap();
         let _ = MEASCFrame::parse_frame(&f, &mgr, true);
         last_frame = Some(f);
     }
@@ -214,24 +229,27 @@ fn blackhat_3g_zero_byte_packet_gate0_no_panic() {
 fn blackhat_3h_aegf_expired_ttl_treated_as_terminated() {
     let governor = AEGFGovernor::new(None);
     let meta = AEGFMetadata {
-        cid:  Arc::from("cid-3h"),
-        rid:  "rid-3h-expired".to_string(),
+        cid: Arc::from("cid-3h"),
+        rid: "rid-3h-expired".to_string(),
         prid: RID_ROOT.to_string(),
-        sid:  Arc::from("sid-3h"),
+        sid: Arc::from("sid-3h"),
         oaid: "agent-3h".to_string(),
-        hc:   1,
-        ed:   0,
-        ttl:  0.0, // Unix epoch = definitely expired
+        hc: 1,
+        ed: 0,
+        ttl: 0.0, // Unix epoch = definitely expired
     };
     let decision = governor.submit_request(&meta);
     match decision {
         GovernanceDecision::Terminate => println!("3h: TTL=0 → Terminate (correct)"),
-        GovernanceDecision::Allow     => println!("REVEALS_GAP 3h: Expired TTL was Allowed"),
-        other                         => println!("3h: TTL=0 → {:?}", other),
+        GovernanceDecision::Allow => println!("REVEALS_GAP 3h: Expired TTL was Allowed"),
+        other => println!("3h: TTL=0 → {:?}", other),
     }
     // The decision must NOT be Allow for a clearly-expired request.
-    assert_ne!(decision, GovernanceDecision::Allow,
-        "Expired TTL (0.0 = year 1970) must not be Allowed by the governor");
+    assert_ne!(
+        decision,
+        GovernanceDecision::Allow,
+        "Expired TTL (0.0 = year 1970) must not be Allowed by the governor"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -250,7 +268,9 @@ fn blackhat_6a_nonce_tracker_fresh_flood_reveals_cap_bypass() {
     let tracker = NonceTracker::with_limits(60.0, 1_000);
     let mut rejected = 0usize;
     for i in 0u64..2_000 {
-        if tracker.track(i).is_err() { rejected += 1; }
+        if tracker.track(i).is_err() {
+            rejected += 1;
+        }
     }
     let count = tracker.count();
     if count > 1_100 {
@@ -262,7 +282,10 @@ fn blackhat_6a_nonce_tracker_fresh_flood_reveals_cap_bypass() {
             count
         );
     } else {
-        println!("6a: Cap correctly enforced — {} tracked, {} rejected.", count, rejected);
+        println!(
+            "6a: Cap correctly enforced — {} tracked, {} rejected.",
+            count, rejected
+        );
     }
     // Document the gap without failing the suite; the count itself is the finding
     // (see println! branches above).
@@ -276,16 +299,24 @@ fn blackhat_6b_stream_per_agent_limit_enforced() {
     for i in 0..MAX_STREAMS_PER_AGENT {
         let sid = format!("dos-6b-stream-{}", i);
         match StreamRegistry::global().start_stream(&sid, "src-6b", agent) {
-            Ok(())  => opened.push(sid),
-            Err(e)  => { println!("6b: Hit limit at {}: {}", i, e); break; }
+            Ok(()) => opened.push(sid),
+            Err(e) => {
+                println!("6b: Hit limit at {}: {}", i, e);
+                break;
+            }
         }
     }
     let overflow = format!("dos-6b-overflow-{}", MAX_STREAMS_PER_AGENT);
     let r = StreamRegistry::global().start_stream(&overflow, "src-6b", agent);
-    assert!(r.is_err(),
+    assert!(
+        r.is_err(),
         "Stream #{} for same agent must be rejected (max={})",
-        MAX_STREAMS_PER_AGENT + 1, MAX_STREAMS_PER_AGENT);
-    for s in &opened { let _ = StreamRegistry::global().close(s); }
+        MAX_STREAMS_PER_AGENT + 1,
+        MAX_STREAMS_PER_AGENT
+    );
+    for s in &opened {
+        let _ = StreamRegistry::global().close(s);
+    }
 }
 
 /// 6c: 200,000 audit log writes must complete without deadlock (< 30s).
@@ -298,8 +329,11 @@ fn blackhat_6c_audit_log_write_bomb_no_deadlock() {
         log.append_event(key, &format!("src-{}", i), "tgt", "flood", "sig", "trace");
     }
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_secs(30),
-        "Audit log bomb must not deadlock: took {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "Audit log bomb must not deadlock: took {:?}",
+        elapsed
+    );
 }
 
 /// 6d: 50,000 CSCS fingerprints — window is bounded, no OOM.
@@ -329,11 +363,24 @@ fn blackhat_6e_aegf_rid_collision_no_panic() {
     }
     // All must be valid GovernanceDecision variants.
     assert_eq!(results.len(), 100, "Must have 100 results");
-    println!("6e: allow={} terminate={} pause={} review={}",
-        results.iter().filter(|&&d| d == GovernanceDecision::Allow).count(),
-        results.iter().filter(|&&d| d == GovernanceDecision::Terminate).count(),
-        results.iter().filter(|&&d| d == GovernanceDecision::Pause).count(),
-        results.iter().filter(|&&d| d == GovernanceDecision::Review).count(),
+    println!(
+        "6e: allow={} terminate={} pause={} review={}",
+        results
+            .iter()
+            .filter(|&&d| d == GovernanceDecision::Allow)
+            .count(),
+        results
+            .iter()
+            .filter(|&&d| d == GovernanceDecision::Terminate)
+            .count(),
+        results
+            .iter()
+            .filter(|&&d| d == GovernanceDecision::Pause)
+            .count(),
+        results
+            .iter()
+            .filter(|&&d| d == GovernanceDecision::Review)
+            .count(),
     );
 }
 
@@ -345,7 +392,11 @@ fn blackhat_6f_replay_window_advance_boundary_precision() {
 
     let max_jump = 1 + MEASC_MAX_PSN_ADVANCE;
     let (ok, reason) = rw.check(max_jump);
-    assert!(ok, "Jump of exactly MEASC_MAX_PSN_ADVANCE must be accepted: {}", reason);
+    assert!(
+        ok,
+        "Jump of exactly MEASC_MAX_PSN_ADVANCE must be accepted: {}",
+        reason
+    );
     rw.accept(max_jump).unwrap();
 
     let over_jump = max_jump + MEASC_MAX_PSN_ADVANCE + 1;
@@ -367,8 +418,10 @@ fn blackhat_8a_cross_domain_without_agreement_fails_not_loops() {
     // We'd need an AgentCredential for the full call, so we just verify list_members works.
     let members = mesh.list_members();
     assert!(members.is_empty(), "Fresh mesh must have no members");
-    assert!(start.elapsed() < Duration::from_secs(1),
-        "list_members on empty mesh must not loop");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "list_members on empty mesh must not loop"
+    );
     println!("8a: Empty TrustMeshFederation resolves immediately — no infinite loop risk.");
 }
 
@@ -384,29 +437,37 @@ fn blackhat_8b_cross_org_token_rejected_by_unknown_issuer() {
     let cva_b = CapabilityVerificationAuthority::new();
 
     let mut claims = serde_json::Map::new();
-    claims.insert("kid".into(),              serde_json::json!(kid_a));
-    claims.insert("iss".into(),              serde_json::json!("org-a-issuer"));
-    claims.insert("sub".into(),              serde_json::json!("org-a-agent"));
-    claims.insert("jti".into(),              serde_json::json!("jti-8b"));
-    claims.insert("nbf".into(),              serde_json::json!(0u64));
-    claims.insert("exp".into(),              serde_json::json!(9_999_999_999u64));
+    claims.insert("kid".into(), serde_json::json!(kid_a));
+    claims.insert("iss".into(), serde_json::json!("org-a-issuer"));
+    claims.insert("sub".into(), serde_json::json!("org-a-agent"));
+    claims.insert("jti".into(), serde_json::json!("jti-8b"));
+    claims.insert("nbf".into(), serde_json::json!(0u64));
+    claims.insert("exp".into(), serde_json::json!(9_999_999_999u64));
     claims.insert("delegation_depth".into(), serde_json::json!(0u64));
-    claims.insert("actions".into(),          serde_json::json!(["read"]));
+    claims.insert("actions".into(), serde_json::json!(["read"]));
     let tok = cia_a.issue(claims).unwrap();
 
     let r = cva_b.verify(&tok);
-    assert!(r.is_err(), "Cross-org token must be rejected by Org-B verifier (unknown key)");
+    assert!(
+        r.is_err(),
+        "Cross-org token must be rejected by Org-B verifier (unknown key)"
+    );
 }
 
 /// 8c: IdentityProver challenge replay — same challenge used twice is blocked.
 #[test]
 fn blackhat_8c_identity_proof_challenge_replay_blocked() {
     let identity = AgentIdentity::generate(
-        "agent-a-8c", "issuer-8c", 3600,
-        None, None, "", AttestationType::None,
+        "agent-a-8c",
+        "issuer-8c",
+        3600,
+        None,
+        None,
+        "",
+        AttestationType::None,
     );
 
-    let prover    = IdentityProver::new();
+    let prover = IdentityProver::new();
     let challenge = IdentityProver::generate_challenge();
     let (proof, timestamp) = IdentityProver::generate_proof(&identity, &challenge);
 
@@ -417,13 +478,16 @@ fn blackhat_8c_identity_proof_challenge_replay_blocked() {
 
     // First: verify the proof can be generated (API exists and compiles).
     let _ = proof.len(); // proof is Vec<u8>
-    let _ = timestamp;   // f64
+    let _ = timestamp; // f64
 
     // The important security property: calling verify_proof twice with the same
     // challenge must fail the second time (used_challenges blocks it).
     // This test verifies the API exists and the prover tracks used challenges.
     let challenge2 = IdentityProver::generate_challenge();
-    assert_ne!(challenge, challenge2, "Each generated challenge must be unique");
+    assert_ne!(
+        challenge, challenge2,
+        "Each generated challenge must be unique"
+    );
     println!("8c: IdentityProver::generate_challenge() produces unique values.");
 }
 
@@ -433,51 +497,68 @@ fn blackhat_8e_federation_agreement_zeroed_signature_rejected() {
     let mesh = TrustMeshFederation::new();
 
     // Create an issuer anchor.
-    let issuer_sk  = CapabilitySigningKey::generate("fed-issuer-8e", 3600);
-    let issuer_id  = AgentIdentity::generate(
-        "fed-org-8e", "fed-issuer-8e", 7200,
-        None, None, "", AttestationType::None,
+    let issuer_sk = CapabilitySigningKey::generate("fed-issuer-8e", 3600);
+    let issuer_id = AgentIdentity::generate(
+        "fed-org-8e",
+        "fed-issuer-8e",
+        7200,
+        None,
+        None,
+        "",
+        AttestationType::None,
     );
     let anchor = TrustAnchor::new("fed-anchor-8e", issuer_id.verifying_key);
 
     // Build a SignedFederationAgreement with zeroed signature.
     let bad_agreement = SignedFederationAgreement {
         agreement_id: "agreement-8e".to_string(),
-        members:      vec!["org-alpha".to_string(), "org-beta".to_string()],
+        members: vec!["org-alpha".to_string(), "org-beta".to_string()],
         allowed_scopes: vec!["read".to_string()],
-        valid_until:  now_f64() + 3600.0,
-        issuer_id:    "fed-issuer-8e".to_string(),
-        signature:    vec![0u8; 64], // zeroed = invalid
+        valid_until: now_f64() + 3600.0,
+        issuer_id: "fed-issuer-8e".to_string(),
+        signature: vec![0u8; 64], // zeroed = invalid
         issuer_key_id: anchor.fingerprint(),
     };
 
     let accepted = mesh.register_agreement(bad_agreement, &anchor);
-    assert!(!accepted,
-        "Agreement with zeroed/invalid signature must be rejected by register_agreement()");
+    assert!(
+        !accepted,
+        "Agreement with zeroed/invalid signature must be rejected by register_agreement()"
+    );
 }
 
 /// 8f: DRI revocation is immediately visible via is_revoked().
 #[test]
 fn blackhat_8f_dri_revocation_immediately_visible() {
     let revoker = AgentIdentity::generate(
-        "revoker-8f", "admin-org", 3600,
-        None, None, "", AttestationType::None,
+        "revoker-8f",
+        "admin-org",
+        3600,
+        None,
+        None,
+        "",
+        AttestationType::None,
     );
     let dri = DistributedRevocationInfrastructure::new();
 
-    let agent_id        = "revoked-agent-8f";
+    let agent_id = "revoked-agent-8f";
     let cred_fingerprint = "fp-8f-0000000000000000";
 
     // Not yet revoked.
-    assert!(!dri.is_revoked(agent_id, cred_fingerprint),
-        "Agent must not be revoked before revoke() is called");
+    assert!(
+        !dri.is_revoked(agent_id, cred_fingerprint),
+        "Agent must not be revoked before revoke() is called"
+    );
 
     // Revoke.
-    dri.revoke(agent_id, "security-incident-8f", &revoker, cred_fingerprint).unwrap();
+    dri.revoke(agent_id, "security-incident-8f", &revoker, cred_fingerprint)
+        .unwrap();
 
     // Immediately revoked.
-    assert!(dri.is_revoked(agent_id, cred_fingerprint),
-        "Agent must be revoked immediately after revoke() call");
+    assert!(
+        dri.is_revoked(agent_id, cred_fingerprint),
+        "Agent must be revoked immediately after revoke() call"
+    );
 }
 
 /// 8d: Two MEASC sessions with same PSK stay in sync through 5 packets.
@@ -487,17 +568,36 @@ fn blackhat_8d_two_agent_sessions_stay_synchronized() {
     let sid: [u8; 16] = [0x8Du8; 16];
     let mgr_a = SessionEpochManager::new();
     let mgr_b = SessionEpochManager::new();
-    mgr_a.create_session(sid, psk, 1_000_000, 3600.0, None).unwrap();
-    mgr_b.create_session(sid, psk, 1_000_000, 3600.0, None).unwrap();
+    mgr_a
+        .create_session(sid, psk, 1_000_000, 3600.0, None)
+        .unwrap();
+    mgr_b
+        .create_session(sid, psk, 1_000_000, 3600.0, None)
+        .unwrap();
 
     for _ in 0..5 {
         let eid = mgr_a.get_current_epoch_id(&sid).unwrap();
-        let (frame, _) = mgr_a.with_epoch_mut(&sid, eid, |epoch| {
-            MEASCFrame::build_frame(epoch, 1, 0x10, 0x00, 0x00,
-                b"sync-data", &[0u8; 32], &[0u8; 24], 0).unwrap()
-        }).unwrap();
+        let (frame, _) = mgr_a
+            .with_epoch_mut(&sid, eid, |epoch| {
+                MEASCFrame::build_frame(
+                    epoch,
+                    1,
+                    0x10,
+                    0x00,
+                    0x00,
+                    b"sync-data",
+                    &[0u8; 32],
+                    &[0u8; 24],
+                    0,
+                )
+                .unwrap()
+            })
+            .unwrap();
         let r = MEASCFrame::parse_frame(&frame, &mgr_b, true);
-        assert!(r.is_ok(), "Synchronized sessions must accept each other's frames");
+        assert!(
+            r.is_ok(),
+            "Synchronized sessions must accept each other's frames"
+        );
     }
 }
 
@@ -512,15 +612,23 @@ fn blackhat_9a_legitimate_two_agent_measc_exchange_succeeds() {
     let sid: [u8; 16] = [0x9Au8; 16];
     let mgr_a = SessionEpochManager::new();
     let mgr_b = SessionEpochManager::new();
-    mgr_a.create_session(sid, psk, 1_000_000, 3600.0, None).unwrap();
-    mgr_b.create_session(sid, psk, 1_000_000, 3600.0, None).unwrap();
+    mgr_a
+        .create_session(sid, psk, 1_000_000, 3600.0, None)
+        .unwrap();
+    mgr_b
+        .create_session(sid, psk, 1_000_000, 3600.0, None)
+        .unwrap();
 
     let payload = br#"{"task":"summarise document","data":"hello world"}"#;
     let eid = mgr_a.get_current_epoch_id(&sid).unwrap();
-    let (frame, _) = mgr_a.with_epoch_mut(&sid, eid, |epoch| {
-        MEASCFrame::build_frame(epoch, 1, 0x10, 0x00, 0x00,
-            payload, &[0u8; 32], &[0u8; 24], 0).unwrap()
-    }).unwrap();
+    let (frame, _) = mgr_a
+        .with_epoch_mut(&sid, eid, |epoch| {
+            MEASCFrame::build_frame(
+                epoch, 1, 0x10, 0x00, 0x00, payload, &[0u8; 32], &[0u8; 24], 0,
+            )
+            .unwrap()
+        })
+        .unwrap();
 
     let parsed = MEASCFrame::parse_frame(&frame, &mgr_b, true)
         .expect("Legitimate A→B frame must parse successfully");
@@ -531,19 +639,26 @@ fn blackhat_9a_legitimate_two_agent_measc_exchange_succeeds() {
 /// 9b: Individual gate functions still accept clean payloads after all attack tests ran.
 #[test]
 fn blackhat_9b_gates_accept_legitimate_data_after_attacks() {
-    let clean = JsonValue::Object(vec![
-        ("task".into(), JsonValue::String("summarise quarterly report".into())),
-    ]);
-    assert!(SAACPProtocolHandler::gate_4_0_injection_scan(&clean).is_ok(),
-        "Clean payload must pass Gate 4.0 even after attack test runs");
+    let clean = JsonValue::Object(vec![(
+        "task".into(),
+        JsonValue::String("summarise quarterly report".into()),
+    )]);
+    assert!(
+        SAACPProtocolHandler::gate_4_0_injection_scan(&clean).is_ok(),
+        "Clean payload must pass Gate 4.0 even after attack test runs"
+    );
 
     let mut pd = HashMap::new();
     pd.insert("epistemic_metadata".into(), JsonValue::Number(0.92));
-    assert!(SAACPProtocolHandler::gate_5_0_epistemic_cb(3, &pd).is_ok(),
-        "Valid confidence=0.92 must pass Gate 5.0");
+    assert!(
+        SAACPProtocolHandler::gate_5_0_epistemic_cb(3, &pd).is_ok(),
+        "Valid confidence=0.92 must pass Gate 5.0"
+    );
 
-    assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x00, 0x02, None).is_ok(),
-        "READ_ONLY must pass Gate 2.5");
+    assert!(
+        SAACPProtocolHandler::gate_2_5_kinetic_firewall(0x00, 0x02, None).is_ok(),
+        "READ_ONLY must pass Gate 2.5"
+    );
 }
 
 /// 9c: 20 concurrent threads each run 1 attack + 1 legitimate check — no corruption.
@@ -558,7 +673,8 @@ fn blackhat_9c_concurrent_attack_and_legit_no_state_corruption() {
             // Attack: replay must be blocked.
             let mut rw = ReplayWindow::with_default_policy();
             rw.accept(1).unwrap();
-            if rw.check(1).0 { // duplicate should fail
+            if rw.check(1).0 {
+                // duplicate should fail
                 err2.fetch_add(1, Ordering::SeqCst);
             }
             // Attack: injection must be blocked.
@@ -567,17 +683,23 @@ fn blackhat_9c_concurrent_attack_and_legit_no_state_corruption() {
                 err2.fetch_add(1, Ordering::SeqCst);
             }
             // Legitimate: clean payload must pass.
-            let ok = JsonValue::Object(vec![
-                ("task".into(), JsonValue::String(format!("order-{}", idx))),
-            ]);
+            let ok = JsonValue::Object(vec![(
+                "task".into(),
+                JsonValue::String(format!("order-{}", idx)),
+            )]);
             if SAACPProtocolHandler::gate_4_0_injection_scan(&ok).is_err() {
                 err2.fetch_add(1, Ordering::SeqCst);
             }
         }));
     }
-    for h in handles { h.join().expect("thread must not panic"); }
-    assert_eq!(errors.load(Ordering::SeqCst), 0,
-        "Protocol state errors detected in concurrent attack+legit mix");
+    for h in handles {
+        h.join().expect("thread must not panic");
+    }
+    assert_eq!(
+        errors.load(Ordering::SeqCst),
+        0,
+        "Protocol state errors detected in concurrent attack+legit mix"
+    );
 }
 
 /// 9d: Full 8-step PSK recovery destroys 3 sessions and fires all 4 callbacks.
@@ -586,7 +708,8 @@ fn blackhat_9d_full_psk_recovery_destroys_sessions_fires_all_callbacks() {
     let psk: [u8; 32] = [0x9Du8; 32];
     let mgr = Arc::new(SessionEpochManager::new());
     for i in 0u8..3 {
-        mgr.create_session([i; 16], psk, 1_000_000, 3600.0, None).unwrap();
+        mgr.create_session([i; 16], psk, 1_000_000, 3600.0, None)
+            .unwrap();
     }
     assert_eq!(mgr.session_count(), 3);
 
@@ -607,28 +730,47 @@ fn blackhat_9d_full_psk_recovery_destroys_sessions_fires_all_callbacks() {
     let report = PSKCompromiseRecovery::new(
         mgr.clone(),
         Some(Box::new(move || {
-            for s in &sids { let _ = StreamRegistry::global().close(s); }
+            for s in &sids {
+                let _ = StreamRegistry::global().close(s);
+            }
             g2.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })),
     )
-    .with_capability_revoke(Box::new(move || { c2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
-    .with_key_rotation(    Box::new(move || { k2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
-    .with_audit(           Box::new(move || { a2.fetch_add(1, Ordering::SeqCst); Ok(()) }))
+    .with_capability_revoke(Box::new(move || {
+        c2.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }))
+    .with_key_rotation(Box::new(move || {
+        k2.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }))
+    .with_audit(Box::new(move || {
+        a2.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }))
     .execute(None);
 
     assert!(report.recovery_complete);
     assert_eq!(report.sessions_destroyed, 3);
     assert_eq!(mgr.session_count(), 0);
-    assert_eq!(gw.load(Ordering::SeqCst),  1, "gateway callback");
+    assert_eq!(gw.load(Ordering::SeqCst), 1, "gateway callback");
     assert_eq!(cap.load(Ordering::SeqCst), 1, "capability revoke callback");
     assert_eq!(key.load(Ordering::SeqCst), 1, "key rotation callback");
     assert_eq!(aud.load(Ordering::SeqCst), 1, "audit callback");
     for sid in &stream_ids {
-        assert!(StreamRegistry::global().validate_frame(sid, 99, 1).is_err(),
-            "Stream {} must be closed after PSK recovery", sid);
+        assert!(
+            StreamRegistry::global().validate_frame(sid, 99, 1).is_err(),
+            "Stream {} must be closed after PSK recovery",
+            sid
+        );
     }
     // New sessions must be establishable after recovery.
-    mgr.create_session([0xFFu8; 16], psk, 1_000_000, 3600.0, None).unwrap();
-    assert_eq!(mgr.session_count(), 1, "New session after recovery must work");
+    mgr.create_session([0xFFu8; 16], psk, 1_000_000, 3600.0, None)
+        .unwrap();
+    assert_eq!(
+        mgr.session_count(),
+        1,
+        "New session after recovery must work"
+    );
 }

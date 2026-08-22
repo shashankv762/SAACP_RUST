@@ -24,18 +24,14 @@
 // in release builds with aggressive stack/register reuse. Run 50 iterations
 // and report the survival rate, not just pass/fail.
 
-use saacp::{
-    KeyDescriptor, KeyAlgorithm, KeyCategory, KeyStatus,
-};
+use saacp::{KeyAlgorithm, KeyCategory, KeyDescriptor, KeyStatus};
 
 // ─── FINDING-2: KeyDescriptor heap survival ───────────────────────────────────
 
 /// Marker key bytes — distinctive pattern for grep-ability, unlikely to appear as heap noise.
 const MARKER_KEY: [u8; 32] = [
-    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
-    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
-    0xCA, 0xFE, 0xBA, 0xBE, 0xCA, 0xFE, 0xBA, 0xBE,
-    0xCA, 0xFE, 0xBA, 0xBE, 0xCA, 0xFE, 0xBA, 0xBE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xCA, 0xFE, 0xBA, 0xBE, 0xCA, 0xFE, 0xBA, 0xBE, 0xCA, 0xFE, 0xBA, 0xBE, 0xCA, 0xFE, 0xBA, 0xBE,
 ];
 
 fn make_test_kid() -> String {
@@ -137,7 +133,10 @@ fn finding_2_key_descriptor_key_bytes_survive_drop_no_pressure() {
          #[derive(Zeroize, ZeroizeOnDrop)] on KeyDescriptor in src/klms.rs.",
         survived_count, trials
     );
-    eprintln!("[FINDING-2 FIXED] Key bytes were zeroized in all {} trials.", trials);
+    eprintln!(
+        "[FINDING-2 FIXED] Key bytes were zeroized in all {} trials.",
+        trials
+    );
 }
 
 /// Run 50 trials with HIGH heap pressure (1000 × 4096-byte allocs).
@@ -167,7 +166,10 @@ fn finding_2_key_descriptor_key_bytes_survive_drop_high_pressure() {
         "FINDING-2 REGRESSED (high pressure): key bytes survived drop in {}/{} trials.",
         survived_count, trials
     );
-    eprintln!("[FINDING-2 FIXED] Key bytes were zeroized in all {} trials under heap pressure.", trials);
+    eprintln!(
+        "[FINDING-2 FIXED] Key bytes were zeroized in all {} trials under heap pressure.",
+        trials
+    );
 }
 
 // ─── FINDING-2b: SessionEpoch panic-unwind key survival ──────────────────────
@@ -197,12 +199,17 @@ fn finding_2b_session_epoch_drop_zeroizes_on_panic_unwind() {
     // Sanity: explicit destroy() still works and is idempotent with Drop.
     let mut epoch = SessionEpoch::new(session_id, 0, marker_key, 1_000_000, 600.0);
     epoch.destroy();
-    assert!(epoch.is_destroyed(), "sanity: destroy() must set is_destroyed() = true");
+    assert!(
+        epoch.is_destroyed(),
+        "sanity: destroy() must set is_destroyed() = true"
+    );
     drop(epoch); // Drop::drop() must no-op safely on an already-destroyed epoch
 
     // PANIC PATH: build a new epoch, don't call destroy(), let the panic
     // unwinder drop it — this must still zeroize via the Drop impl.
-    let epoch2 = Box::new(SessionEpoch::new(session_id, 1, marker_key, 1_000_000, 600.0));
+    let epoch2 = Box::new(SessionEpoch::new(
+        session_id, 1, marker_key, 1_000_000, 600.0,
+    ));
     let raw_ptr = epoch2.as_ref() as *const SessionEpoch as *const u8;
     let footprint = std::mem::size_of::<SessionEpoch>();
 
@@ -252,7 +259,11 @@ fn control_key_evolution_engine_zeroize_on_drop() {
     // ZeroizeOnDrop (structural check via the fact that it's derived in measc.rs).
 
     // Explicit drop via ManuallyDrop::drop()
-    unsafe { ManuallyDrop::drop(&mut std::mem::ManuallyDrop::new(KeyEvolutionEngine::new(marker_secret))); }
+    unsafe {
+        ManuallyDrop::drop(&mut std::mem::ManuallyDrop::new(KeyEvolutionEngine::new(
+            marker_secret,
+        )));
+    }
 
     eprintln!(
         "[CONTROL] KeyEvolutionEngine derives ZeroizeOnDrop — \

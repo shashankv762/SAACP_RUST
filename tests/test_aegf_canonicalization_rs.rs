@@ -10,34 +10,32 @@
 
 use std::sync::Arc;
 
-use saacp::{
-    AEGFMetadata,
-    AEGF_META_SIZE, AEGF_META_FORMAT_VERSION,
-};
+use saacp::{AEGFMetadata, AEGF_META_FORMAT_VERSION, AEGF_META_SIZE};
 
 // ─── Size and Version ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_format_version_assertion() {
     // Python parity: AEGF_META_FORMAT_VERSION == 1
-    assert_eq!(AEGF_META_FORMAT_VERSION, 1,
-        "AEGF_META_FORMAT_VERSION must be 1");
+    assert_eq!(
+        AEGF_META_FORMAT_VERSION, 1,
+        "AEGF_META_FORMAT_VERSION must be 1"
+    );
 }
 
 #[test]
 fn test_aegf_meta_size_is_120() {
-    assert_eq!(AEGF_META_SIZE, 120,
-        "AEGF_META_SIZE must be 120 bytes (README §4.2)");
+    assert_eq!(
+        AEGF_META_SIZE, 120,
+        "AEGF_META_SIZE must be 120 bytes (README §4.2)"
+    );
 }
 
 #[test]
 fn test_pack_produces_120_bytes() {
-    let meta = AEGFMetadata::new(
-        "agent-alpha", "session-1", None, None, 300.0, 0, 0,
-    );
+    let meta = AEGFMetadata::new("agent-alpha", "session-1", None, None, 300.0, 0, 0);
     let packed = meta.pack();
-    assert_eq!(packed.len(), 120,
-        "pack() must produce exactly 120 bytes");
+    assert_eq!(packed.len(), 120, "pack() must produce exactly 120 bytes");
 }
 
 // ─── Field Offsets (README §4.2) ─────────────────────────────────────────────
@@ -69,8 +67,10 @@ fn test_field_offsets_cid_at_0() {
     let packed = meta.pack();
     // CID is at bytes [0..16] — must not be all-zero
     let cid_bytes = &packed[0..16];
-    assert!(!cid_bytes.iter().all(|&b| b == 0),
-        "CID at offset 0 must be non-zero for non-empty CID");
+    assert!(
+        !cid_bytes.iter().all(|&b| b == 0),
+        "CID at offset 0 must be non-zero for non-empty CID"
+    );
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn test_field_offset_hc_at_96() {
         prid: "0".repeat(32),
         sid: Arc::from("0".repeat(32)),
         oaid: String::new(),
-        hc: 0x0042,  // 66 decimal
+        hc: 0x0042, // 66 decimal
         ed: 0,
         ttl: 9999999999.0,
     };
@@ -123,8 +123,10 @@ fn test_field_offset_ttl_at_100() {
     let packed = meta.pack();
     let ttl_bytes: [u8; 8] = packed[100..108].try_into().unwrap();
     let roundtrip = f64::from_be_bytes(ttl_bytes);
-    assert_eq!(roundtrip, ttl_val,
-        "TTL at offset 100 must round-trip exactly");
+    assert_eq!(
+        roundtrip, ttl_val,
+        "TTL at offset 100 must round-trip exactly"
+    );
 }
 
 #[test]
@@ -132,8 +134,10 @@ fn test_reserved_bytes_108_to_120_are_zero() {
     let meta = AEGFMetadata::new("agent", "session", None, None, 300.0, 5, 3);
     let packed = meta.pack();
     let reserved = &packed[108..120];
-    assert!(reserved.iter().all(|&b| b == 0),
-        "Reserved bytes [108..120] must be zero");
+    assert!(
+        reserved.iter().all(|&b| b == 0),
+        "Reserved bytes [108..120] must be zero"
+    );
 }
 
 // ─── Pack / Unpack Roundtrip ──────────────────────────────────────────────────
@@ -142,8 +146,8 @@ fn test_reserved_bytes_108_to_120_are_zero() {
 fn test_pack_unpack_roundtrip_preserves_hc_ed() {
     let meta = AEGFMetadata::new("agent-beta", "session-2", None, None, 600.0, 3, 2);
     let packed = meta.pack();
-    let unpacked = AEGFMetadata::unpack(&packed)
-        .expect("unpack must succeed for valid packed bytes");
+    let unpacked =
+        AEGFMetadata::unpack(&packed).expect("unpack must succeed for valid packed bytes");
     assert_eq!(unpacked.hc, meta.hc, "HC must survive pack/unpack");
     assert_eq!(unpacked.ed, meta.ed, "ED must survive pack/unpack");
 }
@@ -152,8 +156,7 @@ fn test_pack_unpack_roundtrip_preserves_hc_ed() {
 fn test_pack_unpack_roundtrip_preserves_oaid() {
     let meta = AEGFMetadata::new("agent-oaid-test", "session-3", None, None, 60.0, 0, 0);
     let packed = meta.pack();
-    let unpacked = AEGFMetadata::unpack(&packed)
-        .expect("unpack must succeed");
+    let unpacked = AEGFMetadata::unpack(&packed).expect("unpack must succeed");
     assert_eq!(unpacked.oaid, meta.oaid, "OAID must survive pack/unpack");
 }
 
@@ -161,8 +164,7 @@ fn test_pack_unpack_roundtrip_preserves_oaid() {
 fn test_unpack_rejects_short_buffer() {
     let short = vec![0u8; 50]; // Less than 120 bytes
     let result = AEGFMetadata::unpack(&short);
-    assert!(result.is_err(),
-        "unpack of short buffer must return error");
+    assert!(result.is_err(), "unpack of short buffer must return error");
 }
 
 #[test]
@@ -198,9 +200,11 @@ fn test_derive_increments_hc_and_ed() {
 #[test]
 fn test_derive_new_oaid_overrides_parent() {
     let parent = AEGFMetadata::new("parent-agent", "session-5", None, None, 300.0, 0, 0);
-    let child = AEGFMetadata::derive(&parent, Some("child-agent"))
-        .expect("derive must succeed");
-    assert_eq!(child.oaid, "child-agent", "New OAID must override parent's OAID");
+    let child = AEGFMetadata::derive(&parent, Some("child-agent")).expect("derive must succeed");
+    assert_eq!(
+        child.oaid, "child-agent",
+        "New OAID must override parent's OAID"
+    );
 }
 
 #[test]

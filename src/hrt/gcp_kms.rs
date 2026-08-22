@@ -63,9 +63,7 @@ use gcloud_sdk::tonic;
 use gcloud_sdk::{GoogleApi, GoogleAuthMiddleware};
 
 use super::remote::{RemoteSignerRuntime, DEFAULT_REMOTE_TIMEOUT};
-use super::{
-    check_signature_len, ed25519_public_key_from_spki, HardwareKeyStore, HrtError,
-};
+use super::{check_signature_len, ed25519_public_key_from_spki, HardwareKeyStore, HrtError};
 
 const BACKEND: &str = "GCP KMS";
 const KMS_ENDPOINT: &str = "https://cloudkms.googleapis.com";
@@ -105,7 +103,11 @@ impl GcpKmsKeyStore {
                     ))
                 })
         })?;
-        Ok(Self { client, runtime, public_keys: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            client,
+            runtime,
+            public_keys: Mutex::new(HashMap::new()),
+        })
     }
 }
 
@@ -277,7 +279,9 @@ fn map_status(operation: &str, key_id: &str, status: tonic::Status) -> HrtError 
 
 impl std::fmt::Debug for GcpKmsKeyStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GcpKmsKeyStore").field("backend", &BACKEND).finish_non_exhaustive()
+        f.debug_struct("GcpKmsKeyStore")
+            .field("backend", &BACKEND)
+            .finish_non_exhaustive()
     }
 }
 
@@ -300,8 +304,8 @@ mod tests {
     fn a_key_name_without_a_version_suffix_is_refused_locally() {
         // The most common operator mistake — the console shows the key name, but signing
         // requires a version. Must fail before a network round-trip.
-        let err =
-            validate_version_name("projects/p/locations/global/keyRings/r/cryptoKeys/k").unwrap_err();
+        let err = validate_version_name("projects/p/locations/global/keyRings/r/cryptoKeys/k")
+            .unwrap_err();
         assert!(matches!(err, HrtError::Configuration(msg) if msg.contains("cryptoKeyVersions")));
 
         assert!(validate_version_name(
@@ -320,8 +324,14 @@ mod tests {
             BASE64.encode(&spki)
         );
         let der = der_from_pem(&pem).unwrap();
-        assert_eq!(der, spki, "the PEM armor must be stripped and the body base64-decoded");
-        assert_eq!(ed25519_public_key_from_spki(&der, BACKEND).unwrap(), vec![0x5Au8; 32]);
+        assert_eq!(
+            der, spki,
+            "the PEM armor must be stripped and the body base64-decoded"
+        );
+        assert_eq!(
+            ed25519_public_key_from_spki(&der, BACKEND).unwrap(),
+            vec![0x5Au8; 32]
+        );
     }
 
     #[test]

@@ -11,14 +11,14 @@ use std::time::{Duration, SystemTime};
 
 use std::collections::BTreeMap;
 
-use sha2::{Sha256, Digest};
-use hmac::{Hmac, Mac};
-use hkdf::Hkdf;
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use serde::{Serialize, Deserialize};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::state_backend::StateBackend;
@@ -81,22 +81,35 @@ impl CheckpointedSession {
     }
 
     /// Saves the exact pipeline stage linked to the 32-byte Context-State-ID.
-    pub fn save_checkpoint(&self, context_state_id: &[u8], execution_stage: &str, intermediate_data: serde_json::Value) {
+    pub fn save_checkpoint(
+        &self,
+        context_state_id: &[u8],
+        execution_stage: &str,
+        intermediate_data: serde_json::Value,
+    ) {
         let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.checkpoints.insert(context_state_id.to_vec(), CheckpointEntry {
-            stage: execution_stage.to_string(),
-            data: intermediate_data,
-            timestamp: now_secs(),
-        });
+        inner.checkpoints.insert(
+            context_state_id.to_vec(),
+            CheckpointEntry {
+                stage: execution_stage.to_string(),
+                data: intermediate_data,
+                timestamp: now_secs(),
+            },
+        );
         // Evict expired entries if over capacity
         if inner.checkpoints.len() > CHECKPOINT_MAX_ENTRIES {
             let now = now_secs();
-            inner.checkpoints.retain(|_, v| (now - v.timestamp) < CHECKPOINT_TTL_SECONDS);
+            inner
+                .checkpoints
+                .retain(|_, v| (now - v.timestamp) < CHECKPOINT_TTL_SECONDS);
         }
     }
 
     /// Restores the exact state if the agent reconnects after a drop.
-    pub fn resume_checkpoint(&self, context_state_id: &[u8]) -> Option<(String, serde_json::Value)> {
+    pub fn resume_checkpoint(
+        &self,
+        context_state_id: &[u8],
+    ) -> Option<(String, serde_json::Value)> {
         let mut inner = self.inner.lock().expect("lock poisoned");
         if let Some(cp) = inner.checkpoints.get(context_state_id) {
             if (now_secs() - cp.timestamp) > CHECKPOINT_TTL_SECONDS {
@@ -161,7 +174,9 @@ impl CheckpointedSession {
         let now = now_secs();
         let mut inner = self.inner.lock().expect("lock poisoned");
         let before = inner.checkpoints.len();
-        inner.checkpoints.retain(|_, v| (now - v.timestamp) < CHECKPOINT_TTL_SECONDS);
+        inner
+            .checkpoints
+            .retain(|_, v| (now - v.timestamp) < CHECKPOINT_TTL_SECONDS);
         before - inner.checkpoints.len()
     }
 }
@@ -241,7 +256,8 @@ const FEDERATED_MEMORY_SHARDS: usize = 16;
 /// (SHA-256-derived Context-State-IDs are effectively uniformly distributed) —
 /// sharding must not silently multiply the effective capacity bound (Part 12
 /// principle 5, "Bounded Everything").
-const FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES: usize = FEDERATED_MAX_ENTRIES / FEDERATED_MEMORY_SHARDS;
+const FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES: usize =
+    FEDERATED_MAX_ENTRIES / FEDERATED_MEMORY_SHARDS;
 
 /// Maps a Context-State-ID (or intent-envelope hash) to its shard index, using
 /// the first two bytes as a big-endian `u16` modulo the shard count — ids
@@ -263,7 +279,11 @@ static FEDERATED_MEMORY_GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync
 impl FederatedMemory {
     fn new_shards() -> Vec<Mutex<FederatedInner>> {
         (0..FEDERATED_MEMORY_SHARDS)
-            .map(|_| Mutex::new(FederatedInner { store: HashMap::new() }))
+            .map(|_| {
+                Mutex::new(FederatedInner {
+                    store: HashMap::new(),
+                })
+            })
             .collect()
     }
 
@@ -299,13 +319,23 @@ impl FederatedMemory {
     /// Returns `Err` (storing nothing) if `massive_context_string` exceeds
     /// `FEDERATED_MAX_VALUE_BYTES` — see `put_record`'s doc comment for the
     /// reject-don't-truncate rationale (opusplan.md 6.5).
-    pub fn store_context(&self, agent_id: &str, massive_context_string: &str, version: u32) -> Result<Vec<u8>, String> {
+    pub fn store_context(
+        &self,
+        agent_id: &str,
+        massive_context_string: &str,
+        version: u32,
+    ) -> Result<Vec<u8>, String> {
         let mut hasher = Sha256::new();
         hasher.update((agent_id.len() as u64).to_le_bytes());
         hasher.update(agent_id.as_bytes());
         hasher.update(massive_context_string.as_bytes());
         let state_id = hasher.finalize().to_vec();
-        self.put_record(&state_id, massive_context_string.to_string(), version, FEDERATED_TTL_SECONDS)?;
+        self.put_record(
+            &state_id,
+            massive_context_string.to_string(),
+            version,
+            FEDERATED_TTL_SECONDS,
+        )?;
         Ok(state_id)
     }
 
@@ -314,14 +344,18 @@ impl FederatedMemory {
         if state_id.len() != 32 {
             return Err("Context-State-ID must be exactly 32 bytes.".into());
         }
-        let (data, version, expires_at) = self.get_record(state_id)
+        let (data, version, expires_at) = self
+            .get_record(state_id)
             .ok_or("Context-State-ID not found in Federated Memory.")?;
         if now_secs() > expires_at {
             self.remove_record(state_id);
             return Err("Context-State-ID has expired (TTL).".into());
         }
         if version != expected_version {
-            return Err(format!("StaleStateError: Expected version {}, got {}", expected_version, version));
+            return Err(format!(
+                "StaleStateError: Expected version {}, got {}",
+                expected_version, version
+            ));
         }
         Ok(data)
     }
@@ -359,7 +393,8 @@ impl FederatedMemory {
             "_saacp_provenance_v1": true,
             "writer_agent": writer_agent,
             "data": data,
-        }).to_string();
+        })
+        .to_string();
         self.put_record(state_id, tagged, version, FEDERATED_TTL_SECONDS)
     }
 
@@ -379,8 +414,15 @@ impl FederatedMemory {
         let raw = self.fetch_context(state_id, expected_version)?;
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) if v.get("_saacp_provenance_v1") == Some(&serde_json::Value::Bool(true)) => {
-                let writer = v.get("writer_agent").and_then(|w| w.as_str()).map(String::from);
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                let writer = v
+                    .get("writer_agent")
+                    .and_then(|w| w.as_str())
+                    .map(String::from);
+                let data = v
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Ok((data, writer))
             }
             _ => Ok((raw, None)),
@@ -400,7 +442,9 @@ impl FederatedMemory {
     /// poisoning panic must not cascade into every other caller sharing this
     /// shard losing access to its memory records.
     fn shard(&self, id: &[u8]) -> std::sync::MutexGuard<'_, FederatedInner> {
-        self.shards[shard_index(id)].lock().unwrap_or_else(|e| e.into_inner())
+        self.shards[shard_index(id)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// opusplan.md 6.5: rejects (returns `Err`, stores nothing) any `data` payload
@@ -411,24 +455,34 @@ impl FederatedMemory {
     /// at write time can be handled by the caller (e.g. split into multiple records,
     /// or reject the originating request). This mirrors how `MAX_PAYLOAD_SIZE` is
     /// already enforced elsewhere in this crate (reject, never truncate).
-    fn put_record(&self, id: &[u8], data: String, version: u32, ttl_secs: f64) -> Result<(), String> {
+    fn put_record(
+        &self,
+        id: &[u8],
+        data: String,
+        version: u32,
+        ttl_secs: f64,
+    ) -> Result<(), String> {
         if data.len() > FEDERATED_MAX_VALUE_BYTES {
             return Err(format!(
                 "FederatedMemory record exceeds FEDERATED_MAX_VALUE_BYTES ({} > {})",
-                data.len(), FEDERATED_MAX_VALUE_BYTES,
+                data.len(),
+                FEDERATED_MAX_VALUE_BYTES,
             ));
         }
         match &self.backend {
             Some(backend) => {
-                let record = FederatedRecordWire { data, version, expires_at: now_secs() + ttl_secs };
+                let record = FederatedRecordWire {
+                    data,
+                    version,
+                    expires_at: now_secs() + ttl_secs,
+                };
                 // Propagate both the serialization and the backend-write failure:
                 // returning `Ok(())` when the record never reached the backend is a
                 // silent data-loss / false-success bug — a caller that got `Ok` would
                 // later read `None` for a record it believes it durably stored. All
                 // callers already surface this `Result` via `?`.
-                let bytes = serde_json::to_vec(&record).map_err(|e| {
-                    format!("FederatedMemory: failed to serialize record: {e}")
-                })?;
+                let bytes = serde_json::to_vec(&record)
+                    .map_err(|e| format!("FederatedMemory: failed to serialize record: {e}"))?;
                 backend
                     .set(
                         &Self::backend_key(id),
@@ -439,9 +493,14 @@ impl FederatedMemory {
             }
             None => {
                 let mut inner = self.shard(id);
-                inner.store.insert(id.to_vec(), FederatedRecord {
-                    data, version, expires_at: now_secs() + ttl_secs,
-                });
+                inner.store.insert(
+                    id.to_vec(),
+                    FederatedRecord {
+                        data,
+                        version,
+                        expires_at: now_secs() + ttl_secs,
+                    },
+                );
                 // Evict expired entries if this shard is over its (aggregate-cap-
                 // preserving) per-shard capacity — in-process mode only, the
                 // backend mode relies on the backend's own TTL expiry.
@@ -463,15 +522,22 @@ impl FederatedMemory {
             }
             None => {
                 let inner = self.shard(id);
-                inner.store.get(id).map(|r| (r.data.clone(), r.version, r.expires_at))
+                inner
+                    .store
+                    .get(id)
+                    .map(|r| (r.data.clone(), r.version, r.expires_at))
             }
         }
     }
 
     fn remove_record(&self, id: &[u8]) {
         match &self.backend {
-            Some(backend) => { let _ = backend.delete(&Self::backend_key(id)); }
-            None => { self.shard(id).store.remove(id); }
+            Some(backend) => {
+                let _ = backend.delete(&Self::backend_key(id));
+            }
+            None => {
+                self.shard(id).store.remove(id);
+            }
         }
     }
 
@@ -506,18 +572,26 @@ impl FederatedMemory {
 
         // Canonical signed payload: BTreeMap ensures deterministic key ordering.
         let mut signed_fields: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-        signed_fields.insert("root_intent", serde_json::Value::String(root_intent.to_string()));
-        signed_fields.insert("root_issuer", serde_json::Value::String(root_issuer.to_string()));
+        signed_fields.insert(
+            "root_intent",
+            serde_json::Value::String(root_intent.to_string()),
+        );
+        signed_fields.insert(
+            "root_issuer",
+            serde_json::Value::String(root_issuer.to_string()),
+        );
         signed_fields.insert("timestamp", serde_json::json!(ts_u64));
         let canonical_json = serde_json::to_string(&signed_fields).unwrap_or_default();
 
         // HMAC-SHA256 over the canonical payload
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret_key).expect("HMAC accepts any key size");
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(secret_key).expect("HMAC accepts any key size");
         mac.update(canonical_json.as_bytes());
         let root_signature = hex::encode(mac.finalize().into_bytes());
 
         // Store the full envelope (canonical payload + signature) as JSON
-        let mut final_fields: BTreeMap<&str, serde_json::Value> = signed_fields.into_iter().collect();
+        let mut final_fields: BTreeMap<&str, serde_json::Value> =
+            signed_fields.into_iter().collect();
         final_fields.insert("root_signature", serde_json::Value::String(root_signature));
         let final_json = serde_json::to_string(&final_fields).unwrap_or_default();
         let envelope_hash = Sha256::digest(final_json.as_bytes()).to_vec();
@@ -534,8 +608,14 @@ impl FederatedMemory {
             Err(_) => return false,
         };
         match &self.backend {
-            Some(backend) => backend.delete(&Self::backend_key(&intent_hash)).unwrap_or(false),
-            None => self.shard(&intent_hash).store.remove(&intent_hash).is_some(),
+            Some(backend) => backend
+                .delete(&Self::backend_key(&intent_hash))
+                .unwrap_or(false),
+            None => self
+                .shard(&intent_hash)
+                .store
+                .remove(&intent_hash)
+                .is_some(),
         }
     }
 
@@ -573,41 +653,65 @@ impl FederatedMemory {
         secret_key: &[u8],
     ) -> Result<String, SAACPHardDrop> {
         let intent_hash = hex::decode(intent_hash_hex).map_err(|_| {
-            SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Invalid intent hash format.")
+            SAACPHardDrop::new(
+                SAACPBytecodes::InvalidSignature,
+                "Invalid intent hash format.",
+            )
         })?;
 
         let raw_data = {
             let (data, _version, expires_at) = self.get_record(&intent_hash).ok_or_else(|| {
-                SAACPHardDrop::new(SAACPBytecodes::StateExpiredOrStale,
-                    "Intent Envelope missing from Federated Memory.")
+                SAACPHardDrop::new(
+                    SAACPBytecodes::StateExpiredOrStale,
+                    "Intent Envelope missing from Federated Memory.",
+                )
             })?;
             if now_secs() > expires_at {
                 self.remove_record(&intent_hash);
-                return Err(SAACPHardDrop::new(SAACPBytecodes::StateExpiredOrStale,
-                    "Intent Envelope has expired (TTL)."));
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::StateExpiredOrStale,
+                    "Intent Envelope has expired (TTL).",
+                ));
             }
             data
         };
 
         // Parse and verify signature outside lock
-        let envelope: serde_json::Value = serde_json::from_str(&raw_data)
-            .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Envelope parse error."))?;
+        let envelope: serde_json::Value = serde_json::from_str(&raw_data).map_err(|_| {
+            SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Envelope parse error.")
+        })?;
         let obj = envelope.as_object().ok_or_else(|| {
             SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Envelope not an object.")
         })?;
-        let provided_sig = obj.get("root_signature")
+        let provided_sig = obj
+            .get("root_signature")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
         // Reconstruct the EXACT canonical JSON that was signed at creation:
         // BTreeMap-sorted, only the three payload fields, no root_signature.
         // This is the only valid signed payload — no field stripping needed.
-        let root_intent_str = obj.get("root_intent").and_then(|v| v.as_str()).unwrap_or_default();
-        let root_issuer_str = obj.get("root_issuer").and_then(|v| v.as_str()).unwrap_or_default();
-        let timestamp_val = obj.get("timestamp").cloned().unwrap_or(serde_json::Value::Null);
+        let root_intent_str = obj
+            .get("root_intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let root_issuer_str = obj
+            .get("root_issuer")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let timestamp_val = obj
+            .get("timestamp")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let mut signed_fields: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-        signed_fields.insert("root_intent", serde_json::Value::String(root_intent_str.to_string()));
-        signed_fields.insert("root_issuer", serde_json::Value::String(root_issuer_str.to_string()));
+        signed_fields.insert(
+            "root_intent",
+            serde_json::Value::String(root_intent_str.to_string()),
+        );
+        signed_fields.insert(
+            "root_issuer",
+            serde_json::Value::String(root_issuer_str.to_string()),
+        );
         signed_fields.insert("timestamp", timestamp_val);
         let canonical_json = serde_json::to_string(&signed_fields).unwrap_or_default();
 
@@ -616,7 +720,11 @@ impl FederatedMemory {
         let expected_sig = hex::encode(mac.finalize().into_bytes());
 
         // Constant-time comparison prevents timing oracle on the HMAC tag.
-        if expected_sig.as_bytes().ct_ne(provided_sig.as_bytes()).into() {
+        if expected_sig
+            .as_bytes()
+            .ct_ne(provided_sig.as_bytes())
+            .into()
+        {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "Intent Envelope signature verification failed.",
@@ -634,7 +742,11 @@ impl FederatedMemory {
     pub fn count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend.scan_prefix("fedmem:").map(|k| k.len()).unwrap_or(0),
-            None => self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).store.len()).sum(),
+            None => self
+                .shards
+                .iter()
+                .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).store.len())
+                .sum(),
         }
     }
 
@@ -670,8 +782,7 @@ impl FederatedMemory {
 
     /// Fetch context by hex-encoded context state ID.
     pub fn fetch_context_by_hex(&self, hex_id: &str, version: u64) -> Result<String, String> {
-        let bytes = hex::decode(hex_id)
-            .map_err(|e| format!("Invalid hex context ID: {}", e))?;
+        let bytes = hex::decode(hex_id).map_err(|e| format!("Invalid hex context ID: {}", e))?;
         // context_version in the wire format is u32; reject values that don't fit.
         let version_u32 = u32::try_from(version)
             .map_err(|_| format!("context_version {version} exceeds u32 range"))?;
@@ -714,8 +825,13 @@ fn build_aad(owner_id: &str, audience: &[String], expiry: f64) -> Vec<u8> {
     let mut map = serde_json::Map::new();
     map.insert("audience".into(), serde_json::json!(audience));
     map.insert("expiry".into(), serde_json::json!(expiry));
-    map.insert("owner".into(), serde_json::Value::String(owner_id.to_string()));
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default().into_bytes()
+    map.insert(
+        "owner".into(),
+        serde_json::Value::String(owner_id.to_string()),
+    );
+    serde_json::to_string(&serde_json::Value::Object(map))
+        .unwrap_or_default()
+        .into_bytes()
 }
 
 #[allow(dead_code)]
@@ -793,23 +909,27 @@ impl SecureContextStore {
 
         let plaintext = content.as_bytes();
         let mut buffer = plaintext.to_vec();
-        cipher.encrypt_in_place(nonce, &aad, &mut buffer)
+        cipher
+            .encrypt_in_place(nonce, &aad, &mut buffer)
             .map_err(|e| format!("AES-GCM encrypt error: {e}"))?;
 
         let scr_hex = hex::encode(&scr);
         let mut inner = self.inner.lock().expect("lock poisoned");
         Self::evict_if_needed(&mut inner);
-        inner.store.insert(scr_hex.clone(), ScrRecord {
-            ciphertext: buffer,
-            salt,
-            aad,
-            expiry,
-            owner: owner_id.to_string(),
-            audience: audience.to_vec(),
-            revoked: false,
-            classification: classification.to_string(),
-            created_at: now_secs(),
-        });
+        inner.store.insert(
+            scr_hex.clone(),
+            ScrRecord {
+                ciphertext: buffer,
+                salt,
+                aad,
+                expiry,
+                owner: owner_id.to_string(),
+                audience: audience.to_vec(),
+                revoked: false,
+                classification: classification.to_string(),
+                created_at: now_secs(),
+            },
+        );
         Ok(scr_hex)
     }
 
@@ -848,19 +968,26 @@ impl SecureContextStore {
         let buffer = {
             let mut inner = self.inner.lock().expect("lock poisoned");
             let record = inner.store.get(scr_hex).ok_or_else(|| {
-                SAACPHardDrop::new(SAACPBytecodes::ScrNotFound,
-                    "Secure Context Reference not found or expired.")
+                SAACPHardDrop::new(
+                    SAACPBytecodes::ScrNotFound,
+                    "Secure Context Reference not found or expired.",
+                )
             })?;
             if now_secs() > record.expiry {
                 inner.store.remove(scr_hex);
-                return Err(SAACPHardDrop::new(SAACPBytecodes::ScrNotFound,
-                    "Secure Context Reference not found or expired."));
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::ScrNotFound,
+                    "Secure Context Reference not found or expired.",
+                ));
             }
             if record.revoked {
-                return Err(SAACPHardDrop::new(SAACPBytecodes::ScrNotFound,
-                    "Secure Context Reference not found or expired."));
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::ScrNotFound,
+                    "Secure Context Reference not found or expired.",
+                ));
             }
-            if requester_id != record.owner && !record.audience.contains(&requester_id.to_string()) {
+            if requester_id != record.owner && !record.audience.contains(&requester_id.to_string())
+            {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::ScrUnauthorized,
                     "Access denied: requester not authorized for this Secure Context Reference.",
@@ -874,16 +1001,22 @@ impl SecureContextStore {
             let nonce = Nonce::from_slice(&iv);
 
             let mut buffer = record.ciphertext.clone();
-            cipher.decrypt_in_place(nonce, &record.aad, &mut buffer)
-                .map_err(|_| SAACPHardDrop::new(
-                    SAACPBytecodes::InvalidSignature,
-                    "Secure Context Reference authentication failed — tampering detected.",
-                ))?;
+            cipher
+                .decrypt_in_place(nonce, &record.aad, &mut buffer)
+                .map_err(|_| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::InvalidSignature,
+                        "Secure Context Reference authentication failed — tampering detected.",
+                    )
+                })?;
             buffer
         };
 
         String::from_utf8(buffer).map_err(|_| {
-            SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "Decrypted content is not valid UTF-8.")
+            SAACPHardDrop::new(
+                SAACPBytecodes::InvalidSignature,
+                "Decrypted content is not valid UTF-8.",
+            )
         })
     }
 
@@ -936,7 +1069,9 @@ impl SecureContextStore {
         if inner.store.len() >= SCR_MAX_ENTRIES {
             let target = SCR_MAX_ENTRIES / 2;
             let excess = inner.store.len().saturating_sub(target);
-            let mut by_age: Vec<(String, f64)> = inner.store.iter()
+            let mut by_age: Vec<(String, f64)> = inner
+                .store
+                .iter()
                 .map(|(k, v)| (k.clone(), v.created_at))
                 .collect();
             by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1005,11 +1140,19 @@ mod tests {
             let entry = inner.checkpoints.get_mut(&state_id).unwrap();
             entry.timestamp = now_secs() - CHECKPOINT_TTL_SECONDS - 10.0;
         }
-        assert_eq!(cs.count(), 1, "test setup: entry must still be present before sweep");
+        assert_eq!(
+            cs.count(),
+            1,
+            "test setup: entry must still be present before sweep"
+        );
 
         let removed = cs.sweep_expired();
         assert_eq!(removed, 1);
-        assert_eq!(cs.count(), 0, "M-26: expired checkpoint must be proactively removed");
+        assert_eq!(
+            cs.count(),
+            0,
+            "M-26: expired checkpoint must be proactively removed"
+        );
     }
 
     #[test]
@@ -1018,7 +1161,11 @@ mod tests {
         cs.save_checkpoint(&[1u8; 32], "s1", serde_json::json!(null));
         let removed = cs.sweep_expired();
         assert_eq!(removed, 0);
-        assert_eq!(cs.count(), 1, "a freshly saved checkpoint must survive a sweep");
+        assert_eq!(
+            cs.count(),
+            1,
+            "a freshly saved checkpoint must survive a sweep"
+        );
     }
 
     #[test]
@@ -1038,7 +1185,10 @@ mod tests {
         let removed = cs.sweep_expired();
         assert_eq!(removed, 1);
         assert_eq!(cs.count(), 1);
-        assert!(cs.resume_checkpoint(&fresh_id).is_some(), "fresh checkpoint must survive");
+        assert!(
+            cs.resume_checkpoint(&fresh_id).is_some(),
+            "fresh checkpoint must survive"
+        );
     }
 
     #[test]
@@ -1096,7 +1246,9 @@ mod tests {
     fn test_intent_envelope_create_and_fetch() {
         let fm = FederatedMemory::new();
         let secret = b"my_secret_key_for_hmac";
-        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret).unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("do_something", "agent-001", secret)
+            .unwrap();
         assert_eq!(hash_hex.len(), 64); // 32 bytes hex
         let intent = fm.fetch_intent_envelope(&hash_hex, secret).unwrap();
         assert_eq!(intent, "do_something");
@@ -1105,7 +1257,9 @@ mod tests {
     #[test]
     fn test_intent_envelope_wrong_secret() {
         let fm = FederatedMemory::new();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1").unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("intent", "issuer", b"secret1")
+            .unwrap();
         let err = fm.fetch_intent_envelope(&hash_hex, b"secret2").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
     }
@@ -1113,7 +1267,9 @@ mod tests {
     #[test]
     fn test_intent_envelope_delete() {
         let fm = FederatedMemory::new();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret").unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("intent", "issuer", b"secret")
+            .unwrap();
         assert!(fm.delete_intent_envelope(&hash_hex));
         assert!(!fm.delete_intent_envelope(&hash_hex)); // already gone
     }
@@ -1135,7 +1291,11 @@ mod tests {
         let fm = FederatedMemory::new();
         let oversized = "x".repeat(FEDERATED_MAX_VALUE_BYTES + 1);
         assert!(fm.store_context("agent-alpha", &oversized, 1).is_err());
-        assert_eq!(fm.count(), 0, "a rejected write must not leave a partial record behind");
+        assert_eq!(
+            fm.count(),
+            0,
+            "a rejected write must not leave a partial record behind"
+        );
     }
 
     /// A payload exactly at the cap must still be accepted — the cap is an upper
@@ -1155,7 +1315,9 @@ mod tests {
         let fm = FederatedMemory::new();
         let oversized = "x".repeat(FEDERATED_MAX_VALUE_BYTES + 1);
         assert!(fm.save_context(&[3u8; 32], &oversized, 1).is_err());
-        assert!(fm.create_intent_envelope(&oversized, "issuer", b"secret").is_err());
+        assert!(fm
+            .create_intent_envelope(&oversized, "issuer", b"secret")
+            .is_err());
     }
 
     // -- FederatedMemory::global() / set_global_backend() (H-29) --
@@ -1170,7 +1332,10 @@ mod tests {
     fn h29_global_returns_same_instance_across_calls() {
         let a = FederatedMemory::global() as *const FederatedMemory;
         let b = FederatedMemory::global() as *const FederatedMemory;
-        assert_eq!(a, b, "global() must return the same singleton instance across calls");
+        assert_eq!(
+            a, b,
+            "global() must return the same singleton instance across calls"
+        );
     }
 
     #[test]
@@ -1221,7 +1386,8 @@ mod tests {
     fn test_backend_save_context_direct() {
         let fm = backend_fm();
         let state_id = vec![0xCCu8; 32];
-        fm.save_context(&state_id, "direct_backend_data", 5).unwrap();
+        fm.save_context(&state_id, "direct_backend_data", 5)
+            .unwrap();
         let fetched = fm.fetch_context(&state_id, 5).unwrap();
         assert_eq!(fetched, "direct_backend_data");
     }
@@ -1230,7 +1396,9 @@ mod tests {
     fn test_backend_intent_envelope_create_and_fetch() {
         let fm = backend_fm();
         let secret = b"my_secret_key_for_hmac";
-        let hash_hex = fm.create_intent_envelope("do_something", "agent-001", secret).unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("do_something", "agent-001", secret)
+            .unwrap();
         assert_eq!(hash_hex.len(), 64);
         let intent = fm.fetch_intent_envelope(&hash_hex, secret).unwrap();
         assert_eq!(intent, "do_something");
@@ -1239,7 +1407,9 @@ mod tests {
     #[test]
     fn test_backend_intent_envelope_wrong_secret() {
         let fm = backend_fm();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret1").unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("intent", "issuer", b"secret1")
+            .unwrap();
         let err = fm.fetch_intent_envelope(&hash_hex, b"secret2").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
     }
@@ -1247,7 +1417,9 @@ mod tests {
     #[test]
     fn test_backend_intent_envelope_delete() {
         let fm = backend_fm();
-        let hash_hex = fm.create_intent_envelope("intent", "issuer", b"secret").unwrap();
+        let hash_hex = fm
+            .create_intent_envelope("intent", "issuer", b"secret")
+            .unwrap();
         assert!(fm.delete_intent_envelope(&hash_hex));
         assert!(!fm.delete_intent_envelope(&hash_hex)); // already gone
     }
@@ -1310,7 +1482,9 @@ mod tests {
         let key = test_master_key();
         let audience = vec!["agent-b".to_string()];
 
-        let scr_hex = scs.store("secret data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("secret data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         assert_eq!(scr_hex.len(), 64);
 
         let content = scs.retrieve(&scr_hex, "agent-a", &key).unwrap();
@@ -1323,7 +1497,9 @@ mod tests {
         let key = test_master_key();
         let audience = vec!["agent-b".to_string()];
 
-        let scr_hex = scs.store("shared data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("shared data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         let content = scs.retrieve(&scr_hex, "agent-b", &key).unwrap();
         assert_eq!(content, "shared data");
     }
@@ -1334,7 +1510,9 @@ mod tests {
         let key = test_master_key();
         let audience = vec!["agent-b".to_string()];
 
-        let scr_hex = scs.store("secret", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("secret", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         let err = scs.retrieve(&scr_hex, "agent-c", &key).unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::ScrUnauthorized);
     }
@@ -1353,7 +1531,9 @@ mod tests {
         let key = test_master_key();
         let audience: Vec<String> = vec![];
 
-        let scr_hex = scs.store("data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         assert!(scs.revoke(&scr_hex, "agent-a").unwrap());
 
         let err = scs.retrieve(&scr_hex, "agent-a", &key).unwrap_err();
@@ -1367,7 +1547,9 @@ mod tests {
         let scs = Arc::new(SecureContextStore::new());
         let key = test_master_key();
         let audience: Vec<String> = vec![];
-        let scr_hex = scs.store("top secret", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("top secret", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
 
         let revoked = Arc::new(AtomicBool::new(false));
         let revoker_store = Arc::clone(&scs);
@@ -1416,7 +1598,9 @@ mod tests {
         let key = test_master_key();
         let audience: Vec<String> = vec![];
 
-        let scr_hex = scs.store("data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr_hex = scs
+            .store("data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         let err = scs.revoke(&scr_hex, "agent-b").unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::ScrUnauthorized);
     }
@@ -1427,8 +1611,12 @@ mod tests {
         let key = test_master_key();
         let audience: Vec<String> = vec![];
 
-        let scr1 = scs.store("data_a", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
-        let scr2 = scs.store("data_b", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr1 = scs
+            .store("data_a", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
+        let scr2 = scs
+            .store("data_b", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         assert_ne!(scr1, scr2);
     }
 
@@ -1438,8 +1626,12 @@ mod tests {
         let key = test_master_key();
         let audience: Vec<String> = vec![];
 
-        let scr1 = scs.store("same_data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
-        let scr2 = scs.store("same_data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        let scr1 = scs
+            .store("same_data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
+        let scr2 = scs
+            .store("same_data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         // Different salt each time → different SCR
         assert_ne!(scr1, scr2);
     }
@@ -1450,7 +1642,8 @@ mod tests {
         let key = test_master_key();
         let audience: Vec<String> = vec![];
 
-        scs.store("data", "agent-a", &audience, 300.0, &key, "INTERNAL").unwrap();
+        scs.store("data", "agent-a", &audience, 300.0, &key, "INTERNAL")
+            .unwrap();
         assert_eq!(scs.count(), 1);
         assert_eq!(scs.evict_expired(), 0);
     }
@@ -1460,7 +1653,9 @@ mod tests {
         let scs = SecureContextStore::new();
         let short_key = vec![0u8; 16];
         let audience: Vec<String> = vec![];
-        assert!(scs.store("data", "a", &audience, 300.0, &short_key, "INTERNAL").is_err());
+        assert!(scs
+            .store("data", "a", &audience, 300.0, &short_key, "INTERNAL")
+            .is_err());
     }
 
     // -- M-25: SecureContextStore forced eviction is oldest-created-first --
@@ -1489,14 +1684,18 @@ mod tests {
 
     #[test]
     fn test_evict_if_needed_forced_fallback_removes_oldest_created_first() {
-        let mut inner = ScrInner { store: HashMap::new() };
+        let mut inner = ScrInner {
+            store: HashMap::new(),
+        };
         // Populate exactly SCR_MAX_ENTRIES never-expiring records with
         // DESCENDING created_at (so HashMap key/insertion order is the exact
         // opposite of age order — if eviction fell back to key order, it
         // would evict the NEWEST records instead of the oldest).
         for i in 0..SCR_MAX_ENTRIES {
             let created_at = (SCR_MAX_ENTRIES - i) as f64; // last-inserted has smallest created_at
-            inner.store.insert(format!("scr-{i:06}"), scr_record_at(created_at));
+            inner
+                .store
+                .insert(format!("scr-{i:06}"), scr_record_at(created_at));
         }
         assert_eq!(inner.store.len(), SCR_MAX_ENTRIES);
 
@@ -1510,7 +1709,10 @@ mod tests {
         // Every SURVIVING record must have created_at STRICTLY GREATER than
         // every REMOVED record's created_at — i.e. the newest half survived,
         // the oldest half was evicted, regardless of HashMap key order.
-        let min_surviving = inner.store.values().map(|v| v.created_at)
+        let min_surviving = inner
+            .store
+            .values()
+            .map(|v| v.created_at)
             .fold(f64::INFINITY, f64::min);
         let max_possible_created_at = SCR_MAX_ENTRIES as f64;
         assert!(
@@ -1523,15 +1725,25 @@ mod tests {
 
     #[test]
     fn test_evict_if_needed_below_high_water_is_noop() {
-        let mut inner = ScrInner { store: HashMap::new() };
-        inner.store.insert("only-one".to_string(), scr_record_at(1.0));
+        let mut inner = ScrInner {
+            store: HashMap::new(),
+        };
+        inner
+            .store
+            .insert("only-one".to_string(), scr_record_at(1.0));
         SecureContextStore::evict_if_needed(&mut inner);
-        assert_eq!(inner.store.len(), 1, "well below HIGH_WATER, eviction must not run");
+        assert_eq!(
+            inner.store.len(),
+            1,
+            "well below HIGH_WATER, eviction must not run"
+        );
     }
 
     #[test]
     fn test_evict_if_needed_prefers_expired_over_forced_age_eviction() {
-        let mut inner = ScrInner { store: HashMap::new() };
+        let mut inner = ScrInner {
+            store: HashMap::new(),
+        };
         let now = now_secs();
         // Fill to HIGH_WATER with a mix: half already-expired (should be
         // swept by the `retain` pass alone, regardless of age), half fresh.
@@ -1546,6 +1758,9 @@ mod tests {
         SecureContextStore::evict_if_needed(&mut inner);
         // All expired entries must be gone; none of this depends on age-based
         // forced eviction since expiry-retain alone drops well below SCR_MAX_ENTRIES.
-        assert!(inner.store.values().all(|v| v.expiry > now), "no expired record should survive");
+        assert!(
+            inner.store.values().all(|v| v.expiry > now),
+            "no expired record should survive"
+        );
     }
 }

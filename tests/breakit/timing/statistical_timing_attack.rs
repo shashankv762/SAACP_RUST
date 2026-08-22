@@ -23,9 +23,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use saacp::{
-    ZeroTrustGateway,
-    SessionEpochManager, MEASCFrame,
-    MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS,
+    MEASCFrame, SessionEpochManager, ZeroTrustGateway, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS,
 };
 
 // ─── Welch's t-test implementation ───────────────────────────────────────────
@@ -46,7 +45,9 @@ fn welchs_t_test(a: &[f64], b: &[f64]) -> f64 {
     let va = variance(a, ma);
     let vb = variance(b, mb);
     let se = (va / a.len() as f64 + vb / b.len() as f64).sqrt();
-    if se < 1e-15 { return 0.0; } // avoid division by near-zero
+    if se < 1e-15 {
+        return 0.0;
+    } // avoid division by near-zero
     (ma - mb) / se
 }
 
@@ -56,7 +57,12 @@ fn print_timing_report(label: &str, a_label: &str, b_label: &str, a: &[f64], b: 
     let mb = mean(b);
     eprintln!(
         "[TIMING] {}:\n  {} mean: {:.1}ns\n  {} mean: {:.1}ns\n  Welch's t: {:.4}\n  Verdict: {}",
-        label, a_label, ma, b_label, mb, t,
+        label,
+        a_label,
+        ma,
+        b_label,
+        mb,
+        t,
         if t.abs() < 3.3 {
             "PASS — no statistically significant timing channel detected"
         } else {
@@ -75,9 +81,9 @@ fn print_timing_report(label: &str, a_label: &str, b_label: &str, a: &[f64], b: 
 // If constant_time_eq is working correctly, B and C should be indistinguishable.
 
 fn build_valid_hmac_token(secret: &[u8], target: &str) -> Vec<u8> {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use base64::Engine;
 
     let now_u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -112,7 +118,9 @@ fn build_valid_hmac_token(secret: &[u8], target: &str) -> Vec<u8> {
     wire.extend_from_slice(&sig);
 
     // Base64-encode for the API
-    base64::engine::general_purpose::STANDARD.encode(&wire).into_bytes()
+    base64::engine::general_purpose::STANDARD
+        .encode(&wire)
+        .into_bytes()
 }
 
 /// Timing test: early vs late byte mismatch in HMAC signature.
@@ -149,11 +157,15 @@ fn timing_hmac_psk_early_vs_late_byte_mismatch() {
 
     let mut early_bad_decoded = valid_decoded.clone();
     early_bad_decoded[sig_start] ^= 0xFF; // corrupt first HMAC byte
-    let early_bad = base64::engine::general_purpose::STANDARD.encode(&early_bad_decoded).into_bytes();
+    let early_bad = base64::engine::general_purpose::STANDARD
+        .encode(&early_bad_decoded)
+        .into_bytes();
 
     let mut late_bad_decoded = valid_decoded.clone();
     late_bad_decoded[sig_start + 31] ^= 0xFF; // corrupt last HMAC byte
-    let late_bad = base64::engine::general_purpose::STANDARD.encode(&late_bad_decoded).into_bytes();
+    let late_bad = base64::engine::general_purpose::STANDARD
+        .encode(&late_bad_decoded)
+        .into_bytes();
 
     let mut early_times = Vec::with_capacity(SAMPLES);
     let mut late_times = Vec::with_capacity(SAMPLES);
@@ -194,7 +206,8 @@ fn timing_hmac_psk_early_vs_late_byte_mismatch() {
          Early-byte-wrong vs late-byte-wrong comparison is NOT constant-time \
          over {} samples. This is exploitable: an attacker can determine \
          the correct prefix of the HMAC signature by measuring response latency.",
-        t, SAMPLES
+        t,
+        SAMPLES
     );
 }
 
@@ -239,7 +252,10 @@ fn timing_aesgcm_auth_tag_early_vs_late_flip() {
         None,
     );
     if result.is_err() {
-        eprintln!("[TIMING AES-GCM] Could not create session, skipping: {:?}", result.err());
+        eprintln!(
+            "[TIMING AES-GCM] Could not create session, skipping: {:?}",
+            result.err()
+        );
         return;
     }
     let epoch_id = result.unwrap();
@@ -249,7 +265,17 @@ fn timing_aesgcm_auth_tag_early_vs_late_flip() {
     let traceparent = [0u8; 24];
     let payload = b"hello";
     let frame_result = session_mgr.with_epoch_mut(&session_id, epoch_id, |ep| {
-        MEASCFrame::build_frame(ep, 0, 0, 0x00, 0x00, payload, &context_ref_id, &traceparent, 0)
+        MEASCFrame::build_frame(
+            ep,
+            0,
+            0,
+            0x00,
+            0x00,
+            payload,
+            &context_ref_id,
+            &traceparent,
+            0,
+        )
     });
 
     let valid_frame = match frame_result {
@@ -267,7 +293,10 @@ fn timing_aesgcm_auth_tag_early_vs_late_flip() {
     const AUTH_TAG_OFFSET: usize = 104; // immediately after the 104-byte header
 
     if valid_frame.len() < AUTH_TAG_OFFSET + 16 {
-        eprintln!("[TIMING AES-GCM] Frame too short for auth tag manipulation. Len={}.", valid_frame.len());
+        eprintln!(
+            "[TIMING AES-GCM] Frame too short for auth tag manipulation. Len={}.",
+            valid_frame.len()
+        );
         return;
     }
 
@@ -343,7 +372,7 @@ fn timing_hashset_scope_lookup_variance() {
     // is whether the lookup time is consistent across different strings.
 
     let present_scope = "scope:action:0050"; // in the middle of the list
-    let absent_scope  = "scope:action:9999"; // not in the list
+    let absent_scope = "scope:action:9999"; // not in the list
 
     // Scope check is done inside validate_lateral_movement via the token.
     // We test scope check timing directly using the scope list property.
@@ -357,7 +386,7 @@ fn timing_hashset_scope_lookup_variance() {
     }
 
     let mut present_times = Vec::with_capacity(SAMPLES);
-    let mut absent_times  = Vec::with_capacity(SAMPLES);
+    let mut absent_times = Vec::with_capacity(SAMPLES);
 
     for i in 0..SAMPLES {
         if i % 2 == 0 {

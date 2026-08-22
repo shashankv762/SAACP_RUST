@@ -42,7 +42,11 @@ where
             Some(Ok(Message::Binary(data))) => out.extend_from_slice(&data),
             Some(Ok(_other)) => continue, // ignore Ping/Pong/Text
             Some(Err(e)) => panic!("WS error while reading: {}", e),
-            None => panic!("WS closed before {} bytes were received (got {})", n, out.len()),
+            None => panic!(
+                "WS closed before {} bytes were received (got {})",
+                n,
+                out.len()
+            ),
         }
     }
     out.truncate(n);
@@ -65,7 +69,9 @@ where
     let mut client_msg = Vec::with_capacity(64);
     client_msg.extend_from_slice(&client_nonce);
     client_msg.extend_from_slice(client_pub.as_bytes());
-    ws.send(Message::Binary(client_msg)).await.expect("send handshake");
+    ws.send(Message::Binary(client_msg))
+        .await
+        .expect("send handshake");
 
     let server_pub_bytes = recv_exact(ws, 32).await;
     let server_pub = PublicKey::from(
@@ -124,12 +130,20 @@ async fn ws_tunnel_cover_traffic_roundtrip() {
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    let frame = header.encode_encrypted(b"", &session_key).expect("encode_encrypted");
+    let frame = header
+        .encode_encrypted(b"", &session_key)
+        .expect("encode_encrypted");
 
-    ws_stream.send(Message::Binary(frame)).await.expect("send frame");
+    ws_stream
+        .send(Message::Binary(frame))
+        .await
+        .expect("send frame");
 
     let response = recv_exact(&mut ws_stream, 7).await; // b"SUCCESS" = 7 bytes
-    assert_eq!(&response, b"SUCCESS", "cover traffic must ack with WIRE_SUCCESS over the WS tunnel");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "cover traffic must ack with WIRE_SUCCESS over the WS tunnel"
+    );
 
     let _ = ws_stream.close(None).await;
 }
@@ -149,12 +163,19 @@ async fn ws_tunnel_two_connections_independent_sessions() {
 
     let url = format!("ws://127.0.0.1:{}/", port);
 
-    let (mut ws_a, _) = tokio_tungstenite::connect_async(&url).await.expect("connect A");
-    let (mut ws_b, _) = tokio_tungstenite::connect_async(&url).await.expect("connect B");
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect A");
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect B");
 
     let key_a = ws_client_handshake(&mut ws_a).await;
     let key_b = ws_client_handshake(&mut ws_b).await;
-    assert_ne!(key_a, key_b, "each WS connection must derive an independent session key");
+    assert_ne!(
+        key_a, key_b,
+        "each WS connection must derive an independent session key"
+    );
 
     for (ws, key, sid_byte) in [(&mut ws_a, key_a, 0xAAu8), (&mut ws_b, key_b, 0xBBu8)] {
         // See `ws_tunnel_cover_traffic_roundtrip`'s comment: the structural default Gate 0
@@ -174,7 +195,9 @@ async fn ws_tunnel_two_connections_independent_sessions() {
             context_version: 0,
             w3c_traceparent: [0u8; 24],
         };
-        let frame = header.encode_encrypted(b"", &key).expect("encode_encrypted");
+        let frame = header
+            .encode_encrypted(b"", &key)
+            .expect("encode_encrypted");
         ws.send(Message::Binary(frame)).await.expect("send frame");
         let response = recv_exact(ws, 7).await;
         assert_eq!(&response, b"SUCCESS");
@@ -202,5 +225,9 @@ async fn ws_start_with_shutdown_returns_promptly_with_no_connections() {
         .await
         .expect("start_with_shutdown did not return within 10s")
         .expect("daemon task panicked");
-    assert!(result.is_ok(), "start_with_shutdown returned an error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "start_with_shutdown returned an error: {:?}",
+        result
+    );
 }

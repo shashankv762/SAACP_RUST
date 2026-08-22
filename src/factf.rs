@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::acsvaf::{
-    CapabilityVerificationAuthority,
-    SignedCapabilityToken, ACSVAF_MAX_DELEGATION_DEPTH,
+    CapabilityVerificationAuthority, SignedCapabilityToken, ACSVAF_MAX_DELEGATION_DEPTH,
 };
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -77,8 +76,7 @@ impl DelegationChainValidator {
         let jti_set: HashSet<String> = tokens.iter().map(|t| t.jti()).collect();
         let mut seen_jtis: HashSet<String> = HashSet::new();
         let root_sid = tokens[0].sid();
-        let mut effective_actions: HashSet<String> =
-            tokens[0].actions().into_iter().collect();
+        let mut effective_actions: HashSet<String> = tokens[0].actions().into_iter().collect();
         let mut effective_mac: u8 = tokens[0].max_action_class();
         let root_jti = tokens[0].jti();
 
@@ -102,13 +100,16 @@ impl DelegationChainValidator {
             if token.delegation_depth() != i {
                 violations.push(format!(
                     "[{}] delegation_depth={} expected {}.",
-                    i, token.delegation_depth(), i
+                    i,
+                    token.delegation_depth(),
+                    i
                 ));
             }
             if i > ACSVAF_MAX_DELEGATION_DEPTH as usize {
                 violations.push(format!(
-                    "[{}] Chain depth {} exceeds MAX_DELEGATION_DEPTH={}."
-                , i, i, ACSVAF_MAX_DELEGATION_DEPTH));
+                    "[{}] Chain depth {} exceeds MAX_DELEGATION_DEPTH={}.",
+                    i, i, ACSVAF_MAX_DELEGATION_DEPTH
+                ));
             }
 
             // Circular reference
@@ -137,12 +138,9 @@ impl DelegationChainValidator {
             // Anti-amplification
             if i > 0 {
                 let parent = &tokens[i - 1];
-                let parent_actions: HashSet<String> =
-                    parent.actions().into_iter().collect();
-                let child_actions: HashSet<String> =
-                    token.actions().into_iter().collect();
-                let extra: HashSet<_> =
-                    child_actions.difference(&parent_actions).collect();
+                let parent_actions: HashSet<String> = parent.actions().into_iter().collect();
+                let child_actions: HashSet<String> = token.actions().into_iter().collect();
+                let extra: HashSet<_> = child_actions.difference(&parent_actions).collect();
                 if !extra.is_empty() {
                     violations.push(format!(
                         "[{}] Privilege amplification: actions {:?} exceed parent.",
@@ -189,11 +187,7 @@ impl DelegationChainValidator {
         }
     }
 
-    fn verify_ed25519(
-        verifying_key: &VerifyingKey,
-        message: &[u8],
-        signature: &[u8],
-    ) -> bool {
+    fn verify_ed25519(verifying_key: &VerifyingKey, message: &[u8], signature: &[u8]) -> bool {
         if signature.len() != 64 {
             return false;
         }
@@ -319,8 +313,14 @@ impl ThresholdAuthorityIssuer {
     /// [`ThresholdAuthorityIssuer::submit_partial_approval`] time rather than
     /// being allowed into the proposal to be caught only later by
     /// [`ThresholdAuthorityIssuer::verify_threshold_token`].
-    pub fn register_verification_authority(&self, ca: std::sync::Arc<CapabilityVerificationAuthority>) {
-        *self.verification_authority.lock().unwrap_or_else(|e| e.into_inner()) = Some(ca);
+    pub fn register_verification_authority(
+        &self,
+        ca: std::sync::Arc<CapabilityVerificationAuthority>,
+    ) {
+        *self
+            .verification_authority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ca);
     }
 
     /// Register a new threshold request. Returns request_id.
@@ -342,7 +342,8 @@ impl ThresholdAuthorityIssuer {
             requests.retain(|_, s| now <= s.expires_at);
             if requests.len() >= FACTF_MAX_TRACKED_REQUESTS {
                 let evict_count = requests.len() + 1 - FACTF_MAX_TRACKED_REQUESTS;
-                let mut by_age: Vec<(String, f64)> = requests.iter()
+                let mut by_age: Vec<(String, f64)> = requests
+                    .iter()
                     .map(|(k, s)| (k.clone(), s.created_at))
                     .collect();
                 by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -393,7 +394,10 @@ impl ThresholdAuthorityIssuer {
         // Reject expired proposals
         if now_f64() > state.expires_at {
             drop(requests);
-            self.requests.lock().unwrap_or_else(|e| e.into_inner()).remove(request_id);
+            self.requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(request_id);
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AcsvafThresholdNotReached,
                 format!(
@@ -421,7 +425,8 @@ impl ThresholdAuthorityIssuer {
         // `verify_threshold_token` would trust. Fail-closed: a registered CVA
         // that lacks this kid's key rejects the approval.
         {
-            let ca_opt = self.verification_authority
+            let ca_opt = self
+                .verification_authority
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
@@ -434,7 +439,8 @@ impl ThresholdAuthorityIssuer {
                         format!("FACTF: no verification key registered for kid '{}'.", kid),
                     )
                 })?;
-                if !DelegationChainValidator::verify_ed25519(&key, &claims_bytes, &token.signature) {
+                if !DelegationChainValidator::verify_ed25519(&key, &claims_bytes, &token.signature)
+                {
                     return Err(SAACPHardDrop::new(
                         SAACPBytecodes::InvalidSignature,
                         format!(
@@ -478,7 +484,10 @@ impl ThresholdAuthorityIssuer {
 
         if now_f64() > state.expires_at {
             drop(requests);
-            self.requests.lock().unwrap_or_else(|e| e.into_inner()).remove(request_id);
+            self.requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(request_id);
             return Err(format!(
                 "FACTF: Proposal '{}' has expired before reaching threshold.",
                 request_id
@@ -579,11 +588,7 @@ impl ThresholdAuthorityIssuer {
 
             // CRIT-4: always verify against the shared base_claims. Never
             // trust entry.claims_bytes_hex as an alternate signed payload.
-            if DelegationChainValidator::verify_ed25519(
-                &key,
-                &claims_bytes,
-                &sig,
-            ) {
+            if DelegationChainValidator::verify_ed25519(&key, &claims_bytes, &sig) {
                 valid_count += 1;
             }
         }
@@ -631,7 +636,8 @@ mod entry_signature_b64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(d)?;
-        B64.decode(encoded.as_bytes()).map_err(serde::de::Error::custom)
+        B64.decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -846,14 +852,10 @@ impl CapabilityTransparencyLog {
         let sub_hash = sha256_hex(sub.as_bytes());
         let mut sorted_aud: Vec<&str> = aud.to_vec();
         sorted_aud.sort();
-        let aud_hash = sha256_hex(
-            &serde_json::to_vec(&sorted_aud).unwrap_or_default(),
-        );
+        let aud_hash = sha256_hex(&serde_json::to_vec(&sorted_aud).unwrap_or_default());
         let mut sorted_actions: Vec<&str> = actions.to_vec();
         sorted_actions.sort();
-        let act_hash = sha256_hex(
-            &serde_json::to_vec(&sorted_actions).unwrap_or_default(),
-        );
+        let act_hash = sha256_hex(&serde_json::to_vec(&sorted_actions).unwrap_or_default());
         let pjh = parent_jti.map(|p| sha256_hex(p.as_bytes()));
 
         let mut entry = TransparencyLogEntry {
@@ -877,8 +879,7 @@ impl CapabilityTransparencyLog {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         let mut last_hash = self.last_hash.lock().unwrap();
         let prev_hash = last_hash.clone();
-        entry.chain_hash =
-            sha256_hex(format!("{}{}", prev_hash, entry.entry_hash).as_bytes());
+        entry.chain_hash = sha256_hex(format!("{}{}", prev_hash, entry.entry_hash).as_bytes());
 
         if let Some(sk) = signing_key {
             entry.entry_signature = sk.sign(entry.chain_hash.as_bytes()).to_bytes().to_vec();
@@ -897,13 +898,15 @@ impl CapabilityTransparencyLog {
         if let Some(evicted) = self.backend.append(&entry) {
             // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
             *self.chain_floor_hash.lock().unwrap() = evicted.chain_hash;
-            self.pruned_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pruned_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // M-30 fix: this is the only method that changes chain-relevant
         // state, so it is the only place `generation` needs to advance —
         // any `verify_chain_integrity()` cached against an earlier
         // generation is now correctly treated as stale.
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         chain_hash
     }
 
@@ -1101,12 +1104,20 @@ pub struct DefaultPolicy {
 
 impl DefaultPolicy {
     pub fn new(approve_threshold: f64, escalate_threshold: f64) -> Self {
-        Self::with_weights(approve_threshold, escalate_threshold, PolicyWeights::default())
+        Self::with_weights(
+            approve_threshold,
+            escalate_threshold,
+            PolicyWeights::default(),
+        )
     }
 
     /// L-26 fix: same as [`Self::new`] but with deployment-specific scoring weights
     /// instead of this policy's compiled-in defaults.
-    pub fn with_weights(approve_threshold: f64, escalate_threshold: f64, weights: PolicyWeights) -> Self {
+    pub fn with_weights(
+        approve_threshold: f64,
+        escalate_threshold: f64,
+        weights: PolicyWeights,
+    ) -> Self {
         Self {
             approve_threshold,
             escalate_threshold,
@@ -1121,14 +1132,23 @@ impl DefaultPolicy {
         let w = &self.weights;
         if ctx.behavioral_anomaly_flag {
             score += w.behavioral_anomaly;
-            factors.push(format!("Behavioral anomaly detected (+{:.2})", w.behavioral_anomaly));
+            factors.push(format!(
+                "Behavioral anomaly detected (+{:.2})",
+                w.behavioral_anomaly
+            ));
         }
         if ctx.session_trust_level == "minimal" {
             score += w.minimal_trust;
-            factors.push(format!("Minimal session trust level (+{:.2})", w.minimal_trust));
+            factors.push(format!(
+                "Minimal session trust level (+{:.2})",
+                w.minimal_trust
+            ));
         } else if ctx.session_trust_level == "partial" {
             score += w.partial_trust;
-            factors.push(format!("Partial session trust level (+{:.2})", w.partial_trust));
+            factors.push(format!(
+                "Partial session trust level (+{:.2})",
+                w.partial_trust
+            ));
         }
         if ctx.delegation_depth > 6 {
             score += w.very_high_delegation_depth;
@@ -1152,7 +1172,10 @@ impl DefaultPolicy {
         }
         if ctx.requested_action_class == 2 {
             score += w.irreversible_action;
-            factors.push(format!("IRREVERSIBLE action class (+{:.2})", w.irreversible_action));
+            factors.push(format!(
+                "IRREVERSIBLE action class (+{:.2})",
+                w.irreversible_action
+            ));
         }
         if ctx.prior_violation_count >= 3 {
             score += w.prior_violations;
@@ -1170,7 +1193,10 @@ impl DefaultPolicy {
         }
         if ctx.is_high_risk_operation {
             score += w.high_risk_operation;
-            factors.push(format!("High-risk operation flag (+{:.2})", w.high_risk_operation));
+            factors.push(format!(
+                "High-risk operation flag (+{:.2})",
+                w.high_risk_operation
+            ));
         }
 
         score = score.min(1.0);
@@ -1183,8 +1209,7 @@ impl DefaultPolicy {
             "APPROVE"
         };
 
-        let requires_threshold =
-            decision == "ESCALATE" && ctx.is_high_risk_operation;
+        let requires_threshold = decision == "ESCALATE" && ctx.is_high_risk_operation;
         let requires_human = score >= self.escalate_threshold;
 
         RiskEvaluation {
@@ -1216,10 +1241,7 @@ impl RiskAwareAuthorizationEvaluator {
         }
     }
 
-    pub fn with_policy(
-        approve_threshold: f64,
-        escalate_threshold: f64,
-    ) -> Self {
+    pub fn with_policy(approve_threshold: f64, escalate_threshold: f64) -> Self {
         let policy = DefaultPolicy::new(approve_threshold, escalate_threshold);
         Self {
             policy: Box::new(move |ctx| policy.evaluate(ctx)),
@@ -1342,7 +1364,9 @@ pub struct ThresholdNotReached {
 
 impl ThresholdNotReached {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+        Self {
+            message: msg.into(),
+        }
     }
 }
 
@@ -1428,7 +1452,11 @@ pub struct FilesystemBackendIntegrityError {
 
 impl std::fmt::Display for FilesystemBackendIntegrityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FilesystemBackend integrity check failed: {}", self.message)
+        write!(
+            f,
+            "FilesystemBackend integrity check failed: {}",
+            self.message
+        )
     }
 }
 
@@ -1475,11 +1503,10 @@ impl FilesystemBackend {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let entry: TransparencyLogEntry = serde_json::from_str(line).map_err(|e| {
-                    FilesystemBackendIntegrityError {
+                let entry: TransparencyLogEntry =
+                    serde_json::from_str(line).map_err(|e| FilesystemBackendIntegrityError {
                         message: format!("line {}: malformed JSON: {e}", line_no + 1),
-                    }
-                })?;
+                    })?;
 
                 let recomputed = compute_entry_hash(&entry);
                 if recomputed != entry.entry_hash {
@@ -1550,7 +1577,11 @@ impl FilesystemBackend {
     /// file's first entry must chain from this hash, not `GENESIS_CHAIN_HASH`
     /// — otherwise a legitimately-rotated log would be misdiagnosed as
     /// tampered on restart.
-    fn maybe_rotate(w: &mut FilesystemBackendWriter, path: &str, max_file_size: u64) -> std::io::Result<()> {
+    fn maybe_rotate(
+        w: &mut FilesystemBackendWriter,
+        path: &str,
+        max_file_size: u64,
+    ) -> std::io::Result<()> {
         use std::io::Write;
         if w.size <= max_file_size {
             return Ok(());
@@ -1560,7 +1591,10 @@ impl FilesystemBackend {
         std::fs::write(format!("{path}{CHAIN_FLOOR_SUFFIX}"), &w.last_chain_hash)?;
         let rotated = format!("{path}.{}.bak", now_f64() as u64);
         let _ = std::fs::rename(path, &rotated);
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         w.file = std::io::BufWriter::with_capacity(64 * 1024, file);
         w.size = 0;
         Ok(())

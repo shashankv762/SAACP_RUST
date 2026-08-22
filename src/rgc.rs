@@ -121,8 +121,7 @@ impl ExecutionBudgetGuard {
                  of {EXECUTION_BUDGET_MAX_SECONDS:.1}s (spec §12.3)"
             ));
         }
-        let deadline = Instant::now()
-            + std::time::Duration::from_secs_f64(timeout_seconds);
+        let deadline = Instant::now() + std::time::Duration::from_secs_f64(timeout_seconds);
 
         Ok(Self {
             timeout_seconds,
@@ -221,13 +220,41 @@ impl ResourceGovernanceParser {
         // Step d: post-scan limit checks
         Self::check_limit("max_depth", stats.max_depth_seen, pol.max_depth)?;
         Self::check_limit("max_object_count", stats.object_count, pol.max_object_count)?;
-        Self::check_limit("max_array_length", stats.max_array_length_seen, pol.max_array_length)?;
-        Self::check_limit("max_string_length", stats.max_string_length_seen, pol.max_string_length)?;
-        Self::check_limit("max_field_count", stats.max_field_count_seen, pol.max_field_count)?;
-        Self::check_limit("max_schema_complexity", stats.schema_complexity, pol.max_schema_complexity)?;
-        Self::check_limit("max_key_length", stats.max_key_length_seen, pol.max_key_length)?;
-        Self::check_limit("max_unicode_scalar_values", stats.total_string_chars, pol.max_unicode_scalar_values)?;
-        Self::check_limit("max_aggregate_resource_units", stats.aggregate_resource_units, pol.max_aggregate_resource_units)?;
+        Self::check_limit(
+            "max_array_length",
+            stats.max_array_length_seen,
+            pol.max_array_length,
+        )?;
+        Self::check_limit(
+            "max_string_length",
+            stats.max_string_length_seen,
+            pol.max_string_length,
+        )?;
+        Self::check_limit(
+            "max_field_count",
+            stats.max_field_count_seen,
+            pol.max_field_count,
+        )?;
+        Self::check_limit(
+            "max_schema_complexity",
+            stats.schema_complexity,
+            pol.max_schema_complexity,
+        )?;
+        Self::check_limit(
+            "max_key_length",
+            stats.max_key_length_seen,
+            pol.max_key_length,
+        )?;
+        Self::check_limit(
+            "max_unicode_scalar_values",
+            stats.total_string_chars,
+            pol.max_unicode_scalar_values,
+        )?;
+        Self::check_limit(
+            "max_aggregate_resource_units",
+            stats.aggregate_resource_units,
+            pol.max_aggregate_resource_units,
+        )?;
         Self::check_limit("total_nodes", stats.total_nodes, pol.max_object_count)?;
 
         if stats.max_numeric_magnitude_seen > pol.max_numeric_magnitude {
@@ -301,7 +328,11 @@ impl ResourceGovernanceParser {
                 total_nodes += 1;
                 aggregate_resource_units += 11; // 1 (node) + 10 (depth)
                 Self::check_limit("max_object_count", object_count, policy.max_object_count)?;
-                Self::check_limit("max_aggregate_resource_units", aggregate_resource_units, policy.max_aggregate_resource_units)?;
+                Self::check_limit(
+                    "max_aggregate_resource_units",
+                    aggregate_resource_units,
+                    policy.max_aggregate_resource_units,
+                )?;
 
                 container_stack.push('o');
                 field_counts.insert(depth, 0);
@@ -323,7 +354,11 @@ impl ResourceGovernanceParser {
                 total_nodes += 1;
                 aggregate_resource_units += 11;
                 Self::check_limit("max_object_count", total_nodes, policy.max_object_count)?;
-                Self::check_limit("max_aggregate_resource_units", aggregate_resource_units, policy.max_aggregate_resource_units)?;
+                Self::check_limit(
+                    "max_aggregate_resource_units",
+                    aggregate_resource_units,
+                    policy.max_aggregate_resource_units,
+                )?;
 
                 container_stack.push('a');
                 array_element_counts.insert(depth, 0);
@@ -368,7 +403,11 @@ impl ResourceGovernanceParser {
             if ch == ':' {
                 chars.next();
                 schema_complexity += 1;
-                Self::check_limit("max_schema_complexity", schema_complexity, policy.max_schema_complexity)?;
+                Self::check_limit(
+                    "max_schema_complexity",
+                    schema_complexity,
+                    policy.max_schema_complexity,
+                )?;
                 expecting_key = false;
                 if depth > 0 {
                     let fc = field_counts.entry(depth).or_insert(0);
@@ -422,11 +461,19 @@ impl ResourceGovernanceParser {
                 }
 
                 total_string_chars += char_count;
-                Self::check_limit("max_unicode_scalar_values", total_string_chars, policy.max_unicode_scalar_values)?;
+                Self::check_limit(
+                    "max_unicode_scalar_values",
+                    total_string_chars,
+                    policy.max_unicode_scalar_values,
+                )?;
 
                 let string_ru = std::cmp::max(1, (char_count as f64 * 0.01) as usize);
                 aggregate_resource_units += string_ru;
-                Self::check_limit("max_aggregate_resource_units", aggregate_resource_units, policy.max_aggregate_resource_units)?;
+                Self::check_limit(
+                    "max_aggregate_resource_units",
+                    aggregate_resource_units,
+                    policy.max_aggregate_resource_units,
+                )?;
 
                 if expecting_key {
                     if char_count > max_key_length_seen {
@@ -448,12 +495,20 @@ impl ResourceGovernanceParser {
                 let num_start = byte_i;
                 chars.next(); // consume leading '-' or first digit
 
-                while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                while chars
+                    .peek()
+                    .map(|(_, c)| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     chars.next();
                 }
                 if chars.peek().map(|(_, c)| *c) == Some('.') {
                     chars.next();
-                    while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                    while chars
+                        .peek()
+                        .map(|(_, c)| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         chars.next();
                     }
                 }
@@ -462,7 +517,11 @@ impl ResourceGovernanceParser {
                     if matches!(chars.peek().map(|(_, c)| *c), Some('+') | Some('-')) {
                         chars.next();
                     }
-                    while chars.peek().map(|(_, c)| c.is_ascii_digit()).unwrap_or(false) {
+                    while chars
+                        .peek()
+                        .map(|(_, c)| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         chars.next();
                     }
                 }
@@ -489,21 +548,31 @@ impl ResourceGovernanceParser {
                 }
 
                 aggregate_resource_units += 1;
-                Self::check_limit("max_aggregate_resource_units", aggregate_resource_units, policy.max_aggregate_resource_units)?;
+                Self::check_limit(
+                    "max_aggregate_resource_units",
+                    aggregate_resource_units,
+                    policy.max_aggregate_resource_units,
+                )?;
                 continue;
             }
 
             // Literals: true, false, null
             if ch == 't' && text[byte_i..].starts_with("true") {
-                for _ in 0..4 { chars.next(); }
+                for _ in 0..4 {
+                    chars.next();
+                }
                 continue;
             }
             if ch == 'f' && text[byte_i..].starts_with("false") {
-                for _ in 0..5 { chars.next(); }
+                for _ in 0..5 {
+                    chars.next();
+                }
                 continue;
             }
             if ch == 'n' && text[byte_i..].starts_with("null") {
-                for _ in 0..4 { chars.next(); }
+                for _ in 0..4 {
+                    chars.next();
+                }
                 continue;
             }
 
@@ -753,7 +822,10 @@ mod tests {
         // Very short budget: 10ms
         let guard = ExecutionBudgetGuard::new(0.01).unwrap();
         // Immediately it should be OK
-        assert!(guard.check().is_ok(), "guard must be OK immediately after creation");
+        assert!(
+            guard.check().is_ok(),
+            "guard must be OK immediately after creation"
+        );
         // Sleep 50ms to guarantee deadline has passed
         std::thread::sleep(std::time::Duration::from_millis(50));
         // Now check() must raise an error
@@ -761,7 +833,8 @@ mod tests {
         assert!(result.is_err(), "guard.check() must fail after timeout");
         let err = result.unwrap_err();
         assert_eq!(
-            err.bytecode, crate::errors::SAACPBytecodes::RgcResourceLimitExceeded,
+            err.bytecode,
+            crate::errors::SAACPBytecodes::RgcResourceLimitExceeded,
             "timeout must produce RgcResourceLimitExceeded bytecode"
         );
     }

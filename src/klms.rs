@@ -198,7 +198,11 @@ impl KeyDescriptor {
         status: KeyStatus,
         metadata: HashMap<String, String>,
     ) -> Result<Self, String> {
-        if kid.len() != 32 || !kid.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        if kid.len() != 32
+            || !kid
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
             return Err(format!(
                 "kid must be a 32-character lowercase hex string; got {:?}",
                 kid
@@ -613,7 +617,10 @@ impl KeyLifecycleManager {
         let result = self.registry.atomic_rotate(kid, now, move |current| {
             let mut metadata = HashMap::new();
             metadata.insert("rotated_from_version".into(), current.version.to_string());
-            metadata.insert("overlap_expires_at".into(), (now + policy.overlap_seconds).to_string());
+            metadata.insert(
+                "overlap_expires_at".into(),
+                (now + policy.overlap_seconds).to_string(),
+            );
 
             KeyDescriptor::new(
                 kid.to_string(),
@@ -632,10 +639,16 @@ impl KeyLifecycleManager {
         let new_descriptor = match result {
             Ok(desc) => desc,
             Err(e @ KlmsRotateError::NoActiveVersion(_)) => {
-                return Err(SAACPHardDrop::new(SAACPBytecodes::KeyRevoked, e.into_message()));
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::KeyRevoked,
+                    e.into_message(),
+                ));
             }
             Err(e) => {
-                return Err(SAACPHardDrop::new(SAACPBytecodes::KeyVersionMismatch, e.into_message()));
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::KeyVersionMismatch,
+                    e.into_message(),
+                ));
             }
         };
 
@@ -647,11 +660,7 @@ impl KeyLifecycleManager {
     /// Revoke ALL versions of a key immediately.
     ///
     /// If reason is "compromised", status is set to Compromised; otherwise Revoked.
-    pub fn revoke_key(
-        &self,
-        kid: &str,
-        reason: &str,
-    ) -> Result<KeyRevocationRecord, String> {
+    pub fn revoke_key(&self, kid: &str, reason: &str) -> Result<KeyRevocationRecord, String> {
         let now = now_epoch_secs();
         let new_status = if reason == "compromised" {
             KeyStatus::Compromised
@@ -677,7 +686,10 @@ impl KeyLifecycleManager {
             propagated: false,
         };
 
-        self.revocation_log.lock().unwrap_or_else(|e| e.into_inner()).push(record.clone());
+        self.revocation_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(record.clone());
         Ok(record)
     }
 
@@ -694,7 +706,11 @@ impl KeyLifecycleManager {
         // in `KeyRegistry`'s own impl block (see its doc comment): this is the
         // same process-wide-singleton-backing Mutex, so recovering on poison
         // here keeps this direct field access consistent with its siblings.
-        let reg = self.registry.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = self
+            .registry
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stale: Vec<(String, u64)> = reg
             .iter()
             .filter(|(_, desc)| desc.status == KeyStatus::Active && desc.expires_at < now)
@@ -731,7 +747,9 @@ impl KeyLifecycleManager {
             return Vec::new();
         }
 
-        let due = self.registry.list_expiring(self.policy.renewal_lead_seconds, now);
+        let due = self
+            .registry
+            .list_expiring(self.policy.renewal_lead_seconds, now);
         let mut rotated = Vec::new();
         for (kid, version) in due {
             // `version` is the exact snapshotted descriptor `list_expiring` found due —
@@ -747,26 +765,28 @@ impl KeyLifecycleManager {
             // comment for the concurrent double-rotation race this closes. A concurrent
             // sweep that already rotated `kid` past `version` makes this call a safe no-op
             // (`Ok(None)`) rather than a second, spurious rotation.
-            let result = self.registry.atomic_rotate_if_current(&kid, version, now, |current| {
-                let mut metadata = HashMap::new();
-                metadata.insert("rotated_from_version".into(), current.version.to_string());
-                metadata.insert(
-                    "overlap_expires_at".into(),
-                    (now + policy.overlap_seconds).to_string(),
-                );
-                KeyDescriptor::new(
-                    kid.clone(),
-                    current.version + 1,
-                    algorithm,
-                    current.category,
-                    generate_key(algorithm),
-                    now,
-                    now + policy.max_age_seconds,
-                    None,
-                    KeyStatus::Active,
-                    metadata,
-                )
-            });
+            let result = self
+                .registry
+                .atomic_rotate_if_current(&kid, version, now, |current| {
+                    let mut metadata = HashMap::new();
+                    metadata.insert("rotated_from_version".into(), current.version.to_string());
+                    metadata.insert(
+                        "overlap_expires_at".into(),
+                        (now + policy.overlap_seconds).to_string(),
+                    );
+                    KeyDescriptor::new(
+                        kid.clone(),
+                        current.version + 1,
+                        algorithm,
+                        current.category,
+                        generate_key(algorithm),
+                        now,
+                        now + policy.max_age_seconds,
+                        None,
+                        KeyStatus::Active,
+                        metadata,
+                    )
+                });
             if matches!(result, Ok(Some(_))) {
                 rotated.push(kid);
             }
@@ -815,7 +835,10 @@ impl KeyLifecycleManager {
 
     /// Return a copy of the internal revocation log.
     pub fn get_revocation_log(&self) -> Vec<KeyRevocationRecord> {
-        self.revocation_log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.revocation_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Propagate all un-propagated revocation records to federation peers.
@@ -827,7 +850,10 @@ impl KeyLifecycleManager {
         F: FnMut(&KeyRevocationRecord),
     {
         let unpropagated: Vec<usize> = {
-            let log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
+            let log = self
+                .revocation_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             log.iter()
                 .enumerate()
                 .filter(|(_, r)| !r.propagated)
@@ -838,7 +864,10 @@ impl KeyLifecycleManager {
         let mut count = 0;
         for idx in unpropagated {
             let record = {
-                let log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
+                let log = self
+                    .revocation_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 log[idx].clone()
             };
 
@@ -847,7 +876,10 @@ impl KeyLifecycleManager {
                 cb(&record);
             }
 
-            let mut log = self.revocation_log.lock().unwrap_or_else(|e| e.into_inner());
+            let mut log = self
+                .revocation_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             log[idx].propagated = true;
             count += 1;
         }
@@ -962,14 +994,41 @@ mod tests {
     fn test_kid_validation() {
         // Valid
         let kid = "0123456789abcdef0123456789abcdef";
-        assert!(make_descriptor(kid, KeyAlgorithm::Aes256Gcm, KeyCategory::Psk, vec![0; 32], None, None, None).is_ok());
+        assert!(make_descriptor(
+            kid,
+            KeyAlgorithm::Aes256Gcm,
+            KeyCategory::Psk,
+            vec![0; 32],
+            None,
+            None,
+            None
+        )
+        .is_ok());
 
         // Invalid: uppercase
         let bad_kid = "A".repeat(32);
-        assert!(make_descriptor(&bad_kid, KeyAlgorithm::Aes256Gcm, KeyCategory::Psk, vec![0; 32], None, None, None).is_err());
+        assert!(make_descriptor(
+            &bad_kid,
+            KeyAlgorithm::Aes256Gcm,
+            KeyCategory::Psk,
+            vec![0; 32],
+            None,
+            None,
+            None
+        )
+        .is_err());
 
         // Invalid: wrong length
-        assert!(make_descriptor("abc", KeyAlgorithm::Aes256Gcm, KeyCategory::Psk, vec![0; 32], None, None, None).is_err());
+        assert!(make_descriptor(
+            "abc",
+            KeyAlgorithm::Aes256Gcm,
+            KeyCategory::Psk,
+            vec![0; 32],
+            None,
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -1040,7 +1099,9 @@ mod tests {
         reg.register(test_descriptor(&kid)).unwrap();
 
         let mgr = KeyLifecycleManager::new(reg, None);
-        let new_desc = mgr.rotate_key(&kid, vec![1u8; 32], KeyAlgorithm::Aes256Gcm).unwrap();
+        let new_desc = mgr
+            .rotate_key(&kid, vec![1u8; 32], KeyAlgorithm::Aes256Gcm)
+            .unwrap();
         assert_eq!(new_desc.version, 2);
         assert_eq!(new_desc.status, KeyStatus::Active);
     }

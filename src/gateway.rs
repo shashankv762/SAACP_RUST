@@ -5,19 +5,19 @@
 //! cryptographically signed capability tokens.
 //! Uses length-prefix format to prevent token delimiter injection.
 
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::acsvaf::{CapabilityVerificationAuthority, ACSVAF_MAX_DELEGATION_DEPTH};
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::faitf::TrustStore;
-use crate::acsvaf::{CapabilityVerificationAuthority, ACSVAF_MAX_DELEGATION_DEPTH};
 use crate::state_backend::StateBackend;
 
 // ---------------------------------------------------------------------------
@@ -133,7 +133,9 @@ fn ratelimit_shard_index(key: &str) -> usize {
 }
 
 fn new_ratelimit_shards<V>() -> Vec<Mutex<HashMap<String, V>>> {
-    (0..RATE_LIMITER_SHARDS).map(|_| Mutex::new(HashMap::new())).collect()
+    (0..RATE_LIMITER_SHARDS)
+        .map(|_| Mutex::new(HashMap::new()))
+        .collect()
 }
 
 /// Lock and return the shard responsible for `key`.
@@ -145,7 +147,9 @@ fn ratelimit_shard<'a, V>(
     shards: &'a [Mutex<HashMap<String, V>>],
     key: &str,
 ) -> std::sync::MutexGuard<'a, HashMap<String, V>> {
-    shards[ratelimit_shard_index(key)].lock().unwrap_or_else(|e| e.into_inner())
+    shards[ratelimit_shard_index(key)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -198,10 +202,12 @@ fn sorted_str_array(items: &[&str]) -> serde_json::Value {
 
 fn parse_token_wire(token_b64: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SAACPHardDrop> {
     let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token_b64)
-        .map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::LateralMovementBlocked,
-            "Missing or malformed Capability Token.",
-        ))?;
+        .map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::LateralMovementBlocked,
+                "Missing or malformed Capability Token.",
+            )
+        })?;
     if raw.len() < 4 {
         return Err(SAACPHardDrop::new(
             SAACPBytecodes::LateralMovementBlocked,
@@ -313,7 +319,10 @@ impl AgentRateLimiter {
 
     /// Same as [`Self::with_backend`], with a configurable poll interval for
     /// the background lockout-mirroring thread.
-    pub fn with_backend_and_poll_interval(backend: Arc<dyn StateBackend>, poll_interval: Duration) -> Self {
+    pub fn with_backend_and_poll_interval(
+        backend: Arc<dyn StateBackend>,
+        poll_interval: Duration,
+    ) -> Self {
         let records = Arc::new(new_ratelimit_shards());
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -352,12 +361,20 @@ impl AgentRateLimiter {
         // currently-locked-out agents, TTL-bounded at
         // RATE_LIMITER_LOCKOUT_SECONDS), so a SCAN here is cheap — this is
         // not a scan of the full production keyspace.
-        let Ok(keys) = backend.scan_prefix("ratelimit:lock:") else { return };
+        let Ok(keys) = backend.scan_prefix("ratelimit:lock:") else {
+            return;
+        };
         for key in keys {
             let agent_id = key.strip_prefix("ratelimit:lock:").unwrap_or(&key);
-            let Ok(Some(bytes)) = backend.get(&key) else { continue };
-            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-            let Ok(locked_until) = text.parse::<f64>() else { continue };
+            let Ok(Some(bytes)) = backend.get(&key) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Ok(locked_until) = text.parse::<f64>() else {
+                continue;
+            };
 
             let mut r = ratelimit_shard(records, agent_id);
             let rec = r.entry(agent_id.to_string()).or_insert(RateRecord {
@@ -389,7 +406,10 @@ impl AgentRateLimiter {
                     if now < rec.locked_until {
                         return Err(SAACPHardDrop::new(
                             SAACPBytecodes::CircuitBreakerOpen,
-                            format!("Agent '{}' is locked out for malformed packet flooding.", agent_id),
+                            format!(
+                                "Agent '{}' is locked out for malformed packet flooding.",
+                                agent_id
+                            ),
                         ));
                     }
                 }
@@ -465,7 +485,10 @@ impl AgentRateLimiter {
         if now < rec.locked_until {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::CircuitBreakerOpen,
-                format!("Agent '{}' is locked out for malformed packet flooding.", agent_id),
+                format!(
+                    "Agent '{}' is locked out for malformed packet flooding.",
+                    agent_id
+                ),
             ));
         }
 
@@ -713,8 +736,12 @@ pub struct ZeroTrustGateway {
 impl ZeroTrustGateway {
     pub fn new() -> Self {
         Self {
-            revoked_tokens: (0..REVOKED_TOKENS_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            token_cache: (0..TOKEN_CACHE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            revoked_tokens: (0..REVOKED_TOKENS_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            token_cache: (0..TOKEN_CACHE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
             trusted_issuer_keys: Mutex::new(HashMap::new()),
             epochs: arc_swap::ArcSwap::from_pointee(GatewayEpochs {
                 strict_asymmetric_mode: false,
@@ -734,17 +761,21 @@ impl ZeroTrustGateway {
     /// global gateway are honoured by stream-continuation checks even without a per-call
     /// gateway reference.
     pub fn global() -> &'static ZeroTrustGateway {
-        static GLOBAL_ZTG: LazyLock<ZeroTrustGateway> =
-            LazyLock::new(ZeroTrustGateway::new);
+        static GLOBAL_ZTG: LazyLock<ZeroTrustGateway> = LazyLock::new(ZeroTrustGateway::new);
         &GLOBAL_ZTG
     }
 
     /// When true, HMAC-PSK tokens are rejected outright.
     ///
     /// Lock and return the token-cache shard responsible for `cache_key`.
-    fn token_cache_shard(&self, cache_key: &str) -> std::sync::MutexGuard<'_, HashMap<String, CacheEntry>> {
+    fn token_cache_shard(
+        &self,
+        cache_key: &str,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, CacheEntry>> {
         let idx = crate::shard::fnv1a_shard(cache_key, TOKEN_CACHE_SHARDS);
-        self.token_cache[idx].lock().unwrap_or_else(|e| e.into_inner())
+        self.token_cache[idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Drop every cached verdict.
@@ -771,7 +802,10 @@ impl ZeroTrustGateway {
     /// this helper is an event that invalidates cached token verdicts. That makes
     /// cache invalidation a single atomic publish — see `token_cache_valid`.
     fn update_epochs(&self, mutate: impl FnOnce(&mut GatewayEpochs)) {
-        let _w = self.epoch_write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _w = self
+            .epoch_write_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut next = (**self.epochs.load()).clone();
         next.cache_generation = next.cache_generation.wrapping_add(1);
         mutate(&mut next);
@@ -804,7 +838,11 @@ impl ZeroTrustGateway {
 
     /// Register the canonical token-signing key for a trusted issuer.
     /// T3.8: validates non-empty agent string and exactly 32-byte secret.
-    pub fn register_issuer_key(&self, issuer_agent: &str, issuer_secret: &[u8]) -> Result<(), SAACPHardDrop> {
+    pub fn register_issuer_key(
+        &self,
+        issuer_agent: &str,
+        issuer_secret: &[u8],
+    ) -> Result<(), SAACPHardDrop> {
         if issuer_agent.trim().is_empty() {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SchemaMismatch,
@@ -822,11 +860,17 @@ impl ZeroTrustGateway {
         if issuer_secret.len() != 32 {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SchemaMismatch,
-                format!("register_issuer_key: secret must be exactly 32 bytes, got {}", issuer_secret.len()),
+                format!(
+                    "register_issuer_key: secret must be exactly 32 bytes, got {}",
+                    issuer_secret.len()
+                ),
             ));
         }
         {
-            let mut keys = self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner());
+            let mut keys = self
+                .trusted_issuer_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // L-9 fix: reject growing past the cap for a genuinely NEW issuer — but
             // always allow re-registering (rotating the key of) an issuer already
             // tracked, since that never grows the map.
@@ -838,7 +882,10 @@ impl ZeroTrustGateway {
                     ),
                 ));
             }
-            keys.insert(issuer_agent.to_string(), Zeroizing::new(issuer_secret.to_vec()));
+            keys.insert(
+                issuer_agent.to_string(),
+                Zeroizing::new(issuer_secret.to_vec()),
+            );
         }
         self.clear_token_cache();
         self.update_epochs(|e| e.issuer_registry_epoch += 1);
@@ -847,7 +894,10 @@ impl ZeroTrustGateway {
 
     /// Clear trusted issuer registry.
     pub fn clear_trusted_issuers(&self) {
-        self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.trusted_issuer_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.clear_token_cache();
         self.update_epochs(|e| e.issuer_registry_epoch += 1);
     }
@@ -880,9 +930,15 @@ impl ZeroTrustGateway {
         // T3.6: sort lists for deterministic cross-language HMAC
         token_data.insert("allow".into(), sorted_str_array(allowed_agents));
         token_data.insert("forbid".into(), sorted_str_array(forbidden_agents));
-        token_data.insert("max_action_class".into(), serde_json::Value::Number(max_action_class.into()));
+        token_data.insert(
+            "max_action_class".into(),
+            serde_json::Value::Number(max_action_class.into()),
+        );
         if let Some(rih) = root_intent_hash {
-            token_data.insert("root_intent_hash".into(), serde_json::Value::String(rih.into()));
+            token_data.insert(
+                "root_intent_hash".into(),
+                serde_json::Value::String(rih.into()),
+            );
         }
         // T3.4: thash alias for ACSVAF transcript binding
         if let Some(th) = thash {
@@ -900,7 +956,9 @@ impl ZeroTrustGateway {
         packed.extend_from_slice(&signature);
 
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+        base64::engine::general_purpose::STANDARD
+            .encode(&packed)
+            .into_bytes()
     }
 
     /// Lock and return the shard responsible for `sig_hash`.
@@ -910,7 +968,9 @@ impl ZeroTrustGateway {
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing revocation enforcement entirely.
     fn revoked_shard(&self, sig_hash: &str) -> std::sync::MutexGuard<'_, HashMap<String, f64>> {
-        self.revoked_tokens[revoked_token_shard_index(sig_hash)].lock().unwrap_or_else(|e| e.into_inner())
+        self.revoked_tokens[revoked_token_shard_index(sig_hash)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Revoke a token by adding its signature hash to the revocation set.
@@ -922,8 +982,8 @@ impl ZeroTrustGateway {
     /// `REVOKED_TOKENS_MAX` (prune-then-evict-oldest) so a flood of revocations
     /// can never grow this set without bound.
     pub fn revoke_token(&self, token_b64: &[u8]) -> Result<(), String> {
-        let (token_json, signature) = parse_token_wire(token_b64)
-            .map_err(|e| format!("Token revocation failed: {}", e))?;
+        let (token_json, signature) =
+            parse_token_wire(token_b64).map_err(|e| format!("Token revocation failed: {}", e))?;
         if signature.is_empty() {
             return Err("Token has no signature to revoke.".into());
         }
@@ -1012,7 +1072,8 @@ impl ZeroTrustGateway {
 
     /// Check if a token signature hash is in the revocation set.
     pub fn is_token_revoked(&self, token_sig_hash: &str) -> bool {
-        self.revoked_shard(token_sig_hash).contains_key(token_sig_hash)
+        self.revoked_shard(token_sig_hash)
+            .contains_key(token_sig_hash)
     }
 
     /// PSK Compromise Recovery: revoke ALL tokens, flush ALL caches (M-6 fix).
@@ -1037,7 +1098,10 @@ impl ZeroTrustGateway {
         // compromise recovery, which is exactly when that must not happen.
         let now = now_epoch_secs().floor();
         self.clear_token_cache();
-        self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.trusted_issuer_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut new_epoch = 0;
         self.update_epochs(|e| {
             e.blanket_revoked_before = now;
@@ -1073,11 +1137,7 @@ impl ZeroTrustGateway {
         let token_hash = sha256_hex(token_b64);
         let cache_key = format!(
             "{}:{}:{}:{}:{}",
-            target_agent,
-            token_hash,
-            fallback_key_hash,
-            registry_epoch,
-            revocation_epoch,
+            target_agent, token_hash, fallback_key_hash, registry_epoch, revocation_epoch,
         );
 
         // Check cache. An entry is usable only if it is unexpired AND was
@@ -1141,7 +1201,10 @@ impl ZeroTrustGateway {
 
         // HMAC-SHA256 verification
         if sig_alg != "ed25519" {
-            let trusted_keys = self.trusted_issuer_keys.lock().unwrap_or_else(|e| e.into_inner());
+            let trusted_keys = self
+                .trusted_issuer_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let has_registry = !trusted_keys.is_empty();
             let trusted_secret = trusted_keys.get(&source_agent).cloned();
             drop(trusted_keys);
@@ -1275,7 +1338,10 @@ impl ZeroTrustGateway {
         if !allow.contains(target_agent) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::ScopeViolation,
-                format!("Scope violation: '{}' is not in the allowed scope list.", target_agent),
+                format!(
+                    "Scope violation: '{}' is not in the allowed scope list.",
+                    target_agent
+                ),
             ));
         }
 
@@ -1329,14 +1395,18 @@ impl ZeroTrustGateway {
         let delegation_depth = match obj.get("delegation_depth") {
             None => 0,
             Some(v) => {
-                let raw = v.as_u64().ok_or_else(|| SAACPHardDrop::new(
-                    SAACPBytecodes::DelegationRejected,
-                    "delegation_depth claim present but not a non-negative integer.",
-                ))?;
-                let depth = u32::try_from(raw).map_err(|_| SAACPHardDrop::new(
-                    SAACPBytecodes::DelegationRejected,
-                    format!("delegation_depth value {raw} exceeds valid u32 range."),
-                ))?;
+                let raw = v.as_u64().ok_or_else(|| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::DelegationRejected,
+                        "delegation_depth claim present but not a non-negative integer.",
+                    )
+                })?;
+                let depth = u32::try_from(raw).map_err(|_| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::DelegationRejected,
+                        format!("delegation_depth value {raw} exceeds valid u32 range."),
+                    )
+                })?;
                 if depth > ACSVAF_MAX_DELEGATION_DEPTH {
                     return Err(SAACPHardDrop::new(
                         SAACPBytecodes::DelegationRejected,
@@ -1377,28 +1447,28 @@ impl ZeroTrustGateway {
             let current_time = now_epoch_secs();
             // First pass: drop already-expired entries, and any left over from a
             // superseded generation (free, no ordering needed).
-            cache.retain(|_, v| {
-                v.expiry > current_time && v.generation == epochs.cache_generation
-            });
+            cache.retain(|_, v| v.expiry > current_time && v.generation == epochs.cache_generation);
             // Second pass: if still at/above capacity, evict the 20% soonest to expire.
             if cache.len() >= TOKEN_CACHE_PER_SHARD_MAX {
                 let evict_count = TOKEN_CACHE_PER_SHARD_MAX / 5;
-                let mut by_expiry: Vec<(String, f64)> = cache
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.expiry))
-                    .collect();
+                let mut by_expiry: Vec<(String, f64)> =
+                    cache.iter().map(|(k, v)| (k.clone(), v.expiry)).collect();
                 // Sort ascending by expiry — soonest-expiring entries first.
-                by_expiry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                by_expiry
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (k, _) in by_expiry.into_iter().take(evict_count) {
                     cache.remove(&k);
                 }
             }
         }
-        cache.insert(cache_key, CacheEntry {
-            expiry: cache_expiry,
-            result: result.clone(),
-            generation: epochs.cache_generation,
-        });
+        cache.insert(
+            cache_key,
+            CacheEntry {
+                expiry: cache_expiry,
+                result: result.clone(),
+                generation: epochs.cache_generation,
+            },
+        );
 
         Ok(result)
     }
@@ -1431,11 +1501,12 @@ fn verify_ed25519_signature_inner(
             "Ed25519 public key internal conversion failed (unexpected length)",
         )
     })?;
-    let vk = VerifyingKey::from_bytes(&pub_key_arr)
-        .map_err(|_| SAACPHardDrop::new(
+    let vk = VerifyingKey::from_bytes(&pub_key_arr).map_err(|_| {
+        SAACPHardDrop::new(
             SAACPBytecodes::InvalidSignature,
             "Invalid Ed25519 public key bytes",
-        ))?;
+        )
+    })?;
     let sig_arr: [u8; 64] = signature.try_into().map_err(|_| {
         SAACPHardDrop::new(
             SAACPBytecodes::InvalidSignature,
@@ -1443,11 +1514,12 @@ fn verify_ed25519_signature_inner(
         )
     })?;
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify(token_json, &sig)
-        .map_err(|_| SAACPHardDrop::new(
+    vk.verify(token_json, &sig).map_err(|_| {
+        SAACPHardDrop::new(
             SAACPBytecodes::InvalidSignature,
             "Ed25519 signature verification failed",
-        ))
+        )
+    })
 }
 
 impl Default for ZeroTrustGateway {
@@ -1470,14 +1542,13 @@ impl DelegationGuard {
         root_secret: &[u8],
     ) -> Result<(), SAACPHardDrop> {
         let (token_json, signature) = {
-            let raw = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                token_b64,
-            )
-            .map_err(|_| SAACPHardDrop::new(
-                SAACPBytecodes::DelegationRejected,
-                "Delegation attempt with malformed token structure.",
-            ))?;
+            let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token_b64)
+                .map_err(|_| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::DelegationRejected,
+                        "Delegation attempt with malformed token structure.",
+                    )
+                })?;
             if raw.len() < 4 {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::DelegationRejected,
@@ -1603,25 +1674,48 @@ impl RRBCGateway {
         token_data.insert("iss".into(), serde_json::Value::String(issuer_agent.into()));
         token_data.insert(
             "aud".into(),
-            serde_json::Value::Array(audience.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
+            serde_json::Value::Array(
+                audience
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.to_string()))
+                    .collect(),
+            ),
         );
         token_data.insert("sid".into(), serde_json::Value::String(sid.into()));
         token_data.insert("cid".into(), serde_json::Value::String(cid.into()));
         token_data.insert("oaid".into(), serde_json::Value::String(oaid.into()));
         token_data.insert(
             "actions".into(),
-            serde_json::Value::Array(actions.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
+            serde_json::Value::Array(
+                actions
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.to_string()))
+                    .collect(),
+            ),
         );
         token_data.insert(
             "allow".into(),
-            serde_json::Value::Array(allowed_agents.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
+            serde_json::Value::Array(
+                allowed_agents
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.to_string()))
+                    .collect(),
+            ),
         );
         token_data.insert(
             "forbid".into(),
-            serde_json::Value::Array(forbidden_agents.iter().map(|a| serde_json::Value::String(a.to_string())).collect()),
+            serde_json::Value::Array(
+                forbidden_agents
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.to_string()))
+                    .collect(),
+            ),
         );
         token_data.insert("max_use".into(), serde_json::json!(max_use));
-        token_data.insert("max_action_class".into(), serde_json::json!(max_action_class));
+        token_data.insert(
+            "max_action_class".into(),
+            serde_json::json!(max_action_class),
+        );
         // PoP key embedded in token if provided (spec §8.2 step 4).
         // Absent = no PoP required; present = redeem_token enforces Ed25519 proof.
         if let Some(pop_key) = pop_verifying_key {
@@ -1630,7 +1724,8 @@ impl RRBCGateway {
             token_data.insert("pop_key".into(), serde_json::Value::String(pop_key_b64));
         }
 
-        let token_json = serde_json::to_vec(&serde_json::Value::Object(token_data)).unwrap_or_default();
+        let token_json =
+            serde_json::to_vec(&serde_json::Value::Object(token_data)).unwrap_or_default();
         let signature = hmac_sha256(issuer_secret, &token_json);
 
         let json_len = u32::try_from(token_json.len()).unwrap_or(u32::MAX);
@@ -1640,16 +1735,22 @@ impl RRBCGateway {
         packed.extend_from_slice(&signature);
 
         // Register token
-        let data: serde_json::Value = serde_json::from_slice(&token_json).unwrap_or(serde_json::Value::Null);
+        let data: serde_json::Value =
+            serde_json::from_slice(&token_json).unwrap_or(serde_json::Value::Null);
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.tokens.lock().unwrap().insert(jti, RRBCTokenRecord {
-            data,
-            remaining: max_use,
-            revoked: false,
-        });
+        self.tokens.lock().unwrap().insert(
+            jti,
+            RRBCTokenRecord {
+                data,
+                remaining: max_use,
+                revoked: false,
+            },
+        );
 
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+        base64::engine::general_purpose::STANDARD
+            .encode(&packed)
+            .into_bytes()
     }
 
     /// Redeem a single use of an RRBC token (spec §8.2).
@@ -1670,9 +1771,14 @@ impl RRBCGateway {
         issuer_secret: &[u8],
     ) -> Result<RRBCRedemptionResult, SAACPHardDrop> {
         self.redeem_token_with_pop(
-            token_b64, rnonce, presenting_agent,
-            presenting_sid, presenting_cid, presenting_oaid,
-            issuer_secret, None,
+            token_b64,
+            rnonce,
+            presenting_agent,
+            presenting_sid,
+            presenting_cid,
+            presenting_oaid,
+            issuer_secret,
+            None,
         )
     }
 
@@ -1702,10 +1808,9 @@ impl RRBCGateway {
         // to pass if its first byte matches the expected HMAC output.
         // S-3 fix: the MAC tag is ephemeral security-sensitive material — wrap in
         // `Zeroizing` so it's cleared from heap memory as soon as it goes out of scope.
-        let expected_sig: Zeroizing<Vec<u8>> = Zeroizing::new(hmac_sha256(issuer_secret, &token_json));
-        if signature.len() != expected_sig.len()
-            || !constant_time_eq(&expected_sig, &signature)
-        {
+        let expected_sig: Zeroizing<Vec<u8>> =
+            Zeroizing::new(hmac_sha256(issuer_secret, &token_json));
+        if signature.len() != expected_sig.len() || !constant_time_eq(&expected_sig, &signature) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
                 "RRBC: Capability token signature verification failed.",
@@ -1726,7 +1831,11 @@ impl RRBCGateway {
             )
         })?;
 
-        let jti = obj.get("jti").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let jti = obj
+            .get("jti")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Revocation check
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
@@ -1840,20 +1949,28 @@ impl RRBCGateway {
             let pop_key_bytes = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 pop_key_b64.as_bytes(),
-            ).map_err(|_| SAACPHardDrop::new(
-                SAACPBytecodes::RrbcPopFailed,
-                "RRBC PoP: invalid pop_key encoding in token.",
-            ))?;
-            let proof = pop_proof.ok_or_else(|| SAACPHardDrop::new(
-                SAACPBytecodes::RrbcPopFailed,
-                "RRBC PoP: token requires proof-of-possession but none was supplied.",
-            ))?;
-            // Verify Ed25519(pop_key, message=rnonce, sig=proof)
-            verify_ed25519_signature_inner(rnonce.as_bytes(), proof, &pop_key_bytes)
-                .map_err(|_| SAACPHardDrop::new(
+            )
+            .map_err(|_| {
+                SAACPHardDrop::new(
                     SAACPBytecodes::RrbcPopFailed,
-                    "RRBC PoP: Ed25519 proof-of-possession verification failed.",
-                ))?;
+                    "RRBC PoP: invalid pop_key encoding in token.",
+                )
+            })?;
+            let proof = pop_proof.ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::RrbcPopFailed,
+                    "RRBC PoP: token requires proof-of-possession but none was supplied.",
+                )
+            })?;
+            // Verify Ed25519(pop_key, message=rnonce, sig=proof)
+            verify_ed25519_signature_inner(rnonce.as_bytes(), proof, &pop_key_bytes).map_err(
+                |_| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::RrbcPopFailed,
+                        "RRBC PoP: Ed25519 proof-of-possession verification failed.",
+                    )
+                },
+            )?;
         } else if pop_proof.is_some() {
             // Token does not require PoP but caller supplied a proof — reject to prevent
             // bypass attempts where a forged pop_key field is stripped but proof remains.
@@ -1866,7 +1983,11 @@ impl RRBCGateway {
         let extract_strings = |key: &str| -> Vec<String> {
             obj.get(key)
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 
@@ -1877,7 +1998,10 @@ impl RRBCGateway {
         // it silently granted the *highest* possible action class (IRREVERSIBLE) instead
         // of rejecting. Mirrors the pattern already used in
         // `ZeroTrustGateway::validate_lateral_movement` above.
-        let mac_raw = obj.get("max_action_class").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mac_raw = obj
+            .get("max_action_class")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if mac_raw > u8::MAX as u64 {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::ActionClassEscalation,
@@ -2032,7 +2156,8 @@ mod tests {
             counts[ratelimit_shard_index(&key)] += 1;
         }
 
-        let dead: Vec<usize> = counts.iter()
+        let dead: Vec<usize> = counts
+            .iter()
             .enumerate()
             .filter(|(_, &c)| c == 0)
             .map(|(i, _)| i)
@@ -2082,9 +2207,14 @@ mod tests {
         assert!(rl.is_locked("agent1"));
 
         let now = now_epoch_secs();
-        assert!(rl.is_locked_at("agent1", now), "a `now` at the current instant must still read as locked");
-        assert!(!rl.is_locked_at("agent1", now + RATE_LIMITER_LOCKOUT_SECONDS + 1.0),
-            "a `now` far past the lockout window must read as unlocked");
+        assert!(
+            rl.is_locked_at("agent1", now),
+            "a `now` at the current instant must still read as locked"
+        );
+        assert!(
+            !rl.is_locked_at("agent1", now + RATE_LIMITER_LOCKOUT_SECONDS + 1.0),
+            "a `now` far past the lockout window must read as unlocked"
+        );
         assert!(!rl.is_locked_at("never-locked-agent", now));
     }
 
@@ -2138,9 +2268,15 @@ mod tests {
 
         // Node B hasn't seen any traffic for this agent yet — deterministically
         // pull the fleet-wide lockout marker instead of sleeping.
-        assert!(!node_b.is_locked("agentY"), "node B shouldn't know yet without a refresh");
+        assert!(
+            !node_b.is_locked("agentY"),
+            "node B shouldn't know yet without a refresh"
+        );
         node_b.refresh_from_backend();
-        assert!(node_b.is_locked("agentY"), "node B should observe the cross-node lockout after refresh");
+        assert!(
+            node_b.is_locked("agentY"),
+            "node B should observe the cross-node lockout after refresh"
+        );
     }
 
     #[test]
@@ -2150,7 +2286,12 @@ mod tests {
             fn get(&self, _key: &str) -> crate::state_backend::BackendResult<Option<Vec<u8>>> {
                 Err(crate::state_backend::BackendError("boom".into()))
             }
-            fn set(&self, _key: &str, _value: &[u8], _ttl: Option<Duration>) -> crate::state_backend::BackendResult<()> {
+            fn set(
+                &self,
+                _key: &str,
+                _value: &[u8],
+                _ttl: Option<Duration>,
+            ) -> crate::state_backend::BackendResult<()> {
                 Err(crate::state_backend::BackendError("boom".into()))
             }
             fn delete(&self, _key: &str) -> crate::state_backend::BackendResult<bool> {
@@ -2159,10 +2300,18 @@ mod tests {
             fn incr(&self, _key: &str, _by: i64) -> crate::state_backend::BackendResult<i64> {
                 Err(crate::state_backend::BackendError("boom".into()))
             }
-            fn scan_prefix(&self, _prefix: &str) -> crate::state_backend::BackendResult<Vec<String>> {
+            fn scan_prefix(
+                &self,
+                _prefix: &str,
+            ) -> crate::state_backend::BackendResult<Vec<String>> {
                 Err(crate::state_backend::BackendError("boom".into()))
             }
-            fn incr_with_ttl(&self, _key: &str, _by: i64, _ttl: Duration) -> crate::state_backend::BackendResult<i64> {
+            fn incr_with_ttl(
+                &self,
+                _key: &str,
+                _by: i64,
+                _ttl: Duration,
+            ) -> crate::state_backend::BackendResult<i64> {
                 Err(crate::state_backend::BackendError("boom".into()))
             }
         }
@@ -2176,7 +2325,10 @@ mod tests {
                 tripped = true;
             }
         }
-        assert!(tripped, "circuit breaker must still trip when the backend is unreachable");
+        assert!(
+            tripped,
+            "circuit breaker must still trip when the backend is unreachable"
+        );
         assert!(rl.is_locked("agentZ"));
     }
 
@@ -2184,16 +2336,8 @@ mod tests {
     fn test_issue_and_validate_token() {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
-        let token = gw.issue_capability_token(
-            secret,
-            "agent-a",
-            &["agent-b"],
-            &[],
-            3600,
-            None,
-            0x01,
-            None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x01, None);
         let result = gw.validate_lateral_movement("agent-b", &token, secret);
         assert!(result.is_ok());
         let r = result.unwrap();
@@ -2206,16 +2350,8 @@ mod tests {
     fn test_token_scope_violation() {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
-        let token = gw.issue_capability_token(
-            secret,
-            "agent-a",
-            &["agent-b"],
-            &[],
-            3600,
-            None,
-            0x00,
-            None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None);
         let result = gw.validate_lateral_movement("agent-c", &token, secret);
         assert!(result.is_err());
     }
@@ -2224,16 +2360,8 @@ mod tests {
     fn test_token_revocation() {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
-        let token = gw.issue_capability_token(
-            secret,
-            "agent-a",
-            &["agent-b"],
-            &[],
-            3600,
-            None,
-            0x00,
-            None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None);
         gw.revoke_token(&token).unwrap();
         assert_eq!(gw.get_revocation_epoch(), 1);
     }
@@ -2241,7 +2369,8 @@ mod tests {
     #[test]
     fn test_revoke_all_tokens() {
         let gw = ZeroTrustGateway::new();
-        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!").unwrap();
+        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!")
+            .unwrap();
         let epoch = gw.revoke_all_tokens();
         assert_eq!(epoch, 1);
     }
@@ -2254,16 +2383,18 @@ mod tests {
     fn test_revoke_all_tokens_preserves_individual_revocations() {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
-        let token = gw.issue_capability_token(
-            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None);
         gw.revoke_token(&token).unwrap();
-        assert!(gw.validate_lateral_movement("agent-b", &token, secret).is_err());
+        assert!(gw
+            .validate_lateral_movement("agent-b", &token, secret)
+            .is_err());
 
         gw.revoke_all_tokens();
 
         assert!(
-            gw.validate_lateral_movement("agent-b", &token, secret).is_err(),
+            gw.validate_lateral_movement("agent-b", &token, secret)
+                .is_err(),
             "a token individually revoked before revoke_all_tokens() must remain revoked \
              afterwards — revoke_all_tokens() must not clear revoked_tokens"
         );
@@ -2294,14 +2425,20 @@ mod tests {
         packed.extend_from_slice(&token_json);
         packed.extend_from_slice(&signature);
         use base64::Engine;
-        let token = base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes();
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(&packed)
+            .into_bytes();
 
         // Valid before any blanket revocation has occurred.
-        assert!(gw.validate_lateral_movement("agent-b", &token, secret).is_ok());
+        assert!(gw
+            .validate_lateral_movement("agent-b", &token, secret)
+            .is_ok());
 
         gw.revoke_all_tokens();
 
-        let err = gw.validate_lateral_movement("agent-b", &token, secret).unwrap_err();
+        let err = gw
+            .validate_lateral_movement("agent-b", &token, secret)
+            .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::LateralMovementBlocked);
     }
 
@@ -2328,7 +2465,9 @@ mod tests {
             packed.extend_from_slice(&token_json);
             packed.extend_from_slice(&signature);
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+            base64::engine::general_purpose::STANDARD
+                .encode(&packed)
+                .into_bytes()
         }
 
         let gw = ZeroTrustGateway::new();
@@ -2342,12 +2481,16 @@ mod tests {
         assert_eq!(gw.revoked_tokens_len(), 2, "both revocations recorded");
 
         let pruned = gw.prune_expired_revocations();
-        assert_eq!(pruned, 1, "exactly the expired-token revocation is reclaimed");
+        assert_eq!(
+            pruned, 1,
+            "exactly the expired-token revocation is reclaimed"
+        );
         assert_eq!(gw.revoked_tokens_len(), 1, "the live revocation survives");
 
         // The live revocation is still enforced end-to-end.
         assert!(
-            gw.validate_lateral_movement("agent-b", &live, secret).is_err(),
+            gw.validate_lateral_movement("agent-b", &live, secret)
+                .is_err(),
             "a non-expired revoked token must still be blocked after a prune"
         );
     }
@@ -2360,14 +2503,14 @@ mod tests {
     fn test_revoke_all_tokens_preserves_revocation_map_entries() {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
-        let token = gw.issue_capability_token(
-            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None);
         gw.revoke_token(&token).unwrap();
         assert_eq!(gw.revoked_tokens_len(), 1);
         gw.revoke_all_tokens();
         assert_eq!(
-            gw.revoked_tokens_len(), 1,
+            gw.revoked_tokens_len(),
+            1,
             "revoke_all_tokens must not clear individual revocation entries (H-2)"
         );
     }
@@ -2376,11 +2519,11 @@ mod tests {
         let gw = ZeroTrustGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
         gw.revoke_all_tokens();
-        let token = gw.issue_capability_token(
-            secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "agent-a", &["agent-b"], &[], 3600, None, 0x00, None);
         assert!(
-            gw.validate_lateral_movement("agent-b", &token, secret).is_ok(),
+            gw.validate_lateral_movement("agent-b", &token, secret)
+                .is_ok(),
             "a token issued after revoke_all_tokens() must still validate"
         );
     }
@@ -2399,7 +2542,8 @@ mod tests {
         let gw = ZeroTrustGateway::new();
         let registered_secret = b"registered-issuer-secret-32bytes";
         let wrong_fallback_secret = b"totally-different-fallback-key!!";
-        gw.register_issuer_key("agent-a", registered_secret).unwrap();
+        gw.register_issuer_key("agent-a", registered_secret)
+            .unwrap();
 
         let token = gw.issue_capability_token(
             registered_secret,
@@ -2413,7 +2557,10 @@ mod tests {
         );
 
         let result = gw.validate_lateral_movement("agent-b", &token, wrong_fallback_secret);
-        assert!(result.is_ok(), "must validate against the registered issuer key, not the fallback param");
+        assert!(
+            result.is_ok(),
+            "must validate against the registered issuer key, not the fallback param"
+        );
         assert_eq!(result.unwrap().source_agent, "agent-a");
 
         // A token signed with the WRONG secret must still be rejected even though
@@ -2428,7 +2575,9 @@ mod tests {
             0x01,
             None,
         );
-        assert!(gw.validate_lateral_movement("agent-b", &forged_token, wrong_fallback_secret).is_err());
+        assert!(gw
+            .validate_lateral_movement("agent-b", &forged_token, wrong_fallback_secret)
+            .is_err());
     }
 
     /// S-3 regression: once ANY issuer key is registered, an issuer with no
@@ -2440,7 +2589,8 @@ mod tests {
         let gw = ZeroTrustGateway::new();
         let registered_secret = b"registered-issuer-secret-32bytes";
         let untrusted_secret = b"untrusted-issuer-own-secret-key!";
-        gw.register_issuer_key("agent-a", registered_secret).unwrap();
+        gw.register_issuer_key("agent-a", registered_secret)
+            .unwrap();
 
         // "agent-x" has no registry entry, even though its own token is
         // internally self-consistent (signed with a secret only it knows).
@@ -2455,7 +2605,10 @@ mod tests {
             None,
         );
         let result = gw.validate_lateral_movement("agent-b", &token, untrusted_secret);
-        assert!(result.is_err(), "an issuer absent from a non-empty registry must be rejected");
+        assert!(
+            result.is_err(),
+            "an issuer absent from a non-empty registry must be rejected"
+        );
     }
 
     /// Build an Ed25519-signed capability token wire blob: sorted-JSON claims
@@ -2475,12 +2628,18 @@ mod tests {
         let mut token_data: HashMap<String, serde_json::Value> = HashMap::new();
         token_data.insert("iss".into(), serde_json::Value::String(issuer.into()));
         token_data.insert("kid".into(), serde_json::Value::String(kid.into()));
-        token_data.insert("_sig_alg".into(), serde_json::Value::String("ed25519".into()));
+        token_data.insert(
+            "_sig_alg".into(),
+            serde_json::Value::String("ed25519".into()),
+        );
         token_data.insert("iat".into(), serde_json::Value::Number(iat.into()));
         token_data.insert("exp".into(), serde_json::Value::Number((iat + 3600).into()));
         token_data.insert("allow".into(), sorted_str_array(allow));
         token_data.insert("forbid".into(), sorted_str_array(&[]));
-        token_data.insert("max_action_class".into(), serde_json::Value::Number(1u8.into()));
+        token_data.insert(
+            "max_action_class".into(),
+            serde_json::Value::Number(1u8.into()),
+        );
         let token_json = serialize_sorted_json(&token_data);
         let signature = if tamper {
             [0x7u8; 64]
@@ -2492,7 +2651,9 @@ mod tests {
         packed.extend_from_slice(&json_len.to_be_bytes());
         packed.extend_from_slice(&token_json);
         packed.extend_from_slice(&signature);
-        base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes()
+        base64::engine::general_purpose::STANDARD
+            .encode(&packed)
+            .into_bytes()
     }
 
     /// SECURITY regression (ed25519 fail-open): a token declaring
@@ -2512,7 +2673,8 @@ mod tests {
         let gw = ZeroTrustGateway::new();
         let genuine = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], false);
         assert!(
-            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret").is_err(),
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret")
+                .is_err(),
             "ed25519 token with no registered authority must be rejected (fail-closed)"
         );
 
@@ -2522,7 +2684,8 @@ mod tests {
         ca.register_key("some-other-kid", vk);
         gw.register_capability_authority(Arc::clone(&ca));
         assert!(
-            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret").is_err(),
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused-secret")
+                .is_err(),
             "ed25519 token whose kid has no registered key must be rejected"
         );
 
@@ -2533,7 +2696,8 @@ mod tests {
         gw.register_capability_authority(Arc::clone(&ca));
         let forged = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], true);
         assert!(
-            gw.validate_lateral_movement("agent-b", &forged, b"unused-secret").is_err(),
+            gw.validate_lateral_movement("agent-b", &forged, b"unused-secret")
+                .is_err(),
             "ed25519 token with a forged signature must be rejected"
         );
 
@@ -2565,13 +2729,15 @@ mod tests {
 
         let forged = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], true);
         assert!(
-            gw.validate_lateral_movement("agent-b", &forged, b"unused").is_err(),
+            gw.validate_lateral_movement("agent-b", &forged, b"unused")
+                .is_err(),
             "strict mode must not accept a forged ed25519 signature"
         );
 
         let genuine = build_ed25519_token(&sk, kid, "agent-a", &["agent-b"], false);
         assert!(
-            gw.validate_lateral_movement("agent-b", &genuine, b"unused").is_ok(),
+            gw.validate_lateral_movement("agent-b", &genuine, b"unused")
+                .is_ok(),
             "strict mode must accept a genuine ed25519 signature"
         );
     }
@@ -2580,18 +2746,14 @@ mod tests {
     fn test_delegation_guard() {
         let secret = b"root-orchestrator-key-32-bytes!!";
         let gw = ZeroTrustGateway::new();
-        let token = gw.issue_capability_token(
-            secret,
-            "root",
-            &["agent-b"],
-            &[],
-            3600,
-            None,
-            0x00,
-            None,
-        );
+        let token =
+            gw.issue_capability_token(secret, "root", &["agent-b"], &[], 3600, None, 0x00, None);
         assert!(DelegationGuard::validate_not_self_signed(&token, secret).is_ok());
-        assert!(DelegationGuard::validate_not_self_signed(&token, b"wrong-key-32-bytes-long!!!!!!!!!").is_err());
+        assert!(DelegationGuard::validate_not_self_signed(
+            &token,
+            b"wrong-key-32-bytes-long!!!!!!!!!"
+        )
+        .is_err());
     }
 
     /// BUFFER-SAFETY regression: a 4-byte length prefix claiming far more JSON
@@ -2607,7 +2769,8 @@ mod tests {
         let err = DelegationGuard::validate_not_self_signed(
             malicious_token.as_bytes(),
             b"root-orchestrator-key-32-bytes!!",
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::DelegationRejected);
     }
 
@@ -2619,7 +2782,8 @@ mod tests {
         let err = DelegationGuard::validate_not_self_signed(
             malicious_token.as_bytes(),
             b"root-orchestrator-key-32-bytes!!",
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(err.bytecode, SAACPBytecodes::DelegationRejected);
     }
 
@@ -2662,12 +2826,27 @@ mod tests {
         let rbc = RRBCGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
         let token = rbc.issue_token(
-            secret, "a", &["b"], &[], &["read"], &["b"],
-            "s1", "c1", "b", 1, 3600, 0x00, None,
+            secret,
+            "a",
+            &["b"],
+            &[],
+            &["read"],
+            &["b"],
+            "s1",
+            "c1",
+            "b",
+            1,
+            3600,
+            0x00,
+            None,
         );
-        assert!(rbc.redeem_token(&token, "rn", "b", "s1", "c1", "b", secret).is_ok());
+        assert!(rbc
+            .redeem_token(&token, "rn", "b", "s1", "c1", "b", secret)
+            .is_ok());
         // Second redemption with same rnonce should fail
-        assert!(rbc.redeem_token(&token, "rn", "b", "s1", "c1", "b", secret).is_err());
+        assert!(rbc
+            .redeem_token(&token, "rn", "b", "s1", "c1", "b", secret)
+            .is_err());
     }
 
     #[test]
@@ -2675,10 +2854,23 @@ mod tests {
         let rbc = RRBCGateway::new();
         let secret = b"test-secret-key-32-bytes-long!!!";
         let token = rbc.issue_token(
-            secret, "a", &["b"], &[], &["read"], &["b"],
-            "s1", "c1", "b", 1, 3600, 0x00, None,
+            secret,
+            "a",
+            &["b"],
+            &[],
+            &["read"],
+            &["b"],
+            "s1",
+            "c1",
+            "b",
+            1,
+            3600,
+            0x00,
+            None,
         );
-        assert!(rbc.redeem_token(&token, "rn", "b", "wrong-sid", "c1", "b", secret).is_err());
+        assert!(rbc
+            .redeem_token(&token, "rn", "b", "wrong-sid", "c1", "b", secret)
+            .is_err());
     }
 
     /// H-8 regression: `issue_token` must actually embed the PoP verifying key
@@ -2694,21 +2886,30 @@ mod tests {
         let verifying_key_bytes = signing_key.verifying_key().to_bytes();
 
         let token = rbc.issue_token(
-            secret, "a", &["b"], &[], &["read"], &["b"],
-            "s1", "c1", "b", 2, 3600, 0x00, Some(&verifying_key_bytes),
+            secret,
+            "a",
+            &["b"],
+            &[],
+            &["read"],
+            &["b"],
+            "s1",
+            "c1",
+            "b",
+            2,
+            3600,
+            0x00,
+            Some(&verifying_key_bytes),
         );
 
         // No PoP proof supplied — must be rejected.
-        let no_proof = rbc.redeem_token_with_pop(
-            &token, "rn-1", "b", "s1", "c1", "b", secret, None,
-        );
+        let no_proof =
+            rbc.redeem_token_with_pop(&token, "rn-1", "b", "s1", "c1", "b", secret, None);
         assert!(no_proof.is_err());
 
         // Correct Ed25519 proof over the rnonce — must succeed.
         let sig = signing_key.sign(b"rn-2").to_bytes();
-        let with_proof = rbc.redeem_token_with_pop(
-            &token, "rn-2", "b", "s1", "c1", "b", secret, Some(&sig),
-        );
+        let with_proof =
+            rbc.redeem_token_with_pop(&token, "rn-2", "b", "s1", "c1", "b", secret, Some(&sig));
         assert!(with_proof.is_ok());
     }
 
@@ -2740,12 +2941,13 @@ mod tests {
         packed.extend_from_slice(&token_json);
         packed.extend_from_slice(&signature);
         use base64::Engine;
-        let forged_token = base64::engine::general_purpose::STANDARD.encode(&packed).into_bytes();
+        let forged_token = base64::engine::general_purpose::STANDARD
+            .encode(&packed)
+            .into_bytes();
 
         let result = rbc.redeem_token(&forged_token, "rn-forged", "b", "s1", "c1", "b", secret);
-        let err = result.expect_err(
-            "out-of-range max_action_class must be rejected, not truncated to u8::MAX",
-        );
+        let err = result
+            .expect_err("out-of-range max_action_class must be rejected, not truncated to u8::MAX");
         assert_eq!(err.bytecode, SAACPBytecodes::ActionClassEscalation);
     }
 
@@ -2762,14 +2964,23 @@ mod tests {
     fn revoke_all_tokens_increments_both_epochs() {
         let gw = ZeroTrustGateway::new();
         // Register an issuer to give issuer_registry_epoch a baseline to work with
-        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!").unwrap();
+        gw.register_issuer_key("agent-a", b"secret-key-32-bytes-long!!!!!!!!")
+            .unwrap();
         let rev_epoch_before = gw.get_revocation_epoch();
         let epoch = gw.revoke_all_tokens();
         // revoke_all_tokens() increments revocation_epoch by 1 and returns it
-        assert_eq!(epoch, rev_epoch_before + 1, "revocation_epoch must increment");
+        assert_eq!(
+            epoch,
+            rev_epoch_before + 1,
+            "revocation_epoch must increment"
+        );
         // Calling twice must keep incrementing
         let epoch2 = gw.revoke_all_tokens();
-        assert_eq!(epoch2, epoch + 1, "revocation_epoch must increment on each call");
+        assert_eq!(
+            epoch2,
+            epoch + 1,
+            "revocation_epoch must increment on each call"
+        );
         // get_revocation_epoch() must match the return value
         assert_eq!(gw.get_revocation_epoch(), epoch2);
     }
@@ -2788,26 +2999,49 @@ mod tests {
         let secret = b"secret-key-32-bytes-long!!!!!!!!";
         gw.register_issuer_key("issuer-gen", secret).unwrap();
         let token = gw.issue_capability_token(
-            secret, "issuer-gen", &["target-gen"], &[], 3600, None, 0, None);
+            secret,
+            "issuer-gen",
+            &["target-gen"],
+            &[],
+            3600,
+            None,
+            0,
+            None,
+        );
 
         // Populate the cache, then confirm the entry is really there.
-        gw.validate_lateral_movement("target-gen", &token, secret).unwrap();
-        let cached_key_count: usize =
-            gw.token_cache.iter().map(|s| s.lock().unwrap().len()).sum();
-        assert_eq!(cached_key_count, 1, "validation should have cached one verdict");
+        gw.validate_lateral_movement("target-gen", &token, secret)
+            .unwrap();
+        let cached_key_count: usize = gw.token_cache.iter().map(|s| s.lock().unwrap().len()).sum();
+        assert_eq!(
+            cached_key_count, 1,
+            "validation should have cached one verdict"
+        );
 
         // Bump the generation WITHOUT clearing — simulating the window between
         // the atomic publish and a shard's physical clear.
         gw.update_epochs(|_| {});
         let after: usize = gw.token_cache.iter().map(|s| s.lock().unwrap().len()).sum();
-        assert_eq!(after, 1, "entry must still be physically present for this test to mean anything");
+        assert_eq!(
+            after, 1,
+            "entry must still be physically present for this test to mean anything"
+        );
 
         // The stale entry must be ignored: re-validating recomputes and restamps
         // it with the current generation rather than returning the old verdict.
         let epochs_before = gw.epochs.load().cache_generation;
-        gw.validate_lateral_movement("target-gen", &token, secret).unwrap();
-        let stamped: Vec<u64> = gw.token_cache.iter()
-            .flat_map(|s| s.lock().unwrap().values().map(|v| v.generation).collect::<Vec<_>>())
+        gw.validate_lateral_movement("target-gen", &token, secret)
+            .unwrap();
+        let stamped: Vec<u64> = gw
+            .token_cache
+            .iter()
+            .flat_map(|s| {
+                s.lock()
+                    .unwrap()
+                    .values()
+                    .map(|v| v.generation)
+                    .collect::<Vec<_>>()
+            })
             .collect();
         assert!(
             stamped.iter().all(|&g| g == epochs_before),
@@ -2855,10 +3089,15 @@ mod tests {
         }
         // The (THRESHOLD+1)-th call must be rejected as rate-limited.
         let over_limit = rl.record_cover_traffic("agent-cover");
-        assert!(over_limit.is_err(), "cover traffic over threshold must be rejected");
+        assert!(
+            over_limit.is_err(),
+            "cover traffic over threshold must be rejected"
+        );
 
         // Meanwhile, a different agent has independent cover traffic budget.
-        assert!(rl.record_cover_traffic("agent-other").is_ok(),
-            "different agent must have its own budget");
+        assert!(
+            rl.record_cover_traffic("agent-other").is_ok(),
+            "different agent must have its own budget"
+        );
     }
 }

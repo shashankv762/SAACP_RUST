@@ -61,8 +61,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
@@ -79,7 +79,10 @@ use crate::daemon::{client_handshake, SAACPNetworkDaemon};
 use crate::faitf_audit::FAITFAuditLog;
 use crate::gateway::ZeroTrustGateway;
 use crate::handler::{JsonValue, ParsedPacket};
-use crate::measc::{MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS};
+use crate::measc::{
+    MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS,
+};
 use crate::security::ImmutableAuditLog;
 use crate::MAX_PAYLOAD_SIZE;
 
@@ -249,12 +252,20 @@ fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
     match (ip, network) {
         (IpAddr::V4(ip), IpAddr::V4(net)) => {
             let bits = prefix_len.min(32);
-            let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            let mask: u32 = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
             (u32::from(*ip) & mask) == (u32::from(*net) & mask)
         }
         (IpAddr::V6(ip), IpAddr::V6(net)) => {
             let bits = prefix_len.min(128);
-            let mask: u128 = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            let mask: u128 = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
             (u128::from(*ip) & mask) == (u128::from(*net) & mask)
         }
         _ => false,
@@ -284,7 +295,9 @@ async fn resolve_allowed_target(
     allow_private: bool,
 ) -> Result<SocketAddr, SidecarError> {
     let mut first_seen: Option<IpAddr> = None;
-    let candidates = tokio::net::lookup_host(target_addr).await.map_err(SidecarError::Io)?;
+    let candidates = tokio::net::lookup_host(target_addr)
+        .await
+        .map_err(SidecarError::Io)?;
     for addr in candidates {
         if first_seen.is_none() {
             first_seen = Some(addr.ip());
@@ -294,7 +307,9 @@ async fn resolve_allowed_target(
         }
     }
     Err(SidecarError::TargetForbidden(
-        first_seen.map(|ip| ip.to_string()).unwrap_or_else(|| target_addr.to_string()),
+        first_seen
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| target_addr.to_string()),
     ))
 }
 
@@ -359,7 +374,10 @@ struct Inbox {
 
 impl Inbox {
     fn new(rx: mpsc::Receiver<DeliveredMessage>) -> Self {
-        Self { rx: Mutex::new(rx), recv_permit: tokio::sync::Semaphore::new(1) }
+        Self {
+            rx: Mutex::new(rx),
+            recv_permit: tokio::sync::Semaphore::new(1),
+        }
     }
 
     /// Attempt to reserve the single `/receive` slot. Returns `None`
@@ -420,7 +438,10 @@ impl std::fmt::Display for SidecarError {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Timeout => write!(f, "timed out waiting for a response"),
             Self::TargetForbidden(ip) => {
-                write!(f, "target address '{ip}' is not permitted (private/link-local range blocked)")
+                write!(
+                    f,
+                    "target address '{ip}' is not permitted (private/link-local range blocked)"
+                )
             }
         }
     }
@@ -489,15 +510,16 @@ pub async fn send_message(
         timeout,
         resolve_allowed_target(target_addr, target_allowlist, allow_private_targets),
     )
-        .await
-        .map_err(|_| SidecarError::Timeout)??;
+    .await
+    .map_err(|_| SidecarError::Timeout)??;
 
     let mut stream = connect_with_retry(validated_target, retry_attempts, timeout).await?;
 
-    let (session_key, _identity_session_id) = tokio::time::timeout(timeout, client_handshake(&mut stream, None))
-        .await
-        .map_err(|_| SidecarError::Timeout)?
-        .map_err(SidecarError::Handshake)?;
+    let (session_key, _identity_session_id) =
+        tokio::time::timeout(timeout, client_handshake(&mut stream, None))
+            .await
+            .map_err(|_| SidecarError::Timeout)?
+            .map_err(SidecarError::Handshake)?;
 
     let session_id: [u8; 16] = rand::random();
     let epoch_mgr = SessionEpochManager::new();
@@ -522,7 +544,14 @@ pub async fn send_message(
     // see this module's "SAACP Command Center" wiring note.
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        secret, from_agent, &[BOOTSTRAP_AGENT], &[], 60, None, action_class, None,
+        secret,
+        from_agent,
+        &[BOOTSTRAP_AGENT],
+        &[],
+        60,
+        None,
+        action_class,
+        None,
     );
 
     // Command Center trust-mesh wiring: log a real (from_agent -> target_agent) capability
@@ -533,31 +562,49 @@ pub async fn send_message(
     // why this is the correct, low-frequency, semantically-real place for this edge.
     if let Some(log) = audit_log {
         FAITFAuditLog::log_delegation(
-            log, from_agent, target_agent, 0, "sidecar message capability", None, "",
+            log,
+            from_agent,
+            target_agent,
+            0,
+            "sidecar message capability",
+            None,
+            "",
         );
     }
-    let token_str = String::from_utf8(token).map_err(|_| SidecarError::Session(
-        crate::errors::SAACPHardDrop::new(
-            crate::errors::SAACPBytecodes::SchemaMismatch, "issued token was not valid UTF-8",
-        ),
-    ))?;
+    let token_str = String::from_utf8(token).map_err(|_| {
+        SidecarError::Session(crate::errors::SAACPHardDrop::new(
+            crate::errors::SAACPBytecodes::SchemaMismatch,
+            "issued token was not valid UTF-8",
+        ))
+    })?;
 
     let payload = serde_json::json!({
         "task": task,
         "priority": priority,
         "_capability_token": token_str,
-    }).to_string();
+    })
+    .to_string();
 
     let frame = epoch_mgr
         .with_epoch_mut(&session_id, epoch_id, |epoch| {
             MEASCFrame::build_frame(
-                epoch, 1, 0x10, 0, action_class,
-                payload.as_bytes(), &[0u8; 32], &[0u8; 24], 0,
+                epoch,
+                1,
+                0x10,
+                0,
+                action_class,
+                payload.as_bytes(),
+                &[0u8; 32],
+                &[0u8; 24],
+                0,
             )
         })
-        .ok_or_else(|| SidecarError::Session(crate::errors::SAACPHardDrop::new(
-            crate::errors::SAACPBytecodes::EpochExpired, "epoch disappeared immediately after creation",
-        )))?
+        .ok_or_else(|| {
+            SidecarError::Session(crate::errors::SAACPHardDrop::new(
+                crate::errors::SAACPBytecodes::EpochExpired,
+                "epoch disappeared immediately after creation",
+            ))
+        })?
         .map_err(SidecarError::Session)?
         .0;
 
@@ -565,18 +612,18 @@ pub async fn send_message(
         use tokio::io::AsyncWriteExt;
         stream.write_all(&frame)
     })
-        .await
-        .map_err(|_| SidecarError::Timeout)?
-        .map_err(SidecarError::Io)?;
+    .await
+    .map_err(|_| SidecarError::Timeout)?
+    .map_err(SidecarError::Io)?;
 
     let mut response = [0u8; 128];
     let n = tokio::time::timeout(timeout, {
         use tokio::io::AsyncReadExt;
         stream.read(&mut response)
     })
-        .await
-        .map_err(|_| SidecarError::Timeout)?
-        .map_err(SidecarError::Io)?;
+    .await
+    .map_err(|_| SidecarError::Timeout)?
+    .map_err(SidecarError::Io)?;
 
     if &response[..n] == b"SUCCESS"
         || &response[..n] == b"STREAM_ACK"
@@ -638,7 +685,9 @@ struct SendRequest {
     #[serde(default)]
     action_class: u8,
 }
-fn default_priority() -> i64 { 1 }
+fn default_priority() -> i64 {
+    1
+}
 
 #[derive(Serialize)]
 struct SendResponse {
@@ -655,14 +704,18 @@ async fn handle_send(
     let _permit = match tokio::time::timeout(
         Duration::from_millis(SEND_PERMIT_ACQUIRE_WAIT_MS),
         state.send_semaphore.acquire(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(permit)) => permit,
         _ => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(SendResponse {
                     status: "saturated",
-                    detail: Some("too many concurrent outbound sends in flight; retry shortly".into()),
+                    detail: Some(
+                        "too many concurrent outbound sends in flight; retry shortly".into(),
+                    ),
                 }),
             );
         }
@@ -670,28 +723,49 @@ async fn handle_send(
 
     let secret = state.secret_for(&req.to_agent);
     match send_message(
-        &req.target_addr, &req.to_agent, &state.agent_id, &secret,
-        &req.task, req.priority, req.action_class, state.send_retry_attempts,
-        &state.target_allowlist, state.allow_private_targets,
+        &req.target_addr,
+        &req.to_agent,
+        &state.agent_id,
+        &secret,
+        &req.task,
+        req.priority,
+        req.action_class,
+        state.send_retry_attempts,
+        &state.target_allowlist,
+        state.allow_private_targets,
         Some(ImmutableAuditLog::global()),
-    ).await {
+    )
+    .await
+    {
         Ok(SendOutcome::Success) => (
             StatusCode::OK,
-            Json(SendResponse { status: "success", detail: None }),
+            Json(SendResponse {
+                status: "success",
+                detail: None,
+            }),
         ),
         Ok(SendOutcome::Rejected) => (
             StatusCode::OK,
-            Json(SendResponse { status: "rejected", detail: Some("peer rejected the packet".into()) }),
+            Json(SendResponse {
+                status: "rejected",
+                detail: Some("peer rejected the packet".into()),
+            }),
         ),
         // H-21 (SSRF) fix: a forbidden target is a client-request problem (bad/malicious
         // `target_addr`), not an upstream failure — 403, not 502.
         Err(e @ SidecarError::TargetForbidden(_)) => (
             StatusCode::FORBIDDEN,
-            Json(SendResponse { status: "error", detail: Some(e.to_string()) }),
+            Json(SendResponse {
+                status: "error",
+                detail: Some(e.to_string()),
+            }),
         ),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(SendResponse { status: "error", detail: Some(e.to_string()) }),
+            Json(SendResponse {
+                status: "error",
+                detail: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -701,7 +775,9 @@ struct ReceiveQuery {
     #[serde(default = "default_wait_secs")]
     wait_secs: f64,
 }
-fn default_wait_secs() -> f64 { 5.0 }
+fn default_wait_secs() -> f64 {
+    5.0
+}
 
 /// Long-poll for the next delivered message.
 ///
@@ -764,7 +840,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn unauthorized_response() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 /// M-22 fix: applied via `route_layer` to `/send`/`/receive` only — never `/healthz`,
@@ -806,7 +886,10 @@ pub async fn run(config: SidecarConfig) {
 /// with no graceful-shutdown path at all (bare `tokio::spawn` for the inner
 /// daemon with a token that's never propagated, and a bare `axum::serve(...)
 /// .await` with no `.with_graceful_shutdown(...)`).
-pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync::CancellationToken) {
+pub async fn run_with_shutdown(
+    config: SidecarConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let (tx, rx) = mpsc::channel::<DeliveredMessage>(SIDECAR_INBOX_CAPACITY);
 
     let gateway = Arc::new(ZeroTrustGateway::new());
@@ -820,7 +903,10 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
         gateway
             .register_issuer_key(peer_id.as_str(), secret)
             .unwrap_or_else(|e| {
-                panic!("saacp-sidecar: failed to register peer secret for '{peer_id}': {}", e.message)
+                panic!(
+                    "saacp-sidecar: failed to register peer secret for '{peer_id}': {}",
+                    e.message
+                )
             });
     }
 
@@ -831,21 +917,21 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
         config.saacp_listen_addr.port(),
         Some(config.token_issuer_secret.to_vec()),
     )
-        .with_gateway(Arc::clone(&gateway))
-        .with_encrypted_transport(Arc::clone(&epoch_manager))
-        .with_on_delivered(Arc::new(move |parsed: ParsedPacket| {
-            if let Some(msg) = DeliveredMessage::from_parsed(&parsed) {
-                // Synchronous, non-blocking — called from inside `spawn_blocking` (see
-                // `SAACPNetworkDaemon`'s `on_delivered` field doc comment). A full inbox
-                // drops the NEWEST message (preserving the queued backlog) rather than
-                // blocking the gate-pipeline thread — see `SIDECAR_INBOX_CAPACITY`'s
-                // delivery contract. Counted so the loss is visible on `/healthz`
-                // instead of silent.
-                if tx.try_send(msg).is_err() {
-                    delivery_dropped.fetch_add(1, Ordering::Relaxed);
-                }
+    .with_gateway(Arc::clone(&gateway))
+    .with_encrypted_transport(Arc::clone(&epoch_manager))
+    .with_on_delivered(Arc::new(move |parsed: ParsedPacket| {
+        if let Some(msg) = DeliveredMessage::from_parsed(&parsed) {
+            // Synchronous, non-blocking — called from inside `spawn_blocking` (see
+            // `SAACPNetworkDaemon`'s `on_delivered` field doc comment). A full inbox
+            // drops the NEWEST message (preserving the queued backlog) rather than
+            // blocking the gate-pipeline thread — see `SIDECAR_INBOX_CAPACITY`'s
+            // delivery contract. Counted so the loss is visible on `/healthz`
+            // instead of silent.
+            if tx.try_send(msg).is_err() {
+                delivery_dropped.fetch_add(1, Ordering::Relaxed);
             }
-        }));
+        }
+    }));
 
     let daemon_shutdown = shutdown.clone();
     let protocol_listener_healthy = Arc::new(AtomicBool::new(true));
@@ -882,7 +968,10 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
     let protected = Router::new()
         .route("/send", post(handle_send))
         .route("/receive", get(handle_receive))
-        .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_bearer_auth));
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_bearer_auth,
+        ));
 
     let app = Router::new()
         .route("/healthz", get(handle_healthz))
@@ -892,9 +981,17 @@ pub async fn run_with_shutdown(config: SidecarConfig, shutdown: tokio_util::sync
 
     let listener = tokio::net::TcpListener::bind(config.http_listen_addr)
         .await
-        .unwrap_or_else(|e| panic!("saacp-sidecar: bind HTTP {} failed: {}", config.http_listen_addr, e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "saacp-sidecar: bind HTTP {} failed: {}",
+                config.http_listen_addr, e
+            )
+        });
 
-    eprintln!("[SAACP Sidecar] HTTP API listening on {}", config.http_listen_addr);
+    eprintln!(
+        "[SAACP Sidecar] HTTP API listening on {}",
+        config.http_listen_addr
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
@@ -947,7 +1044,9 @@ mod ssrf_target_validation_tests {
         assert!(!is_default_blocked_target(&v4("127.0.0.1")));
         assert!(!is_default_blocked_target(&v4("8.8.8.8")));
         assert!(!is_default_blocked_target(&"::1".parse().unwrap()));
-        assert!(!is_default_blocked_target(&"2001:4860:4860::8888".parse().unwrap()));
+        assert!(!is_default_blocked_target(
+            &"2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -987,8 +1086,13 @@ mod ssrf_target_validation_tests {
 
     #[tokio::test]
     async fn resolve_allowed_target_rejects_blocked_target_before_connecting() {
-        let err = resolve_allowed_target("10.55.66.77:9", &[], false).await.unwrap_err();
-        assert!(matches!(err, SidecarError::TargetForbidden(_)), "expected TargetForbidden, got {err}");
+        let err = resolve_allowed_target("10.55.66.77:9", &[], false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::TargetForbidden(_)),
+            "expected TargetForbidden, got {err}"
+        );
     }
 
     #[tokio::test]
@@ -997,20 +1101,26 @@ mod ssrf_target_validation_tests {
         // allowlist check must succeed (this only tests validation, not connect).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let resolved = resolve_allowed_target(&addr.to_string(), &[], false).await.unwrap();
+        let resolved = resolve_allowed_target(&addr.to_string(), &[], false)
+            .await
+            .unwrap();
         assert_eq!(resolved, addr);
     }
 
     #[tokio::test]
     async fn resolve_allowed_target_permits_private_target_when_allowlisted() {
         let allowlist = vec![(v4("10.55.0.0"), 16)];
-        let resolved = resolve_allowed_target("10.55.66.77:9", &allowlist, false).await.unwrap();
+        let resolved = resolve_allowed_target("10.55.66.77:9", &allowlist, false)
+            .await
+            .unwrap();
         assert_eq!(resolved.ip(), v4("10.55.66.77"));
     }
 
     #[tokio::test]
     async fn resolve_allowed_target_permits_private_target_when_flag_set() {
-        let resolved = resolve_allowed_target("10.55.66.77:9", &[], true).await.unwrap();
+        let resolved = resolve_allowed_target("10.55.66.77:9", &[], true)
+            .await
+            .unwrap();
         assert_eq!(resolved.ip(), v4("10.55.66.77"));
     }
 }

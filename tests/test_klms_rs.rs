@@ -4,10 +4,9 @@
 //! Key registration, rotation, revocation, expiry, audit.
 
 use saacp::{
-    KeyRegistry, KeyLifecycleManager, KeyAlgorithm, KeyCategory, KeyStatus,
-    KeyRotationPolicy,
-    make_kid, make_descriptor, default_key_generator,
-    KLMS_DEFAULT_REGISTRY, KLMS_DEFAULT_POLICY,
+    default_key_generator, make_descriptor, make_kid, KeyAlgorithm, KeyCategory,
+    KeyLifecycleManager, KeyRegistry, KeyRotationPolicy, KeyStatus, KLMS_DEFAULT_POLICY,
+    KLMS_DEFAULT_REGISTRY,
 };
 
 fn register_fresh(registry: &KeyRegistry) -> String {
@@ -17,8 +16,11 @@ fn register_fresh(registry: &KeyRegistry) -> String {
         KeyAlgorithm::Ed25519,
         KeyCategory::TokenSigning,
         vec![0xAAu8; 32],
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     registry.register(desc).unwrap();
     kid
 }
@@ -58,9 +60,27 @@ fn test_register_multiple_keys() {
 fn test_duplicate_registration_rejected() {
     let reg = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning, vec![0u8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     reg.register(desc).unwrap();
-    let desc2 = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning, vec![1u8; 32], None, None, None).unwrap();
+    let desc2 = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![1u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let res = reg.register(desc2);
     assert!(res.is_err(), "Duplicate kid must be rejected");
 }
@@ -78,7 +98,9 @@ fn test_rotate_key_increments_version() {
     let reg = KeyRegistry::new();
     let kid = register_fresh(&reg);
     let mgr = KeyLifecycleManager::new(reg, None);
-    let rotated = mgr.rotate_key(&kid, vec![0xBBu8; 32], KeyAlgorithm::Ed25519).unwrap();
+    let rotated = mgr
+        .rotate_key(&kid, vec![0xBBu8; 32], KeyAlgorithm::Ed25519)
+        .unwrap();
     assert_eq!(rotated.version, 2);
 }
 
@@ -87,11 +109,22 @@ fn test_rotate_key_changes_bytes() {
     let reg = KeyRegistry::new();
     let kid = make_kid();
     let original_bytes = vec![0x11u8; 32];
-    let desc = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning, original_bytes.clone(), None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        original_bytes.clone(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     reg.register(desc).unwrap();
     let mgr = KeyLifecycleManager::new(reg, None);
     let new_bytes = vec![0x22u8; 32];
-    let rotated = mgr.rotate_key(&kid, new_bytes.clone(), KeyAlgorithm::Ed25519).unwrap();
+    let rotated = mgr
+        .rotate_key(&kid, new_bytes.clone(), KeyAlgorithm::Ed25519)
+        .unwrap();
     assert_eq!(rotated.key_material.as_slice(), new_bytes.as_slice());
 }
 
@@ -149,7 +182,16 @@ fn test_revocation_log_grows_with_multiple_revocations() {
 fn test_aes256gcm_key_category_memory() {
     let reg = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::Aes256Gcm, KeyCategory::MemoryProtection, vec![0u8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::Aes256Gcm,
+        KeyCategory::MemoryProtection,
+        vec![0u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     reg.register(desc).unwrap();
     let active = reg.get_active(&kid).unwrap();
     assert!(matches!(active.algorithm, KeyAlgorithm::Aes256Gcm));
@@ -159,7 +201,16 @@ fn test_aes256gcm_key_category_memory() {
 fn test_hkdf_key_category_epoch_traffic() {
     let reg = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::HkdfSha256, KeyCategory::EpochTraffic, vec![0u8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::HkdfSha256,
+        KeyCategory::EpochTraffic,
+        vec![0u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     reg.register(desc).unwrap();
     let active = reg.get_active(&kid).unwrap();
     assert!(matches!(active.algorithm, KeyAlgorithm::HkdfSha256));
@@ -169,7 +220,16 @@ fn test_hkdf_key_category_epoch_traffic() {
 fn test_hmac_key_category_psk() {
     let reg = KeyRegistry::new();
     let kid = make_kid();
-    let desc = make_descriptor(&kid, KeyAlgorithm::HmacSha256, KeyCategory::Psk, vec![0u8; 32], None, None, None).unwrap();
+    let desc = make_descriptor(
+        &kid,
+        KeyAlgorithm::HmacSha256,
+        KeyCategory::Psk,
+        vec![0u8; 32],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     reg.register(desc).unwrap();
     let active = reg.get_active(&kid).unwrap();
     assert!(matches!(active.category, KeyCategory::Psk));
@@ -190,7 +250,9 @@ fn test_rotated_descriptor_version_2() {
     let reg = KeyRegistry::new();
     let kid = register_fresh(&reg);
     let mgr = KeyLifecycleManager::new(reg, None);
-    let new_desc = mgr.rotate_key(&kid, vec![0xFFu8; 32], KeyAlgorithm::Aes256Gcm).unwrap();
+    let new_desc = mgr
+        .rotate_key(&kid, vec![0xFFu8; 32], KeyAlgorithm::Aes256Gcm)
+        .unwrap();
     assert!(matches!(new_desc.status, KeyStatus::Active));
     assert_eq!(new_desc.version, 2);
 }
@@ -230,13 +292,29 @@ fn test_make_kid_unique() {
 #[test]
 fn test_make_descriptor_valid() {
     let kid = make_kid();
-    let res = make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::TokenSigning, vec![1u8; 32], None, None, None);
+    let res = make_descriptor(
+        &kid,
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![1u8; 32],
+        None,
+        None,
+        None,
+    );
     assert!(res.is_ok());
 }
 
 #[test]
 fn test_make_descriptor_bad_kid_fails() {
-    let res = make_descriptor("INVALID", KeyAlgorithm::Ed25519, KeyCategory::TokenSigning, vec![0u8; 32], None, None, None);
+    let res = make_descriptor(
+        "INVALID",
+        KeyAlgorithm::Ed25519,
+        KeyCategory::TokenSigning,
+        vec![0u8; 32],
+        None,
+        None,
+        None,
+    );
     assert!(res.is_err(), "Non-hex kid must fail validation");
 }
 
@@ -257,7 +335,8 @@ fn test_audit_after_rotation_has_two_entries() {
     let reg = KeyRegistry::new();
     let kid = register_fresh(&reg);
     let mgr = KeyLifecycleManager::new(reg, None);
-    mgr.rotate_key(&kid, vec![0xCCu8; 32], KeyAlgorithm::Ed25519).unwrap();
+    mgr.rotate_key(&kid, vec![0xCCu8; 32], KeyAlgorithm::Ed25519)
+        .unwrap();
     let audit = mgr.audit_key_lifecycle(&kid);
     assert_eq!(audit.len(), 2);
 }
@@ -305,7 +384,8 @@ fn register_with_expiry(registry: &KeyRegistry, expires_at: f64, created_at: f64
         None,
         KeyStatus::Active,
         std::collections::HashMap::new(),
-    ).unwrap();
+    )
+    .unwrap();
     registry.register(desc).unwrap();
     kid
 }
@@ -322,8 +402,14 @@ fn test_list_expiring_returns_keys_within_lead_window() {
     let expiring = reg.list_expiring(200.0, now);
     let expiring_kids: Vec<&String> = expiring.iter().map(|(k, _)| k).collect();
 
-    assert!(expiring_kids.contains(&&due_kid), "key within the lead window must be listed");
-    assert!(!expiring_kids.contains(&&far_kid), "key far from expiry must not be listed");
+    assert!(
+        expiring_kids.contains(&&due_kid),
+        "key within the lead window must be listed"
+    );
+    assert!(
+        !expiring_kids.contains(&&far_kid),
+        "key far from expiry must not be listed"
+    );
 }
 
 #[test]
@@ -347,7 +433,8 @@ fn test_list_expiring_excludes_non_active_keys() {
         None,
         KeyStatus::Revoked,
         std::collections::HashMap::new(),
-    ).unwrap();
+    )
+    .unwrap();
     reg.register(revoked_desc).unwrap();
 
     // A genuinely Active descriptor within the same window, for contrast.
@@ -356,8 +443,14 @@ fn test_list_expiring_excludes_non_active_keys() {
     let expiring = reg.list_expiring(200.0, now);
     let expiring_kids: Vec<&String> = expiring.iter().map(|(k, _)| k).collect();
 
-    assert!(!expiring_kids.contains(&&revoked_kid), "a Revoked key must never appear in list_expiring");
-    assert!(expiring_kids.contains(&&active_kid), "sanity: the Active key in the same window IS listed");
+    assert!(
+        !expiring_kids.contains(&&revoked_kid),
+        "a Revoked key must never appear in list_expiring"
+    );
+    assert!(
+        expiring_kids.contains(&&active_kid),
+        "sanity: the Active key in the same window IS listed"
+    );
 }
 
 #[test]
@@ -374,11 +467,18 @@ fn test_sweep_and_rotate_noop_when_auto_rotate_disabled() {
     let mgr = KeyLifecycleManager::new(reg, Some(policy));
 
     let rotated = mgr.sweep_and_rotate(now, default_key_generator);
-    assert!(rotated.is_empty(), "sweep_and_rotate must be a no-op when auto_rotate is false");
+    assert!(
+        rotated.is_empty(),
+        "sweep_and_rotate must be a no-op when auto_rotate is false"
+    );
 
     // The key must still be Active version 1 — untouched.
     let audit = mgr.audit_key_lifecycle(&kid);
-    assert_eq!(audit.len(), 1, "no rotation should have created a second version");
+    assert_eq!(
+        audit.len(),
+        1,
+        "no rotation should have created a second version"
+    );
     assert_eq!(audit[0].version, 1);
     assert_eq!(audit[0].status, "ACTIVE");
 }
@@ -401,10 +501,18 @@ fn test_sweep_and_rotate_full_cycle_with_injectable_clock() {
     let mgr = KeyLifecycleManager::new(reg, Some(policy));
 
     let rotated = mgr.sweep_and_rotate(now, default_key_generator);
-    assert_eq!(rotated, vec![kid.clone()], "the near-expiry key must be rotated");
+    assert_eq!(
+        rotated,
+        vec![kid.clone()],
+        "the near-expiry key must be rotated"
+    );
 
     let audit = mgr.audit_key_lifecycle(&kid);
-    assert_eq!(audit.len(), 2, "rotation must produce a ROTATED v1 and an ACTIVE v2");
+    assert_eq!(
+        audit.len(),
+        2,
+        "rotation must produce a ROTATED v1 and an ACTIVE v2"
+    );
     assert_eq!(audit[0].status, "ROTATED");
     assert_eq!(audit[1].status, "ACTIVE");
     assert_eq!(audit[1].version, 2);
@@ -460,7 +568,9 @@ fn test_concurrent_sweep_and_rotate_does_not_double_rotate() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let mgr = Arc::clone(&mgr);
-        handles.push(thread::spawn(move || mgr.sweep_and_rotate(now, default_key_generator)));
+        handles.push(thread::spawn(move || {
+            mgr.sweep_and_rotate(now, default_key_generator)
+        }));
     }
     let results: Vec<Vec<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
@@ -473,5 +583,9 @@ fn test_concurrent_sweep_and_rotate_does_not_double_rotate() {
     );
 
     let audit = mgr.audit_key_lifecycle(&kid);
-    assert_eq!(audit.len(), 2, "only one rotation must have taken effect, not one per thread");
+    assert_eq!(
+        audit.len(),
+        2,
+        "only one rotation must have taken effect, not one per thread"
+    );
 }

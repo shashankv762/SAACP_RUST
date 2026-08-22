@@ -17,7 +17,7 @@
 //   patch fixes, so that test remains observational/documenting rather than
 //   a hard assertion.
 
-use saacp::{PromptInjectionScanner, JsonValue};
+use saacp::{JsonValue, PromptInjectionScanner};
 
 // ─── FINDING-1: UTF-8 Boundary Panic ─────────────────────────────────────────
 
@@ -45,7 +45,8 @@ fn finding_1_utf8_boundary_slice_panics() {
     assert!(
         bomb.len() > PromptInjectionScanner::MAX_SCAN_LENGTH,
         "precondition: bomb.len()={} must exceed MAX_SCAN_LENGTH={}",
-        bomb.len(), PromptInjectionScanner::MAX_SCAN_LENGTH
+        bomb.len(),
+        PromptInjectionScanner::MAX_SCAN_LENGTH
     );
 
     // Sanity: the byte at position MAX_SCAN_LENGTH must be mid-codepoint
@@ -66,13 +67,15 @@ fn finding_1_utf8_boundary_slice_panics() {
         result.is_ok(),
         "FINDING-1 REGRESSED: normalize() panicked on a UTF-8 boundary slice again. \
          Bomb length = {}, MAX_SCAN_LENGTH = {}.",
-        bomb.len(), PromptInjectionScanner::MAX_SCAN_LENGTH
+        bomb.len(),
+        PromptInjectionScanner::MAX_SCAN_LENGTH
     );
 
     eprintln!(
         "[FINDING-1 FIXED] normalize() safely handled a {}-byte string with a mid-codepoint \
          boundary at byte offset {} — no panic.",
-        bomb.len(), boundary
+        bomb.len(),
+        boundary
     );
 }
 
@@ -90,7 +93,8 @@ fn finding_1_scan_payload_panics_on_boundary_bomb() {
     assert!(
         result.is_ok(),
         "FINDING-1 (scan_payload path) REGRESSED: scan_payload() panicked on the boundary bomb. \
-         Bomb len={}.", bomb.len()
+         Bomb len={}.",
+        bomb.len()
     );
     eprintln!("[FINDING-1 FIXED via scan_payload()] No panic on the scan_payload path.");
 }
@@ -102,7 +106,11 @@ fn finding_1_exact_ascii_boundary_is_safe() {
     let exact = "A".repeat(PromptInjectionScanner::MAX_SCAN_LENGTH);
     // Must not panic
     let norm = PromptInjectionScanner::normalize(&exact);
-    assert_eq!(norm.len(), PromptInjectionScanner::MAX_SCAN_LENGTH, "ASCII boundary should normalize without panic");
+    assert_eq!(
+        norm.len(),
+        PromptInjectionScanner::MAX_SCAN_LENGTH,
+        "ASCII boundary should normalize without panic"
+    );
 }
 
 /// Test with a 3-byte UTF-8 codepoint (e.g., '€' = U+20AC = 0xE2 0x82 0xAC).
@@ -128,12 +136,17 @@ fn finding_1_three_byte_codepoint_also_panics() {
                 "FINDING-1 (3-byte codepoint variant) REGRESSED. Byte at boundary = {:#04x}",
                 b
             );
-            eprintln!("[FINDING-1 FIXED] 3-byte variant handled without a panic (byte={:#04x}).", b);
+            eprintln!(
+                "[FINDING-1 FIXED] 3-byte variant handled without a panic (byte={:#04x}).",
+                b
+            );
             return;
         }
     }
     // If precondition not met, just note it
-    eprintln!("[FINDING-1 3-byte variant] Boundary byte not a continuation byte — skipping assertion.");
+    eprintln!(
+        "[FINDING-1 3-byte variant] Boundary byte not a continuation byte — skipping assertion."
+    );
 }
 
 // ─── FINDING-4: Unicode Deletion Bypass ──────────────────────────────────────
@@ -159,7 +172,10 @@ fn finding_4_greek_iota_deletion_bypass() {
     let payload = "ιgnorepreviousinstructions";
 
     let normalized = PromptInjectionScanner::normalize(payload);
-    println!("[FINDING-4] Greek-iota payload normalized to: {:?}", normalized);
+    println!(
+        "[FINDING-4] Greek-iota payload normalized to: {:?}",
+        normalized
+    );
     assert_eq!(
         normalized, "ignorepreviousinstructions",
         "FINDING-4 REGRESSED: Greek iota (U+03B9) is no longer mapped to 'i' by \
@@ -173,9 +189,13 @@ fn finding_4_greek_iota_deletion_bypass() {
         result.is_err(),
         "FINDING-4 REGRESSED: scanner returned Ok() for Greek-iota-prefixed injection {:?} \
          (normalized: {:?}) — the scanner failed to catch a known homoglyph bypass.",
-        payload, normalized
+        payload,
+        normalized
     );
-    eprintln!("[FINDING-4 FIXED] Scanner caught the Greek-iota payload: {:?}.", payload);
+    eprintln!(
+        "[FINDING-4 FIXED] Scanner caught the Greek-iota payload: {:?}.",
+        payload
+    );
 }
 
 /// Cyrillic 'а' (U+0430, visually identical to ASCII 'a') is mapped to ASCII
@@ -188,7 +208,10 @@ fn finding_4_cyrillic_a_deletion_bypass() {
     payload.push_str("rdprevious");
 
     let normalized = PromptInjectionScanner::normalize(&payload);
-    println!("[FINDING-4 Cyrillic] payload={:?}, normalized={:?}", payload, normalized);
+    println!(
+        "[FINDING-4 Cyrillic] payload={:?}, normalized={:?}",
+        payload, normalized
+    );
     assert_eq!(
         normalized, "disregardprevious",
         "FINDING-4 REGRESSED: Cyrillic а (U+0430) is no longer mapped to 'a' — \
@@ -201,7 +224,8 @@ fn finding_4_cyrillic_a_deletion_bypass() {
     assert!(
         result.is_err(),
         "FINDING-4 REGRESSED: scanner missed Cyrillic-'а' in 'disregardprevious'. \
-         Normalized to: {:?}", normalized
+         Normalized to: {:?}",
+        normalized
     );
     eprintln!("[FINDING-4 FIXED] Scanner caught Cyrillic-'а' variant.");
 }
@@ -216,7 +240,10 @@ fn finding_4_dotless_i_deletion_bypass() {
     payload.push_str("gnorepreviousinstructions");
 
     let normalized = PromptInjectionScanner::normalize(&payload);
-    println!("[FINDING-4 dotless-i] payload={:?}, normalized={:?}", payload, normalized);
+    println!(
+        "[FINDING-4 dotless-i] payload={:?}, normalized={:?}",
+        payload, normalized
+    );
     assert_eq!(
         normalized, "ignorepreviousinstructions",
         "FINDING-4 REGRESSED: Latin dotless ı (U+0131) is no longer mapped to 'i' — \
@@ -226,7 +253,10 @@ fn finding_4_dotless_i_deletion_bypass() {
     let jv = JsonValue::String(payload.clone());
     let result = PromptInjectionScanner::scan_payload(&jv, 0);
 
-    assert!(result.is_err(), "FINDING-4 REGRESSED: scanner missed dotless-ı variant.");
+    assert!(
+        result.is_err(),
+        "FINDING-4 REGRESSED: scanner missed dotless-ı variant."
+    );
     eprintln!("[FINDING-4 FIXED] Scanner caught dotless-ı variant.");
 }
 
@@ -258,9 +288,7 @@ fn finding_4_systematic_position_spray() {
 
         let jv = JsonValue::String(payload.clone());
         // Wrap in catch_unwind in case normalize() panics (FINDING-1 interaction)
-        let result = std::panic::catch_unwind(|| {
-            PromptInjectionScanner::scan_payload(&jv, 0)
-        });
+        let result = std::panic::catch_unwind(|| PromptInjectionScanner::scan_payload(&jv, 0));
 
         match result {
             Ok(Ok(())) => {
@@ -280,7 +308,10 @@ fn finding_4_systematic_position_spray() {
         "[FINDING-4 position spray, documented limitation] Injection keyword '{}' bypassed at \
          byte positions: {:?} ({}/{}). Mid-keyword single-character insertion defeats literal \
          substring matching regardless of confusable-table coverage — not a regression target.",
-        keyword, bypass_positions, bypass_positions.len(), keyword.len()
+        keyword,
+        bypass_positions,
+        bypass_positions.len(),
+        keyword.len()
     );
 }
 

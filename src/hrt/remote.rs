@@ -104,7 +104,11 @@ impl RemoteSignerRuntime {
                     "could not start a dedicated Tokio runtime for the {backend} key store: {e}"
                 ))
             })?;
-        Ok(Self { runtime, timeout, backend })
+        Ok(Self {
+            runtime,
+            timeout,
+            backend,
+        })
     }
 
     /// The backend label this runtime reports in errors.
@@ -175,7 +179,11 @@ mod tests {
 
         // The case `Runtime::block_on` would panic on: an unrelated outer runtime is
         // already driving this thread, exactly like `daemon.rs::ecdh_handshake`.
-        let outer = Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let outer = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         outer.block_on(async {
             assert_eq!(
                 remote.run(async { Ok::<_, HrtError>(9u8) }).unwrap(),
@@ -186,11 +194,10 @@ mod tests {
 
         // And from inside spawn_blocking, the gate-pipeline shape.
         outer.block_on(async {
-            let out = tokio::task::spawn_blocking(move || {
-                remote.run(async { Ok::<_, HrtError>(11u8) })
-            })
-            .await
-            .unwrap();
+            let out =
+                tokio::task::spawn_blocking(move || remote.run(async { Ok::<_, HrtError>(11u8) }))
+                    .await
+                    .unwrap();
             assert_eq!(out.unwrap(), 11);
         });
     }
@@ -211,8 +218,13 @@ mod tests {
     fn a_backend_error_propagates_unchanged() {
         let remote = RemoteSignerRuntime::new("test", DEFAULT_REMOTE_TIMEOUT).unwrap();
         let result: Result<u8, HrtError> = remote.run(async {
-            Err(HrtError::Backend { backend: "test", detail: "AccessDeniedException".to_string() })
+            Err(HrtError::Backend {
+                backend: "test",
+                detail: "AccessDeniedException".to_string(),
+            })
         });
-        assert!(matches!(result, Err(HrtError::Backend { detail, .. }) if detail.contains("AccessDenied")));
+        assert!(
+            matches!(result, Err(HrtError::Backend { detail, .. }) if detail.contains("AccessDenied"))
+        );
     }
 }

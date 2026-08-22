@@ -177,7 +177,15 @@ fn seed_fleet() {
         ("orchestrator-01", "finance-agent-14", 1),
     ];
     for (parent, child, depth) in edges {
-        FAITFAuditLog::log_delegation(audit, parent, child, *depth, "read:docs,call:tool", None, "");
+        FAITFAuditLog::log_delegation(
+            audit,
+            parent,
+            child,
+            *depth,
+            "read:docs,call:tool",
+            None,
+            "",
+        );
     }
 }
 

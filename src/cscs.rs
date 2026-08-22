@@ -1,11 +1,11 @@
+use crate::aegf::{AEGFMetadata, DistributedExecutionGraph};
+use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::state_backend::StateBackend;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-use sha2::{Sha256, Digest};
-use crate::errors::{SAACPBytecodes, SAACPHardDrop};
-use crate::aegf::{AEGFMetadata, DistributedExecutionGraph};
-use crate::state_backend::StateBackend;
 
 pub const CSCS_MAX_OSCILLATION_COUNT: usize = 3;
 pub const CSCS_WINDOW_SIZE: usize = 128;
@@ -92,7 +92,9 @@ fn now_secs() -> f64 {
 impl OscillationFingerprinter {
     pub fn new() -> Self {
         Self {
-            history: (0..CSCS_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            history: (0..CSCS_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
         }
     }
 
@@ -100,7 +102,10 @@ impl OscillationFingerprinter {
     /// `into_inner()` — `GLOBAL_CSCS` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other session's
     /// loop-detection calls.
-    fn shard(&self, session_id: &str) -> std::sync::MutexGuard<'_, HashMap<String, SessionHistory>> {
+    fn shard(
+        &self,
+        session_id: &str,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, SessionHistory>> {
         self.history[cscs_shard_index(session_id)]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -114,16 +119,13 @@ impl OscillationFingerprinter {
     /// fingerprint per iteration and rendering the sliding-window count permanently < 3.
     /// Depth-escalation is already bounded by AEGFMetadata::derive's MAX_HC check.
     /// The stable causal anchor is: who (oaid) + in what conversation (cid) + what (action_class).
-    pub fn compute_fingerprint(
-        meta: &AEGFMetadata,
-        action_class: u8,
-    ) -> String {
+    pub fn compute_fingerprint(meta: &AEGFMetadata, action_class: u8) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(meta.oaid.as_bytes());  // agent identity — stable across a cascade
-        hasher.update(meta.cid.as_bytes());   // conversation context — stable within a session
-        hasher.update([action_class]);        // what action is being requested
-        // hc excluded: attacker-controlled hop count would defeat detection by making
-        // each step in a cascade appear as a distinct fingerprint.
+        hasher.update(meta.oaid.as_bytes()); // agent identity — stable across a cascade
+        hasher.update(meta.cid.as_bytes()); // conversation context — stable within a session
+        hasher.update([action_class]); // what action is being requested
+                                       // hc excluded: attacker-controlled hop count would defeat detection by making
+                                       // each step in a cascade appear as a distinct fingerprint.
         hex::encode(hasher.finalize())
     }
 
@@ -144,19 +146,20 @@ impl OscillationFingerprinter {
         // multiply the effective capacity.
         if hist.len() >= CSCS_PER_SHARD_MAX_SESSIONS && !hist.contains_key(session_id) {
             let evict_count = hist.len() + 1 - CSCS_PER_SHARD_MAX_SESSIONS;
-            let mut by_age: Vec<(String, f64)> = hist.iter()
-                .map(|(k, v)| (k.clone(), v.last_seen))
-                .collect();
+            let mut by_age: Vec<(String, f64)> =
+                hist.iter().map(|(k, v)| (k.clone(), v.last_seen)).collect();
             by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             for (k, _) in by_age.into_iter().take(evict_count) {
                 hist.remove(&k);
             }
         }
 
-        let entry = hist.entry(session_id.to_string()).or_insert_with(|| SessionHistory {
-            window: VecDeque::new(),
-            last_seen: now,
-        });
+        let entry = hist
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionHistory {
+                window: VecDeque::new(),
+                last_seen: now,
+            });
         entry.last_seen = now;
 
         if entry.window.len() >= CSCS_WINDOW_SIZE {
@@ -214,7 +217,10 @@ impl CSCSLoopDetector {
     /// security boundary, and `cs_detect_loop` runs on essentially every
     /// packet). Only the rare trip event is mirrored, via a non-blocking
     /// bounded channel — zero cost on the common non-tripping path.
-    pub fn with_backend(daeg: Arc<DistributedExecutionGraph>, backend: Arc<dyn StateBackend>) -> Self {
+    pub fn with_backend(
+        daeg: Arc<DistributedExecutionGraph>,
+        backend: Arc<dyn StateBackend>,
+    ) -> Self {
         let (tx, rx) = sync_channel::<CscsTripEvent>(CSCS_MIRROR_QUEUE_CAPACITY);
         let _ = std::thread::Builder::new()
             .name("saacp-cscs-mirror".to_string())
@@ -290,7 +296,8 @@ impl Default for CSCSLoopDetector {
     }
 }
 
-pub static GLOBAL_CSCS: LazyLock<CSCSLoopDetector> = LazyLock::new(|| CSCSLoopDetector::new(crate::aegf::GLOBAL_DAEG.clone()));
+pub static GLOBAL_CSCS: LazyLock<CSCSLoopDetector> =
+    LazyLock::new(|| CSCSLoopDetector::new(crate::aegf::GLOBAL_DAEG.clone()));
 
 #[cfg(test)]
 mod tests {
@@ -302,7 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn cscs_new_behavior_unchanged_without_backend() {        let det = CSCSLoopDetector::new(Arc::new(DistributedExecutionGraph::new()));
+    fn cscs_new_behavior_unchanged_without_backend() {
+        let det = CSCSLoopDetector::new(Arc::new(DistributedExecutionGraph::new()));
         let meta = test_meta("sess-1");
         let mut tripped = false;
         for _ in 0..CSCS_MAX_OSCILLATION_COUNT {
@@ -345,7 +353,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(found, "expected a mirrored trip event to appear in the backend");
+        assert!(
+            found,
+            "expected a mirrored trip event to appear in the backend"
+        );
     }
 
     /// P-1 regression: `cscs_shard_index` must keep ALL 16 shards live over the
@@ -437,7 +448,11 @@ mod tests {
         assert_eq!(fp.record_and_count(sid, "fp-y"), 1);
         // clear() removes only that session.
         fp.clear(sid);
-        assert_eq!(fp.record_and_count(sid, "fp-x"), 1, "cleared session restarts");
+        assert_eq!(
+            fp.record_and_count(sid, "fp-x"),
+            1,
+            "cleared session restarts"
+        );
     }
 
     /// P-1: concurrent recording across many distinct sessions must not serialize.

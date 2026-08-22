@@ -55,16 +55,16 @@ pub const AEGF_META_FIELD_OFFSETS: &[(&str, usize, usize)] = &[
 ///
 /// Expected packed output (120 bytes hex):
 pub const AEGF_TEST_VECTOR_BYTES: &str = concat!(
-    "00000000000000000000000000000001",  // CID [0:16]
-    "00000000000000000000000000000002",  // RID [16:32]
-    "00000000000000000000000000000000",  // PRID [32:48]
-    "00000000000000000000000000000003",  // SID [48:64]
-    "746573742d6167656e74000000000000",  // OAID [64:96] = "test-agent" padded
-    "00000000000000000000000000000000",  // (continuation of OAID padding)
-    "0000",                              // HC [96:98]
-    "0000",                              // ED [98:100]
-    "0000000000000000",                  // TTL [100:108] (f64 = 0.0)
-    "000000000000000000000000",          // reserved [108:120]
+    "00000000000000000000000000000001", // CID [0:16]
+    "00000000000000000000000000000002", // RID [16:32]
+    "00000000000000000000000000000000", // PRID [32:48]
+    "00000000000000000000000000000003", // SID [48:64]
+    "746573742d6167656e74000000000000", // OAID [64:96] = "test-agent" padded
+    "00000000000000000000000000000000", // (continuation of OAID padding)
+    "0000",                             // HC [96:98]
+    "0000",                             // ED [98:100]
+    "0000000000000000",                 // TTL [100:108] (f64 = 0.0)
+    "000000000000000000000000",         // reserved [108:120]
 );
 
 /// Maximum value for HC and ED fields (uint16).
@@ -135,23 +135,50 @@ fn allowed_transitions(state: ExecutionState) -> &'static [ExecutionState] {
     use ExecutionState::*;
     match state {
         Created => &[
-            Processing, WaitingHumanReview, Paused, Completed, Failed, Terminated, Expired,
+            Processing,
+            WaitingHumanReview,
+            Paused,
+            Completed,
+            Failed,
+            Terminated,
+            Expired,
         ],
         Processing => &[
-            WaitingAgentResponse, WaitingExternalResource, WaitingHumanReview, Paused,
-            Completed, Failed, Terminated, Expired,
+            WaitingAgentResponse,
+            WaitingExternalResource,
+            WaitingHumanReview,
+            Paused,
+            Completed,
+            Failed,
+            Terminated,
+            Expired,
         ],
         WaitingAgentResponse => &[
-            Processing, WaitingHumanReview, Paused, Completed, Failed, Terminated, Expired,
+            Processing,
+            WaitingHumanReview,
+            Paused,
+            Completed,
+            Failed,
+            Terminated,
+            Expired,
         ],
         WaitingExternalResource => &[
-            Processing, WaitingHumanReview, Paused, Completed, Failed, Terminated, Expired,
+            Processing,
+            WaitingHumanReview,
+            Paused,
+            Completed,
+            Failed,
+            Terminated,
+            Expired,
         ],
-        WaitingHumanReview => &[
-            Processing, Paused, Completed, Failed, Terminated, Expired,
-        ],
+        WaitingHumanReview => &[Processing, Paused, Completed, Failed, Terminated, Expired],
         Paused => &[
-            Processing, WaitingHumanReview, Completed, Failed, Terminated, Expired,
+            Processing,
+            WaitingHumanReview,
+            Completed,
+            Failed,
+            Terminated,
+            Expired,
         ],
         // Terminal states: no outgoing transitions.
         Completed | Failed | Terminated | Expired => &[],
@@ -254,7 +281,10 @@ impl AEGFMetadata {
         if parent.ed == MAX_ED {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AegfDepthLimitExceeded,
-                format!("Execution depth {} already at maximum {}.", parent.ed, MAX_ED),
+                format!(
+                    "Execution depth {} already at maximum {}.",
+                    parent.ed, MAX_ED
+                ),
             ));
         }
         Ok(Self {
@@ -263,8 +293,14 @@ impl AEGFMetadata {
             prid: parent.rid.clone(),
             sid: parent.sid.clone(),
             oaid: new_oaid.unwrap_or(&parent.oaid).to_string(),
-            hc: parent.hc.checked_add(1).expect("hc bounded by MAX_HC check above"),
-            ed: parent.ed.checked_add(1).expect("ed bounded by MAX_ED check above"),
+            hc: parent
+                .hc
+                .checked_add(1)
+                .expect("hc bounded by MAX_HC check above"),
+            ed: parent
+                .ed
+                .checked_add(1)
+                .expect("ed bounded by MAX_ED check above"),
             ttl: parent.ttl,
         })
     }
@@ -317,8 +353,7 @@ impl AEGFMetadata {
         let hc = u16::from_be_bytes([data[96], data[97]]);
         let ed = u16::from_be_bytes([data[98], data[99]]);
         let ttl = f64::from_be_bytes([
-            data[100], data[101], data[102], data[103],
-            data[104], data[105], data[106], data[107],
+            data[100], data[101], data[102], data[103], data[104], data[105], data[106], data[107],
         ]);
 
         Ok(Self {
@@ -381,7 +416,10 @@ impl ExecutionStateMachine {
     pub fn create(&self, rid: &str, reason: &str) -> Result<ExecutionState, String> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         if states.contains_key(rid) {
-            return Err(format!("RID {}… already registered in ESM.", &rid[..8.min(rid.len())]));
+            return Err(format!(
+                "RID {}… already registered in ESM.",
+                &rid[..8.min(rid.len())]
+            ));
         }
         Self::evict_if_needed(&mut states);
         let now = now_epoch_f64();
@@ -625,7 +663,11 @@ impl DistributedExecutionGraph {
 
     /// Current node count.
     pub fn node_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).nodes.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .len()
     }
 
     /// Return true if `rid` has a cycle in its ancestor chain (DFS).
@@ -693,11 +735,7 @@ impl DistributedExecutionGraph {
     /// 3. Execution depth (O(1))
     /// 4. Repeated path (O(1))
     /// 5. Cycle detection DFS (O(V+E))
-    pub fn validate_and_add(
-        &self,
-        meta: &AEGFMetadata,
-        policy: &AEGFPolicy,
-    ) -> GovernanceDecision {
+    pub fn validate_and_add(&self, meta: &AEGFMetadata, policy: &AEGFPolicy) -> GovernanceDecision {
         // 0. Graph node cap — cheap early-exit pre-check (not authoritative;
         // see the re-check below held under the same lock as the insert).
         //
@@ -1052,9 +1090,9 @@ impl AEGFGovernor {
 
         match decision {
             GovernanceDecision::Allow => {
-                let _ = self
-                    .esm
-                    .transition(&meta.rid, ExecutionState::Processing, "governance_allow");
+                let _ =
+                    self.esm
+                        .transition(&meta.rid, ExecutionState::Processing, "governance_allow");
             }
             GovernanceDecision::Pause => {
                 let _ = self
@@ -1129,7 +1167,9 @@ impl AEGFGovernor {
         // DEG. Safe to return directly with no further work.
         if meta.is_expired() {
             let _ = self.esm.create(&meta.rid, "expired_on_arrival");
-            let _ = self.esm.transition(&meta.rid, ExecutionState::Expired, "TTL expired");
+            let _ = self
+                .esm
+                .transition(&meta.rid, ExecutionState::Expired, "TTL expired");
             return GovernanceDecision::Terminate;
         }
 
@@ -1170,16 +1210,30 @@ impl AEGFGovernor {
         if !skip_transition_match {
             match decision {
                 GovernanceDecision::Allow => {
-                    let _ = self.esm.transition(&meta.rid, ExecutionState::Processing, "governance_allow");
+                    let _ = self.esm.transition(
+                        &meta.rid,
+                        ExecutionState::Processing,
+                        "governance_allow",
+                    );
                 }
                 GovernanceDecision::Pause => {
-                    let _ = self.esm.transition(&meta.rid, ExecutionState::Paused, "governance_pause");
+                    let _ =
+                        self.esm
+                            .transition(&meta.rid, ExecutionState::Paused, "governance_pause");
                 }
                 GovernanceDecision::Review => {
-                    let _ = self.esm.transition(&meta.rid, ExecutionState::WaitingHumanReview, "governance_review");
+                    let _ = self.esm.transition(
+                        &meta.rid,
+                        ExecutionState::WaitingHumanReview,
+                        "governance_review",
+                    );
                 }
                 GovernanceDecision::Terminate => {
-                    let _ = self.esm.transition(&meta.rid, ExecutionState::Terminated, "governance_terminate");
+                    let _ = self.esm.transition(
+                        &meta.rid,
+                        ExecutionState::Terminated,
+                        "governance_terminate",
+                    );
                 }
             }
         }
@@ -1189,7 +1243,9 @@ impl AEGFGovernor {
         // calls `complete_request` after `submit_request` returns regardless
         // of which internal branch fired (including the idempotent-resubmit
         // branch above, matching that same unconditional-call behavior).
-        let _ = self.esm.transition(&meta.rid, ExecutionState::Completed, "completed");
+        let _ = self
+            .esm
+            .transition(&meta.rid, ExecutionState::Completed, "completed");
         if deg_may_have_inserted {
             self.deg.remove_request(&meta.rid);
         }
@@ -1245,8 +1301,7 @@ pub static GLOBAL_DAEG: LazyLock<std::sync::Arc<DistributedExecutionGraph>> =
 /// Used by Gate 11.0 in `SAACPProtocolHandler::_intercept_packet_inner()` when
 /// no AEGFGovernor is explicitly injected. Shares `GLOBAL_DAEG` with the CSCS
 /// loop detector so both see the same causal graph state.
-pub static GLOBAL_AEGF_GOVERNOR: LazyLock<AEGFGovernor> =
-    LazyLock::new(|| AEGFGovernor::new(None));
+pub static GLOBAL_AEGF_GOVERNOR: LazyLock<AEGFGovernor> = LazyLock::new(|| AEGFGovernor::new(None));
 
 #[cfg(test)]
 mod tests {
@@ -1259,18 +1314,21 @@ mod tests {
     #[test]
     fn test_aegf_meta_canonical_pack() {
         // AEGF_META_FORMAT_VERSION must be 1
-        assert_eq!(AEGF_META_FORMAT_VERSION, 1, "AEGF_META_FORMAT_VERSION must be 1");
+        assert_eq!(
+            AEGF_META_FORMAT_VERSION, 1,
+            "AEGF_META_FORMAT_VERSION must be 1"
+        );
         assert_eq!(AEGF_META_SIZE, 120, "AEGF_META_SIZE must be 120 bytes");
 
         let meta = AEGFMetadata {
-            cid:  Arc::from("0".repeat(30) + "01"),
-            rid:  "0".repeat(30) + "02",
+            cid: Arc::from("0".repeat(30) + "01"),
+            rid: "0".repeat(30) + "02",
             prid: "0".repeat(32),
-            sid:  Arc::from("0".repeat(30) + "03"),
+            sid: Arc::from("0".repeat(30) + "03"),
             oaid: "test-agent".to_string(),
-            hc:   0,
-            ed:   0,
-            ttl:  0.0,
+            hc: 0,
+            ed: 0,
+            ttl: 0.0,
         };
 
         let packed = meta.pack();
@@ -1285,7 +1343,11 @@ mod tests {
         assert_eq!(packed[31], 0x02, "RID last byte must be 0x02");
 
         // PRID: offset 32..48 → all zeros (RID_ROOT)
-        assert_eq!(&packed[32..48], &[0u8; 16], "PRID must be all-zero for RID_ROOT");
+        assert_eq!(
+            &packed[32..48],
+            &[0u8; 16],
+            "PRID must be all-zero for RID_ROOT"
+        );
 
         // SID: offset 48..64 → 0x00..0x00, 0x00, 0x03
         assert_eq!(&packed[48..63], &[0u8; 15]);
@@ -1294,8 +1356,16 @@ mod tests {
         // OAID: offset 64..96 → "test-agent" UTF-8, rest zeros
         const OAID_STR: &[u8] = b"test-agent";
         const OAID_LEN: usize = 10; // b"test-agent".len()
-        assert_eq!(&packed[64..64 + OAID_LEN], OAID_STR, "OAID prefix must match");
-        assert_eq!(&packed[64 + OAID_LEN..96], &[0u8; 32 - OAID_LEN], "OAID padding must be zero");
+        assert_eq!(
+            &packed[64..64 + OAID_LEN],
+            OAID_STR,
+            "OAID prefix must match"
+        );
+        assert_eq!(
+            &packed[64 + OAID_LEN..96],
+            &[0u8; 32 - OAID_LEN],
+            "OAID padding must be zero"
+        );
 
         // HC: offset 96..98 → 0x0000
         assert_eq!(&packed[96..98], &[0x00, 0x00], "HC must be 0x0000");
@@ -1304,7 +1374,11 @@ mod tests {
         assert_eq!(&packed[98..100], &[0x00, 0x00], "ED must be 0x0000");
 
         // TTL: offset 100..108 → IEEE 754 f64 BE of 0.0 = all zeros
-        assert_eq!(&packed[100..108], &[0u8; 8], "TTL 0.0 must be all-zero bytes");
+        assert_eq!(
+            &packed[100..108],
+            &[0u8; 8],
+            "TTL 0.0 must be all-zero bytes"
+        );
 
         // Reserved: offset 108..120 → all zeros
         assert_eq!(&packed[108..120], &[0u8; 12], "Reserved bytes must be zero");
@@ -1331,7 +1405,10 @@ mod tests {
     fn test_deg_max_graph_nodes_cap() {
         // N-7 fix: validate_and_add returns Pause when graph is full
         let gov = AEGFGovernor::new(None);
-        gov.set_policy(AEGFPolicy { max_graph_nodes: 2, ..Default::default() });
+        gov.set_policy(AEGFPolicy {
+            max_graph_nodes: 2,
+            ..Default::default()
+        });
 
         let make_meta = |suffix: &str| -> AEGFMetadata {
             AEGFMetadata {
@@ -1346,10 +1423,19 @@ mod tests {
             }
         };
 
-        assert_eq!(gov.submit_request(&make_meta("1")), GovernanceDecision::Allow);
-        assert_eq!(gov.submit_request(&make_meta("2")), GovernanceDecision::Allow);
+        assert_eq!(
+            gov.submit_request(&make_meta("1")),
+            GovernanceDecision::Allow
+        );
+        assert_eq!(
+            gov.submit_request(&make_meta("2")),
+            GovernanceDecision::Allow
+        );
         // Graph now has 2 nodes = max_graph_nodes; next must be Pause
-        assert_eq!(gov.submit_request(&make_meta("3")), GovernanceDecision::Pause);
+        assert_eq!(
+            gov.submit_request(&make_meta("3")),
+            GovernanceDecision::Pause
+        );
     }
 
     // ── Phase 3 / P-2: submit_and_complete fast-path equivalence ────────────
@@ -1377,7 +1463,10 @@ mod tests {
         // complete_request's net-zero effect on node_count for a root rid.
         assert_eq!(gov.deg().node_count(), 0);
         // ESM ends in Completed, exactly as complete_request would leave it.
-        assert_eq!(gov.get_request_state("fp-allow-1"), Some(ExecutionState::Completed));
+        assert_eq!(
+            gov.get_request_state("fp-allow-1"),
+            Some(ExecutionState::Completed)
+        );
     }
 
     #[test]
@@ -1404,7 +1493,10 @@ mod tests {
     fn submit_and_complete_matches_submit_then_complete_for_graph_cap_pause() {
         let gov_fast = AEGFGovernor::new(None);
         let gov_slow = AEGFGovernor::new(None);
-        let policy = AEGFPolicy { max_graph_nodes: 1, ..Default::default() };
+        let policy = AEGFPolicy {
+            max_graph_nodes: 1,
+            ..Default::default()
+        };
         gov_fast.set_policy(policy.clone());
         gov_slow.set_policy(policy);
 
@@ -1443,7 +1535,10 @@ mod tests {
         let meta = root_meta("fp-idempotent");
 
         // First submission on each governor.
-        assert_eq!(gov_fast.submit_and_complete(&meta), GovernanceDecision::Allow);
+        assert_eq!(
+            gov_fast.submit_and_complete(&meta),
+            GovernanceDecision::Allow
+        );
         let first_slow = gov_slow.submit_request(&meta);
         gov_slow.complete_request(&meta.rid, None);
         assert_eq!(first_slow, GovernanceDecision::Allow);
@@ -1514,8 +1609,15 @@ mod tests {
         let deg = DistributedExecutionGraph::new();
         let policy = AEGFPolicy::default();
         let meta = root_meta("transient-check");
-        assert_eq!(deg.validate_transient_root(&meta, &policy), GovernanceDecision::Allow);
-        assert_eq!(deg.node_count(), 0, "validate_transient_root must never insert a node");
+        assert_eq!(
+            deg.validate_transient_root(&meta, &policy),
+            GovernanceDecision::Allow
+        );
+        assert_eq!(
+            deg.node_count(),
+            0,
+            "validate_transient_root must never insert a node"
+        );
     }
 
     #[test]
@@ -1574,7 +1676,9 @@ mod tests {
             drop(guard);
         });
 
-        held_rx.recv().expect("holder thread must signal lock acquisition");
+        held_rx
+            .recv()
+            .expect("holder thread must signal lock acquisition");
         // The lock is held by `holder` at this instant; this call's probe must
         // observe WouldBlock, then block on the authoritative acquisition until
         // the holder's brief hold elapses.
@@ -1583,7 +1687,10 @@ mod tests {
         holder.join().unwrap();
 
         let after = crate::telemetry::global_telemetry().mutex_contention_count("deg_state");
-        assert!(after > before, "expected deg_state contention probe to increment: before={before}, after={after}");
+        assert!(
+            after > before,
+            "expected deg_state contention probe to increment: before={before}, after={after}"
+        );
     }
 
     #[test]
@@ -1594,12 +1701,16 @@ mod tests {
             1,
             vec!["auth-1".to_string()],
             0.001, // 1ms TTL so it expires immediately
-        ).unwrap();
+        )
+        .unwrap();
         let _req_id = tai.create_request(serde_json::json!({"test": true}));
         // Wait briefly for TTL to elapse
         std::thread::sleep(std::time::Duration::from_millis(5));
         let purged = tai.gc_expired_proposals();
-        assert_eq!(purged, 1, "gc_expired_proposals must have purged the expired proposal");
+        assert_eq!(
+            purged, 1,
+            "gc_expired_proposals must have purged the expired proposal"
+        );
     }
 
     #[test]
@@ -1619,7 +1730,10 @@ mod tests {
         let packed_hex = hex::encode(packed);
 
         // Remove whitespace from AEGF_TEST_VECTOR_BYTES for comparison
-        let expected = AEGF_TEST_VECTOR_BYTES.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let expected = AEGF_TEST_VECTOR_BYTES
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
         assert_eq!(
             packed_hex, expected,
             "AEGF test vector mismatch — pack() output must match AEGF_TEST_VECTOR_BYTES canonical hex"

@@ -29,10 +29,7 @@
 //   - Protocol version mismatch
 //   - MEASC frame confusion with HTTP bytes
 
-use saacp::{
-    SuiteNegotiator, CryptoTransparencyLedger,
-    SAACPProtocolHandler,
-};
+use saacp::{CryptoTransparencyLedger, SAACPProtocolHandler, SuiteNegotiator};
 
 // The approved AEAD cipher suite baseline
 const BASELINE: &str = "AES-256-GCM-HKDF-SHA256";
@@ -62,14 +59,7 @@ fn finding_5_lowercase_suite_causes_rejection() {
     let uppercased_sig = SIG_BASELINE.to_uppercase();
     let remote = vec![uppercased_sig.as_str(), BASELINE];
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
 
     let transcript = result.unwrap_or_else(|e| {
         panic!(
@@ -101,14 +91,7 @@ fn finding_5_mixed_case_suite_rejected() {
     let local = vec![BASELINE, SIG_BASELINE];
     let remote = vec![mixed, SIG_BASELINE];
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
 
     let transcript = result.unwrap_or_else(|e| {
         panic!(
@@ -137,16 +120,12 @@ fn empty_remote_suite_list_hard_failure() {
     let local = VALID_SUITES;
     let remote: Vec<&str> = vec![];
 
-    let result = SuiteNegotiator::negotiate(
-        local,
-        &remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(local, &remote, &session_id(), None, None, &ledger);
 
-    assert!(result.is_err(), "Empty remote suite list must cause hard failure");
+    assert!(
+        result.is_err(),
+        "Empty remote suite list must cause hard failure"
+    );
     eprintln!("[DOWNGRADE] Empty remote suite list: hard failure (correct, no fallback).");
 }
 
@@ -154,14 +133,7 @@ fn empty_remote_suite_list_hard_failure() {
 #[test]
 fn both_empty_suite_lists_hard_failure() {
     let ledger = make_ledger();
-    let result = SuiteNegotiator::negotiate(
-        &[],
-        &[],
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&[], &[], &session_id(), None, None, &ledger);
     assert!(result.is_err(), "Both-empty suite lists must fail");
     eprintln!("[DOWNGRADE] Both-empty suite lists: hard failure (correct).");
 }
@@ -178,14 +150,7 @@ fn prefix_suite_not_selected() {
     let local = vec![SIG_BASELINE, BASELINE, prefix_suite];
     let remote = vec![SIG_BASELINE, prefix_suite]; // remote lacks the full AEAD suite name
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
 
     match &result {
         Ok(transcript) => {
@@ -194,11 +159,16 @@ fn prefix_suite_not_selected() {
                 "Prefix AEAD suite '{}' must not be selected",
                 prefix_suite
             );
-            eprintln!("[DOWNGRADE] Prefix '{}' not selected (selected: '{}').",
-                prefix_suite, transcript.selected_suite);
+            eprintln!(
+                "[DOWNGRADE] Prefix '{}' not selected (selected: '{}').",
+                prefix_suite, transcript.selected_suite
+            );
         }
         Err(e) => {
-            eprintln!("[DOWNGRADE] Prefix '{}' caused failure (no common approved AEAD suite): {}", prefix_suite, e);
+            eprintln!(
+                "[DOWNGRADE] Prefix '{}' caused failure (no common approved AEAD suite): {}",
+                prefix_suite, e
+            );
         }
     }
 }
@@ -215,14 +185,7 @@ fn unknown_suite_blocked_and_logged() {
     let local = vec![SIG_BASELINE, BASELINE, unknown];
     let remote = vec![SIG_BASELINE, BASELINE, unknown];
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
 
     // Should succeed — ed25519 sig baseline is present in both lists.
     // "ed25519" is selected first (first in local order) before the negotiation
@@ -245,7 +208,8 @@ fn unknown_suite_blocked_and_logged() {
         Err(e) => {
             panic!(
                 "Negotiation should succeed when both valid suites are present alongside unknown. \
-                 Error: {}", e
+                 Error: {}",
+                e
             );
         }
     }
@@ -262,21 +226,21 @@ fn leading_space_suite_rejected() {
     let local = vec![SIG_BASELINE, BASELINE];
     let remote_suites = vec![SIG_BASELINE, spaced_aead.as_str()];
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote_suites,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote_suites, &session_id(), None, None, &ledger);
 
     // Sig baseline ed25519 is common, but spaced AEAD is not approved → no AEAD common suite
     // Result: either selects sig-only (if policy allows) or fails on AEAD mismatch
     match &result {
         Ok(transcript) => {
-            assert_ne!(transcript.selected_suite, spaced_aead, "Leading-space AEAD must not be selected");
-            eprintln!("[DOWNGRADE] Leading-space AEAD not selected (selected: '{}').", transcript.selected_suite);
+            assert_ne!(
+                transcript.selected_suite, spaced_aead,
+                "Leading-space AEAD must not be selected"
+            );
+            eprintln!(
+                "[DOWNGRADE] Leading-space AEAD not selected (selected: '{}').",
+                transcript.selected_suite
+            );
         }
         Err(e) => {
             eprintln!("[DOWNGRADE] Leading-space AEAD caused failure (correct — no common approved AEAD): {}", e);
@@ -292,22 +256,25 @@ fn trailing_space_suite_rejected() {
     let local = vec![SIG_BASELINE, BASELINE];
     let remote_suites = vec![SIG_BASELINE, spaced_aead.as_str()];
 
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        &remote_suites,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote_suites, &session_id(), None, None, &ledger);
 
     match &result {
         Ok(transcript) => {
-            assert_ne!(transcript.selected_suite, spaced_aead, "Trailing-space AEAD must not be selected");
-            eprintln!("[DOWNGRADE] Trailing-space AEAD not selected (selected: '{}').", transcript.selected_suite);
+            assert_ne!(
+                transcript.selected_suite, spaced_aead,
+                "Trailing-space AEAD must not be selected"
+            );
+            eprintln!(
+                "[DOWNGRADE] Trailing-space AEAD not selected (selected: '{}').",
+                transcript.selected_suite
+            );
         }
         Err(e) => {
-            eprintln!("[DOWNGRADE] Trailing-space AEAD caused failure (correct): {}", e);
+            eprintln!(
+                "[DOWNGRADE] Trailing-space AEAD caused failure (correct): {}",
+                e
+            );
         }
     }
 }
@@ -326,14 +293,7 @@ fn duplicate_suite_entries_no_panic_no_hang() {
     let remote = remote_vec.as_slice();
 
     let start = std::time::Instant::now();
-    let result = SuiteNegotiator::negotiate(
-        &local,
-        remote,
-        &session_id(),
-        None,
-        None,
-        &ledger,
-    );
+    let result = SuiteNegotiator::negotiate(&local, remote, &session_id(), None, None, &ledger);
     let elapsed = start.elapsed();
 
     assert!(
@@ -390,13 +350,11 @@ fn measc_frame_http_post_bytes_rejected() {
 #[test]
 fn measc_frame_all_zeros_rejected() {
     let zeros = vec![0u8; 128];
-    let result = SAACPProtocolHandler::intercept_packet(
-        &zeros,
-        &[0u8; 32],
-        "test-agent",
-        false,
+    let result = SAACPProtocolHandler::intercept_packet(&zeros, &[0u8; 32], "test-agent", false);
+    assert!(
+        result.is_err(),
+        "All-zero packet must be rejected (wrong magic)"
     );
-    assert!(result.is_err(), "All-zero packet must be rejected (wrong magic)");
     eprintln!("[PROTOCOL CONFUSION] All-zero 128-byte packet rejected at Gate 0.");
 }
 
@@ -408,13 +366,12 @@ fn measc_frame_tls_client_hello_rejected() {
     tls_bytes[1] = 0x03; // TLS version: 3.x
     tls_bytes[2] = 0x01; // TLS 1.0
 
-    let result = SAACPProtocolHandler::intercept_packet(
-        &tls_bytes,
-        &[0u8; 32],
-        "test-agent",
-        false,
+    let result =
+        SAACPProtocolHandler::intercept_packet(&tls_bytes, &[0u8; 32], "test-agent", false);
+    assert!(
+        result.is_err(),
+        "TLS ClientHello bytes must be rejected at Gate 0"
     );
-    assert!(result.is_err(), "TLS ClientHello bytes must be rejected at Gate 0");
     eprintln!("[PROTOCOL CONFUSION] TLS ClientHello bytes rejected at Gate 0.");
 }
 
@@ -433,7 +390,7 @@ fn non_standard_protocol_version_recorded() {
         &local,
         &remote,
         &session_id(),
-        Some("SAACP/0.0-alpha"),  // non-standard version
+        Some("SAACP/0.0-alpha"), // non-standard version
         None,
         &ledger,
     );
@@ -452,7 +409,10 @@ fn non_standard_protocol_version_recorded() {
             );
         }
         Err(e) => {
-            panic!("Negotiation with non-standard version should succeed. Error: {}", e);
+            panic!(
+                "Negotiation with non-standard version should succeed. Error: {}",
+                e
+            );
         }
     }
 }

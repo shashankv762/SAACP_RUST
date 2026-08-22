@@ -73,10 +73,16 @@ struct FailingKeyStore;
 
 impl HardwareKeyStore for FailingKeyStore {
     fn sign(&self, _key_id: &str, _message: &[u8]) -> Result<Vec<u8>, HrtError> {
-        Err(HrtError::Backend { backend: "test", detail: "HSM unreachable".to_string() })
+        Err(HrtError::Backend {
+            backend: "test",
+            detail: "HSM unreachable".to_string(),
+        })
     }
     fn public_key(&self, _key_id: &str) -> Result<Vec<u8>, HrtError> {
-        Ok(SigningKey::generate(&mut rand::rngs::OsRng).verifying_key().to_bytes().to_vec())
+        Ok(SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes()
+            .to_vec())
     }
 }
 
@@ -190,7 +196,9 @@ fn hardware_issued_capability_tokens_verify_and_match_the_software_path() {
     claims.insert("sub".to_string(), Value::String("agent-beta".to_string()));
     claims.insert("scope".to_string(), Value::String("read".to_string()));
 
-    let token = authority.issue(claims.clone()).expect("issuance must succeed");
+    let token = authority
+        .issue(claims.clone())
+        .expect("issuance must succeed");
     assert_eq!(store.sign_calls.load(Ordering::SeqCst), 1);
     assert_eq!(authority.kid(), "ed25519-v1-test");
     assert_eq!(authority.issuer_id(), "issuer-hsm");
@@ -311,7 +319,12 @@ fn hardware_backed_attestation_claims_verify() {
     );
 
     let claim = authority
-        .try_issue("agent-delta", SafetyLevel::AlignedModel, "prod-enclave", 600)
+        .try_issue(
+            "agent-delta",
+            SafetyLevel::AlignedModel,
+            "prod-enclave",
+            600,
+        )
         .expect("hardware-backed attestation issuance must succeed");
     assert_eq!(claim.operator_signature.len(), 64);
 

@@ -4,9 +4,8 @@
 //! WireErrorResponse always 44 bytes, protocol version tag, sanitize mapping.
 
 use saacp::{
-    ErrorConfidentialityFilter, ErrorCategory,
-    WIRE_SIZE, SENTINEL_NO_RETRY, PROTOCOL_VERSION_WIRE,
-    make_opaque_error,
+    make_opaque_error, ErrorCategory, ErrorConfidentialityFilter, PROTOCOL_VERSION_WIRE,
+    SENTINEL_NO_RETRY, WIRE_SIZE,
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -218,7 +217,11 @@ fn test_roundtrip_multiple_bytecodes() {
     for bytecode in [0x01u8, 0x03, 0x14, 0x20, 0x2B, 0x40] {
         let resp = ErrorConfidentialityFilter::sanitize(bytecode, "internal detail dropped");
         let wire = ErrorConfidentialityFilter::format_wire_bytes(&resp);
-        assert_eq!(wire.len(), WIRE_SIZE, "wire must be 44 bytes for 0x{bytecode:02X}");
+        assert_eq!(
+            wire.len(),
+            WIRE_SIZE,
+            "wire must be 44 bytes for 0x{bytecode:02X}"
+        );
         let parsed = ErrorConfidentialityFilter::parse_wire_bytes(&wire)
             .unwrap_or_else(|e| panic!("parse failed for 0x{bytecode:02X}: {e}"));
         assert_eq!(parsed.category, resp.category);
@@ -260,14 +263,38 @@ fn test_make_opaque_error_injection_attempt_sanitized() {
 
 #[test]
 fn test_error_category_from_byte_valid() {
-    assert_eq!(ErrorCategory::from_byte(0x01), Some(ErrorCategory::TransportFailure));
-    assert_eq!(ErrorCategory::from_byte(0x02), Some(ErrorCategory::AuthFailure));
-    assert_eq!(ErrorCategory::from_byte(0x03), Some(ErrorCategory::PolicyViolation));
-    assert_eq!(ErrorCategory::from_byte(0x04), Some(ErrorCategory::ResourceLimit));
-    assert_eq!(ErrorCategory::from_byte(0x05), Some(ErrorCategory::ProtocolError));
-    assert_eq!(ErrorCategory::from_byte(0x06), Some(ErrorCategory::CapabilityFailure));
-    assert_eq!(ErrorCategory::from_byte(0x07), Some(ErrorCategory::GovernanceViolation));
-    assert_eq!(ErrorCategory::from_byte(0x08), Some(ErrorCategory::Internal));
+    assert_eq!(
+        ErrorCategory::from_byte(0x01),
+        Some(ErrorCategory::TransportFailure)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x02),
+        Some(ErrorCategory::AuthFailure)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x03),
+        Some(ErrorCategory::PolicyViolation)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x04),
+        Some(ErrorCategory::ResourceLimit)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x05),
+        Some(ErrorCategory::ProtocolError)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x06),
+        Some(ErrorCategory::CapabilityFailure)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x07),
+        Some(ErrorCategory::GovernanceViolation)
+    );
+    assert_eq!(
+        ErrorCategory::from_byte(0x08),
+        Some(ErrorCategory::Internal)
+    );
 }
 
 #[test]

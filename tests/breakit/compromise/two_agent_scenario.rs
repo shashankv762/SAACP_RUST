@@ -23,17 +23,15 @@
 //
 // This test DOCUMENTS findings, not just passes/fails.
 
-use saacp::ZeroTrustGateway;
-use std::sync::Arc;
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use saacp::ZeroTrustGateway;
 use sha2::Sha256;
+use std::sync::Arc;
 
 const TEST_PSK: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
 ];
 
 const PLANNER_ID: &str = "planner-agent";
@@ -71,17 +69,29 @@ fn build_planner_token(secret: &[u8], target: &str, iat: f64) -> Vec<u8> {
     wire.extend_from_slice(&json_bytes);
     wire.extend_from_slice(&sig);
 
-    base64::engine::general_purpose::STANDARD.encode(&wire).into_bytes()
+    base64::engine::general_purpose::STANDARD
+        .encode(&wire)
+        .into_bytes()
 }
 
 #[allow(dead_code)]
-fn build_token_for_different_audience(secret: &[u8], original_token_b64: &[u8], new_aud: &str) -> Vec<u8> {
+fn build_token_for_different_audience(
+    secret: &[u8],
+    original_token_b64: &[u8],
+    new_aud: &str,
+) -> Vec<u8> {
     // Re-sign a new token with the same secret but a different audience
     // (simulates an attacker trying to present A→B token to agent C)
-    let decoded = base64::engine::general_purpose::STANDARD.decode(original_token_b64).unwrap();
-    if decoded.len() < 4 { return vec![]; }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(original_token_b64)
+        .unwrap();
+    if decoded.len() < 4 {
+        return vec![];
+    }
     let json_len = u32::from_le_bytes(decoded[0..4].try_into().unwrap()) as usize;
-    if 4 + json_len > decoded.len() { return vec![]; }
+    if 4 + json_len > decoded.len() {
+        return vec![];
+    }
 
     let json_bytes = &decoded[4..4 + json_len];
     let mut data: serde_json::Value = serde_json::from_slice(json_bytes).unwrap();
@@ -100,7 +110,9 @@ fn build_token_for_different_audience(secret: &[u8], original_token_b64: &[u8], 
     wire.extend_from_slice(&new_json);
     wire.extend_from_slice(&sig);
 
-    base64::engine::general_purpose::STANDARD.encode(&wire).into_bytes()
+    base64::engine::general_purpose::STANDARD
+        .encode(&wire)
+        .into_bytes()
 }
 
 /// The core two-agent compromise scenario.
@@ -122,16 +134,21 @@ fn phase_6_two_agent_compromise_scenario() {
     // Normal flow: Planner → Executor (validate 50 times = 50 rounds of normal traffic)
     let mut normal_successes = 0usize;
     for _ in 0..50 {
-        if executor_gw.validate_lateral_movement(
-            EXECUTOR_ID,
-            &legitimate_token,
-            &TEST_PSK,
-        ).is_ok() {
+        if executor_gw
+            .validate_lateral_movement(EXECUTOR_ID, &legitimate_token, &TEST_PSK)
+            .is_ok()
+        {
             normal_successes += 1;
         }
     }
-    eprintln!("[PHASE-6] Normal operation: {}/50 validations succeeded.", normal_successes);
-    assert_eq!(normal_successes, 50, "All 50 normal-operation validations must succeed");
+    eprintln!(
+        "[PHASE-6] Normal operation: {}/50 validations succeeded.",
+        normal_successes
+    );
+    assert_eq!(
+        normal_successes, 50,
+        "All 50 normal-operation validations must succeed"
+    );
 
     // ── STEP 3: REAL compromise — extract token from Planner's "memory" ────────
     //
@@ -146,14 +163,14 @@ fn phase_6_two_agent_compromise_scenario() {
     );
 
     // ── STEP 4: Attack A — Stolen token used against same executor, same audience ──
-    let attack_a = executor_gw.validate_lateral_movement(
-        EXECUTOR_ID,
-        &stolen_token,
-        &TEST_PSK,
-    );
+    let attack_a = executor_gw.validate_lateral_movement(EXECUTOR_ID, &stolen_token, &TEST_PSK);
     eprintln!(
         "[PHASE-6] Attack A (stolen token, same target): {:?}",
-        if attack_a.is_ok() { "ACCEPTED (token still valid)" } else { "REJECTED" }
+        if attack_a.is_ok() {
+            "ACCEPTED (token still valid)"
+        } else {
+            "REJECTED"
+        }
     );
 
     // ── STEP 5: Attack B — Stolen token against DIFFERENT session/conversation ──
@@ -170,17 +187,17 @@ fn phase_6_two_agent_compromise_scenario() {
     );
     eprintln!(
         "[PHASE-6] Attack B (stolen token, wrong target agent): {:?}",
-        if attack_b.is_ok() { "ACCEPTED — audience binding NOT enforced" }
-        else { "REJECTED — audience binding enforced" }
+        if attack_b.is_ok() {
+            "ACCEPTED — audience binding NOT enforced"
+        } else {
+            "REJECTED — audience binding enforced"
+        }
     );
 
     // ── STEP 6: Attack C — Stolen token against third agent (never contacted before) ──
     let third_agent_gw = ZeroTrustGateway::new();
-    let attack_c = third_agent_gw.validate_lateral_movement(
-        THIRD_AGENT_ID,
-        &stolen_token,
-        &TEST_PSK,
-    );
+    let attack_c =
+        third_agent_gw.validate_lateral_movement(THIRD_AGENT_ID, &stolen_token, &TEST_PSK);
     eprintln!(
         "[PHASE-6] Attack C (stolen A→B token presented to agent C): {:?}",
         if attack_c.is_ok() {
@@ -218,14 +235,16 @@ fn phase_6_two_agent_compromise_scenario() {
     eprintln!("    - Token TTL (typically 1h based on exp=iat+3600) = worst-case window");
 
     // ── STEP 8: Post-compromise — legitimate traffic should still work ────────
-    let post_attack_ok = executor_gw.validate_lateral_movement(
-        EXECUTOR_ID,
-        &legitimate_token,
-        &TEST_PSK,
-    ).is_ok();
+    let post_attack_ok = executor_gw
+        .validate_lateral_movement(EXECUTOR_ID, &legitimate_token, &TEST_PSK)
+        .is_ok();
     eprintln!(
         "\n[PHASE-6] Post-compromise legitimate traffic: {}",
-        if post_attack_ok { "Still accepted (correct)" } else { "Rejected (regression!)" }
+        if post_attack_ok {
+            "Still accepted (correct)"
+        } else {
+            "Rejected (regression!)"
+        }
     );
     assert!(
         post_attack_ok,
@@ -234,15 +253,39 @@ fn phase_6_two_agent_compromise_scenario() {
 
     // ── Final verdict ─────────────────────────────────────────────────────────
     eprintln!("\n[PHASE-6 FINDINGS SUMMARY]");
-    eprintln!("  Attack A (stolen token, same target): {}",
-        if attack_a.is_ok() { "SUCCEEDED" } else { "BLOCKED" });
-    eprintln!("  Attack B (stolen token, wrong target): {}",
-        if attack_b.is_ok() { "SUCCEEDED (audience binding gap)" } else { "BLOCKED (audience binding works)" });
-    eprintln!("  Attack C (stolen A→B token to agent C): {}",
-        if attack_c.is_ok() { "SUCCEEDED (cross-audience binding gap)" } else { "BLOCKED (audience binding works)" });
+    eprintln!(
+        "  Attack A (stolen token, same target): {}",
+        if attack_a.is_ok() {
+            "SUCCEEDED"
+        } else {
+            "BLOCKED"
+        }
+    );
+    eprintln!(
+        "  Attack B (stolen token, wrong target): {}",
+        if attack_b.is_ok() {
+            "SUCCEEDED (audience binding gap)"
+        } else {
+            "BLOCKED (audience binding works)"
+        }
+    );
+    eprintln!(
+        "  Attack C (stolen A→B token to agent C): {}",
+        if attack_c.is_ok() {
+            "SUCCEEDED (cross-audience binding gap)"
+        } else {
+            "BLOCKED (audience binding works)"
+        }
+    );
     eprintln!("  Automatic compromise detection: NONE (bearer token architecture)");
-    eprintln!("  Legitimate traffic post-attack: {}",
-        if post_attack_ok { "UNAFFECTED (correct)" } else { "BROKEN (regression)" });
+    eprintln!(
+        "  Legitimate traffic post-attack: {}",
+        if post_attack_ok {
+            "UNAFFECTED (correct)"
+        } else {
+            "BROKEN (regression)"
+        }
+    );
 }
 
 /// Verify that the token expiry field is enforced.
@@ -254,11 +297,7 @@ fn phase_6_expired_token_auto_rejected() {
     // exp = past_iat + 3600 = ~year 2001 — definitely expired
 
     let executor_gw = ZeroTrustGateway::new();
-    let result = executor_gw.validate_lateral_movement(
-        EXECUTOR_ID,
-        &past_token,
-        &TEST_PSK,
-    );
+    let result = executor_gw.validate_lateral_movement(EXECUTOR_ID, &past_token, &TEST_PSK);
 
     assert!(
         result.is_err(),

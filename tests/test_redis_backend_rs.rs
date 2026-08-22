@@ -66,10 +66,14 @@ fn redis_incr_with_ttl_sets_ttl_once() {
     let key = format!("test:saacp:ttlonce:{}", std::process::id());
     let _ = backend.delete(&key);
 
-    backend.incr_with_ttl(&key, 1, Duration::from_secs(1)).unwrap();
+    backend
+        .incr_with_ttl(&key, 1, Duration::from_secs(1))
+        .unwrap();
     std::thread::sleep(Duration::from_millis(500));
     // A second increment before expiry must NOT reset the TTL clock.
-    backend.incr_with_ttl(&key, 1, Duration::from_secs(999)).unwrap();
+    backend
+        .incr_with_ttl(&key, 1, Duration::from_secs(999))
+        .unwrap();
     std::thread::sleep(Duration::from_millis(700));
 
     assert_eq!(
@@ -96,11 +100,20 @@ fn redis_backend_cross_process_lockout() {
             tripped = true;
         }
     }
-    assert!(tripped, "node A should have tripped the fleet-wide circuit breaker");
+    assert!(
+        tripped,
+        "node A should have tripped the fleet-wide circuit breaker"
+    );
 
-    assert!(!node_b.is_locked(&agent), "node B shouldn't know yet without a refresh");
+    assert!(
+        !node_b.is_locked(&agent),
+        "node B shouldn't know yet without a refresh"
+    );
     node_b.refresh_from_backend();
-    assert!(node_b.is_locked(&agent), "node B should observe the real cross-process lockout after refresh");
+    assert!(
+        node_b.is_locked(&agent),
+        "node B should observe the real cross-process lockout after refresh"
+    );
 
     node_a.reset(Some(&agent));
 }
@@ -110,7 +123,9 @@ fn redis_backend_unreachable_fails_safe() {
     // Port 1 on localhost: nothing listens there. `redis::Client::open` is
     // lazy (just parses the URL), so this succeeds; the actual connect
     // attempt — and its failure — happens inside `record_error`.
-    let backend = Arc::new(RedisBackend::with_timeout("redis://127.0.0.1:1/", Duration::from_millis(50)).unwrap());
+    let backend = Arc::new(
+        RedisBackend::with_timeout("redis://127.0.0.1:1/", Duration::from_millis(50)).unwrap(),
+    );
     let rl = AgentRateLimiter::with_backend(backend);
 
     let started = std::time::Instant::now();
@@ -121,5 +136,8 @@ fn redis_backend_unreachable_fails_safe() {
         }
     }
     assert!(tripped, "circuit breaker must still enforce locally when Redis is unreachable (fail-safe, not fail-open)");
-    assert!(started.elapsed() < Duration::from_secs(5), "must fail fast on a bounded timeout, not hang");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must fail fast on a bounded timeout, not hang"
+    );
 }

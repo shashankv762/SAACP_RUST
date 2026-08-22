@@ -5,10 +5,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::state_backend::StateBackend;
 
@@ -117,7 +117,11 @@ impl DeadMansSwitch {
 
     /// Like [`DeadMansSwitch::with_backend`], with custom timeout/session-cap
     /// settings (mirrors [`DeadMansSwitch::with_limits`] for the local mode).
-    pub fn with_backend_and_limits(max_timeout: f64, max_sessions: usize, backend: Arc<dyn StateBackend>) -> Self {
+    pub fn with_backend_and_limits(
+        max_timeout: f64,
+        max_sessions: usize,
+        backend: Arc<dyn StateBackend>,
+    ) -> Self {
         Self {
             inner: Mutex::new(DeadManInner {
                 active_sessions: HashMap::new(),
@@ -145,9 +149,16 @@ impl DeadMansSwitch {
                 // non-hot-path operation (once per session lifetime, not per packet).
                 let keys = backend.scan_prefix("dms:session:").unwrap_or_default();
                 if keys.len() >= self.max_sessions {
-                    if let Some(oldest) = keys.iter()
+                    if let Some(oldest) = keys
+                        .iter()
                         .filter_map(|k| backend.get(k).ok().flatten().map(|v| (k.clone(), v)))
-                        .filter_map(|(k, v)| std::str::from_utf8(&v).ok()?.parse::<f64>().ok().map(|ts| (k, ts)))
+                        .filter_map(|(k, v)| {
+                            std::str::from_utf8(&v)
+                                .ok()?
+                                .parse::<f64>()
+                                .ok()
+                                .map(|ts| (k, ts))
+                        })
                         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(k, _)| k)
                     {
@@ -168,14 +179,18 @@ impl DeadMansSwitch {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if inner.active_sessions.len() >= self.max_sessions {
                     // Evict the oldest session to stay under the cap
-                    if let Some(oldest_key) = inner.active_sessions.iter()
+                    if let Some(oldest_key) = inner
+                        .active_sessions
+                        .iter()
                         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(k, _)| k.clone())
                     {
                         inner.active_sessions.remove(&oldest_key);
                     }
                 }
-                inner.active_sessions.insert(context_state_id.to_vec(), now_secs());
+                inner
+                    .active_sessions
+                    .insert(context_state_id.to_vec(), now_secs());
             }
         }
     }
@@ -199,9 +214,13 @@ impl DeadMansSwitch {
         // ── Ping-flood detection (DMS-PINGFLOOD fix) ─────────────────────────
         // A compromised context can call ping at maximum rate to stay alive forever.
         // Track pings per context per window and reject excess pings.
-        let flood_rec = inner.ping_flood_records
+        let flood_rec = inner
+            .ping_flood_records
             .entry(context_state_id.to_vec())
-            .or_insert(PingRecord { window_start: now, count: 0 });
+            .or_insert(PingRecord {
+                window_start: now,
+                count: 0,
+            });
 
         if (now - flood_rec.window_start) > DEAD_MAN_PING_FLOOD_WINDOW_SECS {
             // Reset window
@@ -221,11 +240,22 @@ impl DeadMansSwitch {
         true
     }
 
-    fn ping_backend(&self, backend: &Arc<dyn StateBackend>, context_state_id: &[u8], now: f64) -> bool {
+    fn ping_backend(
+        &self,
+        backend: &Arc<dyn StateBackend>,
+        context_state_id: &[u8],
+        now: f64,
+    ) -> bool {
         let flood_key = Self::flood_key(context_state_id);
-        let mut rec = backend.get(&flood_key).ok().flatten()
+        let mut rec = backend
+            .get(&flood_key)
+            .ok()
+            .flatten()
             .and_then(|b| serde_json::from_slice::<PingRecordWire>(&b).ok())
-            .unwrap_or(PingRecordWire { window_start: now, count: 0 });
+            .unwrap_or(PingRecordWire {
+                window_start: now,
+                count: 0,
+            });
 
         if (now - rec.window_start) > DEAD_MAN_PING_FLOOD_WINDOW_SECS {
             rec.window_start = now;
@@ -235,7 +265,13 @@ impl DeadMansSwitch {
         let flood_detected = rec.count > DEAD_MAN_PING_FLOOD_THRESHOLD;
 
         if let Ok(bytes) = serde_json::to_vec(&rec) {
-            let _ = backend.set(&flood_key, &bytes, Some(Duration::from_secs_f64(DEAD_MAN_PING_FLOOD_WINDOW_SECS * 2.0)));
+            let _ = backend.set(
+                &flood_key,
+                &bytes,
+                Some(Duration::from_secs_f64(
+                    DEAD_MAN_PING_FLOOD_WINDOW_SECS * 2.0,
+                )),
+            );
         }
 
         if flood_detected {
@@ -270,7 +306,9 @@ impl DeadMansSwitch {
     /// delete here.
     pub fn unregister_session(&self, context_state_id: &[u8]) {
         match &self.backend {
-            Some(backend) => { let _ = backend.delete(&Self::session_key(context_state_id)); }
+            Some(backend) => {
+                let _ = backend.delete(&Self::session_key(context_state_id));
+            }
             None => {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 inner.active_sessions.remove(context_state_id);
@@ -288,11 +326,20 @@ impl DeadMansSwitch {
                 let keys = backend.scan_prefix("dms:session:").unwrap_or_default();
                 let mut stale = Vec::new();
                 for key in keys {
-                    let Some(hex_id) = key.strip_prefix("dms:session:") else { continue };
-                    let Ok(id) = hex::decode(hex_id) else { continue };
-                    let Some(ts) = backend.get(&key).ok().flatten()
+                    let Some(hex_id) = key.strip_prefix("dms:session:") else {
+                        continue;
+                    };
+                    let Ok(id) = hex::decode(hex_id) else {
+                        continue;
+                    };
+                    let Some(ts) = backend
+                        .get(&key)
+                        .ok()
+                        .flatten()
                         .and_then(|b| std::str::from_utf8(&b).ok()?.parse::<f64>().ok())
-                    else { continue };
+                    else {
+                        continue;
+                    };
                     if (now - ts) > self.max_timeout {
                         let _ = backend.delete(&key);
                         stale.push(id);
@@ -302,7 +349,9 @@ impl DeadMansSwitch {
             }
             None => {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                let stale: Vec<Vec<u8>> = inner.active_sessions.iter()
+                let stale: Vec<Vec<u8>> = inner
+                    .active_sessions
+                    .iter()
                     .filter(|(_, &last_ping)| (now - last_ping) > self.max_timeout)
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -321,16 +370,33 @@ impl DeadMansSwitch {
     /// namespace — an O(n) diagnostic operation, not a hot-path call.
     pub fn session_count(&self) -> usize {
         match &self.backend {
-            Some(backend) => backend.scan_prefix("dms:session:").map(|k| k.len()).unwrap_or(0),
-            None => self.inner.lock().unwrap_or_else(|e| e.into_inner()).active_sessions.len(),
+            Some(backend) => backend
+                .scan_prefix("dms:session:")
+                .map(|k| k.len())
+                .unwrap_or(0),
+            None => self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_sessions
+                .len(),
         }
     }
 
     /// Check if a specific session is active.
     pub fn is_active(&self, context_state_id: &[u8]) -> bool {
         match &self.backend {
-            Some(backend) => backend.get(&Self::session_key(context_state_id)).ok().flatten().is_some(),
-            None => self.inner.lock().unwrap_or_else(|e| e.into_inner()).active_sessions.contains_key(context_state_id),
+            Some(backend) => backend
+                .get(&Self::session_key(context_state_id))
+                .ok()
+                .flatten()
+                .is_some(),
+            None => self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_sessions
+                .contains_key(context_state_id),
         }
     }
 
@@ -385,11 +451,7 @@ pub struct TemporalHeartbeat {
 
 impl TemporalHeartbeat {
     /// Start a heartbeat thread that pings the given switch at the specified interval.
-    pub fn start(
-        switch: Arc<DeadMansSwitch>,
-        session_id: Vec<u8>,
-        interval_secs: f64,
-    ) -> Self {
+    pub fn start(switch: Arc<DeadMansSwitch>, session_id: Vec<u8>, interval_secs: f64) -> Self {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_clone = stop.clone();
 
@@ -618,7 +680,11 @@ mod tests {
 
     fn backend_dms(max_timeout: f64, max_sessions: usize) -> DeadMansSwitch {
         use crate::state_backend::InMemoryBackend;
-        DeadMansSwitch::with_backend_and_limits(max_timeout, max_sessions, Arc::new(InMemoryBackend::new()))
+        DeadMansSwitch::with_backend_and_limits(
+            max_timeout,
+            max_sessions,
+            Arc::new(InMemoryBackend::new()),
+        )
     }
 
     #[test]

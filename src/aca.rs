@@ -204,7 +204,10 @@ impl AttestationAuthority {
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
-        Self { source: AttestationKeySource::Local(signing_key), verifying_key }
+        Self {
+            source: AttestationKeySource::Local(signing_key),
+            verifying_key,
+        }
     }
 
     /// Build an authority whose signing key lives in hardware.
@@ -229,7 +232,10 @@ impl AttestationAuthority {
         })?;
         let verifying_key = VerifyingKey::from_bytes(&bytes)
             .map_err(|_| crate::hrt::HrtError::MalformedKeyMaterial(key_id.clone()))?;
-        Ok(Self { source: AttestationKeySource::Hardware { store, key_id }, verifying_key })
+        Ok(Self {
+            source: AttestationKeySource::Hardware { store, key_id },
+            verifying_key,
+        })
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -271,7 +277,13 @@ impl AttestationAuthority {
     ) -> Result<AttestationClaim, crate::hrt::HrtError> {
         let issued_at = now_secs();
         let expires_at = issued_at + ttl_seconds as f64;
-        let body = AttestationClaim::canonical_bytes(agent_id, safety_level, execution_environment, issued_at, expires_at);
+        let body = AttestationClaim::canonical_bytes(
+            agent_id,
+            safety_level,
+            execution_environment,
+            issued_at,
+            expires_at,
+        );
         let operator_signature = match &self.source {
             AttestationKeySource::Local(sk) => sk.sign(&body).to_bytes().to_vec(),
             AttestationKeySource::Hardware { store, key_id } => store.sign(key_id, &body)?,
@@ -308,7 +320,10 @@ pub enum AcaError {
 impl std::fmt::Display for AcaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcaError::UntrustedOperator => write!(f, "attestation claim's operator key is not trusted by this registry"),
+            AcaError::UntrustedOperator => write!(
+                f,
+                "attestation claim's operator key is not trusted by this registry"
+            ),
             AcaError::SignatureInvalid => write!(f, "attestation claim signature is invalid"),
             AcaError::Expired => write!(f, "attestation claim is already expired"),
         }
@@ -352,7 +367,10 @@ impl AttestationRegistry {
     /// least once before any claim can ever be installed.
     pub fn trust_operator(&self, verifying_key: VerifyingKey) {
         let key_id = key_id_for(&verifying_key);
-        self.trusted_operators.lock().unwrap_or_else(|e| e.into_inner()).insert(key_id, verifying_key);
+        self.trusted_operators
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key_id, verifying_key);
     }
 
     /// Verify `claim`'s signature against a trusted operator key and, if
@@ -365,7 +383,10 @@ impl AttestationRegistry {
     /// evicted" tier).
     pub fn install_claim(&self, claim: AttestationClaim) -> Result<(), AcaError> {
         {
-            let operators = self.trusted_operators.lock().unwrap_or_else(|e| e.into_inner());
+            let operators = self
+                .trusted_operators
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Some(operator_key) = operators.get(&claim.operator_key_id) else {
                 return Err(AcaError::UntrustedOperator);
             };
@@ -376,8 +397,11 @@ impl AttestationRegistry {
             sig_bytes.copy_from_slice(&claim.operator_signature);
             let sig = Signature::from_bytes(&sig_bytes);
             let body = AttestationClaim::canonical_bytes(
-                &claim.agent_id, claim.safety_level, &claim.execution_environment,
-                claim.issued_at, claim.expires_at,
+                &claim.agent_id,
+                claim.safety_level,
+                &claim.execution_environment,
+                claim.issued_at,
+                claim.expires_at,
             );
             if operator_key.verify(&body, &sig).is_err() {
                 return Err(AcaError::SignatureInvalid);
@@ -390,8 +414,13 @@ impl AttestationRegistry {
 
         let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
         if claims.len() >= ACA_MAX_CLAIMS && !claims.contains_key(&claim.agent_id) {
-            if let Some(oldest) = claims.iter()
-                .min_by(|(_, a), (_, b)| a.issued_at.partial_cmp(&b.issued_at).unwrap_or(std::cmp::Ordering::Equal))
+            if let Some(oldest) = claims
+                .iter()
+                .min_by(|(_, a), (_, b)| {
+                    a.issued_at
+                        .partial_cmp(&b.issued_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|(k, _)| k.clone())
             {
                 claims.remove(&oldest);
@@ -487,7 +516,12 @@ mod tests {
     #[test]
     fn issued_claim_carries_requested_fields() {
         let authority = AttestationAuthority::generate();
-        let claim = authority.issue("agent-a", SafetyLevel::AlignedModel, "docker: no-network", 3600);
+        let claim = authority.issue(
+            "agent-a",
+            SafetyLevel::AlignedModel,
+            "docker: no-network",
+            3600,
+        );
         assert_eq!(claim.agent_id, "agent-a");
         assert_eq!(claim.safety_level, SafetyLevel::AlignedModel);
         assert_eq!(claim.operator_key_id, authority.key_id());
@@ -510,7 +544,10 @@ mod tests {
         registry.trust_operator(authority.verifying_key());
         let claim = authority.issue("agent-a", SafetyLevel::AlignedModel, "env", 3600);
         assert!(registry.install_claim(claim).is_ok());
-        assert_eq!(registry.current_safety_level("agent-a"), SafetyLevel::AlignedModel);
+        assert_eq!(
+            registry.current_safety_level("agent-a"),
+            SafetyLevel::AlignedModel
+        );
     }
 
     #[test]
@@ -519,8 +556,14 @@ mod tests {
         let authority = AttestationAuthority::generate();
         // Deliberately never call registry.trust_operator(...).
         let claim = authority.issue("agent-a", SafetyLevel::AlignedModel, "env", 3600);
-        assert_eq!(registry.install_claim(claim), Err(AcaError::UntrustedOperator));
-        assert_eq!(registry.current_safety_level("agent-a"), SafetyLevel::Unattested);
+        assert_eq!(
+            registry.install_claim(claim),
+            Err(AcaError::UntrustedOperator)
+        );
+        assert_eq!(
+            registry.current_safety_level("agent-a"),
+            SafetyLevel::Unattested
+        );
     }
 
     #[test]
@@ -531,7 +574,10 @@ mod tests {
         let mut claim = authority.issue("agent-a", SafetyLevel::AlignedModel, "env", 3600);
         // Tamper with the safety level after signing.
         claim.safety_level = SafetyLevel::HardwareAttested;
-        assert_eq!(registry.install_claim(claim), Err(AcaError::SignatureInvalid));
+        assert_eq!(
+            registry.install_claim(claim),
+            Err(AcaError::SignatureInvalid)
+        );
     }
 
     #[test]
@@ -541,9 +587,13 @@ mod tests {
         let attacker_authority = AttestationAuthority::generate();
         registry.trust_operator(real_authority.verifying_key());
         // Attacker signs a claim, then relabels it as if the trusted operator issued it.
-        let mut forged = attacker_authority.issue("agent-a", SafetyLevel::HardwareAttested, "env", 3600);
+        let mut forged =
+            attacker_authority.issue("agent-a", SafetyLevel::HardwareAttested, "env", 3600);
         forged.operator_key_id = real_authority.key_id();
-        assert_eq!(registry.install_claim(forged), Err(AcaError::SignatureInvalid));
+        assert_eq!(
+            registry.install_claim(forged),
+            Err(AcaError::SignatureInvalid)
+        );
     }
 
     #[test]
@@ -558,7 +608,10 @@ mod tests {
     #[test]
     fn current_safety_level_defaults_to_unattested_when_no_claim() {
         let registry = AttestationRegistry::new();
-        assert_eq!(registry.current_safety_level("never-attested-agent"), SafetyLevel::Unattested);
+        assert_eq!(
+            registry.current_safety_level("never-attested-agent"),
+            SafetyLevel::Unattested
+        );
     }
 
     #[test]
@@ -566,10 +619,20 @@ mod tests {
         let registry = AttestationRegistry::new();
         let authority = AttestationAuthority::generate();
         registry.trust_operator(authority.verifying_key());
-        registry.install_claim(authority.issue("agent-a", SafetyLevel::BasicFiltering, "env", 3600)).unwrap();
-        assert_eq!(registry.current_safety_level("agent-a"), SafetyLevel::BasicFiltering);
-        registry.install_claim(authority.issue("agent-a", SafetyLevel::AuditedAligned, "env", 3600)).unwrap();
-        assert_eq!(registry.current_safety_level("agent-a"), SafetyLevel::AuditedAligned);
+        registry
+            .install_claim(authority.issue("agent-a", SafetyLevel::BasicFiltering, "env", 3600))
+            .unwrap();
+        assert_eq!(
+            registry.current_safety_level("agent-a"),
+            SafetyLevel::BasicFiltering
+        );
+        registry
+            .install_claim(authority.issue("agent-a", SafetyLevel::AuditedAligned, "env", 3600))
+            .unwrap();
+        assert_eq!(
+            registry.current_safety_level("agent-a"),
+            SafetyLevel::AuditedAligned
+        );
         assert_eq!(registry.tracked_count(), 1);
     }
 
@@ -579,8 +642,12 @@ mod tests {
         let authority = AttestationAuthority::generate();
         registry.trust_operator(authority.verifying_key());
         assert_eq!(registry.tracked_count(), 0);
-        registry.install_claim(authority.issue("agent-a", SafetyLevel::AlignedModel, "env", 3600)).unwrap();
-        registry.install_claim(authority.issue("agent-b", SafetyLevel::AlignedModel, "env", 3600)).unwrap();
+        registry
+            .install_claim(authority.issue("agent-a", SafetyLevel::AlignedModel, "env", 3600))
+            .unwrap();
+        registry
+            .install_claim(authority.issue("agent-b", SafetyLevel::AlignedModel, "env", 3600))
+            .unwrap();
         assert_eq!(registry.tracked_count(), 2);
     }
 
@@ -596,7 +663,8 @@ mod tests {
     #[test]
     #[serial]
     fn enforce_attestation_rejects_insufficient_level_when_required() {
-        AttestationRegistry::global().trust_operator(AttestationAuthority::generate().verifying_key());
+        AttestationRegistry::global()
+            .trust_operator(AttestationAuthority::generate().verifying_key());
         set_required(true);
         let result = enforce_attestation("unattested-agent-under-enforcement", 0x02);
         set_required(false);
@@ -609,9 +677,14 @@ mod tests {
     fn enforce_attestation_allows_sufficient_level_when_required() {
         let authority = AttestationAuthority::generate();
         AttestationRegistry::global().trust_operator(authority.verifying_key());
-        AttestationRegistry::global().install_claim(
-            authority.issue("sufficiently-attested-agent", SafetyLevel::AlignedModel, "env", 3600)
-        ).unwrap();
+        AttestationRegistry::global()
+            .install_claim(authority.issue(
+                "sufficiently-attested-agent",
+                SafetyLevel::AlignedModel,
+                "env",
+                3600,
+            ))
+            .unwrap();
         set_required(true);
         let result = enforce_attestation("sufficiently-attested-agent", 0x02);
         set_required(false);
@@ -624,6 +697,9 @@ mod tests {
         set_required(true);
         let result = enforce_attestation("never-attested-read-only-agent", 0x00);
         set_required(false);
-        assert!(result.is_ok(), "READ_ONLY's minimum SafetyLevel is Unattested — every agent already meets it");
+        assert!(
+            result.is_ok(),
+            "READ_ONLY's minimum SafetyLevel is Unattested — every agent already meets it"
+        );
     }
 }

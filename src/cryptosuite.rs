@@ -3,13 +3,12 @@
 //! Provides an algorithm-agnostic signing and verification interface.
 //! Ed25519 is the mandatory default trust primitive (SAACP v6.0).
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier};
-use sha2::{Sha256, Digest};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::crypto_governance::{
-    CryptoLedgerEntry, CryptoTransparencyLedger, SuiteStatus,
-    get_active_policy,
+    get_active_policy, CryptoLedgerEntry, CryptoTransparencyLedger, SuiteStatus,
 };
 
 fn now_epoch_secs() -> f64 {
@@ -85,12 +84,18 @@ impl CryptoSuite for Ed25519Suite {
         let mut csprng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
-        (signing_key.to_bytes().to_vec(), verifying_key.to_bytes().to_vec())
+        (
+            signing_key.to_bytes().to_vec(),
+            verifying_key.to_bytes().to_vec(),
+        )
     }
 
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
         if private_key.len() != 32 {
-            return Err(format!("Ed25519 private key must be 32 bytes, got {}", private_key.len()));
+            return Err(format!(
+                "Ed25519 private key must be 32 bytes, got {}",
+                private_key.len()
+            ));
         }
         let mut key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         key_bytes.copy_from_slice(private_key);
@@ -158,7 +163,12 @@ pub fn get_suite(
             event_type: "DEPRECATION".into(),
             suite_name: algorithm.into(),
             session_id: String::new(),
-            outcome: if deployment_profile == "PRODUCTION" { "BLOCKED" } else { "APPROVED" }.into(),
+            outcome: if deployment_profile == "PRODUCTION" {
+                "BLOCKED"
+            } else {
+                "APPROVED"
+            }
+            .into(),
             transcript_hash: String::new(),
             details: format!(
                 "get_suite('{}') called; suite is DEPRECATED in {}.",
@@ -223,20 +233,16 @@ pub fn register_suite(
 ) -> Result<(), String> {
     // Step 1: allow_override guard
     if !allow_override {
-        return Err(
-            "register_suite() requires allow_override=true. \
+        return Err("register_suite() requires allow_override=true. \
              Suite registration is a security-critical operation."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Step 2: PRODUCTION block
     if deployment_profile == "PRODUCTION" {
-        return Err(
-            "register_suite(): runtime registration is unconditionally \
+        return Err("register_suite(): runtime registration is unconditionally \
              prohibited in PRODUCTION deployments."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Step 3: 'ed25519' is the immutable root — allow re-registration (no-op)

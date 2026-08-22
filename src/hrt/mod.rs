@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey, Signature};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::klms::{KeyAlgorithm, KeyRegistry};
 
@@ -73,7 +73,6 @@ pub mod aws_kms;
 #[cfg(feature = "hrt-gcp-kms")]
 pub mod gcp_kms;
 
-
 /// Errors a [`HardwareKeyStore`] implementation can return.
 ///
 /// Implements `std::error::Error` (unlike the lighter `faitf::DRIError` style used
@@ -92,7 +91,10 @@ pub enum HrtError {
     UnknownKey(String),
     /// The key exists but is not usable for signing (e.g. an AES-256-GCM or HKDF key
     /// asked to produce an Ed25519 signature).
-    WrongAlgorithm { key_id: String, algorithm: &'static str },
+    WrongAlgorithm {
+        key_id: String,
+        algorithm: &'static str,
+    },
     /// Key material was the wrong length for the expected algorithm — should be
     /// unreachable given `klms::KeyDescriptor::new`'s own construction-time validation,
     /// but checked explicitly here rather than panicking on a slice-to-array conversion.
@@ -106,7 +108,10 @@ pub enum HrtError {
     /// API error, a denied IAM policy). `detail` is the backend's own message, kept for
     /// operator logs — it is never surfaced to a protocol peer, since `hrt.rs` sits
     /// behind the `pecf.rs` error-confidentiality filter like every other subsystem.
-    Backend { backend: &'static str, detail: String },
+    Backend {
+        backend: &'static str,
+        detail: String,
+    },
     /// The backend did not answer within the configured timeout. Distinct from
     /// [`Self::Backend`] because it is the one failure a caller may sensibly retry:
     /// a network KMS can be transiently slow, whereas a `CKR_KEY_HANDLE_INVALID`
@@ -119,22 +124,36 @@ pub enum HrtError {
     /// The backend returned a signature or public key that was not the size Ed25519
     /// requires. Treated as a hard failure rather than passed through: a truncated
     /// signature would fail verification much later, somewhere far less diagnosable.
-    MalformedResponse { backend: &'static str, expected: usize, got: usize },
+    MalformedResponse {
+        backend: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl std::fmt::Display for HrtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownKey(id) => write!(f, "HRT: unknown or inactive key_id '{id}'"),
-            Self::WrongAlgorithm { key_id, algorithm } =>
-                write!(f, "HRT: key_id '{key_id}' is a {algorithm} key, not usable for this operation"),
-            Self::MalformedKeyMaterial(id) => write!(f, "HRT: key_id '{id}' has malformed key material"),
+            Self::WrongAlgorithm { key_id, algorithm } => write!(
+                f,
+                "HRT: key_id '{key_id}' is a {algorithm} key, not usable for this operation"
+            ),
+            Self::MalformedKeyMaterial(id) => {
+                write!(f, "HRT: key_id '{id}' has malformed key material")
+            }
             Self::VerificationFailed => write!(f, "HRT: signature verification failed"),
             Self::NotImplemented(backend) => write!(f, "HRT: {backend} backend is not implemented"),
-            Self::Backend { backend, detail } => write!(f, "HRT: {backend} backend error: {detail}"),
+            Self::Backend { backend, detail } => {
+                write!(f, "HRT: {backend} backend error: {detail}")
+            }
             Self::Timeout { backend } => write!(f, "HRT: {backend} backend timed out"),
             Self::Configuration(detail) => write!(f, "HRT: misconfigured key store: {detail}"),
-            Self::MalformedResponse { backend, expected, got } => write!(
+            Self::MalformedResponse {
+                backend,
+                expected,
+                got,
+            } => write!(
                 f,
                 "HRT: {backend} backend returned {got} bytes where Ed25519 requires {expected}"
             ),
@@ -163,8 +182,9 @@ pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
 ///   03 21 00                     BIT STRING (33 bytes, 0 unused bits)
 ///     <32 bytes of public key>
 /// ```
-pub const ED25519_SPKI_PREFIX: [u8; 12] =
-    [0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
+pub const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 /// Extract the raw 32-byte Ed25519 public key from a DER `SubjectPublicKeyInfo`.
 ///
@@ -173,10 +193,17 @@ pub const ED25519_SPKI_PREFIX: [u8; 12] =
 /// *different* algorithm (an operator pointing at an ECDSA P-256 key by mistake is
 /// the realistic case), that must be a loud configuration error, not a 32-byte
 /// tail that looks plausible and fails verification much later.
-pub fn ed25519_public_key_from_spki(der: &[u8], backend: &'static str) -> Result<Vec<u8>, HrtError> {
+pub fn ed25519_public_key_from_spki(
+    der: &[u8],
+    backend: &'static str,
+) -> Result<Vec<u8>, HrtError> {
     let expected = ED25519_SPKI_PREFIX.len() + ED25519_PUBLIC_KEY_LEN;
     if der.len() != expected {
-        return Err(HrtError::MalformedResponse { backend, expected, got: der.len() });
+        return Err(HrtError::MalformedResponse {
+            backend,
+            expected,
+            got: der.len(),
+        });
     }
     if der[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(HrtError::Backend {
@@ -192,7 +219,11 @@ pub fn ed25519_public_key_from_spki(der: &[u8], backend: &'static str) -> Result
 /// Check a backend's signature is exactly 64 bytes before handing it upward.
 ///
 /// Only referenced by the feature-gated backends, so it is unused in a default build.
-#[cfg(any(feature = "hrt-pkcs11", feature = "hrt-aws-kms", feature = "hrt-gcp-kms"))]
+#[cfg(any(
+    feature = "hrt-pkcs11",
+    feature = "hrt-aws-kms",
+    feature = "hrt-gcp-kms"
+))]
 fn check_signature_len(sig: Vec<u8>, backend: &'static str) -> Result<Vec<u8>, HrtError> {
     if sig.len() != ED25519_SIGNATURE_LEN {
         return Err(HrtError::MalformedResponse {
@@ -236,12 +267,20 @@ impl SoftwareKeyStore {
     }
 
     fn active_ed25519_signing_key(&self, key_id: &str) -> Result<SigningKey, HrtError> {
-        let desc = self.registry.get_active(key_id)
+        let desc = self
+            .registry
+            .get_active(key_id)
             .map_err(|_| HrtError::UnknownKey(key_id.to_string()))?;
         if desc.algorithm != KeyAlgorithm::Ed25519 {
-            return Err(HrtError::WrongAlgorithm { key_id: key_id.to_string(), algorithm: desc.algorithm.value() });
+            return Err(HrtError::WrongAlgorithm {
+                key_id: key_id.to_string(),
+                algorithm: desc.algorithm.value(),
+            });
         }
-        let bytes: [u8; 32] = desc.key_material.as_slice().try_into()
+        let bytes: [u8; 32] = desc
+            .key_material
+            .as_slice()
+            .try_into()
             .map_err(|_| HrtError::MalformedKeyMaterial(key_id.to_string()))?;
         Ok(SigningKey::from_bytes(&bytes))
     }
@@ -264,14 +303,17 @@ impl HardwareKeyStore for SoftwareKeyStore {
 /// of `sign` eventually needs, kept as a free function since verification never touches
 /// private key material and so has no reason to go through the trait.
 pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(), HrtError> {
-    let pk_bytes: [u8; 32] = public_key.try_into()
+    let pk_bytes: [u8; 32] = public_key
+        .try_into()
         .map_err(|_| HrtError::MalformedKeyMaterial("<verify: public_key argument>".to_string()))?;
-    let sig_bytes: [u8; 64] = signature.try_into()
+    let sig_bytes: [u8; 64] = signature
+        .try_into()
         .map_err(|_| HrtError::MalformedKeyMaterial("<verify: signature argument>".to_string()))?;
     let vk = VerifyingKey::from_bytes(&pk_bytes)
         .map_err(|_| HrtError::MalformedKeyMaterial("<verify: public_key argument>".to_string()))?;
     let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify(message, &sig).map_err(|_| HrtError::VerificationFailed)
+    vk.verify(message, &sig)
+        .map_err(|_| HrtError::VerificationFailed)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,9 +369,18 @@ mod tests {
         let kid = make_kid();
         let reg = KeyRegistry::new();
         reg.register(
-            make_descriptor(&kid, KeyAlgorithm::Ed25519, KeyCategory::Identity, material, None, None, None)
-                .expect("valid descriptor")
-        ).expect("register");
+            make_descriptor(
+                &kid,
+                KeyAlgorithm::Ed25519,
+                KeyCategory::Identity,
+                material,
+                None,
+                None,
+                None,
+            )
+            .expect("valid descriptor"),
+        )
+        .expect("register");
         (Arc::new(reg), kid)
     }
 
@@ -356,8 +407,14 @@ mod tests {
     #[test]
     fn unknown_key_id_is_rejected() {
         let store = SoftwareKeyStore::new(Arc::new(KeyRegistry::new()));
-        assert_eq!(store.sign("does-not-exist", b"x"), Err(HrtError::UnknownKey("does-not-exist".to_string())));
-        assert_eq!(store.public_key("does-not-exist"), Err(HrtError::UnknownKey("does-not-exist".to_string())));
+        assert_eq!(
+            store.sign("does-not-exist", b"x"),
+            Err(HrtError::UnknownKey("does-not-exist".to_string()))
+        );
+        assert_eq!(
+            store.public_key("does-not-exist"),
+            Err(HrtError::UnknownKey("does-not-exist".to_string()))
+        );
     }
 
     #[test]
@@ -365,13 +422,25 @@ mod tests {
         let kid = make_kid();
         let reg = KeyRegistry::new();
         reg.register(
-            make_descriptor(&kid, KeyAlgorithm::Aes256Gcm, KeyCategory::EpochTraffic, vec![0u8; 32], None, None, None)
-                .expect("valid descriptor")
-        ).expect("register");
+            make_descriptor(
+                &kid,
+                KeyAlgorithm::Aes256Gcm,
+                KeyCategory::EpochTraffic,
+                vec![0u8; 32],
+                None,
+                None,
+                None,
+            )
+            .expect("valid descriptor"),
+        )
+        .expect("register");
         let store = SoftwareKeyStore::new(Arc::new(reg));
         assert_eq!(
             store.sign(&kid, b"x"),
-            Err(HrtError::WrongAlgorithm { key_id: kid.clone(), algorithm: KeyAlgorithm::Aes256Gcm.value() })
+            Err(HrtError::WrongAlgorithm {
+                key_id: kid.clone(),
+                algorithm: KeyAlgorithm::Aes256Gcm.value()
+            })
         );
     }
 
@@ -384,15 +453,28 @@ mod tests {
             use rand::RngCore;
             let mut material = vec![0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut material);
-            registry.register(
-                make_descriptor(&kid_b, KeyAlgorithm::Ed25519, KeyCategory::Identity, material, None, None, None)
-                    .expect("valid descriptor")
-            ).expect("register");
+            registry
+                .register(
+                    make_descriptor(
+                        &kid_b,
+                        KeyAlgorithm::Ed25519,
+                        KeyCategory::Identity,
+                        material,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("valid descriptor"),
+                )
+                .expect("register");
         }
         let store = SoftwareKeyStore::new(registry);
         let pk_a = store.public_key(&kid_a).expect("pk a");
         let pk_b = store.public_key(&kid_b).expect("pk b");
-        assert_ne!(pk_a, pk_b, "distinct key_ids must have distinct key material");
+        assert_ne!(
+            pk_a, pk_b,
+            "distinct key_ids must have distinct key material"
+        );
 
         let sig_a = store.sign(&kid_a, b"same message").expect("sign a");
         // A signature made with key A's private key must not verify against key B's

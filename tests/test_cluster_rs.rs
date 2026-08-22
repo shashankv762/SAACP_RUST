@@ -22,8 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use saacp::cluster::{
-    ClusterConfig, ClusterEngine, ClusterMessageKind, ClusterRejection, ClusterTransport,
-    NodeState,
+    ClusterConfig, ClusterEngine, ClusterMessageKind, ClusterRejection, ClusterTransport, NodeState,
 };
 use saacp::faitf::{AgentIdentity, AttestationType, TrustStore};
 use saacp::framing::MEASCFrame as StructuralFrame;
@@ -56,7 +55,10 @@ impl Switchboard {
     }
 
     fn sever(&self, a: &str, b: &str) {
-        self.severed.lock().unwrap().push((a.to_string(), b.to_string()));
+        self.severed
+            .lock()
+            .unwrap()
+            .push((a.to_string(), b.to_string()));
     }
 
     fn take_inbox(&self, node: &str) -> Vec<Vec<u8>> {
@@ -245,12 +247,19 @@ fn three_node_cluster_converges_on_exactly_one_leader() {
     cluster.converge();
 
     for engine in &cluster.engines {
-        assert_eq!(engine.alive_count(), 3, "every node must see all three members alive");
+        assert_eq!(
+            engine.alive_count(),
+            3,
+            "every node must see all three members alive"
+        );
         assert!(engine.has_quorum());
     }
 
     let leaders = cluster.leaders();
-    assert!(leaders.iter().all(|l| l.is_some()), "every node must know a leader");
+    assert!(
+        leaders.iter().all(|l| l.is_some()),
+        "every node must know a leader"
+    );
     assert!(
         leaders.windows(2).all(|w| w[0] == w[1]),
         "all nodes must agree on the same leader, got {leaders:?}"
@@ -267,7 +276,9 @@ fn leader_death_fails_over_to_a_surviving_node() {
     let cluster = fast_cluster(&["node-alpha", "node-beta", "node-gamma"], 3);
     cluster.converge();
 
-    let original_leader = cluster.engines[0].leader().expect("a leader must be elected");
+    let original_leader = cluster.engines[0]
+        .leader()
+        .expect("a leader must be elected");
     let survivor = cluster
         .engines
         .iter()
@@ -290,7 +301,10 @@ fn leader_death_fails_over_to_a_surviving_node() {
     );
 
     let new_leader = survivor.leader();
-    assert!(new_leader.is_some(), "surviving quorum must elect a replacement");
+    assert!(
+        new_leader.is_some(),
+        "surviving quorum must elect a replacement"
+    );
     assert_ne!(
         new_leader.as_deref(),
         Some(original_leader.as_str()),
@@ -307,7 +321,11 @@ fn split_brain_leaves_the_minority_partition_with_no_leader() {
     // 5 nodes, quorum = 3. Partition into {a,b,c} | {d,e}.
     let cluster = fast_cluster(&["node-a", "node-b", "node-c", "node-d", "node-e"], 5);
     cluster.converge();
-    assert_eq!(cluster.self_declared_leaders().len(), 1, "healthy cluster has one leader");
+    assert_eq!(
+        cluster.self_declared_leaders().len(),
+        1,
+        "healthy cluster has one leader"
+    );
 
     for majority in ["node-a", "node-b", "node-c"] {
         for minority in ["node-d", "node-e"] {
@@ -326,7 +344,10 @@ fn split_brain_leaves_the_minority_partition_with_no_leader() {
 
     for minority in ["node-d", "node-e"] {
         let node = cluster.get(minority);
-        assert!(!node.has_quorum(), "{minority} must not believe it has quorum");
+        assert!(
+            !node.has_quorum(),
+            "{minority} must not believe it has quorum"
+        );
         assert_eq!(
             node.leader(),
             None,
@@ -365,7 +386,10 @@ fn majority_partition_keeps_serving_after_the_split() {
         let node = cluster.get(majority);
         assert_eq!(node.alive_count(), 3);
         assert!(node.has_quorum(), "{majority} retains a 3-of-5 majority");
-        assert!(node.leader().is_some(), "{majority} must still have a leader");
+        assert!(
+            node.leader().is_some(),
+            "{majority} must still have a leader"
+        );
     }
 
     let majority_leaders: Vec<Option<String>> = ["node-a", "node-b", "node-c"]
@@ -417,7 +441,11 @@ fn a_node_outside_the_roster_cannot_join_the_cluster() {
         Err(ClusterRejection::UnknownSender),
         "an unrostered node must be refused even with a valid signature"
     );
-    assert_eq!(victim.member_count(), before, "a refused node must not enter the view");
+    assert_eq!(
+        victim.member_count(),
+        before,
+        "a refused node must not enter the view"
+    );
     assert_eq!(victim.state_of("node-intruder"), None);
 }
 
@@ -448,13 +476,17 @@ async fn tcp_client_handshake(stream: &mut TcpStream) -> [u8; 32] {
     stream.write_all(&client_msg).await.expect("send handshake");
 
     let mut server_pub_bytes = [0u8; 32];
-    stream.read_exact(&mut server_pub_bytes).await.expect("read server pubkey");
+    stream
+        .read_exact(&mut server_pub_bytes)
+        .await
+        .expect("read server pubkey");
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
     let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
-    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key).expect("HKDF expand");
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .expect("HKDF expand");
     session_key
 }
 
@@ -485,10 +517,22 @@ fn daemon_cluster_pair(
     peer_node: &str,
 ) -> (Arc<ClusterEngine>, Arc<ClusterEngine>) {
     let daemon_identity = Arc::new(AgentIdentity::generate(
-        daemon_node, "issuer-cluster-daemon", 86_400, None, None, "", AttestationType::None,
+        daemon_node,
+        "issuer-cluster-daemon",
+        86_400,
+        None,
+        None,
+        "",
+        AttestationType::None,
     ));
     let peer_identity = Arc::new(AgentIdentity::generate(
-        peer_node, "issuer-cluster-daemon", 86_400, None, None, "", AttestationType::None,
+        peer_node,
+        "issuer-cluster-daemon",
+        86_400,
+        None,
+        None,
+        "",
+        AttestationType::None,
     ));
 
     let daemon_store = Arc::new(TrustStore::new());
@@ -517,13 +561,7 @@ fn daemon_cluster_pair(
 }
 
 /// Encode a schema-12 payload the way a real peer daemon would.
-fn cluster_payload(
-    blob: &str,
-    sender: &str,
-    epoch: u64,
-    kind: &str,
-    token_b64: &str,
-) -> String {
+fn cluster_payload(blob: &str, sender: &str, epoch: u64, kind: &str, token_b64: &str) -> String {
     serde_json::json!({
         "cluster_message": blob,
         "sender_id": sender,
@@ -579,12 +617,21 @@ async fn inbound_schema_12_packet_reaches_the_wired_cluster_engine() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let _session_key = tcp_client_handshake(&mut stream).await;
 
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        &mesh_secret, "peer-daemon-agent", &["unknown"], &[], 60, None, 0, None,
+        &mesh_secret,
+        "peer-daemon-agent",
+        &["unknown"],
+        &[],
+        60,
+        None,
+        0,
+        None,
     );
     let token_b64 = String::from_utf8(token).expect("token utf8");
 
@@ -618,14 +665,21 @@ async fn forged_cluster_message_over_a_real_connection_changes_nothing() {
     // An attacker that holds a valid SAACP capability token (so the packet clears the gate
     // pipeline) but no cluster identity the daemon trusts.
     let attacker = Arc::new(AgentIdentity::generate(
-        "peer-node-2", "issuer-attacker", 86_400, None, None, "", AttestationType::None,
+        "peer-node-2",
+        "issuer-attacker",
+        86_400,
+        None,
+        None,
+        "",
+        AttestationType::None,
     ));
     let attacker_store = Arc::new(TrustStore::new());
     attacker_store.pin_identity(&attacker.agent_id, attacker.verifying_key);
     let attacker_engine = ClusterEngine::new(
         attacker,
         attacker_store,
-        Arc::new(RosterOnlyTransport(vec!["daemon-node-2".to_string()])) as Arc<dyn ClusterTransport>,
+        Arc::new(RosterOnlyTransport(vec!["daemon-node-2".to_string()]))
+            as Arc<dyn ClusterTransport>,
         ClusterConfig::new("daemon-cluster", 2),
         "127.0.0.1:0",
     );
@@ -640,12 +694,21 @@ async fn forged_cluster_message_over_a_real_connection_changes_nothing() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let _session_key = tcp_client_handshake(&mut stream).await;
 
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        &mesh_secret, "attacker-agent", &["unknown"], &[], 60, None, 0, None,
+        &mesh_secret,
+        "attacker-agent",
+        &["unknown"],
+        &[],
+        60,
+        None,
+        0,
+        None,
     );
     let token_b64 = String::from_utf8(token).expect("token utf8");
 
@@ -688,12 +751,21 @@ async fn tampered_envelope_routing_fields_are_rejected_over_a_real_connection() 
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let _session_key = tcp_client_handshake(&mut stream).await;
 
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        &mesh_secret, "mitm-agent", &["unknown"], &[], 60, None, 0, None,
+        &mesh_secret,
+        "mitm-agent",
+        &["unknown"],
+        &[],
+        60,
+        None,
+        0,
+        None,
     );
     let token_b64 = String::from_utf8(token).expect("token utf8");
 
@@ -734,12 +806,21 @@ async fn daemon_without_a_cluster_engine_ignores_schema_12_packets() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let _session_key = tcp_client_handshake(&mut stream).await;
 
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        &mesh_secret, "peer-daemon-agent", &["unknown"], &[], 60, None, 0, None,
+        &mesh_secret,
+        "peer-daemon-agent",
+        &["unknown"],
+        &[],
+        60,
+        None,
+        0,
+        None,
     );
     let token_b64 = String::from_utf8(token).expect("token utf8");
 

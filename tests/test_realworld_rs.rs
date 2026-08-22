@@ -3,20 +3,15 @@
 //! Ports Python: tests/test_realworld.py, tests/test_multi_agent.py
 //! End-to-end flows: capability issuance → verification → delegation → governance.
 
-use std::sync::Arc;
 use serde_json::{Map, Value};
+use std::sync::Arc;
 
 use saacp::{
-    CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
-    AEGFGovernor, AEGFMetadata, GovernanceDecision,
-    AgentIdentity, AgentCredential, TrustAnchor, TrustStore, AttestationType,
-    TrustMeshFederation,
-    CapabilityTransparencyLog,
-    ThresholdAuthorityIssuer,
-    DelegationChainValidator,
-    DeadMansSwitch,
-    StreamSession, StreamRegistry,
-    SessionEpochManager,
+    AEGFGovernor, AEGFMetadata, AgentCredential, AgentIdentity, AttestationType,
+    CapabilityIssuanceAuthority, CapabilitySigningKey, CapabilityTransparencyLog,
+    CapabilityVerificationAuthority, DeadMansSwitch, DelegationChainValidator, GovernanceDecision,
+    SessionEpochManager, StreamRegistry, StreamSession, ThresholdAuthorityIssuer, TrustAnchor,
+    TrustMeshFederation, TrustStore,
 };
 
 fn make_pair(iss: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationAuthority) {
@@ -29,18 +24,35 @@ fn make_pair(iss: &str) -> (CapabilityIssuanceAuthority, CapabilityVerificationA
     (cia, cva)
 }
 
-fn issue_token(cia: &CapabilityIssuanceAuthority, sub: &str, actions: &[&str], jti: &str) -> saacp::SignedCapabilityToken {
+fn issue_token(
+    cia: &CapabilityIssuanceAuthority,
+    sub: &str,
+    actions: &[&str],
+    jti: &str,
+) -> saacp::SignedCapabilityToken {
     let mut claims = Map::new();
     claims.insert("kid".into(), Value::String(cia.kid().to_string()));
     claims.insert("iss".into(), Value::String(cia.issuer_id().to_string()));
     claims.insert("sub".into(), Value::String(sub.to_string()));
     claims.insert("jti".into(), Value::String(jti.to_string()));
     claims.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("exp".into(), Value::Number(serde_json::Number::from(9_999_999_999u64)));
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("actions".into(), Value::Array(
-        actions.iter().map(|a| Value::String(a.to_string())).collect(),
-    ));
+    claims.insert(
+        "exp".into(),
+        Value::Number(serde_json::Number::from(9_999_999_999u64)),
+    );
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
+    claims.insert(
+        "actions".into(),
+        Value::Array(
+            actions
+                .iter()
+                .map(|a| Value::String(a.to_string()))
+                .collect(),
+        ),
+    );
     cia.issue(claims).expect("issue token")
 }
 
@@ -71,14 +83,21 @@ fn test_healthcare_governance_allows_normal_request() {
     let gov = AEGFGovernor::new(None);
     let m = AEGFMetadata::new("agent-doctor", "session-hc", None, None, 60.0, 0, 0);
     let decision = gov.submit_request(&m);
-    assert!(matches!(decision, GovernanceDecision::Allow | GovernanceDecision::Pause));
+    assert!(matches!(
+        decision,
+        GovernanceDecision::Allow | GovernanceDecision::Pause
+    ));
 }
 
 // ─── Scenario 2: Financial Institution Threshold Authorization ────────────────
 
 #[test]
 fn test_financial_2_of_3_threshold() {
-    let auths = vec!["compliance".to_string(), "cto".to_string(), "cfo".to_string()];
+    let auths = vec![
+        "compliance".to_string(),
+        "cto".to_string(),
+        "cfo".to_string(),
+    ];
     let issuer = ThresholdAuthorityIssuer::new(2, auths, 600.0).unwrap();
 
     let req = issuer.create_request(serde_json::json!({
@@ -95,9 +114,13 @@ fn test_financial_2_of_3_threshold() {
     let cia_cto = CapabilityIssuanceAuthority::new(sk_cto);
     let tok_cto = issue_token(&cia_cto, "system", &["approve"], "jti-cto");
 
-    let s1 = issuer.submit_partial_approval(&req, "compliance", &tok_comp).unwrap();
+    let s1 = issuer
+        .submit_partial_approval(&req, "compliance", &tok_comp)
+        .unwrap();
     assert!(!s1.is_ready);
-    let s2 = issuer.submit_partial_approval(&req, "cto", &tok_cto).unwrap();
+    let s2 = issuer
+        .submit_partial_approval(&req, "cto", &tok_cto)
+        .unwrap();
     assert!(s2.is_ready, "2-of-3 must be ready after 2 approvals");
 }
 
@@ -119,8 +142,8 @@ fn test_financial_1_approval_not_enough() {
 
 #[test]
 fn test_trust_mesh_two_orgs_register() {
-    use rand::rngs::OsRng;
     use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     let sk1 = SigningKey::generate(&mut OsRng);
     let vk1 = sk1.verifying_key();
@@ -141,8 +164,8 @@ fn test_trust_mesh_two_orgs_register() {
 
 #[test]
 fn test_trust_mesh_cross_domain_validation() {
-    use rand::rngs::OsRng;
     use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     let sk_issuer = SigningKey::generate(&mut OsRng);
     let vk_issuer = sk_issuer.verifying_key();
@@ -151,7 +174,15 @@ fn test_trust_mesh_cross_domain_validation() {
     let mesh = TrustMeshFederation::new();
     mesh.register_member("org-X", &anchor);
 
-    let identity = AgentIdentity::generate("agent-cross", "org-Y-iss", 3600, None, None, "", AttestationType::None);
+    let identity = AgentIdentity::generate(
+        "agent-cross",
+        "org-Y-iss",
+        3600,
+        None,
+        None,
+        "",
+        AttestationType::None,
+    );
     let cred = AgentCredential::issue(&identity, &sk_issuer, &vk_issuer);
 
     let store = TrustStore::new();
@@ -168,7 +199,11 @@ fn test_delegation_chain_single_hop() {
     let (cia, cva) = make_pair("root-iss");
     let tok = issue_token(&cia, "agent-delegated", &["read"], "jti-chain-1");
     let result = DelegationChainValidator::validate_chain(&[tok], &cva);
-    assert!(result.valid, "Single-hop delegation must be valid: {:?}", result.violations);
+    assert!(
+        result.valid,
+        "Single-hop delegation must be valid: {:?}",
+        result.violations
+    );
 }
 
 #[test]
@@ -179,7 +214,18 @@ fn test_capability_log_multi_agent_events() {
     for i in 0..5u32 {
         let sub = format!("agent-{}", i);
         let jti = format!("jti-{}", i);
-        log.append("ISSUED", cia.issuer_id(), Some(jti.as_str()), Some(cia.kid()), &sub, &[], &["read"], 0, None, None);
+        log.append(
+            "ISSUED",
+            cia.issuer_id(),
+            Some(jti.as_str()),
+            Some(cia.kid()),
+            &sub,
+            &[],
+            &["read"],
+            0,
+            None,
+            None,
+        );
     }
     assert_eq!(log.count(), 5);
     assert!(log.verify_chain_integrity());
@@ -193,7 +239,9 @@ fn test_session_epoch_multi_agent() {
     for i in 0..5u8 {
         let mut sid = [0u8; 16];
         sid[0] = i;
-        manager.create_session(sid, [0xAAu8; 32], 10_000, 600.0, None).unwrap();
+        manager
+            .create_session(sid, [0xAAu8; 32], 10_000, 600.0, None)
+            .unwrap();
     }
     assert_eq!(manager.session_count(), 5);
 }
@@ -201,8 +249,12 @@ fn test_session_epoch_multi_agent() {
 #[test]
 fn test_session_epoch_destruction() {
     let manager = Arc::new(SessionEpochManager::new());
-    manager.create_session([0x01u8; 16], [0xAAu8; 32], 1000, 60.0, None).unwrap();
-    manager.create_session([0x02u8; 16], [0xBBu8; 32], 1000, 60.0, None).unwrap();
+    manager
+        .create_session([0x01u8; 16], [0xAAu8; 32], 1000, 60.0, None)
+        .unwrap();
+    manager
+        .create_session([0x02u8; 16], [0xBBu8; 32], 1000, 60.0, None)
+        .unwrap();
 
     let recovery = saacp::PSKCompromiseRecovery::new(manager.clone(), None);
     let report = recovery.execute(None);
@@ -266,7 +318,16 @@ fn test_token_revocation_cascade() {
     // Revoke the signing key — all tokens become invalid
     cva.revoke_trusted_key(cia.kid());
 
-    assert!(cva.verify(&tok1).is_err(), "tok1 must fail after key revocation");
-    assert!(cva.verify(&tok2).is_err(), "tok2 must fail after key revocation");
-    assert!(cva.verify(&tok3).is_err(), "tok3 must fail after key revocation");
+    assert!(
+        cva.verify(&tok1).is_err(),
+        "tok1 must fail after key revocation"
+    );
+    assert!(
+        cva.verify(&tok2).is_err(),
+        "tok2 must fail after key revocation"
+    );
+    assert!(
+        cva.verify(&tok3).is_err(),
+        "tok3 must fail after key revocation"
+    );
 }

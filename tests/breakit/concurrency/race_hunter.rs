@@ -57,18 +57,17 @@ use std::thread;
 use std::time::Duration;
 
 use saacp::{
-    StreamRegistry, StreamSession,
-    ZeroTrustGateway,
-    AEGFMetadata, AEGFGovernor, AEGFPolicy, RID_ROOT, CID_NONE,
+    AEGFGovernor, AEGFMetadata, AEGFPolicy, StreamRegistry, StreamSession, ZeroTrustGateway,
+    CID_NONE, RID_ROOT,
 };
 
 // ─── Race B: Token revocation vs validation race ──────────────────────────────
 
 /// Build a minimal HMAC-PSK token wire bytes for ZeroTrustGateway testing.
 fn build_hmac_token(secret: &[u8], target: &str, iat: f64) -> Vec<u8> {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use base64::Engine;
 
     // "allow" required by scope check; "exp" must be u64 (parsed via as_u64())
     let iat_u64 = iat as u64;
@@ -96,7 +95,9 @@ fn build_hmac_token(secret: &[u8], target: &str, iat: f64) -> Vec<u8> {
     wire.extend_from_slice(&json_bytes);
     wire.extend_from_slice(&sig);
 
-    base64::engine::general_purpose::STANDARD.encode(&wire).into_bytes()
+    base64::engine::general_purpose::STANDARD
+        .encode(&wire)
+        .into_bytes()
 }
 
 /// Race B: 200 threads validate a token while 1 thread revokes it.
@@ -139,7 +140,8 @@ fn race_b_token_revocation_cache_toctou() {
         let tok = token_wire.clone();
         let secret_bytes = *secret;
         handles.push(thread::spawn(move || {
-            gw.validate_lateral_movement(target, &tok, &secret_bytes).is_ok()
+            gw.validate_lateral_movement(target, &tok, &secret_bytes)
+                .is_ok()
         }));
     }
 
@@ -166,7 +168,8 @@ fn race_b_token_revocation_cache_toctou() {
          cached valid entries when revoke_token() is called. Cache entries remain valid \
          for up to TOKEN_CACHE_TTL (30s) after revocation. This means a revoked token \
          may be accepted by up to {} concurrent validation threads that have \
-         a cached result.", total
+         a cached result.",
+        total
     );
 }
 
@@ -213,7 +216,11 @@ fn race_c_aegf_graph_cap_overflow() {
         };
         let _ = governor_clone.submit_request(&meta);
     }
-    assert_eq!(governor.deg().node_count(), 9, "sanity: graph must be filled to cap-1");
+    assert_eq!(
+        governor.deg().node_count(),
+        9,
+        "sanity: graph must be filled to cap-1"
+    );
 
     // Now race 16 threads to add one more node each
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -242,8 +249,12 @@ fn race_c_aegf_graph_cap_overflow() {
         }));
     }
 
-    let decisions: Vec<GovernanceDecision> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let allowed = decisions.iter().filter(|&&d| d == GovernanceDecision::Allow).count();
+    let decisions: Vec<GovernanceDecision> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let allowed = decisions
+        .iter()
+        .filter(|&&d| d == GovernanceDecision::Allow)
+        .count();
     let final_count = governor.deg().node_count();
 
     eprintln!(
@@ -257,7 +268,8 @@ fn race_c_aegf_graph_cap_overflow() {
         "RACE-C REGRESSED: graph exceeded max_graph_nodes ({}) — final node_count={}. \
          The cap check in validate_and_add() must be re-checked atomically under the same \
          lock that performs the insert (src/aegf.rs).",
-        MAX_GRAPH_NODES, final_count
+        MAX_GRAPH_NODES,
+        final_count
     );
     assert_eq!(
         allowed, 1,
@@ -265,7 +277,10 @@ fn race_c_aegf_graph_cap_overflow() {
          remaining cap slot, got {}.",
         THREADS, allowed
     );
-    eprintln!("[RACE-C FIXED] Cap enforcement held under concurrent load: exactly 1/{} accepted.", THREADS);
+    eprintln!(
+        "[RACE-C FIXED] Cap enforcement held under concurrent load: exactly 1/{} accepted.",
+        THREADS
+    );
 }
 
 // ─── Race E: AEGF repeated-path threshold enforcement (CRIT-7) ────────────────
@@ -339,9 +354,16 @@ fn race_e_aegf_repeated_path_toctou() {
         }));
     }
 
-    let decisions: Vec<GovernanceDecision> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let allowed = decisions.iter().filter(|&&d| d == GovernanceDecision::Allow).count();
-    let reviewed = decisions.iter().filter(|&&d| d == GovernanceDecision::Review).count();
+    let decisions: Vec<GovernanceDecision> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let allowed = decisions
+        .iter()
+        .filter(|&&d| d == GovernanceDecision::Allow)
+        .count();
+    let reviewed = decisions
+        .iter()
+        .filter(|&&d| d == GovernanceDecision::Review)
+        .count();
 
     eprintln!(
         "[RACE-E] AEGF repeated-path race: {} threads competed on one edge, {} got Allow, \
@@ -355,7 +377,9 @@ fn race_e_aegf_repeated_path_toctou() {
          concurrent load — {} of {} racing threads got Allow on the same edge. \
          The repeated-path check in validate_and_add() must be performed under the \
          SAME continuous lock hold as the insert (src/aegf.rs).",
-        REPEATED_PATH_THRESHOLD, allowed, THREADS
+        REPEATED_PATH_THRESHOLD,
+        allowed,
+        THREADS
     );
     assert_eq!(
         allowed + reviewed,
@@ -389,11 +413,7 @@ fn race_d_stream_registry_concurrent_ops() {
         handles.push(thread::spawn(move || {
             for i in 0..OPS_PER_THREAD {
                 let stream_id = format!("stream-{}-{}", t, i);
-                let session = StreamSession::new(
-                    stream_id.clone(),
-                    format!("agent-{}", t),
-                    100,
-                );
+                let session = StreamSession::new(stream_id.clone(), format!("agent-{}", t), 100);
                 let _ = reg.register(session);
 
                 // Immediately close — race with other threads
@@ -416,8 +436,10 @@ fn race_d_stream_registry_concurrent_ops() {
         final_count
     );
 
-    eprintln!("[RACE-D] StreamRegistry: {} threads × {} ops each. Final active_count = {} (expected 0).",
-        THREADS, OPS_PER_THREAD, final_count);
+    eprintln!(
+        "[RACE-D] StreamRegistry: {} threads × {} ops each. Final active_count = {} (expected 0).",
+        THREADS, OPS_PER_THREAD, final_count
+    );
 }
 
 /// Verify consistent lock ordering doesn't deadlock under maximum concurrency.
@@ -449,8 +471,10 @@ fn race_d_no_deadlock_under_concurrent_register_close() {
         // We can't use join with timeout in stable Rust, so just join and check wall time
         h.join().unwrap();
         if start.elapsed() > timeout {
-            panic!("DEADLOCK DETECTED: concurrent register/close operations exceeded 5s timeout. \
-                    Lock ordering is inconsistent.");
+            panic!(
+                "DEADLOCK DETECTED: concurrent register/close operations exceeded 5s timeout. \
+                    Lock ordering is inconsistent."
+            );
         }
     }
 
@@ -463,7 +487,9 @@ fn race_d_no_deadlock_under_concurrent_register_close() {
     eprintln!(
         "[RACE-D] Deadlock regression test: {} threads × {} iters completed in {:.2}s. \
          No deadlock. Previous ABBA report was incorrect — lock order IS consistent.",
-        THREADS, ITERS, start.elapsed().as_secs_f64()
+        THREADS,
+        ITERS,
+        start.elapsed().as_secs_f64()
     );
 }
 

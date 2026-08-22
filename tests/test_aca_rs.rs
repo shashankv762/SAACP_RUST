@@ -27,7 +27,10 @@ use saacp::gateway::ZeroTrustGateway;
 use saacp::{SAACPBytecodes, SAACPProtocolHandler};
 
 fn now_u64() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Hand-rolled HMAC-PSK capability token wire builder — matches
@@ -72,7 +75,9 @@ fn build_frame(session: [u8; 16], secret: &[u8], payload: &[u8], action_class: u
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    frame.encode_encrypted(payload, secret).expect("encode_encrypted must succeed")
+    frame
+        .encode_encrypted(payload, secret)
+        .expect("encode_encrypted must succeed")
 }
 
 /// Drive one IRREVERSIBLE-class (`action_class = 0x02`), fully-authorized
@@ -81,18 +86,33 @@ fn build_frame(session: [u8; 16], secret: &[u8], payload: &[u8], action_class: u
 /// DEG is a process-wide singleton keyed by a hash of `(session_uuid,
 /// sequence_id)` — reusing the same session/sequence pair across independent
 /// test calls collides with an already-registered DEG node from a prior call.
-fn drive_irreversible_packet(secret: &[u8], gw: &ZeroTrustGateway, issuer: &str, target: &str, session_byte: u8) -> Result<saacp::ParsedPacket, saacp::SAACPHardDrop> {
+fn drive_irreversible_packet(
+    secret: &[u8],
+    gw: &ZeroTrustGateway,
+    issuer: &str,
+    target: &str,
+    session_byte: u8,
+) -> Result<saacp::ParsedPacket, saacp::SAACPHardDrop> {
     let session = [session_byte; 16];
     let token_b64 = build_token(secret, issuer, target, 0x02);
     let clean_payload = serde_json::json!({
         "task": "archive the quarterly ledger",
         "priority": 1,
         "_capability_token": token_b64,
-    }).to_string();
+    })
+    .to_string();
     let frame = build_frame(session, secret, clean_payload.as_bytes(), 0x02);
 
     SAACPProtocolHandler::intercept_packet_full(
-        &frame, secret, target, false, Some(gw), None, None, None, None,
+        &frame,
+        secret,
+        target,
+        false,
+        Some(gw),
+        None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -102,11 +122,21 @@ fn aca_disabled_by_default_irreversible_packet_passes_without_attestation() {
     aca::set_required(false);
     let secret = [0xACu8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("aca-e2e-orchestrator-1", &secret).unwrap();
+    gw.register_issuer_key("aca-e2e-orchestrator-1", &secret)
+        .unwrap();
 
-    let result = drive_irreversible_packet(&secret, &gw, "aca-e2e-orchestrator-1", "aca-e2e-worker-1", 0xA1);
-    assert!(result.is_ok(), "with ACA not required, an IRREVERSIBLE packet from a never-attested \
-        agent must still pass the real pipeline: {result:?}");
+    let result = drive_irreversible_packet(
+        &secret,
+        &gw,
+        "aca-e2e-orchestrator-1",
+        "aca-e2e-worker-1",
+        0xA1,
+    );
+    assert!(
+        result.is_ok(),
+        "with ACA not required, an IRREVERSIBLE packet from a never-attested \
+        agent must still pass the real pipeline: {result:?}"
+    );
 }
 
 #[test]
@@ -117,14 +147,23 @@ fn aca_enabled_rejects_irreversible_packet_from_unattested_agent_through_real_pi
 
     let secret = [0xACu8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("aca-e2e-orchestrator-2", &secret).unwrap();
+    gw.register_issuer_key("aca-e2e-orchestrator-2", &secret)
+        .unwrap();
 
-    let result = drive_irreversible_packet(&secret, &gw, "aca-e2e-orchestrator-2", "aca-e2e-worker-2", 0xA2);
+    let result = drive_irreversible_packet(
+        &secret,
+        &gw,
+        "aca-e2e-orchestrator-2",
+        "aca-e2e-worker-2",
+        0xA2,
+    );
 
     aca::set_required(false);
 
-    let err = result.expect_err("an IRREVERSIBLE packet from a never-attested agent must be \
-        rejected by the real pipeline once ACA is required");
+    let err = result.expect_err(
+        "an IRREVERSIBLE packet from a never-attested agent must be \
+        rejected by the real pipeline once ACA is required",
+    );
     assert_eq!(err.bytecode, SAACPBytecodes::InsufficientAttestation);
 }
 
@@ -133,19 +172,34 @@ fn aca_enabled_rejects_irreversible_packet_from_unattested_agent_through_real_pi
 fn aca_enabled_allows_irreversible_packet_from_sufficiently_attested_agent_through_real_pipeline() {
     let authority = AttestationAuthority::generate();
     AttestationRegistry::global().trust_operator(authority.verifying_key());
-    AttestationRegistry::global().install_claim(
-        authority.issue("aca-e2e-orchestrator-3", SafetyLevel::AlignedModel, "docker: no-network", 3600)
-    ).unwrap();
+    AttestationRegistry::global()
+        .install_claim(authority.issue(
+            "aca-e2e-orchestrator-3",
+            SafetyLevel::AlignedModel,
+            "docker: no-network",
+            3600,
+        ))
+        .unwrap();
     aca::set_required(true);
 
     let secret = [0xACu8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("aca-e2e-orchestrator-3", &secret).unwrap();
+    gw.register_issuer_key("aca-e2e-orchestrator-3", &secret)
+        .unwrap();
 
-    let result = drive_irreversible_packet(&secret, &gw, "aca-e2e-orchestrator-3", "aca-e2e-worker-3", 0xA3);
+    let result = drive_irreversible_packet(
+        &secret,
+        &gw,
+        "aca-e2e-orchestrator-3",
+        "aca-e2e-worker-3",
+        0xA3,
+    );
 
     aca::set_required(false);
 
-    assert!(result.is_ok(), "a sufficiently (AlignedModel-)attested agent's IRREVERSIBLE packet \
-        must pass the real pipeline once ACA is required: {result:?}");
+    assert!(
+        result.is_ok(),
+        "a sufficiently (AlignedModel-)attested agent's IRREVERSIBLE packet \
+        must pass the real pipeline once ACA is required: {result:?}"
+    );
 }

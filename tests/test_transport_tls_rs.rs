@@ -34,7 +34,8 @@ async fn free_port() -> u16 {
 /// fixture, not a CA-chain validation test).
 fn self_signed_tls_pair() -> (Arc<rustls::ServerConfig>, TlsConnector) {
     let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate self-signed cert");
+        generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
     let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
@@ -45,7 +46,9 @@ fn self_signed_tls_pair() -> (Arc<rustls::ServerConfig>, TlsConnector) {
     .expect("build server TLS config");
 
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.add(cert_der).expect("add self-signed cert to client root store");
+    root_store
+        .add(cert_der)
+        .expect("add self-signed cert to client root store");
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let client_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -76,13 +79,17 @@ where
     stream.write_all(&client_msg).await.expect("send handshake");
 
     let mut server_pub_bytes = [0u8; 32];
-    stream.read_exact(&mut server_pub_bytes).await.expect("read server pubkey");
+    stream
+        .read_exact(&mut server_pub_bytes)
+        .await
+        .expect("read server pubkey");
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
     let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
-    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key).expect("HKDF expand");
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .expect("HKDF expand");
     session_key
 }
 
@@ -96,9 +103,14 @@ async fn tls_tunnel_cover_traffic_roundtrip() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let mut tls = connector.connect(server_name, tcp).await.expect("TLS handshake failed");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS handshake failed");
 
     let session_key = tls_client_handshake(&mut tls).await;
 
@@ -121,12 +133,17 @@ async fn tls_tunnel_cover_traffic_roundtrip() {
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    let frame = header.encode_encrypted(b"", &session_key).expect("encode_encrypted");
+    let frame = header
+        .encode_encrypted(b"", &session_key)
+        .expect("encode_encrypted");
     tls.write_all(&frame).await.expect("send frame");
 
     let mut response = [0u8; 7]; // b"SUCCESS" = 7 bytes
     tls.read_exact(&mut response).await.expect("read response");
-    assert_eq!(&response, b"SUCCESS", "cover traffic must ack with WIRE_SUCCESS over the TLS transport");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "cover traffic must ack with WIRE_SUCCESS over the TLS transport"
+    );
 }
 
 /// M-15/R-2 fix: `start_with_shutdown` on `SAACPTlsDaemon` must stop accepting new
@@ -148,5 +165,9 @@ async fn tls_start_with_shutdown_returns_promptly_with_no_connections() {
         .await
         .expect("start_with_shutdown did not return within 10s")
         .expect("daemon task panicked");
-    assert!(result.is_ok(), "start_with_shutdown returned an error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "start_with_shutdown returned an error: {:?}",
+        result
+    );
 }

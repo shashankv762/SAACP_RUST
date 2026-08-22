@@ -32,8 +32,7 @@ use tokio::net::TcpStream;
 
 use saacp::daemon::{client_handshake, ClientIdentityConfig};
 use saacp::{
-    AgentIdentityCertificate, MEASCFrame, SAACPNetworkDaemon, SessionEpochManager,
-    ZeroTrustGateway,
+    AgentIdentityCertificate, MEASCFrame, SAACPNetworkDaemon, SessionEpochManager, ZeroTrustGateway,
 };
 
 async fn free_port() -> u16 {
@@ -43,7 +42,8 @@ async fn free_port() -> u16 {
 
 fn issue_token(secret: &[u8], issuer: &str, allow: &[&str], max_action_class: u8) -> String {
     let gw = ZeroTrustGateway::new();
-    let token = gw.issue_capability_token(secret, issuer, allow, &[], 60, None, max_action_class, None);
+    let token =
+        gw.issue_capability_token(secret, issuer, allow, &[], 60, None, max_action_class, None);
     String::from_utf8(token).expect("token is valid utf8")
 }
 
@@ -61,13 +61,22 @@ fn build_task_frame(
         "task": task,
         "priority": 1,
         "_capability_token": cap_token_b64,
-    }).to_string();
+    })
+    .to_string();
     let (frame, _psn) = mgr
         .with_epoch_mut(&session_id, eid, |epoch| {
             MEASCFrame::build_frame(
-                epoch, 1, 0x10, 0, 0,
-                payload.as_bytes(), &[0u8; 32], &[0u8; 24], 0,
-            ).expect("build_frame")
+                epoch,
+                1,
+                0x10,
+                0,
+                0,
+                payload.as_bytes(),
+                &[0u8; 32],
+                &[0u8; 24],
+                0,
+            )
+            .expect("build_frame")
         })
         .expect("with_epoch_mut");
     frame
@@ -94,9 +103,18 @@ fn issue_identity(ca_signing_key: &SigningKey, ca_kid: &str, agent_id: &str) -> 
     let agent_signing_key = SigningKey::generate(&mut OsRng);
     let agent_pk_hex = hex::encode(agent_signing_key.verifying_key().as_bytes());
     let cert = AgentIdentityCertificate::issue(
-        agent_id, &agent_pk_hex, ca_signing_key, ca_kid, "root-ca", 86400.0, "ed25519",
+        agent_id,
+        &agent_pk_hex,
+        ca_signing_key,
+        ca_kid,
+        "root-ca",
+        86400.0,
+        "ed25519",
     );
-    IssuedIdentity { cert, agent_signing_key }
+    IssuedIdentity {
+        cert,
+        agent_signing_key,
+    }
 }
 
 #[tokio::test]
@@ -118,10 +136,14 @@ async fn identity_bound_matching_token_accepted() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let cfg = ClientIdentityConfig {
         certificate: identity.cert,
         signing_key: identity.agent_signing_key,
@@ -162,10 +184,14 @@ async fn identity_bound_token_claiming_different_agent_rejected() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let cfg = ClientIdentityConfig {
         certificate: identity.cert,
         signing_key: identity.agent_signing_key,
@@ -205,14 +231,22 @@ async fn identity_bound_untrusted_ca_certificate_rejected() {
     let identity = issue_identity(&untrusted_ca, "ca-untrusted", "agent-gamma");
 
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
-        .with_identity_binding(server_seed, "daemon-main", &[("ca-trusted-01", trusted_ca_vk)])
+        .with_identity_binding(
+            server_seed,
+            "daemon-main",
+            &[("ca-trusted-01", trusted_ca_vk)],
+        )
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let cfg = ClientIdentityConfig {
         certificate: identity.cert,
         signing_key: identity.agent_signing_key,
@@ -221,7 +255,8 @@ async fn identity_bound_untrusted_ca_certificate_rejected() {
     let result = tokio::time::timeout(
         Duration::from_millis(500),
         client_handshake(&mut stream, Some(&cfg)),
-    ).await;
+    )
+    .await;
     match result {
         Ok(handshake_result) => assert!(
             handshake_result.is_err(),
@@ -251,10 +286,14 @@ async fn identity_bound_forged_proof_of_possession_rejected() {
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let cfg = ClientIdentityConfig {
         certificate: identity.cert,
         signing_key: attacker_signing_key, // does NOT match the certificate's public key
@@ -263,7 +302,8 @@ async fn identity_bound_forged_proof_of_possession_rejected() {
     let result = tokio::time::timeout(
         Duration::from_millis(500),
         client_handshake(&mut stream, Some(&cfg)),
-    ).await;
+    )
+    .await;
     match result {
         Ok(handshake_result) => assert!(
             handshake_result.is_err(),
@@ -284,19 +324,29 @@ async fn non_identity_bound_connection_unaffected() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let (session_key, session_id) = client_handshake(&mut stream, None)
         .await
         .expect("unauthenticated handshake must still work");
-    assert!(session_id.is_none(), "non-identity-bound handshake must not produce a session_id");
+    assert!(
+        session_id.is_none(),
+        "non-identity-bound handshake must not produce a session_id"
+    );
 
     let token = issue_token(&mesh_secret, "client-agent", &["unknown"], 0);
     let frame = build_task_frame(*session_key, [0xEEu8; 16], "business as usual", &token);
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS", "non-identity-bound connections must be entirely unaffected");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "non-identity-bound connections must be entirely unaffected"
+    );
 }

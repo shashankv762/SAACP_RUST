@@ -12,14 +12,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 
 use saacp::faitf::{
     AgentIdentity, AttestationType, DistributedRevocationInfrastructure, TrustAnchor, TrustStore,
 };
-use saacp::gossip::{GossipEngine, GossipEnvelope, GossipTransport};
 use saacp::framing::MEASCFrame as StructuralFrame;
+use saacp::gossip::{GossipEngine, GossipEnvelope, GossipTransport};
 use saacp::{SAACPNetworkDaemon, ZeroTrustGateway};
 
 async fn free_port() -> u16 {
@@ -45,13 +45,17 @@ async fn tcp_client_handshake(stream: &mut TcpStream) -> [u8; 32] {
     stream.write_all(&client_msg).await.expect("send handshake");
 
     let mut server_pub_bytes = [0u8; 32];
-    stream.read_exact(&mut server_pub_bytes).await.expect("read server pubkey");
+    stream
+        .read_exact(&mut server_pub_bytes)
+        .await
+        .expect("read server pubkey");
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
     let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
-    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key).expect("HKDF expand");
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .expect("HKDF expand");
     session_key
 }
 
@@ -69,7 +73,9 @@ async fn read_response(stream: &mut TcpStream, max_len: usize) -> Vec<u8> {
 /// `receive` path storing the revocation, not further re-forwarding.
 struct NoopTransport;
 impl GossipTransport for NoopTransport {
-    fn known_peers(&self) -> Vec<String> { Vec::new() }
+    fn known_peers(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn send_to_peer(&self, _peer_id: &str, _bytes: &[u8]) {}
 }
 
@@ -81,7 +87,13 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
     // Build a validly-signed revocation record from a "peer node"'s identity, verifiable
     // against a TrustStore anchor this daemon's GossipEngine is configured with.
     let revoker = AgentIdentity::generate(
-        "peer-revoker", "issuer-gossip-daemon-test", 86_400, None, None, "", AttestationType::None,
+        "peer-revoker",
+        "issuer-gossip-daemon-test",
+        86_400,
+        None,
+        None,
+        "",
+        AttestationType::None,
     );
     let record = DistributedRevocationInfrastructure::new()
         .revoke("victim-agent", "compromised", &revoker, "fp-victim")
@@ -101,10 +113,14 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", port, Some(mesh_secret.to_vec()))
         .with_gateway(Arc::new(ZeroTrustGateway::new()))
         .with_gossip_engine(engine);
-    tokio::spawn(async move { let _ = daemon.start().await; });
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     // The ECDH handshake still runs as a protocol formality, but its derived session_key is
     // discarded below: with `.with_gateway(...)` configured WITHOUT `.with_encrypted_transport(...)`,
     // `daemon::handle_client` decrypts Gate 0's structural frame using `gate_secret`
@@ -117,7 +133,16 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
     // Structural, not measc-epoch — matches the `.with_gateway` (no `.with_encrypted_transport`)
     // combination's Gate 0, exactly as `test_telemetry_wiring_rs.rs::build_frame` does.
     let gw = ZeroTrustGateway::new();
-    let token = gw.issue_capability_token(&mesh_secret, "peer-daemon-agent", &["unknown"], &[], 60, None, 0, None);
+    let token = gw.issue_capability_token(
+        &mesh_secret,
+        "peer-daemon-agent",
+        &["unknown"],
+        &[],
+        60,
+        None,
+        0,
+        None,
+    );
     let token_b64 = String::from_utf8(token).expect("token utf8");
 
     let gossip_record_b64 = B64.encode(record.to_wire());
@@ -127,7 +152,8 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
         "origin_id": "remote-peer-node",
         "revocation_id": revocation_id,
         "_capability_token": token_b64,
-    }).to_string();
+    })
+    .to_string();
 
     let frame = StructuralFrame {
         schema_id: 11,
@@ -141,11 +167,16 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
         context_ref_id: [0u8; 32],
         context_version: 0,
         w3c_traceparent: [0u8; 24],
-    }.encode_encrypted(payload.as_bytes(), &mesh_secret).expect("encode_encrypted");
+    }
+    .encode_encrypted(payload.as_bytes(), &mesh_secret)
+    .expect("encode_encrypted");
 
     stream.write_all(&frame).await.expect("send frame");
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS", "a well-formed gossip envelope must clear the gate pipeline");
+    assert_eq!(
+        &response, b"SUCCESS",
+        "a well-formed gossip envelope must clear the gate pipeline"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(

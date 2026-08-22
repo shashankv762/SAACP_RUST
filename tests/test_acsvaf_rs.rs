@@ -3,11 +3,11 @@
 //! Ports Python: tests/test_acsvaf.py, tests/test_acsvaf_tokens.py
 //! Ed25519 key gen, issuance, verification, expiry, revocation, delegation.
 
-use serde_json::{Map, Value};
 use saacp::{
-    CapabilitySigningKey, CapabilityIssuanceAuthority, CapabilityVerificationAuthority,
+    CapabilityIssuanceAuthority, CapabilitySigningKey, CapabilityVerificationAuthority,
     ACSVAF_MAX_DELEGATION_DEPTH,
 };
+use serde_json::{Map, Value};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -21,19 +21,39 @@ fn make_pair(issuer_id: &str) -> (CapabilityIssuanceAuthority, CapabilityVerific
     (cia, cva)
 }
 
-fn make_claims(cia: &CapabilityIssuanceAuthority, sub: &str, actions: &[&str], exp: u64) -> Map<String, Value> {
+fn make_claims(
+    cia: &CapabilityIssuanceAuthority,
+    sub: &str,
+    actions: &[&str],
+    exp: u64,
+) -> Map<String, Value> {
     let mut claims = Map::new();
     claims.insert("kid".into(), Value::String(cia.kid().to_string()));
     claims.insert("iss".into(), Value::String(cia.issuer_id().to_string()));
     claims.insert("sub".into(), Value::String(sub.to_string()));
-    claims.insert("jti".into(), Value::String(uuid::Uuid::new_v4().to_string()));
+    claims.insert(
+        "jti".into(),
+        Value::String(uuid::Uuid::new_v4().to_string()),
+    );
     claims.insert("nbf".into(), Value::Number(serde_json::Number::from(0u64)));
     claims.insert("exp".into(), Value::Number(serde_json::Number::from(exp)));
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(0u64)));
-    claims.insert("actions".into(), Value::Array(
-        actions.iter().map(|a| Value::String(a.to_string())).collect(),
-    ));
-    claims.insert("audience".into(), Value::Array(vec![Value::String("agent-*".to_string())]));
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(0u64)),
+    );
+    claims.insert(
+        "actions".into(),
+        Value::Array(
+            actions
+                .iter()
+                .map(|a| Value::String(a.to_string()))
+                .collect(),
+        ),
+    );
+    claims.insert(
+        "audience".into(),
+        Value::Array(vec![Value::String("agent-*".to_string())]),
+    );
     claims
 }
 
@@ -170,7 +190,10 @@ fn test_nbf_in_future_rejected() {
     let (cia, cva) = make_pair("iss-11");
     let mut claims = make_claims(&cia, "agent-k", &["read"], 9_999_999_999);
     // nbf far in the future
-    claims.insert("nbf".into(), Value::Number(serde_json::Number::from(9_999_999_000u64)));
+    claims.insert(
+        "nbf".into(),
+        Value::Number(serde_json::Number::from(9_999_999_000u64)),
+    );
     let tok = cia.issue(claims).unwrap();
     let res = cva.verify(&tok);
     assert!(res.is_err(), "Token with future nbf must be rejected");
@@ -321,7 +344,10 @@ fn test_delegation_depth_at_max_allowed() {
     // delegation_depth = 3 is the max allowed per spec §5.7
     let (cia, cva) = make_pair("iss-del-1");
     let mut claims = make_claims(&cia, "agent-del", &["read"], 9_999_999_999);
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(ACSVAF_MAX_DELEGATION_DEPTH)));
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(ACSVAF_MAX_DELEGATION_DEPTH)),
+    );
     let tok = cia.issue(claims).unwrap();
     // depth = 3 (max) must be accepted
     assert!(cva.verify(&tok).is_ok());
@@ -332,7 +358,10 @@ fn test_delegation_depth_above_max_rejected() {
     // delegation_depth = 4 > MAX (3) must be rejected per spec §5.7
     let (cia, cva) = make_pair("iss-del-2");
     let mut claims = make_claims(&cia, "agent-del2", &["read"], 9_999_999_999);
-    claims.insert("delegation_depth".into(), Value::Number(serde_json::Number::from(ACSVAF_MAX_DELEGATION_DEPTH + 1)));
+    claims.insert(
+        "delegation_depth".into(),
+        Value::Number(serde_json::Number::from(ACSVAF_MAX_DELEGATION_DEPTH + 1)),
+    );
     let tok = cia.issue(claims).unwrap();
     // depth = 4 exceeds max (3), verify must reject
     assert!(cva.verify(&tok).is_err());
@@ -365,9 +394,7 @@ fn test_to_wire_is_base64() {
     let wire = tok.to_wire();
     // Base64 alphabet — should decode without error
     let s = String::from_utf8(wire).unwrap();
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, &s
-    );
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &s);
     assert!(decoded.is_ok());
 }
 

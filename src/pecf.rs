@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -23,8 +23,7 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 // ---------------------------------------------------------------------------
 
 /// Controls how much detail escapes to the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeploymentProfile {
     /// Full internal detail returned; timing equalisation disabled.
     Development,
@@ -44,7 +43,6 @@ impl DeploymentProfile {
         }
     }
 }
-
 
 /// Backing state for the global active profile: the profile itself plus
 /// whether it was ever set programmatically via `set_active_profile`.
@@ -79,8 +77,8 @@ pub const ENV_DEPLOYMENT_PROFILE: &str = "SAACP_DEPLOYMENT_PROFILE";
 fn profile_from_env() -> DeploymentProfile {
     match std::env::var(ENV_DEPLOYMENT_PROFILE).as_deref() {
         Ok("DEVELOPMENT") => DeploymentProfile::Development,
-        Ok("STAGING")     => DeploymentProfile::Staging,
-        _                 => DeploymentProfile::Production,
+        Ok("STAGING") => DeploymentProfile::Staging,
+        _ => DeploymentProfile::Production,
     }
 }
 
@@ -413,7 +411,10 @@ impl SdlEntry {
         vec![
             ("correlation_id".into(), self.correlation_id.clone()),
             ("timestamp".into(), format!("{}", self.timestamp)),
-            ("internal_bytecode".into(), format!("0x{:02X}", self.internal_bytecode)),
+            (
+                "internal_bytecode".into(),
+                format!("0x{:02X}", self.internal_bytecode),
+            ),
             ("internal_message".into(), self.internal_message.clone()),
             ("validation_stage".into(), self.validation_stage.clone()),
             ("external_code".into(), self.external_code.name().into()),
@@ -436,7 +437,8 @@ impl SdlEntry {
     /// `serde_json::Value` instead, whose `Display`/`to_string()` escaping is
     /// complete and spec-compliant.
     pub fn to_json(&self) -> String {
-        let map: serde_json::Map<String, serde_json::Value> = self.to_map()
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .to_map()
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
@@ -479,7 +481,11 @@ impl SecureDiagnosticLedger {
     pub fn query(&self, correlation_id: Option<&str>, limit: usize) -> Vec<SdlEntry> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let filtered: Vec<SdlEntry> = if let Some(cid) = correlation_id {
-            entries.iter().filter(|e| e.correlation_id == cid).cloned().collect()
+            entries
+                .iter()
+                .filter(|e| e.correlation_id == cid)
+                .cloned()
+                .collect()
         } else {
             entries.iter().cloned().collect()
         };
@@ -489,7 +495,10 @@ impl SecureDiagnosticLedger {
 
     /// Wipe the ledger (used in tests).
     pub fn clear(&self) {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Return the current number of entries.
@@ -573,7 +582,8 @@ impl SREL {
         // The internal generator always produces 32 chars; this assert catches
         // any caller passing a wrong-length string.
         debug_assert_eq!(
-            correlation_id.len(), 32,
+            correlation_id.len(),
+            32,
             "PECF correlation_id must be exactly 32 hex chars, got {}",
             correlation_id.len()
         );
@@ -605,7 +615,11 @@ pub struct ExternalResponse {
 impl ExternalResponse {
     /// Create a new ExternalResponse.
     pub fn new(code: ExternalCode, correlation_id: String, detail: Option<String>) -> Self {
-        Self { code, correlation_id, detail }
+        Self {
+            code,
+            correlation_id,
+            detail,
+        }
     }
 
     /// Serialise for network transmission.
@@ -650,14 +664,8 @@ fn hash_bytes(value: &[u8]) -> String {
 /// for SDL records. This detail never crosses the wire.
 fn infer_stage(bytecode: u8) -> &'static str {
     use SAACPBytecodes as B;
-    let framing_codes: &[u8] = &[
-        B::MalformedHeader as u8,
-        B::PayloadTooLarge as u8,
-    ];
-    let schema_codes: &[u8] = &[
-        B::SchemaMismatch as u8,
-        B::AmbiguousIntent as u8,
-    ];
+    let framing_codes: &[u8] = &[B::MalformedHeader as u8, B::PayloadTooLarge as u8];
+    let schema_codes: &[u8] = &[B::SchemaMismatch as u8, B::AmbiguousIntent as u8];
     let auth_codes: &[u8] = &[
         B::InvalidSignature as u8,
         B::TokenExpired as u8,
@@ -666,14 +674,8 @@ fn infer_stage(bytecode: u8) -> &'static str {
         B::DelegationRejected as u8,
         B::ActionClassEscalation as u8,
     ];
-    let replay_codes: &[u8] = &[
-        B::CircuitBreakerOpen as u8,
-        B::TemporalTimeout as u8,
-    ];
-    let memory_codes: &[u8] = &[
-        B::StateExpiredOrStale as u8,
-        B::StateSyncRequired as u8,
-    ];
+    let replay_codes: &[u8] = &[B::CircuitBreakerOpen as u8, B::TemporalTimeout as u8];
+    let memory_codes: &[u8] = &[B::StateExpiredOrStale as u8, B::StateSyncRequired as u8];
 
     if framing_codes.contains(&bytecode) {
         "framing"
@@ -816,18 +818,51 @@ mod tests {
 
     #[test]
     fn test_internal_to_external_mapping() {
-        assert_eq!(internal_to_external(SAACPBytecodes::MalformedHeader), ExternalCode::RequestRejected);
-        assert_eq!(internal_to_external(SAACPBytecodes::SchemaMismatch), ExternalCode::RequestRejected);
-        assert_eq!(internal_to_external(SAACPBytecodes::InvalidSignature), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external(SAACPBytecodes::TokenExpired), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external(SAACPBytecodes::EpistemicUncertainty), ExternalCode::SessionTerminated);
-        assert_eq!(internal_to_external(SAACPBytecodes::BudgetExceeded), ExternalCode::SessionTerminated);
-        assert_eq!(internal_to_external(SAACPBytecodes::CircuitBreakerOpen), ExternalCode::RateLimited);
-        assert_eq!(internal_to_external(SAACPBytecodes::StateExpiredOrStale), ExternalCode::ServiceUnavailable);
-        assert_eq!(internal_to_external(SAACPBytecodes::StreamAbort), ExternalCode::SessionTerminated);
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::MalformedHeader),
+            ExternalCode::RequestRejected
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::SchemaMismatch),
+            ExternalCode::RequestRejected
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::InvalidSignature),
+            ExternalCode::AccessDenied
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::TokenExpired),
+            ExternalCode::AccessDenied
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::EpistemicUncertainty),
+            ExternalCode::SessionTerminated
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::BudgetExceeded),
+            ExternalCode::SessionTerminated
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::CircuitBreakerOpen),
+            ExternalCode::RateLimited
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::StateExpiredOrStale),
+            ExternalCode::ServiceUnavailable
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::StreamAbort),
+            ExternalCode::SessionTerminated
+        );
         // Unmapped code → InternalFailure
-        assert_eq!(internal_to_external(SAACPBytecodes::Success), ExternalCode::InternalFailure);
-        assert_eq!(internal_to_external(SAACPBytecodes::HeartbeatPing), ExternalCode::InternalFailure);
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::Success),
+            ExternalCode::InternalFailure
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::HeartbeatPing),
+            ExternalCode::InternalFailure
+        );
     }
 
     /// CRIT-11 regression: 0x41-0x43 must resolve to their intended external
@@ -847,16 +882,28 @@ mod tests {
             ExternalCode::SessionTerminated
         );
 
-        assert_eq!(internal_to_external_raw(0x41), ExternalCode::ServiceUnavailable);
+        assert_eq!(
+            internal_to_external_raw(0x41),
+            ExternalCode::ServiceUnavailable
+        );
         assert_eq!(internal_to_external_raw(0x42), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external_raw(0x43), ExternalCode::SessionTerminated);
+        assert_eq!(
+            internal_to_external_raw(0x43),
+            ExternalCode::SessionTerminated
+        );
     }
 
     #[test]
     fn test_internal_to_external_raw() {
-        assert_eq!(internal_to_external_raw(0x01), ExternalCode::RequestRejected);
+        assert_eq!(
+            internal_to_external_raw(0x01),
+            ExternalCode::RequestRejected
+        );
         assert_eq!(internal_to_external_raw(0x03), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external_raw(0xFF), ExternalCode::InternalFailure);
+        assert_eq!(
+            internal_to_external_raw(0xFF),
+            ExternalCode::InternalFailure
+        );
     }
 
     /// H-34 regression: every named bytecode from 0x1B through 0x43 must
@@ -881,14 +928,38 @@ mod tests {
     /// H-34 spot checks: representative bytecode from each newly-mapped group.
     #[test]
     fn test_internal_to_external_h34_representative_mappings() {
-        assert_eq!(internal_to_external(SAACPBytecodes::RgcResourceLimitExceeded), ExternalCode::RequestRejected);
-        assert_eq!(internal_to_external(SAACPBytecodes::PsnReplayDetected), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external(SAACPBytecodes::IdentityNotVerified), ExternalCode::AccessDenied);
-        assert_eq!(internal_to_external(SAACPBytecodes::SessionSpliceDetected), ExternalCode::SessionTerminated);
-        assert_eq!(internal_to_external(SAACPBytecodes::SequenceOverflow), ExternalCode::SessionTerminated);
-        assert_eq!(internal_to_external(SAACPBytecodes::RrbcUsageExhausted), ExternalCode::RateLimited);
-        assert_eq!(internal_to_external(SAACPBytecodes::PsnOutOfWindow), ExternalCode::RateLimited);
-        assert_eq!(internal_to_external(SAACPBytecodes::KeyEvolutionRequired), ExternalCode::ServiceUnavailable);
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::RgcResourceLimitExceeded),
+            ExternalCode::RequestRejected
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::PsnReplayDetected),
+            ExternalCode::AccessDenied
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::IdentityNotVerified),
+            ExternalCode::AccessDenied
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::SessionSpliceDetected),
+            ExternalCode::SessionTerminated
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::SequenceOverflow),
+            ExternalCode::SessionTerminated
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::RrbcUsageExhausted),
+            ExternalCode::RateLimited
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::PsnOutOfWindow),
+            ExternalCode::RateLimited
+        );
+        assert_eq!(
+            internal_to_external(SAACPBytecodes::KeyEvolutionRequired),
+            ExternalCode::ServiceUnavailable
+        );
     }
 
     #[test]
@@ -902,7 +973,7 @@ mod tests {
         assert_eq!(resp[0], 0xFE); // PECF marker
         assert_eq!(resp[1], 0x02); // AccessDenied
         assert_eq!(&resp[2..34], corr.as_bytes()); // exactly 32 ASCII hex chars
-        // [34..64]: 30 bytes zero padding
+                                                   // [34..64]: 30 bytes zero padding
         assert!(resp[34..].iter().all(|&b| b == 0));
     }
 
@@ -1021,11 +1092,7 @@ mod tests {
     #[serial]
     fn test_external_response_to_wire_production() {
         set_active_profile(DeploymentProfile::Production);
-        let resp = ExternalResponse::new(
-            ExternalCode::AccessDenied,
-            "a".repeat(32),
-            None,
-        );
+        let resp = ExternalResponse::new(ExternalCode::AccessDenied, "a".repeat(32), None);
         let wire = resp.to_wire();
         assert_eq!(wire.len(), 64);
         assert_eq!(wire[0], 0xFE);
@@ -1051,11 +1118,26 @@ mod tests {
 
     #[test]
     fn test_infer_stage() {
-        assert_eq!(infer_stage(SAACPBytecodes::MalformedHeader as u8), "framing");
-        assert_eq!(infer_stage(SAACPBytecodes::SchemaMismatch as u8), "schema_validation");
-        assert_eq!(infer_stage(SAACPBytecodes::InvalidSignature as u8), "capability_validation");
-        assert_eq!(infer_stage(SAACPBytecodes::CircuitBreakerOpen as u8), "replay_detection");
-        assert_eq!(infer_stage(SAACPBytecodes::StateExpiredOrStale as u8), "memory_access");
+        assert_eq!(
+            infer_stage(SAACPBytecodes::MalformedHeader as u8),
+            "framing"
+        );
+        assert_eq!(
+            infer_stage(SAACPBytecodes::SchemaMismatch as u8),
+            "schema_validation"
+        );
+        assert_eq!(
+            infer_stage(SAACPBytecodes::InvalidSignature as u8),
+            "capability_validation"
+        );
+        assert_eq!(
+            infer_stage(SAACPBytecodes::CircuitBreakerOpen as u8),
+            "replay_detection"
+        );
+        assert_eq!(
+            infer_stage(SAACPBytecodes::StateExpiredOrStale as u8),
+            "memory_access"
+        );
         assert_eq!(infer_stage(0xFF), "internal");
     }
 

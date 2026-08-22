@@ -234,7 +234,9 @@ fn now_secs() -> f64 {
 /// pre-existing `ip:`-prefixed keys `daemon.rs` writes into this same map.
 pub fn trust_key_for(agent_id: &str, session_id_hex: &str) -> String {
     let fingerprint = crate::identity_binding::DEFAULT_IDENTITY_REGISTRY
-        .get_by_session_id(session_id_hex, |session| session.client_public_key_hex.clone())
+        .get_by_session_id(session_id_hex, |session| {
+            session.client_public_key_hex.clone()
+        })
         .filter(|pk_hex| !pk_hex.is_empty())
         .and_then(|pk_hex| hex::decode(&pk_hex).ok())
         .map(|pk_bytes| hex::encode(Sha256::digest(&pk_bytes)));
@@ -459,7 +461,9 @@ impl Default for TrustDecayEngine {
 impl TrustDecayEngine {
     pub fn new() -> Self {
         Self {
-            shards: (0..TRUST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..TRUST_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
             observers: Mutex::new(HashMap::new()),
             next_observer_id: AtomicU64::new(0),
         }
@@ -472,7 +476,9 @@ impl TrustDecayEngine {
     /// process-wide singleton, so one poisoning panic must not cascade into
     /// every other agent's trust-score checks.
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, TrustEntry>> {
-        self.shards[trust_shard_index(key)].lock().unwrap_or_else(|e| e.into_inner())
+        self.shards[trust_shard_index(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Process-wide singleton, matching `AgentRateLimiter::global()` /
@@ -492,7 +498,10 @@ impl TrustDecayEngine {
     /// loop) that subscribed more than once. Returns `None` (no-op, nothing registered)
     /// if already at the cap, rather than evicting an active subscriber a caller may
     /// still be relying on.
-    pub fn subscribe(&self, cb: Arc<dyn Fn(TrustSignal) + Send + Sync>) -> Option<TrustObserverHandle> {
+    pub fn subscribe(
+        &self,
+        cb: Arc<dyn Fn(TrustSignal) + Send + Sync>,
+    ) -> Option<TrustObserverHandle> {
         let mut observers = self.observers.lock().unwrap_or_else(|e| e.into_inner());
         if observers.len() >= TRUST_MAX_OBSERVERS {
             return None;
@@ -505,7 +514,11 @@ impl TrustDecayEngine {
     /// L-25 fix: stop receiving signals for a handle returned by [`Self::subscribe`].
     /// A no-op (returns `false`) if the handle was already unsubscribed.
     pub fn unsubscribe(&self, handle: TrustObserverHandle) -> bool {
-        self.observers.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle.0).is_some()
+        self.observers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle.0)
+            .is_some()
     }
 
     /// M-27 fix: snapshot-clone the observer list (a `Vec<Arc<dyn Fn...>>` —
@@ -523,9 +536,18 @@ impl TrustDecayEngine {
     /// (and had already documented emit's own behavior as matching, before
     /// this fix made that true).
     fn emit(&self, agent_id: &str, score: f64, event: TrustEvent) {
-        let signal = TrustSignal { agent_id: agent_id.to_string(), score, event };
-        let observers: Vec<_> = self.observers.lock().unwrap_or_else(|e| e.into_inner())
-            .values().cloned().collect();
+        let signal = TrustSignal {
+            agent_id: agent_id.to_string(),
+            score,
+            event,
+        };
+        let observers: Vec<_> = self
+            .observers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         for cb in observers.iter() {
             cb(signal.clone());
         }
@@ -536,7 +558,10 @@ impl TrustDecayEngine {
         let mut entries = self.shard(agent_id);
         let now = now_secs();
         match entries.get_mut(agent_id) {
-            Some(e) => { e.recover_to(now); e.score }
+            Some(e) => {
+                e.recover_to(now);
+                e.score
+            }
             None => TRUST_SCORE_INITIAL,
         }
     }
@@ -577,18 +602,22 @@ impl TrustDecayEngine {
                 // signal (nearly/fully recovered, no active penalty) and are
                 // safest to forget first — evict those before anything with
                 // a lower, more diagnostic score.
-                let mut candidates: Vec<(String, f64)> = entries.iter()
+                let mut candidates: Vec<(String, f64)> = entries
+                    .iter()
                     .filter(|(_, e)| e.locked_at.is_none())
                     .map(|(k, e)| (k.clone(), e.score))
                     .collect();
-                candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                candidates
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (k, _) in candidates.into_iter().take(evict_count) {
                     entries.remove(&k);
                 }
             }
         }
 
-        let entry = entries.entry(agent_id.to_string()).or_insert_with(|| TrustEntry::fresh(now));
+        let entry = entries
+            .entry(agent_id.to_string())
+            .or_insert_with(|| TrustEntry::fresh(now));
         entry.recover_to(now);
         let was_downgraded = entry.score < TRUST_DOWNGRADE_THRESHOLD;
 
@@ -663,18 +692,22 @@ impl TrustDecayEngine {
 
             if entries.len() >= TRUST_PER_SHARD_MAX_ENTRIES {
                 let evict_count = entries.len() + 1 - TRUST_PER_SHARD_MAX_ENTRIES;
-                let mut candidates: Vec<(String, f64)> = entries.iter()
+                let mut candidates: Vec<(String, f64)> = entries
+                    .iter()
                     .filter(|(_, e)| e.locked_at.is_none())
                     .map(|(k, e)| (k.clone(), e.score))
                     .collect();
-                candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                candidates
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (k, _) in candidates.into_iter().take(evict_count) {
                     entries.remove(&k);
                 }
             }
         }
 
-        let entry = entries.entry(agent_id.to_string()).or_insert_with(|| TrustEntry::fresh(now));
+        let entry = entries
+            .entry(agent_id.to_string())
+            .or_insert_with(|| TrustEntry::fresh(now));
         entry.recover_to(now);
 
         if !entry.try_consume_reward_slot(now) {
@@ -702,7 +735,11 @@ impl TrustDecayEngine {
         // 1.0 rewarded again) — reward must never *decrease* a score, only
         // ever leave it unchanged or raise it.
         let raw_new_score = entry.score + amount;
-        let cap = if entry.score < TRUST_REWARD_FLOOR { TRUST_REWARD_FLOOR } else { TRUST_REWARD_CEILING };
+        let cap = if entry.score < TRUST_REWARD_FLOOR {
+            TRUST_REWARD_FLOOR
+        } else {
+            TRUST_REWARD_CEILING
+        };
         entry.score = raw_new_score.min(cap).max(entry.score);
 
         let now_downgraded = entry.score < TRUST_DOWNGRADE_THRESHOLD;
@@ -719,7 +756,11 @@ impl TrustDecayEngine {
     /// `Some(0)` (READ_ONLY only) when the agent's score is below
     /// `TRUST_DOWNGRADE_THRESHOLD`; `None` (no cap) otherwise.
     pub fn scope_cap(&self, agent_id: &str) -> Option<u8> {
-        if self.score(agent_id) < TRUST_DOWNGRADE_THRESHOLD { Some(0) } else { None }
+        if self.score(agent_id) < TRUST_DOWNGRADE_THRESHOLD {
+            Some(0)
+        } else {
+            None
+        }
     }
 
     /// True while the agent must be rejected outright (soft reset in effect).
@@ -738,10 +779,14 @@ impl TrustDecayEngine {
     /// hand.
     pub fn requires_reauth_at(&self, agent_id: &str, now: f64) -> bool {
         let mut entries = self.shard(agent_id);
-        let Some(entry) = entries.get_mut(agent_id) else { return false; };
+        let Some(entry) = entries.get_mut(agent_id) else {
+            return false;
+        };
         entry.recover_to(now);
 
-        let Some(locked_at) = entry.locked_at else { return false; };
+        let Some(locked_at) = entry.locked_at else {
+            return false;
+        };
         let cooldown_elapsed = (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
         let score_recovered = entry.score >= TRUST_REAUTH_THRESHOLD;
 
@@ -764,15 +809,24 @@ impl TrustDecayEngine {
     /// `AgentRateLimiter::reset`.
     pub fn reset(&self, agent_id: Option<&str>) {
         match agent_id {
-            Some(id) => { self.shard(id).remove(id); }
-            None => { for shard in &self.shards { shard.lock().unwrap_or_else(|e| e.into_inner()).clear(); } }
+            Some(id) => {
+                self.shard(id).remove(id);
+            }
+            None => {
+                for shard in &self.shards {
+                    shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                }
+            }
         }
     }
 
     /// Number of currently-tracked agents (for the bounded-cardinality
     /// `saacp_trust_agents_tracked` telemetry gauge).
     pub fn tracked_count(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 
     /// opusplan.md 6.5: proactively remove every entry that has gone completely
@@ -837,17 +891,26 @@ impl TrustDecayEngine {
                 e.recover_to(now);
                 let requires_reauth = match e.locked_at {
                     Some(locked_at) => {
-                        let cooldown_elapsed = (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
+                        let cooldown_elapsed =
+                            (now - locked_at) >= TRUST_REAUTH_MIN_COOLDOWN_SECONDS;
                         let score_recovered = e.score >= TRUST_REAUTH_THRESHOLD;
                         !(cooldown_elapsed && score_recovered)
                     }
                     None => false,
                 };
-                AgentTrustSnapshot { agent_id: id.clone(), score: e.score, requires_reauth }
+                AgentTrustSnapshot {
+                    agent_id: id.clone(),
+                    score: e.score,
+                    requires_reauth,
+                }
             }));
         }
 
-        out.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(limit);
         out
     }
@@ -911,7 +974,9 @@ impl Default for IntentDriftTracker {
 
 impl IntentDriftTracker {
     pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Process-wide singleton.
@@ -933,7 +998,8 @@ impl IntentDriftTracker {
 
         if sessions.len() >= DRIFT_MAX_TRACKED_SESSIONS && !sessions.contains_key(session_uuid) {
             let evict_count = sessions.len() + 1 - DRIFT_MAX_TRACKED_SESSIONS;
-            let mut by_age: Vec<(String, f64)> = sessions.iter()
+            let mut by_age: Vec<(String, f64)> = sessions
+                .iter()
                 .map(|(k, v)| (k.clone(), v.last_update))
                 .collect();
             by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -942,8 +1008,12 @@ impl IntentDriftTracker {
             }
         }
 
-        let entry = sessions.entry(session_uuid.to_string())
-            .or_insert(DriftEntry { total: 0.0, last_update: now });
+        let entry = sessions
+            .entry(session_uuid.to_string())
+            .or_insert(DriftEntry {
+                total: 0.0,
+                last_update: now,
+            });
         // (H-30) Decay before accumulating so a burst of hops in quick
         // succession — the pattern this ceiling actually defends against —
         // still accumulates fully (elapsed ~= 0 between hops), while a
@@ -958,13 +1028,18 @@ impl IntentDriftTracker {
     pub fn reset(&self, session_uuid: Option<&str>) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match session_uuid {
-            Some(id) => { sessions.remove(id); }
+            Some(id) => {
+                sessions.remove(id);
+            }
             None => sessions.clear(),
         }
     }
 
     pub fn tracked_count(&self) -> usize {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -1004,7 +1079,10 @@ mod tests {
         // time, it doesn't wait for a "tick." The design invariant under
         // test is "floors at (effectively) zero," not "stays at bit-exact
         // 0.0 forever," which would contradict lazy recovery entirely.
-        assert!(e.score("agent-a") < 1e-6, "score must floor at effectively zero");
+        assert!(
+            e.score("agent-a") < 1e-6,
+            "score must floor at effectively zero"
+        );
     }
 
     #[test]
@@ -1013,7 +1091,11 @@ mod tests {
         // Two ScopeViolations: 1.0 -> 0.75 -> 0.50 (not yet below threshold)
         e.penalize("agent-a", PenaltyKind::ScopeViolation);
         e.penalize("agent-a", PenaltyKind::ScopeViolation);
-        assert_eq!(e.scope_cap("agent-a"), None, "0.50 is not strictly below the 0.50 threshold");
+        assert_eq!(
+            e.scope_cap("agent-a"),
+            None,
+            "0.50 is not strictly below the 0.50 threshold"
+        );
         // One more push below 0.50
         e.penalize("agent-a", PenaltyKind::EpistemicOverclaim);
         assert_eq!(e.scope_cap("agent-a"), Some(0));
@@ -1026,7 +1108,10 @@ mod tests {
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         assert!(e.score("agent-a") < TRUST_REAUTH_THRESHOLD);
-        assert!(e.requires_reauth("agent-a"), "must require reauth immediately after crossing threshold");
+        assert!(
+            e.requires_reauth("agent-a"),
+            "must require reauth immediately after crossing threshold"
+        );
         // Cooldown floor hasn't elapsed yet (real time), so it must still be locked
         // even though the score itself may recover slightly on repeated queries.
         assert!(e.requires_reauth("agent-a"));
@@ -1043,7 +1128,10 @@ mod tests {
         assert!(e.score("agent-a") < TRUST_REAUTH_THRESHOLD);
 
         let now = now_secs();
-        assert!(e.requires_reauth_at("agent-a", now), "a `now` at the current instant must still require reauth");
+        assert!(
+            e.requires_reauth_at("agent-a", now),
+            "a `now` at the current instant must still require reauth"
+        );
         assert!(!e.requires_reauth_at("never-tracked-agent", now));
     }
 
@@ -1079,7 +1167,10 @@ mod tests {
         let sigs = received.lock().unwrap();
         assert!(!sigs.is_empty());
         assert_eq!(sigs[0].agent_id, "agent-a");
-        assert!(matches!(sigs[0].event, TrustEvent::Penalized(PenaltyKind::InjectionAttempt)));
+        assert!(matches!(
+            sigs[0].event,
+            TrustEvent::Penalized(PenaltyKind::InjectionAttempt)
+        ));
     }
 
     /// M-29 regression: `ReauthRequired` must fire exactly ONCE — on the
@@ -1105,7 +1196,10 @@ mod tests {
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
 
         let evs = events.lock().unwrap();
-        let reauth_count = evs.iter().filter(|e| matches!(e, TrustEvent::ReauthRequired)).count();
+        let reauth_count = evs
+            .iter()
+            .filter(|e| matches!(e, TrustEvent::ReauthRequired))
+            .count();
         assert_eq!(
             reauth_count, 1,
             "M-29: ReauthRequired must fire exactly once across repeated \
@@ -1148,7 +1242,10 @@ mod tests {
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
 
         let evs = events.lock().unwrap();
-        let reauth_count = evs.iter().filter(|e| matches!(e, TrustEvent::ReauthRequired)).count();
+        let reauth_count = evs
+            .iter()
+            .filter(|e| matches!(e, TrustEvent::ReauthRequired))
+            .count();
         assert_eq!(
             reauth_count, 1,
             "a second, independent lockout must re-emit ReauthRequired, got {:?}",
@@ -1220,7 +1317,7 @@ mod tests {
         let e = TrustDecayEngine::new();
         e.penalize("agent-low", PenaltyKind::ReplaySuspicion); // 1.0 -> 0.60
         e.penalize("agent-low", PenaltyKind::ReplaySuspicion); // 0.60 -> 0.20
-        e.penalize("agent-mid", PenaltyKind::ScopeViolation);  // 1.0 -> 0.75
+        e.penalize("agent-mid", PenaltyKind::ScopeViolation); // 1.0 -> 0.75
         e.penalize("agent-high", PenaltyKind::GenericHardDrop); // 1.0 -> 0.95
 
         let snap = e.snapshot(10);
@@ -1249,7 +1346,10 @@ mod tests {
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion); // drops below TRUST_REAUTH_THRESHOLD
         let snap = e.snapshot(10);
         let entry = snap.iter().find(|s| s.agent_id == "agent-a").unwrap();
-        assert!(entry.requires_reauth, "just-locked agent should show requires_reauth=true");
+        assert!(
+            entry.requires_reauth,
+            "just-locked agent should show requires_reauth=true"
+        );
     }
 
     #[test]
@@ -1273,7 +1373,10 @@ mod tests {
         for i in 0..(TRUST_MAX_ENTRIES + 500) {
             e.penalize(&format!("bounded-agent-{i}"), PenaltyKind::GenericHardDrop);
         }
-        assert!(e.tracked_count() <= TRUST_MAX_ENTRIES, "map must not grow unbounded past its cap");
+        assert!(
+            e.tracked_count() <= TRUST_MAX_ENTRIES,
+            "map must not grow unbounded past its cap"
+        );
     }
 
     #[test]
@@ -1294,7 +1397,10 @@ mod tests {
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
-        assert!(e.requires_reauth(victim), "victim must be reauth-locked before the flood");
+        assert!(
+            e.requires_reauth(victim),
+            "victim must be reauth-locked before the flood"
+        );
 
         // Flood with enough distinct, freshly-penalized (near-full-trust)
         // agents to blow well past the cap and force repeated eviction
@@ -1328,12 +1434,22 @@ mod tests {
         // other white-box tests already do.
         {
             let mut shard = e.shard("stale-agent");
-            let entry = shard.get_mut("stale-agent").expect("entry must exist after penalize");
+            let entry = shard
+                .get_mut("stale-agent")
+                .expect("entry must exist after penalize");
             entry.last_update = now_secs() - TRUST_ENTRY_STALENESS_SECONDS - 1.0;
         }
 
-        assert_eq!(e.sweep_stale(), 1, "sweep_stale must report exactly one entry removed");
-        assert_eq!(e.tracked_count(), 0, "the stale entry must actually be gone");
+        assert_eq!(
+            e.sweep_stale(),
+            1,
+            "sweep_stale must report exactly one entry removed"
+        );
+        assert_eq!(
+            e.tracked_count(),
+            0,
+            "the stale entry must actually be gone"
+        );
     }
 
     /// A fresh (recently-touched) entry must survive `sweep_stale` untouched —
@@ -1358,7 +1474,10 @@ mod tests {
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
         e.penalize(victim, PenaltyKind::ReplaySuspicion);
-        assert!(e.requires_reauth(victim), "test setup: victim must be reauth-locked");
+        assert!(
+            e.requires_reauth(victim),
+            "test setup: victim must be reauth-locked"
+        );
 
         {
             let mut shard = e.shard(victim);
@@ -1366,7 +1485,11 @@ mod tests {
             entry.last_update = now_secs() - TRUST_ENTRY_STALENESS_SECONDS - 1.0;
         }
 
-        assert_eq!(e.sweep_stale(), 0, "a locked entry must never be counted as swept");
+        assert_eq!(
+            e.sweep_stale(),
+            0,
+            "a locked entry must never be counted as swept"
+        );
         assert!(
             e.requires_reauth(victim),
             "a locked entry must survive sweep_stale even when it has also gone stale"
@@ -1392,10 +1515,16 @@ mod tests {
         let sid = vec![0xE5; 16];
         let client_pk_hex = "aa".repeat(32);
         let session = TranscriptBoundSession::establish(
-            sid, "agent-claim-1", "server-x",
-            &client_pk_hex, &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "agent-claim-1",
+            "server-x",
+            &client_pk_hex,
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let session_id_hex = session.session_id_hex();
         DEFAULT_IDENTITY_REGISTRY.register(session);
@@ -1406,13 +1535,21 @@ mod tests {
         // it's derived from the proven public key, not the bearer claim.
         let key2 = trust_key_for("agent-claim-2-rotated", &session_id_hex);
 
-        DEFAULT_IDENTITY_REGISTRY.remove(&DEFAULT_IDENTITY_REGISTRY
-            .get_by_session_id(&session_id_hex, |s| s.thash.clone())
-            .unwrap());
+        DEFAULT_IDENTITY_REGISTRY.remove(
+            &DEFAULT_IDENTITY_REGISTRY
+                .get_by_session_id(&session_id_hex, |s| s.thash.clone())
+                .unwrap(),
+        );
 
-        assert!(key1.starts_with("pk:"), "expected a pk: fingerprint key, got {key1}");
-        assert_eq!(key1, key2, "rotating the claimed agent_id on a fixed identity-bound \
-            session must not change the trust key");
+        assert!(
+            key1.starts_with("pk:"),
+            "expected a pk: fingerprint key, got {key1}"
+        );
+        assert_eq!(
+            key1, key2,
+            "rotating the claimed agent_id on a fixed identity-bound \
+            session must not change the trust key"
+        );
         assert_ne!(key1, "aid:agent-claim-1");
     }
 
@@ -1422,17 +1559,29 @@ mod tests {
 
         let sid_a = vec![0xE6; 16];
         let session_a = TranscriptBoundSession::establish(
-            sid_a, "agent-a", "server-x",
-            &"11".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid_a,
+            "agent-a",
+            "server-x",
+            &"11".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let sid_b = vec![0xE7; 16];
         let session_b = TranscriptBoundSession::establish(
-            sid_b, "agent-b", "server-x",
-            &"22".repeat(32), &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid_b,
+            "agent-b",
+            "server-x",
+            &"22".repeat(32),
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let sid_hex_a = session_a.session_id_hex();
         let sid_hex_b = session_b.session_id_hex();
@@ -1447,7 +1596,10 @@ mod tests {
         DEFAULT_IDENTITY_REGISTRY.remove(&thash_a);
         DEFAULT_IDENTITY_REGISTRY.remove(&thash_b);
 
-        assert_ne!(key_a, key_b, "distinct public keys must produce distinct trust keys");
+        assert_ne!(
+            key_a, key_b,
+            "distinct public keys must produce distinct trust keys"
+        );
     }
 
     // ── trust_shard_index (Part 6.3 sharding) ───────────────────────────────
@@ -1470,9 +1622,20 @@ mod tests {
         const N: usize = 4_000;
 
         for (label, keys) in [
-            ("pk:", (0..N).map(|i| format!("pk:{:064x}", i)).collect::<Vec<_>>()),
-            ("aid:", (0..N).map(|i| format!("aid:agent-{i:05}")).collect()),
-            ("ip:", (0..N).map(|i| format!("ip:10.{}.{}.{}", i / 65536 % 256, i / 256 % 256, i % 256)).collect()),
+            (
+                "pk:",
+                (0..N).map(|i| format!("pk:{:064x}", i)).collect::<Vec<_>>(),
+            ),
+            (
+                "aid:",
+                (0..N).map(|i| format!("aid:agent-{i:05}")).collect(),
+            ),
+            (
+                "ip:",
+                (0..N)
+                    .map(|i| format!("ip:10.{}.{}.{}", i / 65536 % 256, i / 256 % 256, i % 256))
+                    .collect(),
+            ),
         ] {
             let mut counts = vec![0usize; SHARDS];
             for k in &keys {
@@ -1520,7 +1683,10 @@ mod tests {
         // negligible (< 1e-4 even under heavy CI scheduling jitter) but no
         // longer exactly zero, unlike before decay was introduced.
         let total2 = t.accumulate("session-a", 0.5);
-        assert!((total2 - 0.8).abs() < 1e-4, "unexpected drift beyond decay tolerance: total2={total2}");
+        assert!(
+            (total2 - 0.8).abs() < 1e-4,
+            "unexpected drift beyond decay tolerance: total2={total2}"
+        );
     }
 
     #[test]
@@ -1537,7 +1703,10 @@ mod tests {
         t.accumulate("session-a", 1.0);
         t.reset(Some("session-a"));
         let total = t.accumulate("session-a", 0.2);
-        assert!((total - 0.2).abs() < 1e-9, "reset must zero the running total");
+        assert!(
+            (total - 0.2).abs() < 1e-9,
+            "reset must zero the running total"
+        );
     }
 
     #[test]
@@ -1546,7 +1715,10 @@ mod tests {
         for i in 0..(DRIFT_MAX_TRACKED_SESSIONS + 500) {
             t.accumulate(&format!("session-{i}"), 0.1);
         }
-        assert!(t.tracked_count() <= DRIFT_MAX_TRACKED_SESSIONS, "session map must not grow unbounded past its cap");
+        assert!(
+            t.tracked_count() <= DRIFT_MAX_TRACKED_SESSIONS,
+            "session map must not grow unbounded past its cap"
+        );
     }
 
     #[test]

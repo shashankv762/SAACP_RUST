@@ -11,11 +11,10 @@ use std::sync::Mutex;
 static PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
 use saacp::{
-    ExternalCode, ExternalResponse, PECFFilter, SREL, SecureDiagnosticLedger, SdlEntry,
-    DeploymentProfile, internal_to_external, internal_to_external_raw,
-    get_active_profile, set_active_profile,
-    SDL_MAX_ENTRIES, SREL_FLOOR_SECONDS, SREL_WIRE_RESPONSE_SIZE, PECF_MARKER,
-    SAACPHardDrop, SAACPBytecodes,
+    get_active_profile, internal_to_external, internal_to_external_raw, set_active_profile,
+    DeploymentProfile, ExternalCode, ExternalResponse, PECFFilter, SAACPBytecodes, SAACPHardDrop,
+    SdlEntry, SecureDiagnosticLedger, PECF_MARKER, SDL_MAX_ENTRIES, SREL, SREL_FLOOR_SECONDS,
+    SREL_WIRE_RESPONSE_SIZE,
 };
 
 fn make_sdl_entry(correlation_id: &str, bytecode: u8) -> SdlEntry {
@@ -143,7 +142,10 @@ fn test_external_code_name() {
     assert_eq!(ExternalCode::AccessDenied.name(), "ACCESS_DENIED");
     assert_eq!(ExternalCode::SessionTerminated.name(), "SESSION_TERMINATED");
     assert_eq!(ExternalCode::RateLimited.name(), "RATE_LIMITED");
-    assert_eq!(ExternalCode::ServiceUnavailable.name(), "SERVICE_UNAVAILABLE");
+    assert_eq!(
+        ExternalCode::ServiceUnavailable.name(),
+        "SERVICE_UNAVAILABLE"
+    );
     assert_eq!(ExternalCode::InternalFailure.name(), "INTERNAL_FAILURE");
 }
 
@@ -211,7 +213,12 @@ fn test_normalize_response_all_codes_64_bytes() {
         ExternalCode::InternalFailure,
     ] {
         let wire = SREL::normalize_response(code, TEST_CORR);
-        assert_eq!(wire.len(), 64, "code {:?} must produce 64-byte wire response", code);
+        assert_eq!(
+            wire.len(),
+            64,
+            "code {:?} must produce 64-byte wire response",
+            code
+        );
     }
 }
 
@@ -292,10 +299,7 @@ fn test_pecf_filter_translate_raw_maps_correctly() {
     let _g = PROFILE_LOCK.lock().unwrap();
     set_active_profile(DeploymentProfile::Production);
     let ledger = SecureDiagnosticLedger::new();
-    let resp = PECFFilter::translate_raw(
-        SAACPBytecodes::TokenExpired, "expired",
-        &ledger, &[], "",
-    );
+    let resp = PECFFilter::translate_raw(SAACPBytecodes::TokenExpired, "expired", &ledger, &[], "");
     assert!(matches!(resp.code, ExternalCode::AccessDenied));
     ledger.clear();
     set_active_profile(DeploymentProfile::Production);

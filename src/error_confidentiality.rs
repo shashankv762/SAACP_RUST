@@ -19,8 +19,6 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-
-
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// Total byte length of every serialised wire error response.
@@ -71,30 +69,72 @@ static BYTECODE_CATEGORY_MAP: LazyLock<HashMap<u8, ErrorCategory>> = LazyLock::n
     let mut m = HashMap::new();
     use ErrorCategory::*;
     let entries: &[(u8, ErrorCategory)] = &[
-        (0x00, Internal), (0x01, TransportFailure), (0x02, ProtocolError),
-        (0x03, AuthFailure), (0x04, ProtocolError), (0x05, CapabilityFailure),
-        (0x06, PolicyViolation), (0x07, ProtocolError), (0x08, Internal),
-        (0x09, PolicyViolation), (0x0A, Internal), (0x0B, Internal),
-        (0x0C, PolicyViolation), (0x0D, PolicyViolation), (0x0E, ResourceLimit),
-        (0x0F, Internal), (0x10, ProtocolError), (0x11, TransportFailure),
-        (0x12, CapabilityFailure), (0x13, CapabilityFailure), (0x14, PolicyViolation),
-        (0x15, CapabilityFailure), (0x16, PolicyViolation),
-        (0x17, ProtocolError), (0x18, ProtocolError), (0x19, ProtocolError), (0x1A, ProtocolError),
-        (0x1B, AuthFailure), (0x1C, AuthFailure), (0x1D, AuthFailure),
-        (0x1E, TransportFailure), (0x1F, AuthFailure),
-        (0x20, GovernanceViolation), (0x21, GovernanceViolation),
-        (0x22, GovernanceViolation), (0x23, GovernanceViolation), (0x24, GovernanceViolation),
-        (0x25, CapabilityFailure), (0x26, CapabilityFailure),
-        (0x27, AuthFailure), (0x28, CapabilityFailure), (0x29, AuthFailure), (0x2A, AuthFailure),
-        (0x2B, ResourceLimit), (0x2C, AuthFailure), (0x2D, AuthFailure),
+        (0x00, Internal),
+        (0x01, TransportFailure),
+        (0x02, ProtocolError),
+        (0x03, AuthFailure),
+        (0x04, ProtocolError),
+        (0x05, CapabilityFailure),
+        (0x06, PolicyViolation),
+        (0x07, ProtocolError),
+        (0x08, Internal),
+        (0x09, PolicyViolation),
+        (0x0A, Internal),
+        (0x0B, Internal),
+        (0x0C, PolicyViolation),
+        (0x0D, PolicyViolation),
+        (0x0E, ResourceLimit),
+        (0x0F, Internal),
+        (0x10, ProtocolError),
+        (0x11, TransportFailure),
+        (0x12, CapabilityFailure),
+        (0x13, CapabilityFailure),
+        (0x14, PolicyViolation),
+        (0x15, CapabilityFailure),
+        (0x16, PolicyViolation),
+        (0x17, ProtocolError),
+        (0x18, ProtocolError),
+        (0x19, ProtocolError),
+        (0x1A, ProtocolError),
+        (0x1B, AuthFailure),
+        (0x1C, AuthFailure),
+        (0x1D, AuthFailure),
+        (0x1E, TransportFailure),
+        (0x1F, AuthFailure),
+        (0x20, GovernanceViolation),
+        (0x21, GovernanceViolation),
+        (0x22, GovernanceViolation),
+        (0x23, GovernanceViolation),
+        (0x24, GovernanceViolation),
+        (0x25, CapabilityFailure),
+        (0x26, CapabilityFailure),
+        (0x27, AuthFailure),
+        (0x28, CapabilityFailure),
+        (0x29, AuthFailure),
+        (0x2A, AuthFailure),
+        (0x2B, ResourceLimit),
+        (0x2C, AuthFailure),
+        (0x2D, AuthFailure),
         // v15 additions
-        (0x2E, CapabilityFailure), (0x2F, CapabilityFailure), (0x30, CapabilityFailure),
-        (0x31, CapabilityFailure), (0x32, CapabilityFailure), (0x33, CapabilityFailure),
-        (0x34, CapabilityFailure), (0x35, ProtocolError),
-        (0x36, AuthFailure), (0x37, PolicyViolation), (0x38, PolicyViolation),
-        (0x39, PolicyViolation), (0x3A, GovernanceViolation), (0x3B, GovernanceViolation),
-        (0x3C, AuthFailure), (0x3D, AuthFailure), (0x3E, AuthFailure),
-        (0x3F, AuthFailure), (0x40, AuthFailure),
+        (0x2E, CapabilityFailure),
+        (0x2F, CapabilityFailure),
+        (0x30, CapabilityFailure),
+        (0x31, CapabilityFailure),
+        (0x32, CapabilityFailure),
+        (0x33, CapabilityFailure),
+        (0x34, CapabilityFailure),
+        (0x35, ProtocolError),
+        (0x36, AuthFailure),
+        (0x37, PolicyViolation),
+        (0x38, PolicyViolation),
+        (0x39, PolicyViolation),
+        (0x3A, GovernanceViolation),
+        (0x3B, GovernanceViolation),
+        (0x3C, AuthFailure),
+        (0x3D, AuthFailure),
+        (0x3E, AuthFailure),
+        (0x3F, AuthFailure),
+        (0x40, AuthFailure),
         // CRIT-11: 0x41-0x43 previously fell through to the Internal
         // catch-all, masking auth/retry semantics from callers.
         (0x41, ResourceLimit),   // AuditSubsystemDegraded -> ServiceUnavailable
@@ -202,8 +242,9 @@ impl ErrorConfidentialityFilter {
         // this function needs to propagate): `correlation_id` is always exactly
         // `hex::encode` of a 16-byte buffer, i.e. always exactly 32 hex chars, so
         // `new()`'s length check can never actually fail from this call site.
-        WireErrorResponse::new(category, correlation_id, retry_after_seconds)
-            .expect("sanitize(): correlation_id is always hex::encode of a 16-byte buffer (32 chars)")
+        WireErrorResponse::new(category, correlation_id, retry_after_seconds).expect(
+            "sanitize(): correlation_id is always hex::encode of a 16-byte buffer (32 chars)",
+        )
     }
 
     /// Serialize a WireErrorResponse to the fixed 44-byte wire format.
@@ -220,9 +261,7 @@ impl ErrorConfidentialityFilter {
         }
 
         // Bytes 17-20: retry_after_seconds big-endian uint32
-        let retry_val = response
-            .retry_after_seconds
-            .unwrap_or(SENTINEL_NO_RETRY);
+        let retry_val = response.retry_after_seconds.unwrap_or(SENTINEL_NO_RETRY);
         wire[17..21].copy_from_slice(&retry_val.to_be_bytes());
 
         // Bytes 21-24: protocol tag
@@ -406,8 +445,14 @@ mod tests {
             let parsed = ErrorConfidentialityFilter::parse_wire_bytes(&wire)
                 .unwrap_or_else(|e| panic!("parse failed for 0x{bytecode:02X}: {e}"));
             assert_eq!(parsed.category, resp.category, "category roundtrip failed");
-            assert_eq!(parsed.correlation_id, resp.correlation_id, "correlation_id roundtrip failed");
-            assert_eq!(parsed.retry_after_seconds, resp.retry_after_seconds, "retry roundtrip failed");
+            assert_eq!(
+                parsed.correlation_id, resp.correlation_id,
+                "correlation_id roundtrip failed"
+            );
+            assert_eq!(
+                parsed.retry_after_seconds, resp.retry_after_seconds,
+                "retry roundtrip failed"
+            );
         }
     }
 
@@ -423,10 +468,19 @@ mod tests {
             );
         }
         // Bytecodes 0x3A-0x3B also GovernanceViolation.
-        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x3A), ErrorCategory::GovernanceViolation);
-        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x3B), ErrorCategory::GovernanceViolation);
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x3A),
+            ErrorCategory::GovernanceViolation
+        );
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x3B),
+            ErrorCategory::GovernanceViolation
+        );
         // Bytecode 0x2B must map to ResourceLimit (RGC).
-        assert_eq!(ErrorConfidentialityFilter::bytecode_to_category(0x2B), ErrorCategory::ResourceLimit);
+        assert_eq!(
+            ErrorConfidentialityFilter::bytecode_to_category(0x2B),
+            ErrorCategory::ResourceLimit
+        );
         // Bytecodes 0x3C-0x40 must map to AuthFailure (identity binding).
         for code in 0x3Cu8..=0x40 {
             assert_eq!(

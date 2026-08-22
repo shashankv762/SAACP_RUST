@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_cover_rate_limiting() {
         let mut ct = CoverTraffic::with_rate(1000.0); // 1000 Hz → 1ms interval
-        // First emit
+                                                      // First emit
         assert!(ct.should_emit());
         // Immediately after — should be suppressed (< 1ms elapsed)
         let suppressed_before = ct.total_suppressed();
@@ -559,7 +559,10 @@ mod tests {
         let mut b = TimingObfuscator::new();
         let seq_a: Vec<u64> = (0..20).map(|_| a.jitter_ms()).collect();
         let seq_b: Vec<u64> = (0..20).map(|_| b.jitter_ms()).collect();
-        assert_ne!(seq_a, seq_b, "jitter sequences must not be deterministic across instances");
+        assert_ne!(
+            seq_a, seq_b,
+            "jitter sequences must not be deterministic across instances"
+        );
         for &j in seq_a.iter().chain(seq_b.iter()) {
             assert!((MPF_TIMING_JITTER_MIN_MS..=MPF_TIMING_JITTER_MS).contains(&j));
         }

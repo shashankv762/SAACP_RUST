@@ -95,9 +95,9 @@
 //!   is out of proportion to the actual requirement.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 #[cfg(feature = "redis-backend")]
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 // ─── Error type ────────────────────────────────────────────────────────────
@@ -238,7 +238,9 @@ pub struct InMemoryBackend {
 
 impl InMemoryBackend {
     pub fn new() -> Self {
-        Self { store: RwLock::new(HashMap::new()) }
+        Self {
+            store: RwLock::new(HashMap::new()),
+        }
     }
 }
 
@@ -270,10 +272,13 @@ impl StateBackend for InMemoryBackend {
 
     fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> BackendResult<()> {
         let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
-        store.insert(key.to_string(), Entry {
-            value: value.to_vec(),
-            expires_at: ttl.map(|d| Instant::now() + d),
-        });
+        store.insert(
+            key.to_string(),
+            Entry {
+                value: value.to_vec(),
+                expires_at: ttl.map(|d| Instant::now() + d),
+            },
+        );
         Ok(())
     }
 
@@ -295,16 +300,22 @@ impl StateBackend for InMemoryBackend {
         // unbounded one.
         let (current, existing_ttl): (i64, Option<Instant>) = match store.get(key) {
             Some(e) if !e.is_expired() => (
-                std::str::from_utf8(&e.value).ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+                std::str::from_utf8(&e.value)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
                 e.expires_at,
             ),
             _ => (0, None),
         };
         let next = current.saturating_add(by);
-        store.insert(key.to_string(), Entry {
-            value: next.to_string().into_bytes(),
-            expires_at: existing_ttl,
-        });
+        store.insert(
+            key.to_string(),
+            Entry {
+                value: next.to_string().into_bytes(),
+                expires_at: existing_ttl,
+            },
+        );
         Ok(next)
     }
 
@@ -313,15 +324,21 @@ impl StateBackend for InMemoryBackend {
         // Sweep expired entries opportunistically so scan results (and
         // memory usage) don't accumulate stale keys indefinitely.
         store.retain(|_, e| !e.is_expired());
-        Ok(store.keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+        Ok(store
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
     }
 
     fn incr_with_ttl(&self, key: &str, by: i64, ttl: Duration) -> BackendResult<i64> {
         let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         match store.get_mut(key) {
             Some(e) if !e.is_expired() => {
-                let current: i64 =
-                    std::str::from_utf8(&e.value).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let current: i64 = std::str::from_utf8(&e.value)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 let next = current.saturating_add(by);
                 e.value = next.to_string().into_bytes();
                 // Only set a TTL if this entry didn't already have one — a
@@ -333,10 +350,13 @@ impl StateBackend for InMemoryBackend {
             }
             _ => {
                 let next = by;
-                store.insert(key.to_string(), Entry {
-                    value: next.to_string().into_bytes(),
-                    expires_at: Some(Instant::now() + ttl),
-                });
+                store.insert(
+                    key.to_string(),
+                    Entry {
+                        value: next.to_string().into_bytes(),
+                        expires_at: Some(Instant::now() + ttl),
+                    },
+                );
                 Ok(next)
             }
         }
@@ -359,10 +379,13 @@ impl StateBackend for InMemoryBackend {
         if current != expected {
             return Ok(false);
         }
-        store.insert(key.to_string(), Entry {
-            value: new.to_vec(),
-            expires_at: ttl.map(|d| Instant::now() + d),
-        });
+        store.insert(
+            key.to_string(),
+            Entry {
+                value: new.to_vec(),
+                expires_at: ttl.map(|d| Instant::now() + d),
+            },
+        );
         Ok(true)
     }
 }
@@ -426,9 +449,18 @@ impl RedisBackend {
         Self::with_pool_size(redis_url, timeout, REDIS_DEFAULT_MAX_POOL_SIZE)
     }
 
-    pub fn with_pool_size(redis_url: &str, timeout: Duration, max_pool_size: usize) -> BackendResult<Self> {
+    pub fn with_pool_size(
+        redis_url: &str,
+        timeout: Duration,
+        max_pool_size: usize,
+    ) -> BackendResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| BackendError(e.to_string()))?;
-        Ok(Self { client, timeout, pool: Mutex::new(Vec::new()), max_pool_size })
+        Ok(Self {
+            client,
+            timeout,
+            pool: Mutex::new(Vec::new()),
+            max_pool_size,
+        })
     }
 
     /// Take a pooled connection if one is idle, otherwise open a fresh one.
@@ -453,7 +485,10 @@ impl RedisBackend {
     /// Run `f` against a pooled connection, returning it to the pool only on
     /// success — a command that errors may have left the connection in an
     /// indeterminate protocol state, so it's dropped instead of reused.
-    fn with_conn<T>(&self, f: impl FnOnce(&mut redis::Connection) -> BackendResult<T>) -> BackendResult<T> {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> BackendResult<T>,
+    ) -> BackendResult<T> {
         let mut conn = self.checkout()?;
         let result = f(&mut conn);
         if result.is_ok() {
@@ -475,9 +510,12 @@ impl StateBackend for RedisBackend {
         self.with_conn(|conn| match ttl {
             Some(d) => {
                 let secs = d.as_secs().max(1); // Redis EX requires a positive integer.
-                conn.set_ex(key, value, secs).map_err(|e| BackendError(e.to_string()))
+                conn.set_ex(key, value, secs)
+                    .map_err(|e| BackendError(e.to_string()))
             }
-            None => conn.set(key, value).map_err(|e| BackendError(e.to_string())),
+            None => conn
+                .set(key, value)
+                .map_err(|e| BackendError(e.to_string())),
         })
     }
 
@@ -502,8 +540,9 @@ impl StateBackend for RedisBackend {
         // before the connection is returned to the pool.
         self.with_conn(|conn| {
             let pattern = format!("{prefix}*");
-            let iter: redis::Iter<'_, String> =
-                conn.scan_match(pattern).map_err(|e| BackendError(e.to_string()))?;
+            let iter: redis::Iter<'_, String> = conn
+                .scan_match(pattern)
+                .map_err(|e| BackendError(e.to_string()))?;
             Ok(iter.collect())
         })
     }
@@ -718,7 +757,8 @@ mod tests {
     #[test]
     fn scan_prefix_excludes_expired_keys() {
         let b = InMemoryBackend::new();
-        b.set("agent:a", b"1", Some(Duration::from_millis(20))).unwrap();
+        b.set("agent:a", b"1", Some(Duration::from_millis(20)))
+            .unwrap();
         b.set("agent:b", b"2", None).unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let keys = b.scan_prefix("agent:").unwrap();
@@ -771,7 +811,11 @@ mod tests {
         b.incr_with_ttl("c", 1, Duration::from_secs(999)).unwrap();
         // Total lifetime is measured from the FIRST creation, not the second call.
         std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(b.get("c").unwrap(), None, "TTL should have expired from first creation, not been reset");
+        assert_eq!(
+            b.get("c").unwrap(),
+            None,
+            "TTL should have expired from first creation, not been reset"
+        );
     }
 
     #[test]
@@ -785,7 +829,8 @@ mod tests {
             let b = Arc::clone(&b);
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
-                    b.incr_with_ttl("shared", 1, Duration::from_secs(30)).unwrap();
+                    b.incr_with_ttl("shared", 1, Duration::from_secs(30))
+                        .unwrap();
                 }
             }));
         }
@@ -875,7 +920,9 @@ mod tests {
             let successes = Arc::clone(&successes);
             handles.push(thread::spawn(move || {
                 let new_val = format!("v_from_{i}");
-                if b.compare_and_swap("k", Some(b"v0"), new_val.as_bytes(), None).unwrap() {
+                if b.compare_and_swap("k", Some(b"v0"), new_val.as_bytes(), None)
+                    .unwrap()
+                {
                     successes.fetch_add(1, Ordering::SeqCst);
                 }
             }));

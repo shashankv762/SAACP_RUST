@@ -342,7 +342,9 @@ impl ClusterMessage {
         let mut updates = Vec::new();
         if let Some(arr) = parsed["updates"].as_array() {
             if arr.len() > CLUSTER_MAX_MEMBERS {
-                return Err("cluster message carries more updates than CLUSTER_MAX_MEMBERS".to_string());
+                return Err(
+                    "cluster message carries more updates than CLUSTER_MAX_MEMBERS".to_string(),
+                );
             }
             for entry in arr {
                 let node_id = entry["node_id"].as_str().unwrap_or("").to_string();
@@ -693,7 +695,10 @@ impl ClusterEngine {
 
     /// The node this one currently believes is leader, or `None` when quorum is lost.
     pub fn leader(&self) -> Option<String> {
-        self.leader.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.leader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether this node currently holds leadership. `false` on both sides of a
@@ -917,7 +922,10 @@ impl ClusterEngine {
         }
 
         {
-            let mut hw = self.replay_high_water.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hw = self
+                .replay_high_water
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let incoming = (msg.sender_incarnation, msg.sequence);
             if let Some(prev) = hw.get(&msg.sender_id) {
                 if incoming <= *prev {
@@ -953,11 +961,10 @@ impl ClusterEngine {
         declared_epoch: u64,
         declared_kind: &str,
     ) -> Result<(), ClusterRejection> {
-        let msg = ClusterMessage::from_wire(cluster_message_b64.as_bytes())
-            .map_err(|_| {
-                crate::telemetry::global_telemetry().record_cluster_message_rejected();
-                ClusterRejection::Malformed
-            })?;
+        let msg = ClusterMessage::from_wire(cluster_message_b64.as_bytes()).map_err(|_| {
+            crate::telemetry::global_telemetry().record_cluster_message_rejected();
+            ClusterRejection::Malformed
+        })?;
         if msg.sender_id != declared_sender
             || msg.leader_epoch != declared_epoch
             || msg.kind.as_str() != declared_kind
@@ -1060,7 +1067,8 @@ impl ClusterEngine {
                     }
                 }
                 let supersedes = update.incarnation > existing.incarnation
-                    || (update.incarnation == existing.incarnation && update.state > existing.state);
+                    || (update.incarnation == existing.incarnation
+                        && update.state > existing.state);
                 if supersedes {
                     if existing.state != update.state {
                         existing.state_changed_at = now;
@@ -1294,7 +1302,10 @@ impl ClusterEngine {
         };
 
         if !removed.is_empty() {
-            let mut hw = self.replay_high_water.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hw = self
+                .replay_high_water
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for id in &removed {
                 hw.remove(id);
             }
@@ -1430,8 +1441,16 @@ mod tests {
         assert_eq!(parsed.kind, ClusterMessageKind::Heartbeat);
         assert_eq!(parsed.sequence, msg.sequence);
         assert_eq!(parsed.sender_key_id, msg.sender_key_id);
-        assert_eq!(parsed.body_bytes(), msg.body_bytes(), "body must be byte-stable");
-        assert!(verify_data(&a.verifying_key, &parsed.body_bytes(), &parsed.signature));
+        assert_eq!(
+            parsed.body_bytes(),
+            msg.body_bytes(),
+            "body must be byte-stable"
+        );
+        assert!(verify_data(
+            &a.verifying_key,
+            &parsed.body_bytes(),
+            &parsed.signature
+        ));
     }
 
     #[test]
@@ -1463,7 +1482,11 @@ mod tests {
             node_a.receive_wire(&msg.to_wire()),
             Err(ClusterRejection::BadSignature)
         );
-        assert_eq!(node_a.state_of("node-b"), None, "rejected message must not create state");
+        assert_eq!(
+            node_a.state_of("node-b"),
+            None,
+            "rejected message must not create state"
+        );
     }
 
     #[test]
@@ -1561,7 +1584,10 @@ mod tests {
 
         let msg = node_b.build_message(ClusterMessageKind::Heartbeat);
         let (blob, sender, epoch, kind) = ClusterEngine::envelope_fields(&msg);
-        assert_eq!(node_a.receive_envelope(&blob, &sender, epoch, &kind), Ok(()));
+        assert_eq!(
+            node_a.receive_envelope(&blob, &sender, epoch, &kind),
+            Ok(())
+        );
 
         // A second, fresh message whose plaintext sender is rewritten in transit.
         let msg2 = node_b.build_message(ClusterMessageKind::Heartbeat);
@@ -1632,7 +1658,10 @@ mod tests {
         assert_eq!(node_a.alive_count(), 2);
         assert_eq!(node_a.config().quorum(), 3);
         assert!(!node_a.has_quorum());
-        assert!(!node_a.is_leader(), "minority partition must not elect a leader");
+        assert!(
+            !node_a.is_leader(),
+            "minority partition must not elect a leader"
+        );
         assert_eq!(node_a.leader(), None);
     }
 
@@ -1649,8 +1678,22 @@ mod tests {
         let sink = Arc::clone(&changes);
         node_a.on_leadership_change(move |ch| sink.lock().unwrap().push(ch.clone()));
 
-        assert_eq!(node_a.receive_wire(&node_b.build_message(ClusterMessageKind::Heartbeat).to_wire()), Ok(()));
-        assert_eq!(node_a.receive_wire(&node_c.build_message(ClusterMessageKind::Heartbeat).to_wire()), Ok(()));
+        assert_eq!(
+            node_a.receive_wire(
+                &node_b
+                    .build_message(ClusterMessageKind::Heartbeat)
+                    .to_wire()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            node_a.receive_wire(
+                &node_c
+                    .build_message(ClusterMessageKind::Heartbeat)
+                    .to_wire()
+            ),
+            Ok(())
+        );
         assert_eq!(node_a.alive_count(), 3);
 
         let first_leader = node_a.leader().expect("quorum reached, leader must exist");
@@ -1659,7 +1702,11 @@ mod tests {
         // Kill whichever node was elected (unless it is us — then kill another, since a
         // node never times its own record out).
         let victim = if first_leader == "node-a" {
-            if node_a.leader().as_deref() == Some("node-a") { "node-b".to_string() } else { first_leader.clone() }
+            if node_a.leader().as_deref() == Some("node-a") {
+                "node-b".to_string()
+            } else {
+                first_leader.clone()
+            }
         } else {
             first_leader.clone()
         };
@@ -1668,7 +1715,9 @@ mod tests {
         // would drift, then run the detector.
         {
             let mut members = node_a.members.lock().unwrap();
-            let m = members.get_mut(&victim).expect("victim must be a known member");
+            let m = members
+                .get_mut(&victim)
+                .expect("victim must be a known member");
             m.last_seen = now_f64() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
             m.state = NodeState::Suspect;
         }
@@ -1676,13 +1725,20 @@ mod tests {
 
         assert_eq!(node_a.state_of(&victim), Some(NodeState::Dead));
         if first_leader == victim {
-            assert_ne!(node_a.leader().as_deref(), Some(victim.as_str()), "dead node must not remain leader");
+            assert_ne!(
+                node_a.leader().as_deref(),
+                Some(victim.as_str()),
+                "dead node must not remain leader"
+            );
             assert!(
                 node_a.leader_epoch() > epoch_before,
                 "failover must advance the fencing epoch"
             );
             let recorded = changes.lock().unwrap();
-            assert!(!recorded.is_empty(), "failover must fire the leadership hook");
+            assert!(
+                !recorded.is_empty(),
+                "failover must fire the leadership hook"
+            );
         }
     }
 
@@ -1695,8 +1751,22 @@ mod tests {
         let (node_b, _tb) = make_node(&b, &["node-a", "node-c"], &[&a, &b, &c], 3);
         let (node_c, _tc) = make_node(&c, &["node-a", "node-b"], &[&a, &b, &c], 3);
 
-        assert_eq!(node_a.receive_wire(&node_b.build_message(ClusterMessageKind::Heartbeat).to_wire()), Ok(()));
-        assert_eq!(node_a.receive_wire(&node_c.build_message(ClusterMessageKind::Heartbeat).to_wire()), Ok(()));
+        assert_eq!(
+            node_a.receive_wire(
+                &node_b
+                    .build_message(ClusterMessageKind::Heartbeat)
+                    .to_wire()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            node_a.receive_wire(
+                &node_c
+                    .build_message(ClusterMessageKind::Heartbeat)
+                    .to_wire()
+            ),
+            Ok(())
+        );
         assert!(node_a.leader().is_some());
 
         // Both peers go silent → alive_count drops to 1, below quorum(3) = 2.
@@ -1711,7 +1781,11 @@ mod tests {
         node_a.tick();
 
         assert!(!node_a.has_quorum());
-        assert_eq!(node_a.leader(), None, "a node without quorum must step down");
+        assert_eq!(
+            node_a.leader(),
+            None,
+            "a node without quorum must step down"
+        );
         assert!(!node_a.is_leader());
     }
 
@@ -1724,7 +1798,11 @@ mod tests {
         node_a.absorb_epoch(e1 + 500);
         assert_eq!(node_a.leader_epoch(), e1 + 500);
         node_a.absorb_epoch(1);
-        assert_eq!(node_a.leader_epoch(), e1 + 500, "a lower peer epoch must never lower ours");
+        assert_eq!(
+            node_a.leader_epoch(),
+            e1 + 500,
+            "a lower peer epoch must never lower ours"
+        );
     }
 
     #[test]
@@ -1754,7 +1832,10 @@ mod tests {
             "refutation must bump our incarnation above the suspicion"
         );
         assert_eq!(node_a.state_of("node-a"), Some(NodeState::Alive));
-        assert!(ta.sent_count() > 0, "refutation must be broadcast immediately");
+        assert!(
+            ta.sent_count() > 0,
+            "refutation must be broadcast immediately"
+        );
 
         // The refutation node-b receives must actually clear the suspicion.
         let refutation = ta.last_payload().expect("a refutation was sent");
@@ -1779,7 +1860,12 @@ mod tests {
         );
         ClusterEngine::merge_one(
             &mut members,
-            &MemberUpdate { node_id: "n1".into(), addr: String::new(), incarnation: 6, state: NodeState::Alive },
+            &MemberUpdate {
+                node_id: "n1".into(),
+                addr: String::new(),
+                incarnation: 6,
+                state: NodeState::Alive,
+            },
             now,
             false,
         );
@@ -1788,18 +1874,32 @@ mod tests {
         // ...but an equal-incarnation Alive must NOT override Dead.
         ClusterEngine::merge_one(
             &mut members,
-            &MemberUpdate { node_id: "n1".into(), addr: String::new(), incarnation: 6, state: NodeState::Dead },
+            &MemberUpdate {
+                node_id: "n1".into(),
+                addr: String::new(),
+                incarnation: 6,
+                state: NodeState::Dead,
+            },
             now,
             false,
         );
         assert_eq!(members["n1"].state, NodeState::Dead);
         ClusterEngine::merge_one(
             &mut members,
-            &MemberUpdate { node_id: "n1".into(), addr: String::new(), incarnation: 6, state: NodeState::Alive },
+            &MemberUpdate {
+                node_id: "n1".into(),
+                addr: String::new(),
+                incarnation: 6,
+                state: NodeState::Alive,
+            },
             now,
             false,
         );
-        assert_eq!(members["n1"].state, NodeState::Dead, "state precedence must hold at equal incarnation");
+        assert_eq!(
+            members["n1"].state,
+            NodeState::Dead,
+            "state precedence must hold at equal incarnation"
+        );
     }
 
     #[test]
@@ -1826,7 +1926,10 @@ mod tests {
             1,
             "a peer we have never heard from must not be counted alive"
         );
-        assert!(!node_a.is_leader(), "quorum(2)=2 is unmet with one alive node");
+        assert!(
+            !node_a.is_leader(),
+            "quorum(2)=2 is unmet with one alive node"
+        );
     }
 
     #[test]
@@ -1835,7 +1938,14 @@ mod tests {
         let b = make_identity("node-b");
         let (node_a, _ta) = make_node(&a, &["node-b"], &[&a, &b], 2);
         let (node_b, _tb) = make_node(&b, &["node-a"], &[&a, &b], 2);
-        assert_eq!(node_a.receive_wire(&node_b.build_message(ClusterMessageKind::Heartbeat).to_wire()), Ok(()));
+        assert_eq!(
+            node_a.receive_wire(
+                &node_b
+                    .build_message(ClusterMessageKind::Heartbeat)
+                    .to_wire()
+            ),
+            Ok(())
+        );
         assert_eq!(node_a.member_count(), 2);
 
         {
@@ -1848,7 +1958,11 @@ mod tests {
         assert_eq!(node_a.sweep_expired(), 1);
         assert_eq!(node_a.member_count(), 1);
         assert!(
-            !node_a.replay_high_water.lock().unwrap().contains_key("node-b"),
+            !node_a
+                .replay_high_water
+                .lock()
+                .unwrap()
+                .contains_key("node-b"),
             "replay state for a removed member must be reclaimed"
         );
     }

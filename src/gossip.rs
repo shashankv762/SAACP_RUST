@@ -97,7 +97,9 @@ pub struct SeenSet {
 
 impl SeenSet {
     pub fn new() -> Self {
-        Self { seen: Mutex::new(HashMap::new()) }
+        Self {
+            seen: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Returns `true` if `revocation_id` was already present (and thus should not be
@@ -316,7 +318,12 @@ impl StaticPeerListTransport {
 
 impl GossipTransport for StaticPeerListTransport {
     fn known_peers(&self) -> Vec<String> {
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+        self.peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn send_to_peer(&self, peer_id: &str, bytes: &[u8]) {
@@ -334,10 +341,9 @@ impl GossipTransport for StaticPeerListTransport {
         // connect/write is dropped silently by design — see the module/struct docs.
         std::thread::spawn(move || {
             use std::io::Write;
-            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                &addr,
-                std::time::Duration::from_secs(2),
-            ) {
+            if let Ok(mut stream) =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+            {
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
                 let _ = stream.write_all(&bytes);
             }
@@ -351,7 +357,15 @@ mod tests {
     use crate::faitf::{AgentIdentity, AttestationType, TrustAnchor};
 
     fn make_identity(id: &str) -> AgentIdentity {
-        AgentIdentity::generate(id, "issuer-gossip-test", 86_400, None, None, "", AttestationType::None)
+        AgentIdentity::generate(
+            id,
+            "issuer-gossip-test",
+            86_400,
+            None,
+            None,
+            "",
+            AttestationType::None,
+        )
     }
 
     struct FakeTransport {
@@ -368,7 +382,12 @@ mod tests {
         }
 
         fn sent_peer_ids(&self) -> Vec<String> {
-            self.sent.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect()
         }
     }
 
@@ -377,7 +396,10 @@ mod tests {
             self.peers.clone()
         }
         fn send_to_peer(&self, peer_id: &str, bytes: &[u8]) {
-            self.sent.lock().unwrap().push((peer_id.to_string(), bytes.to_vec()));
+            self.sent
+                .lock()
+                .unwrap()
+                .push((peer_id.to_string(), bytes.to_vec()));
         }
     }
 
@@ -407,7 +429,11 @@ mod tests {
         let sent = transport.sent_peer_ids();
         assert_eq!(sent.len(), GOSSIP_FANOUT);
         let unique: std::collections::HashSet<_> = sent.iter().collect();
-        assert_eq!(unique.len(), GOSSIP_FANOUT, "fanout targets must be distinct peers");
+        assert_eq!(
+            unique.len(),
+            GOSSIP_FANOUT,
+            "fanout targets must be distinct peers"
+        );
     }
 
     #[test]
@@ -469,8 +495,14 @@ mod tests {
             revocation_id: "rev-at-max-hops".to_string(),
         };
 
-        assert!(engine.receive(envelope), "record still verifies and is accepted");
-        assert!(transport.sent.lock().unwrap().is_empty(), "must not forward once hop_count == GOSSIP_MAX_HOPS");
+        assert!(
+            engine.receive(envelope),
+            "record still verifies and is accepted"
+        );
+        assert!(
+            transport.sent.lock().unwrap().is_empty(),
+            "must not forward once hop_count == GOSSIP_MAX_HOPS"
+        );
     }
 
     #[test]
@@ -494,9 +526,18 @@ mod tests {
             revocation_id: "rev-forged".to_string(),
         };
 
-        assert!(!engine.receive(envelope), "unverifiable record must be rejected");
-        assert!(transport.sent.lock().unwrap().is_empty(), "rejected record must never be forwarded");
-        assert!(!dri.is_revoked("victim-5", "fp-x"), "rejected record must never be stored");
+        assert!(
+            !engine.receive(envelope),
+            "unverifiable record must be rejected"
+        );
+        assert!(
+            transport.sent.lock().unwrap().is_empty(),
+            "rejected record must never be forwarded"
+        );
+        assert!(
+            !dri.is_revoked("victim-5", "fp-x"),
+            "rejected record must never be stored"
+        );
     }
 
     #[test]
@@ -547,5 +588,4 @@ mod tests {
         let id1b = GossipEnvelope::derive_revocation_id(&record1);
         assert_eq!(id1a, id1b);
     }
-
 }

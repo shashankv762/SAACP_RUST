@@ -20,10 +20,8 @@
 //! them through `SAACPProtocolHandler::intercept_packet_full`, exactly as the
 //! daemon does — not a direct call into the gate function.
 
-use saacp::{
-    SAACPProtocolHandler, ZeroTrustGateway, ImmutableAuditLog, SAACPBytecodes,
-};
 use saacp::framing::MEASCFrame as StructuralFrame;
+use saacp::{ImmutableAuditLog, SAACPBytecodes, SAACPProtocolHandler, ZeroTrustGateway};
 
 /// Shared 32-byte HMAC/AES secret for this file's tests — both the Gate 0
 /// AES-256-GCM key material (via `encode_encrypted`/`intercept_packet_full`)
@@ -40,19 +38,34 @@ fn build_frame(
     psn: u64,
 ) -> Vec<u8> {
     let frame = StructuralFrame {
-        schema_id: 1, status_code, flags: 0, action_class,
+        schema_id: 1,
+        status_code,
+        flags: 0,
+        action_class,
         payload_length: 0, // auto-corrected by encode_encrypted
-        session_id, epoch_id: 0, psn,
-        context_ref_id: [0u8; 32], context_version: 0,
+        session_id,
+        epoch_id: 0,
+        psn,
+        context_ref_id: [0u8; 32],
+        context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    frame.encode_encrypted(payload, &SECRET).expect("encode_encrypted must succeed")
+    frame
+        .encode_encrypted(payload, &SECRET)
+        .expect("encode_encrypted must succeed")
 }
 
 fn issue_token(source_agent: &str, target_agent: &str, max_action_class: u8) -> String {
     let gw = ZeroTrustGateway::new();
     let token = gw.issue_capability_token(
-        &SECRET, source_agent, &[target_agent], &[], 3600, None, max_action_class, None,
+        &SECRET,
+        source_agent,
+        &[target_agent],
+        &[],
+        3600,
+        None,
+        max_action_class,
+        None,
     );
     String::from_utf8(token).expect("token bytes must be valid utf8 (base64)")
 }
@@ -66,8 +79,10 @@ fn crit2a_stream_continuation_action_class_escalation_blocked() {
     let gateway = ZeroTrustGateway::new();
     let source_agent = "crit2a-source-agent";
     let target_agent = "crit2a-target-agent";
-    let session_id = [0xC2u8, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A,
-                       0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A];
+    let session_id = [
+        0xC2u8, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A,
+        0x0A,
+    ];
 
     // Token only ever authorizes READ_ONLY (max_action_class = 0).
     let token = issue_token(source_agent, target_agent, 0);
@@ -78,11 +93,21 @@ fn crit2a_stream_continuation_action_class_escalation_blocked() {
     });
     let start_frame = build_frame(
         &serde_json::to_vec(&start_payload).unwrap(),
-        SAACPBytecodes::StreamStart as u8, 0, session_id, 1,
+        SAACPBytecodes::StreamStart as u8,
+        0,
+        session_id,
+        1,
     );
     let start_result = SAACPProtocolHandler::intercept_packet_full(
-        &start_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+        &start_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
     );
     assert!(
         start_result.is_ok(),
@@ -93,10 +118,23 @@ fn crit2a_stream_continuation_action_class_escalation_blocked() {
     // Attack: a continuation frame claims action_class = IRREVERSIBLE (2) — far
     // beyond what the originating token was ever validated for. Pre-CRIT-2-fix,
     // handle_stream_continuation never ran Gate 2.5 at all, so this sailed through.
-    let escalation_frame = build_frame(b"", SAACPBytecodes::StreamContinuation as u8, 2, session_id, 2);
+    let escalation_frame = build_frame(
+        b"",
+        SAACPBytecodes::StreamContinuation as u8,
+        2,
+        session_id,
+        2,
+    );
     let escalation_result = SAACPProtocolHandler::intercept_packet_full(
-        &escalation_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+        &escalation_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
     );
     assert!(
         escalation_result.is_err(),
@@ -118,8 +156,10 @@ fn crit2a_stream_continuation_within_authorized_ceiling_still_works() {
     let gateway = ZeroTrustGateway::new();
     let source_agent = "crit2a-ok-source-agent";
     let target_agent = "crit2a-ok-target-agent";
-    let session_id = [0xC2u8, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
-                       0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B];
+    let session_id = [
+        0xC2u8, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+        0x0B,
+    ];
 
     // Token authorizes up to REVERSIBLE (1).
     let token = issue_token(source_agent, target_agent, 1);
@@ -130,19 +170,46 @@ fn crit2a_stream_continuation_within_authorized_ceiling_still_works() {
     });
     let start_frame = build_frame(
         &serde_json::to_vec(&start_payload).unwrap(),
-        SAACPBytecodes::StreamStart as u8, 1, session_id, 1,
+        SAACPBytecodes::StreamStart as u8,
+        1,
+        session_id,
+        1,
     );
     let start_result = SAACPProtocolHandler::intercept_packet_full(
-        &start_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+        &start_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
     );
-    assert!(start_result.is_ok(), "STREAM_START must succeed: {:?}", start_result.err());
+    assert!(
+        start_result.is_ok(),
+        "STREAM_START must succeed: {:?}",
+        start_result.err()
+    );
 
     // Continuation at the SAME action_class (1) — must pass Gate 2.5.
-    let ok_frame = build_frame(b"benign continuation text", SAACPBytecodes::StreamContinuation as u8, 1, session_id, 2);
+    let ok_frame = build_frame(
+        b"benign continuation text",
+        SAACPBytecodes::StreamContinuation as u8,
+        1,
+        session_id,
+        2,
+    );
     let ok_result = SAACPProtocolHandler::intercept_packet_full(
-        &ok_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+        &ok_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
     );
     assert!(
         ok_result.is_ok(),
@@ -161,8 +228,10 @@ fn crit2b_stream_continuation_writes_audit_entry() {
     let gateway = ZeroTrustGateway::new();
     let source_agent = "crit2b-source-agent";
     let target_agent = "crit2b-target-agent";
-    let session_id = [0xC2u8, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
-                       0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C];
+    let session_id = [
+        0xC2u8, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
+        0x0C,
+    ];
 
     let token = issue_token(source_agent, target_agent, 0);
     let start_payload = serde_json::json!({
@@ -172,13 +241,27 @@ fn crit2b_stream_continuation_writes_audit_entry() {
     });
     let start_frame = build_frame(
         &serde_json::to_vec(&start_payload).unwrap(),
-        SAACPBytecodes::StreamStart as u8, 0, session_id, 1,
+        SAACPBytecodes::StreamStart as u8,
+        0,
+        session_id,
+        1,
     );
     let start_result = SAACPProtocolHandler::intercept_packet_full(
-        &start_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+        &start_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
     );
-    assert!(start_result.is_ok(), "STREAM_START must succeed: {:?}", start_result.err());
+    assert!(
+        start_result.is_ok(),
+        "STREAM_START must succeed: {:?}",
+        start_result.err()
+    );
 
     // Uses the global ImmutableAuditLog (audit_log: None falls back to it, same as
     // handle_stream_continuation's own fallback) — assert a monotonic increase
@@ -186,12 +269,29 @@ fn crit2b_stream_continuation_writes_audit_entry() {
     // running concurrently in this binary.
     let before = ImmutableAuditLog::global().event_count();
 
-    let cont_frame = build_frame(b"legitimate stream text", SAACPBytecodes::StreamContinuation as u8, 0, session_id, 2);
-    let cont_result = SAACPProtocolHandler::intercept_packet_full(
-        &cont_frame, &SECRET, target_agent, false,
-        Some(&gateway), None, None, None, None,
+    let cont_frame = build_frame(
+        b"legitimate stream text",
+        SAACPBytecodes::StreamContinuation as u8,
+        0,
+        session_id,
+        2,
     );
-    assert!(cont_result.is_ok(), "Legitimate continuation frame must succeed: {:?}", cont_result.err());
+    let cont_result = SAACPProtocolHandler::intercept_packet_full(
+        &cont_frame,
+        &SECRET,
+        target_agent,
+        false,
+        Some(&gateway),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        cont_result.is_ok(),
+        "Legitimate continuation frame must succeed: {:?}",
+        cont_result.err()
+    );
 
     let after = ImmutableAuditLog::global().event_count();
     assert!(

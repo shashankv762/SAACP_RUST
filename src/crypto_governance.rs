@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::security::constant_time_eq_hex;
 
@@ -133,7 +133,11 @@ impl<'a> From<&'a CryptoLedgerEntry> for CanonicalLedgerEntry<'a> {
             // caller sources `timestamp` from `now_epoch_secs()` (which
             // already falls back to 0.0 on clock error), so this clamp is a
             // defensive no-op in practice, not a behavior change.
-            timestamp: if e.timestamp.is_finite() { e.timestamp } else { 0.0 },
+            timestamp: if e.timestamp.is_finite() {
+                e.timestamp
+            } else {
+                0.0
+            },
             transcript_hash: &e.transcript_hash,
         }
     }
@@ -143,8 +147,9 @@ impl<'a> From<&'a CryptoLedgerEntry> for CanonicalLedgerEntry<'a> {
 /// `append` and `verify_chain` — a single shared implementation guarantees
 /// they can never drift out of sync with each other.
 fn canonical_json(entry: &CryptoLedgerEntry) -> String {
-    serde_json::to_string(&CanonicalLedgerEntry::from(entry))
-        .expect("CanonicalLedgerEntry serialization is infallible: every field is a &str or a finite f64")
+    serde_json::to_string(&CanonicalLedgerEntry::from(entry)).expect(
+        "CanonicalLedgerEntry serialization is infallible: every field is a &str or a finite f64",
+    )
 }
 
 /// Append-only, hash-chained ledger of all cryptographic governance events.
@@ -176,12 +181,19 @@ impl CryptoTransparencyLedger {
     /// Append an entry with hash-chaining.
     pub fn append(&self, mut entry: CryptoLedgerEntry) {
         let canonical = canonical_json(&entry);
-        let prev = self.last_hash.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let prev = self
+            .last_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let chain_input = format!("{}{}", prev, canonical);
         let hash = sha256_hex(chain_input.as_bytes());
         entry.entry_hash = hash.clone();
         *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
-        self.log.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(entry);
     }
 
     /// Return all entries.
@@ -274,7 +286,10 @@ impl ApprovedSuitePolicy {
             ));
         }
         if !self.is_approved(algorithm) {
-            return Err(format!("Suite '{}' is not on the approved allowlist.", algorithm));
+            return Err(format!(
+                "Suite '{}' is not on the approved allowlist.",
+                algorithm
+            ));
         }
         if sig_len < self.minimum_signature_length {
             return Err(format!(
@@ -567,7 +582,10 @@ impl SuiteNegotiator {
             session_id: session_hex,
             outcome: "SELECTED".into(),
             transcript_hash: transcript.transcript_hash_hex(),
-            details: format!("Suite '{}' selected and bound to session transcript.", selected),
+            details: format!(
+                "Suite '{}' selected and bound to session transcript.",
+                selected
+            ),
             entry_hash: String::new(),
         });
 
@@ -589,7 +607,10 @@ impl SuiteNegotiator {
             session_id: hex::encode(session_id),
             outcome: "APPROVED".into(),
             transcript_hash: String::new(),
-            details: format!("Rotated from '{}' to '{}'. {}", old_suite, new_suite, reason),
+            details: format!(
+                "Rotated from '{}' to '{}'. {}",
+                old_suite, new_suite, reason
+            ),
             entry_hash: String::new(),
         });
     }
@@ -831,8 +852,12 @@ mod tests {
     #[test]
     fn test_validate_registration() {
         let p = production_policy();
-        assert!(p.validate_registration("ed25519", 64, 32, "PRODUCTION").is_err());
-        assert!(p.validate_registration("ed25519", 64, 32, "DEVELOPMENT").is_ok());
+        assert!(p
+            .validate_registration("ed25519", 64, 32, "PRODUCTION")
+            .is_err());
+        assert!(p
+            .validate_registration("ed25519", 64, 32, "DEVELOPMENT")
+            .is_ok());
     }
 
     /// Task: suite_negotiator_downgrade_logs_event
@@ -853,7 +878,10 @@ mod tests {
         // The ledger must contain a DOWNGRADE_ATTEMPT entry
         let entries = ledger.entries();
         let has_downgrade = entries.iter().any(|e| e.event_type == "DOWNGRADE_ATTEMPT");
-        assert!(has_downgrade, "DOWNGRADE_ATTEMPT must be logged in the ledger");
+        assert!(
+            has_downgrade,
+            "DOWNGRADE_ATTEMPT must be logged in the ledger"
+        );
         let blocked = entries.iter().any(|e| e.outcome == "BLOCKED");
         assert!(blocked, "the downgrade entry must have outcome=BLOCKED");
     }
@@ -865,7 +893,9 @@ mod tests {
     fn approved_suite_policy_forbidden_rejected() {
         let mut policy = production_policy();
         // Add a known-bad suite to the status map as Forbidden
-        policy.suite_status_map.push(("RC4-MD5".into(), SuiteStatus::Forbidden));
+        policy
+            .suite_status_map
+            .push(("RC4-MD5".into(), SuiteStatus::Forbidden));
 
         // get_status() must return Forbidden for RC4-MD5
         assert_eq!(
@@ -879,7 +909,9 @@ mod tests {
             "Forbidden suite must not be in approved_algorithms"
         );
         // Add a Deprecated suite
-        policy.suite_status_map.push(("3DES-CBC-SHA1".into(), SuiteStatus::Deprecated));
+        policy
+            .suite_status_map
+            .push(("3DES-CBC-SHA1".into(), SuiteStatus::Deprecated));
         assert_eq!(
             policy.get_status("3DES-CBC-SHA1"),
             SuiteStatus::Deprecated,

@@ -40,10 +40,16 @@ fn bind_session(session_id_byte: u8, client_agent_id: &str) -> (SigningKey, Stri
     let client_pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
     let sid = vec![session_id_byte; 16];
     let session = TranscriptBoundSession::establish(
-        sid, client_agent_id, "server-x",
-        &client_pk_hex, &"bb".repeat(32),
-        &"cc".repeat(16), &"dd".repeat(16),
-        "SAACP/0.1-beta2", "Ed25519-AES256GCM", None,
+        sid,
+        client_agent_id,
+        "server-x",
+        &client_pk_hex,
+        &"bb".repeat(32),
+        &"cc".repeat(16),
+        &"dd".repeat(16),
+        "SAACP/0.1-beta2",
+        "Ed25519-AES256GCM",
+        None,
     );
     let session_id_hex = session.session_id_hex();
     let thash = session.thash.clone();
@@ -55,7 +61,12 @@ fn bind_session(session_id_byte: u8, client_agent_id: &str) -> (SigningKey, Stri
 /// pipeline (Gate 0 through Gate 12.0) has already accepted a schema_id=10
 /// `ExecutionReceipt`. Only the fields `ievl::handle_execution_receipt` actually
 /// reads are meaningfully populated.
-fn receipt_parsed_packet(session_uuid: &str, source_agent: &str, action_class: u8, payload_dict: HashMap<String, JsonValue>) -> ParsedPacket {
+fn receipt_parsed_packet(
+    session_uuid: &str,
+    source_agent: &str,
+    action_class: u8,
+    payload_dict: HashMap<String, JsonValue>,
+) -> ParsedPacket {
     ParsedPacket {
         schema_id: 10,
         flags: 0,
@@ -77,14 +88,34 @@ fn receipt_parsed_packet(session_uuid: &str, source_agent: &str, action_class: u
     }
 }
 
-fn receipt_payload(declaration_ref: &str, actual_action: &str, actual_targets: &[String], signature_b64: &str) -> HashMap<String, JsonValue> {
+fn receipt_payload(
+    declaration_ref: &str,
+    actual_action: &str,
+    actual_targets: &[String],
+    signature_b64: &str,
+) -> HashMap<String, JsonValue> {
     let mut pd = HashMap::new();
-    pd.insert("declaration_ref".to_string(), JsonValue::String(declaration_ref.to_string()));
-    pd.insert("actual_action".to_string(), JsonValue::String(actual_action.to_string()));
-    pd.insert("actual_targets".to_string(), JsonValue::Array(
-        actual_targets.iter().map(|t| JsonValue::String(t.clone())).collect(),
-    ));
-    pd.insert("receipt_signature".to_string(), JsonValue::String(signature_b64.to_string()));
+    pd.insert(
+        "declaration_ref".to_string(),
+        JsonValue::String(declaration_ref.to_string()),
+    );
+    pd.insert(
+        "actual_action".to_string(),
+        JsonValue::String(actual_action.to_string()),
+    );
+    pd.insert(
+        "actual_targets".to_string(),
+        JsonValue::Array(
+            actual_targets
+                .iter()
+                .map(|t| JsonValue::String(t.clone()))
+                .collect(),
+        ),
+    );
+    pd.insert(
+        "receipt_signature".to_string(),
+        JsonValue::String(signature_b64.to_string()),
+    );
     pd
 }
 
@@ -98,19 +129,36 @@ fn consistent_receipt_through_real_entry_point_rewards_trust_score() {
 
     // Drive the score down first — at TRUST_SCORE_INITIAL (1.0) a reward is a
     // no-op ceiling, so the very first pass wouldn't observably move the score.
-    TrustDecayEngine::global().penalize(&trust_key, saacp::trust_decay::PenaltyKind::EpistemicOverclaim);
+    TrustDecayEngine::global().penalize(
+        &trust_key,
+        saacp::trust_decay::PenaltyKind::EpistemicOverclaim,
+    );
     let after_penalty = TrustDecayEngine::global().score(&trust_key);
 
     // Exactly what handler.rs's Gate 1.5 hook calls.
     IevlEngine::global().register_declaration(
-        &session_id_hex, 1, agent_id,
-        "archive the quarterly ledger".to_string(), 0x02, vec!["ledger-1".to_string()],
+        &session_id_hex,
+        1,
+        agent_id,
+        "archive the quarterly ledger".to_string(),
+        0x02,
+        vec!["ledger-1".to_string()],
     );
 
     let declaration_ref = ievl::declaration_id(&session_id_hex, 1);
     let targets = vec!["ledger-1".to_string()];
-    let sig = ievl::sign_receipt(&signing_key, &declaration_ref, "archive the quarterly ledger", &targets);
-    let payload = receipt_payload(&declaration_ref, "archive the quarterly ledger", &targets, &sig);
+    let sig = ievl::sign_receipt(
+        &signing_key,
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &targets,
+    );
+    let payload = receipt_payload(
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &targets,
+        &sig,
+    );
     let parsed = receipt_parsed_packet(&session_id_hex, agent_id, 0x02, payload);
 
     // Exactly what daemon.rs's schema_id=10 dispatch calls.
@@ -135,15 +183,29 @@ fn target_violation_receipt_through_real_entry_point_penalizes_trust() {
     let before = TrustDecayEngine::global().score(&trust_key);
 
     IevlEngine::global().register_declaration(
-        &session_id_hex, 1, agent_id,
-        "archive the quarterly ledger".to_string(), 0x02, vec!["ledger-1".to_string()],
+        &session_id_hex,
+        1,
+        agent_id,
+        "archive the quarterly ledger".to_string(),
+        0x02,
+        vec!["ledger-1".to_string()],
     );
 
     let declaration_ref = ievl::declaration_id(&session_id_hex, 1);
     // Reports touching a completely different target than what was declared.
     let actual_targets = vec!["unrelated-production-database".to_string()];
-    let sig = ievl::sign_receipt(&signing_key, &declaration_ref, "archive the quarterly ledger", &actual_targets);
-    let payload = receipt_payload(&declaration_ref, "archive the quarterly ledger", &actual_targets, &sig);
+    let sig = ievl::sign_receipt(
+        &signing_key,
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &actual_targets,
+    );
+    let payload = receipt_payload(
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &actual_targets,
+        &sig,
+    );
     let parsed = receipt_parsed_packet(&session_id_hex, agent_id, 0x02, payload);
 
     ievl::handle_execution_receipt(&parsed);
@@ -168,8 +230,12 @@ fn class_escalation_receipt_through_real_entry_point_calls_real_dri_revoke() {
     assert!(!DistributedRevocationInfrastructure::global().is_revoked(agent_id, ""));
 
     IevlEngine::global().register_declaration(
-        &session_id_hex, 1, agent_id,
-        "archive the quarterly ledger".to_string(), 0x02, vec!["ledger-1".to_string()],
+        &session_id_hex,
+        1,
+        agent_id,
+        "archive the quarterly ledger".to_string(),
+        0x02,
+        vec!["ledger-1".to_string()],
     );
 
     let declaration_ref = ievl::declaration_id(&session_id_hex, 1);
@@ -178,8 +244,18 @@ fn class_escalation_receipt_through_real_entry_point_calls_real_dri_revoke() {
     // the realistic production escalation signal (see ievl.rs's module docs:
     // numeric action_class alone can't fire once a declaration is already at
     // the protocol ceiling).
-    let sig = ievl::sign_receipt(&signing_key, &declaration_ref, "wipe the quarterly ledger", &targets);
-    let payload = receipt_payload(&declaration_ref, "wipe the quarterly ledger", &targets, &sig);
+    let sig = ievl::sign_receipt(
+        &signing_key,
+        &declaration_ref,
+        "wipe the quarterly ledger",
+        &targets,
+    );
+    let payload = receipt_payload(
+        &declaration_ref,
+        "wipe the quarterly ledger",
+        &targets,
+        &sig,
+    );
     let parsed = receipt_parsed_packet(&session_id_hex, agent_id, 0x02, payload);
 
     ievl::handle_execution_receipt(&parsed);
@@ -200,16 +276,30 @@ fn forged_signature_through_real_entry_point_is_rejected_and_declaration_survive
     let _ = &signing_key; // the attacker does NOT use the real session key below
 
     IevlEngine::global().register_declaration(
-        &session_id_hex, 1, agent_id,
-        "archive the quarterly ledger".to_string(), 0x02, vec!["ledger-1".to_string()],
+        &session_id_hex,
+        1,
+        agent_id,
+        "archive the quarterly ledger".to_string(),
+        0x02,
+        vec!["ledger-1".to_string()],
     );
 
     let declaration_ref = ievl::declaration_id(&session_id_hex, 1);
     let targets = vec!["ledger-1".to_string()];
     // Sign with a DIFFERENT, unregistered keypair — forged relative to this session.
     let attacker_key = SigningKey::generate(&mut OsRng);
-    let forged_sig = ievl::sign_receipt(&attacker_key, &declaration_ref, "archive the quarterly ledger", &targets);
-    let payload = receipt_payload(&declaration_ref, "archive the quarterly ledger", &targets, &forged_sig);
+    let forged_sig = ievl::sign_receipt(
+        &attacker_key,
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &targets,
+    );
+    let payload = receipt_payload(
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &targets,
+        &forged_sig,
+    );
     let parsed = receipt_parsed_packet(&session_id_hex, agent_id, 0x02, payload);
 
     ievl::handle_execution_receipt(&parsed);
@@ -218,12 +308,18 @@ fn forged_signature_through_real_entry_point_is_rejected_and_declaration_survive
     // able to consume/clear it (that would let an attacker suppress the
     // legitimate ReceiptTimeout penalty the real client's silence should
     // eventually earn).
-    let still_pending = IevlEngine::global().process_receipt(&declaration_ref, "archive the quarterly ledger", &targets, 0x02);
+    let still_pending = IevlEngine::global().process_receipt(
+        &declaration_ref,
+        "archive the quarterly ledger",
+        &targets,
+        0x02,
+    );
 
     DEFAULT_IDENTITY_REGISTRY.remove(&thash);
 
     assert_eq!(
-        still_pending, VerificationVerdict::Consistent,
+        still_pending,
+        VerificationVerdict::Consistent,
         "the declaration must have survived the forged receipt untouched — this second, \
          correctly-unauthenticated-context call is the first thing to actually consume it"
     );
@@ -249,7 +345,10 @@ fn receipt_missing_for_unknown_declaration_ref_through_real_entry_point() {
 
     DEFAULT_IDENTITY_REGISTRY.remove(&thash);
 
-    assert_eq!(after, before, "a receipt with no matching declaration must not move trust at all");
+    assert_eq!(
+        after, before,
+        "a receipt with no matching declaration must not move trust at all"
+    );
 }
 
 // ─── Schema wiring sanity ──────────────────────────────────────────────────

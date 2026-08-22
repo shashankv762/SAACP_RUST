@@ -25,23 +25,32 @@ fn dependency_version_audit() {
     // If Cargo.lock is regenerated, re-run this audit.
     let audited_versions: HashMap<&str, (&str, &str)> = HashMap::from([
         // (crate_name, (pinned_version, audit_status))
-        ("aes-gcm",              ("0.10.3", "OK — no known vulns in 0.10.x")),
-        ("ed25519-dalek",        ("2.1.1",  "OK — ZeroizeOnDrop present in 2.x")),
-        ("hkdf",                 ("0.12.4", "OK")),
-        ("sha2",                 ("0.10.9", "OK")),
-        ("hmac",                 ("0.12.1", "OK")),
-        ("x25519-dalek",         ("2.0.1",  "OK")),
-        ("serde",                ("1.0.x",  "OK — no crypto, de/ser only")),
-        ("serde_json",           ("1.0.x",  "OK")),
-        ("uuid",                 ("1.x",    "OK")),
-        ("tokio",                ("1.x",    "OK — check for RUSTSEC advisories on each upgrade")),
-        ("base64",               ("0.22.x", "OK")),
-        ("zeroize",              ("1.x",    "OK — core dependency, no known vulns")),
-        ("subtle",               ("2.x",    "OK — constant-time primitives, no known vulns")),
-        ("aho-corasick",         ("1.x",    "OK")),
+        ("aes-gcm", ("0.10.3", "OK — no known vulns in 0.10.x")),
+        (
+            "ed25519-dalek",
+            ("2.1.1", "OK — ZeroizeOnDrop present in 2.x"),
+        ),
+        ("hkdf", ("0.12.4", "OK")),
+        ("sha2", ("0.10.9", "OK")),
+        ("hmac", ("0.12.1", "OK")),
+        ("x25519-dalek", ("2.0.1", "OK")),
+        ("serde", ("1.0.x", "OK — no crypto, de/ser only")),
+        ("serde_json", ("1.0.x", "OK")),
+        ("uuid", ("1.x", "OK")),
+        (
+            "tokio",
+            ("1.x", "OK — check for RUSTSEC advisories on each upgrade"),
+        ),
+        ("base64", ("0.22.x", "OK")),
+        ("zeroize", ("1.x", "OK — core dependency, no known vulns")),
+        (
+            "subtle",
+            ("2.x", "OK — constant-time primitives, no known vulns"),
+        ),
+        ("aho-corasick", ("1.x", "OK")),
         ("unicode-normalization", ("0.1.x", "OK")),
-        ("rand",                 ("0.8.x",  "OK")),
-        ("hex",                  ("0.4.x",  "OK")),
+        ("rand", ("0.8.x", "OK")),
+        ("hex", ("0.4.x", "OK")),
     ]);
 
     eprintln!("\n[SUPPLY CHAIN] Dependency version audit:");
@@ -81,10 +90,16 @@ fn all_dependencies_from_crates_io() {
     for line in lock_content.lines() {
         let line = line.trim();
         if line.starts_with("name = ") {
-            current_name = line.trim_start_matches("name = ").trim_matches('"').to_string();
+            current_name = line
+                .trim_start_matches("name = ")
+                .trim_matches('"')
+                .to_string();
             current_source.clear();
         } else if line.starts_with("source = ") {
-            current_source = line.trim_start_matches("source = ").trim_matches('"').to_string();
+            current_source = line
+                .trim_start_matches("source = ")
+                .trim_matches('"')
+                .to_string();
             if current_source.starts_with("git+") && !current_source.contains('#') {
                 // Git source WITHOUT a commit hash — supply chain risk
                 git_deps_without_commit.push(format!("{} ({})", current_name, current_source));
@@ -122,11 +137,13 @@ fn cargo_toml_uses_semver_ranges_not_exact_pins() {
     };
 
     // Count dependencies with `= "1"` (semver range) vs `= "=1.x.y"` (exact pin)
-    let exact_pinned = toml_content.lines()
+    let exact_pinned = toml_content
+        .lines()
         .filter(|l| l.contains("= \"=")) // exact version: `dep = "=1.2.3"`
         .count();
 
-    let semver_range = toml_content.lines()
+    let semver_range = toml_content
+        .lines()
         .filter(|l| {
             // semver ranges: "0.10", "1", "2", etc. (not "=x.y.z")
             l.contains("version = \"") && !l.contains("version = \"=")

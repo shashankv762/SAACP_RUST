@@ -9,8 +9,8 @@
 use saacp::acsvaf::SignedCapabilityToken;
 use saacp::framing::SAACPFrame;
 use saacp::{
-    MEASCFrame, NonceTracker, RGCPolicy, SessionEpochManager,
-    MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS,
+    MEASCFrame, NonceTracker, RGCPolicy, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+    MEASC_DEFAULT_EPOCH_TIME_SECONDS,
 };
 
 /// Minimal PRNG (xorshift64) — no external crate, deterministic, reproducible.
@@ -86,8 +86,8 @@ fn saacpframe_parse_header_never_panics_edge_cases() {
     let cases: &[&[u8]] = &[
         b"",
         &[0u8; 1],
-        &[0u8; 120],  // one byte under min (121)
-        &[0u8; 121],  // exact minimum
+        &[0u8; 120], // one byte under min (121)
+        &[0u8; 121], // exact minimum
         &[0xffu8; 200],
         &[0u8; 65536],
     ];
@@ -129,8 +129,8 @@ fn measc_parse_frame_never_panics_edge_cases() {
     let cases: &[&[u8]] = &[
         b"",
         &[0u8; 1],
-        &[0u8; 127],   // one byte under MEASC_HEADER_SIZE (128)
-        &[0u8; 128],   // exact header, no payload
+        &[0u8; 127], // one byte under MEASC_HEADER_SIZE (128)
+        &[0u8; 128], // exact header, no payload
         &[0xffu8; 256],
         &[0u8; 65536],
     ];

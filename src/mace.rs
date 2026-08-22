@@ -210,7 +210,8 @@ impl MultiAgentCollusionEngine {
         let mut fp = self.fingerprints.lock().unwrap_or_else(|e| e.into_inner());
 
         if fp.len() >= MACE_MAX_FINGERPRINTED_AGENTS && !fp.contains_key(agent_id) {
-            if let Some(smallest) = fp.iter()
+            if let Some(smallest) = fp
+                .iter()
                 .min_by_key(|(_, gates)| gates.values().sum::<u64>())
                 .map(|(k, _)| k.clone())
             {
@@ -218,7 +219,10 @@ impl MultiAgentCollusionEngine {
             }
         }
 
-        *fp.entry(agent_id.to_string()).or_default().entry(gate.to_string()).or_insert(0) += 1;
+        *fp.entry(agent_id.to_string())
+            .or_default()
+            .entry(gate.to_string())
+            .or_insert(0) += 1;
     }
 
     /// Cosine similarity between two sparse gate-rejection-count vectors.
@@ -245,7 +249,8 @@ impl MultiAgentCollusionEngine {
     /// not a per-packet check.
     pub fn detect_sybil_clusters(&self) -> Vec<(String, String, f64)> {
         let fp = self.fingerprints.lock().unwrap_or_else(|e| e.into_inner());
-        let candidates: Vec<(&String, &HashMap<String, u64>)> = fp.iter()
+        let candidates: Vec<(&String, &HashMap<String, u64>)> = fp
+            .iter()
             .filter(|(_, gates)| gates.values().sum::<u64>() >= SYBIL_MIN_OBSERVATIONS)
             .collect();
 
@@ -281,7 +286,10 @@ impl MultiAgentCollusionEngine {
     /// entry cap independent of the window (survives a flood faster than the
     /// window alone could prune).
     pub fn record_rate_limit_event(&self, agent_id: &str, now: f64) {
-        let mut events = self.rate_limit_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .rate_limit_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         while let Some(&(ts, _)) = events.front() {
             if now - ts > COORDINATED_EXHAUSTION_WINDOW_SECONDS {
                 events.pop_front();
@@ -299,7 +307,10 @@ impl MultiAgentCollusionEngine {
     /// [`COORDINATED_EXHAUSTION_WINDOW_SECONDS`], if at least
     /// [`COORDINATED_EXHAUSTION_MIN_AGENTS`] distinct agents are present.
     pub fn detect_coordinated_exhaustion(&self, now: f64) -> Option<usize> {
-        let mut events = self.rate_limit_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .rate_limit_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         while let Some(&(ts, _)) = events.front() {
             if now - ts > COORDINATED_EXHAUSTION_WINDOW_SECONDS {
                 events.pop_front();
@@ -325,7 +336,10 @@ impl MultiAgentCollusionEngine {
     /// rate-limit-window mutex is held.
     pub fn detect_and_enforce_coordinated_exhaustion(&self, now: f64) -> Vec<String> {
         let flagged: Vec<String> = {
-            let mut events = self.rate_limit_events.lock().unwrap_or_else(|e| e.into_inner());
+            let mut events = self
+                .rate_limit_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             while let Some(&(ts, _)) = events.front() {
                 if now - ts > COORDINATED_EXHAUSTION_WINDOW_SECONDS {
                     events.pop_front();
@@ -353,7 +367,8 @@ impl MultiAgentCollusionEngine {
     /// `around_timestamp`, pulled from [`crate::telemetry::SecurityAlertFeed`].
     pub fn detect_distraction_cover(&self, around_timestamp: f64) -> bool {
         let recent = global_alert_feed().recent(DISTRACTION_COVER_SCAN_LIMIT);
-        let low_severity_nearby = recent.iter()
+        let low_severity_nearby = recent
+            .iter()
             .filter(|a| !HIGH_SEVERITY_BYTECODES.contains(&a.bytecode.as_str()))
             .filter(|a| (a.timestamp - around_timestamp).abs() <= DISTRACTION_COVER_WINDOW_SECONDS)
             .count();
@@ -377,19 +392,26 @@ impl MultiAgentCollusionEngine {
         let recent = global_alert_feed().recent(DISTRACTION_COVER_SCAN_LIMIT);
         let mut enforced: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for anchor in recent.iter()
+        for anchor in recent
+            .iter()
             .filter(|a| HIGH_SEVERITY_BYTECODES.contains(&a.bytecode.as_str()))
         {
             if anchor.agent_id.is_empty() || seen.contains(&anchor.agent_id) {
                 continue;
             }
-            let low_severity_nearby = recent.iter()
+            let low_severity_nearby = recent
+                .iter()
                 .filter(|a| !HIGH_SEVERITY_BYTECODES.contains(&a.bytecode.as_str()))
-                .filter(|a| (a.timestamp - anchor.timestamp).abs() <= DISTRACTION_COVER_WINDOW_SECONDS)
+                .filter(|a| {
+                    (a.timestamp - anchor.timestamp).abs() <= DISTRACTION_COVER_WINDOW_SECONDS
+                })
                 .count();
             if low_severity_nearby >= DISTRACTION_COVER_MIN_LOW_SEVERITY {
                 seen.insert(anchor.agent_id.clone());
-                enforce_collusion(&anchor.agent_id, "MACE: distraction-cover masked high-severity action");
+                enforce_collusion(
+                    &anchor.agent_id,
+                    "MACE: distraction-cover masked high-severity action",
+                );
                 enforced.push(anchor.agent_id.clone());
             }
         }
@@ -402,7 +424,10 @@ impl MultiAgentCollusionEngine {
     /// action — the baseline [`Self::feed_delegation`]'s Privilege Relay
     /// check compares against.
     pub fn record_irreversible_origin(&self, agent_id: &str) {
-        let mut origins = self.irreversible_origins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut origins = self
+            .irreversible_origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         origins.insert(agent_id.to_string());
     }
 
@@ -440,20 +465,34 @@ impl MultiAgentCollusionEngine {
     /// checking both Circular Delegation and Privilege Relay. See the module
     /// docs' "Honest scope" section for why no production call site feeds
     /// this today.
-    pub fn feed_delegation(&self, from_agent: &str, to_agent: &str, action_class: u8) -> DelegationSignal {
+    pub fn feed_delegation(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+        action_class: u8,
+    ) -> DelegationSignal {
         let creates_cycle = {
-            let edges = self.delegation_edges.lock().unwrap_or_else(|e| e.into_inner());
+            let edges = self
+                .delegation_edges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             from_agent == to_agent || Self::path_exists(&edges, to_agent, from_agent)
         };
 
         {
-            let mut edges = self.delegation_edges.lock().unwrap_or_else(|e| e.into_inner());
+            let mut edges = self
+                .delegation_edges
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let already_known = edges.contains_key(from_agent)
                 || edges.values().any(|tos| tos.contains(from_agent))
                 || edges.contains_key(to_agent)
                 || edges.values().any(|tos| tos.contains(to_agent));
             if already_known || Self::delegation_agent_count(&edges) < MACE_MAX_DELEGATION_AGENTS {
-                edges.entry(from_agent.to_string()).or_default().insert(to_agent.to_string());
+                edges
+                    .entry(from_agent.to_string())
+                    .or_default()
+                    .insert(to_agent.to_string());
             }
         }
 
@@ -464,7 +503,11 @@ impl MultiAgentCollusionEngine {
         }
 
         if action_class >= crate::framing::ACTION_CLASS_IRREVERSIBLE {
-            let is_origin = self.irreversible_origins.lock().unwrap_or_else(|e| e.into_inner()).contains(to_agent);
+            let is_origin = self
+                .irreversible_origins
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(to_agent);
             if !is_origin {
                 enforce_collusion(to_agent, "MACE: privilege relay detected");
                 return DelegationSignal::PrivilegeRelay;
@@ -477,14 +520,20 @@ impl MultiAgentCollusionEngine {
     /// Number of distinct agent_ids currently tracked in the delegation
     /// graph (observability/tests).
     pub fn delegation_tracked_agent_count(&self) -> usize {
-        let edges = self.delegation_edges.lock().unwrap_or_else(|e| e.into_inner());
+        let edges = self
+            .delegation_edges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Self::delegation_agent_count(&edges)
     }
 
     /// Number of distinct agent_ids currently fingerprinted
     /// (observability/tests).
     pub fn fingerprinted_agent_count(&self) -> usize {
-        self.fingerprints.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.fingerprints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -508,7 +557,10 @@ fn enforce_collusion(agent_id: &str, reason: &str) {
     // (a trust-score drop, a revocation record), never as a first-class
     // event a human/dashboard could see and correlate with `reason`.
     global_alert_feed().record(SecurityAlert {
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
         agent_id: agent_id.to_string(),
         gate: "mace_collusion",
         bytecode: format!("{:?}", SAACPBytecodes::CollusionDetected),
@@ -613,7 +665,10 @@ pub fn sweep_and_enforce() {
 
     // Coordinated Exhaustion — a confirmed lockstep circuit-breaker swarm
     // revokes every distinct agent currently inside the rolling window.
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     engine.detect_and_enforce_coordinated_exhaustion(now);
 
     // Distraction Cover — a high-severity action masked by a temporally
@@ -679,7 +734,10 @@ mod tests {
         let empty = HashMap::new();
         let mut a = HashMap::new();
         a.insert("g1".to_string(), 3u64);
-        assert_eq!(MultiAgentCollusionEngine::cosine_similarity(&a, &empty), 0.0);
+        assert_eq!(
+            MultiAgentCollusionEngine::cosine_similarity(&a, &empty),
+            0.0
+        );
     }
 
     #[test]
@@ -693,7 +751,10 @@ mod tests {
         let matches = engine.detect_and_enforce_sybil_clusters();
         assert_eq!(matches.len(), 1);
         let after_x = TrustDecayEngine::global().score(&trust_key_for("sybil-x", ""));
-        assert!(after_x < before_x, "confirmed Sybil match must penalize trust");
+        assert!(
+            after_x < before_x,
+            "confirmed Sybil match must penalize trust"
+        );
         assert!(DistributedRevocationInfrastructure::global().is_revoked("sybil-x", ""));
         assert!(DistributedRevocationInfrastructure::global().is_revoked("sybil-y", ""));
     }
@@ -706,7 +767,10 @@ mod tests {
         for i in 0..COORDINATED_EXHAUSTION_MIN_AGENTS {
             engine.record_rate_limit_event(&format!("flood-agent-{i}"), 100.0);
         }
-        assert_eq!(engine.detect_coordinated_exhaustion(100.0), Some(COORDINATED_EXHAUSTION_MIN_AGENTS));
+        assert_eq!(
+            engine.detect_coordinated_exhaustion(100.0),
+            Some(COORDINATED_EXHAUSTION_MIN_AGENTS)
+        );
     }
 
     #[test]
@@ -796,14 +860,23 @@ mod tests {
     #[test]
     fn simple_delegation_chain_is_ok() {
         let engine = MultiAgentCollusionEngine::new();
-        assert_eq!(engine.feed_delegation("orchestrator", "worker-a", 0x00), DelegationSignal::Ok);
-        assert_eq!(engine.feed_delegation("worker-a", "worker-b", 0x00), DelegationSignal::Ok);
+        assert_eq!(
+            engine.feed_delegation("orchestrator", "worker-a", 0x00),
+            DelegationSignal::Ok
+        );
+        assert_eq!(
+            engine.feed_delegation("worker-a", "worker-b", 0x00),
+            DelegationSignal::Ok
+        );
     }
 
     #[test]
     fn direct_self_delegation_is_circular() {
         let engine = MultiAgentCollusionEngine::new();
-        assert_eq!(engine.feed_delegation("agent-a", "agent-a", 0x00), DelegationSignal::CircularDelegation);
+        assert_eq!(
+            engine.feed_delegation("agent-a", "agent-a", 0x00),
+            DelegationSignal::CircularDelegation
+        );
     }
 
     #[test]
@@ -812,7 +885,10 @@ mod tests {
         assert_eq!(engine.feed_delegation("a", "b", 0x00), DelegationSignal::Ok);
         assert_eq!(engine.feed_delegation("b", "c", 0x00), DelegationSignal::Ok);
         // Closing the loop: c -> a, where a already (transitively) delegates to c.
-        assert_eq!(engine.feed_delegation("c", "a", 0x00), DelegationSignal::CircularDelegation);
+        assert_eq!(
+            engine.feed_delegation("c", "a", 0x00),
+            DelegationSignal::CircularDelegation
+        );
     }
 
     #[test]
@@ -852,7 +928,11 @@ mod tests {
     #[test]
     fn privilege_relay_flagged_for_non_origin_agent() {
         let engine = MultiAgentCollusionEngine::new();
-        let signal = engine.feed_delegation("orchestrator", "never-declared-agent", crate::framing::ACTION_CLASS_IRREVERSIBLE);
+        let signal = engine.feed_delegation(
+            "orchestrator",
+            "never-declared-agent",
+            crate::framing::ACTION_CLASS_IRREVERSIBLE,
+        );
         assert_eq!(signal, DelegationSignal::PrivilegeRelay);
     }
 
@@ -860,14 +940,22 @@ mod tests {
     fn privilege_relay_not_flagged_for_recorded_origin() {
         let engine = MultiAgentCollusionEngine::new();
         engine.record_irreversible_origin("legit-agent");
-        let signal = engine.feed_delegation("orchestrator", "legit-agent", crate::framing::ACTION_CLASS_IRREVERSIBLE);
+        let signal = engine.feed_delegation(
+            "orchestrator",
+            "legit-agent",
+            crate::framing::ACTION_CLASS_IRREVERSIBLE,
+        );
         assert_eq!(signal, DelegationSignal::Ok);
     }
 
     #[test]
     fn privilege_relay_not_checked_for_reversible_class() {
         let engine = MultiAgentCollusionEngine::new();
-        let signal = engine.feed_delegation("orchestrator", "some-agent", crate::framing::ACTION_CLASS_REVERSIBLE);
+        let signal = engine.feed_delegation(
+            "orchestrator",
+            "some-agent",
+            crate::framing::ACTION_CLASS_REVERSIBLE,
+        );
         assert_eq!(signal, DelegationSignal::Ok);
     }
 
@@ -888,7 +976,10 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         wire_mace_alert_feed();
         global_alert_feed().record(SecurityAlert {
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
             agent_id: "wiring-smoke-test-agent".to_string(),
             gate: "gate_smoke_test",
             bytecode: "GenericHardDrop".to_string(),

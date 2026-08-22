@@ -5,9 +5,8 @@
 //! enforce_issuance_policy, enforce_verification_policy.
 
 use saacp::{
-    AuthorityClass, AuthorityPolicy, AuthorityRegistry,
-    enforce_issuance_policy, enforce_verification_policy,
-    SAACPBytecodes,
+    enforce_issuance_policy, enforce_verification_policy, AuthorityClass, AuthorityPolicy,
+    AuthorityRegistry, SAACPBytecodes,
 };
 
 // ─── AuthorityClass ───────────────────────────────────────────────────────────
@@ -25,10 +24,22 @@ fn test_authority_class_variants_exist() {
 #[test]
 fn test_authority_class_as_str() {
     assert_eq!(AuthorityClass::RootAuthority.as_str(), "root_authority");
-    assert_eq!(AuthorityClass::FederationAuthority.as_str(), "federation_authority");
-    assert_eq!(AuthorityClass::AdministrativeAuthority.as_str(), "administrative_authority");
-    assert_eq!(AuthorityClass::ServiceAuthority.as_str(), "service_authority");
-    assert_eq!(AuthorityClass::DelegatedAuthority.as_str(), "delegated_authority");
+    assert_eq!(
+        AuthorityClass::FederationAuthority.as_str(),
+        "federation_authority"
+    );
+    assert_eq!(
+        AuthorityClass::AdministrativeAuthority.as_str(),
+        "administrative_authority"
+    );
+    assert_eq!(
+        AuthorityClass::ServiceAuthority.as_str(),
+        "service_authority"
+    );
+    assert_eq!(
+        AuthorityClass::DelegatedAuthority.as_str(),
+        "delegated_authority"
+    );
     assert_eq!(AuthorityClass::ExecutionAgent.as_str(), "execution_agent");
 }
 
@@ -134,14 +145,20 @@ fn test_registry_deregister_nonexistent_returns_false() {
 fn test_registry_get_authority_class() {
     let reg = AuthorityRegistry::new();
     reg.register(AuthorityPolicy::new("root", AuthorityClass::RootAuthority));
-    assert_eq!(reg.get_authority_class("root"), Some(AuthorityClass::RootAuthority));
+    assert_eq!(
+        reg.get_authority_class("root"),
+        Some(AuthorityClass::RootAuthority)
+    );
     assert_eq!(reg.get_authority_class("unknown"), None);
 }
 
 #[test]
 fn test_registry_set_federation_root_ok() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     assert!(reg.set_federation_root("root-1", true).is_ok());
     assert!(reg.may_self_issue("root-1"));
     assert!(reg.set_federation_root("root-1", false).is_ok());
@@ -151,7 +168,10 @@ fn test_registry_set_federation_root_ok() {
 #[test]
 fn test_registry_set_federation_root_wrong_class_fails() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority));
+    reg.register(AuthorityPolicy::new(
+        "svc-1",
+        AuthorityClass::ServiceAuthority,
+    ));
     let err = reg.set_federation_root("svc-1", true).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::FederationRootRequired);
 }
@@ -159,14 +179,20 @@ fn test_registry_set_federation_root_wrong_class_fails() {
 #[test]
 fn test_registry_is_terminal_for_execution_agent() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("exec-1", AuthorityClass::ExecutionAgent));
+    reg.register(AuthorityPolicy::new(
+        "exec-1",
+        AuthorityClass::ExecutionAgent,
+    ));
     assert!(reg.is_terminal("exec-1"));
 }
 
 #[test]
 fn test_registry_is_not_terminal_for_root() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     assert!(!reg.is_terminal("root-1"));
 }
 
@@ -185,7 +211,10 @@ fn test_registry_list_issuers() {
 #[test]
 fn test_enforce_issuance_terminal_class_blocked() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("exec-1", AuthorityClass::ExecutionAgent));
+    reg.register(AuthorityPolicy::new(
+        "exec-1",
+        AuthorityClass::ExecutionAgent,
+    ));
     let err = enforce_issuance_policy("exec-1", "someone", 0, None, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::UnauthorizedIssuerClass);
 }
@@ -193,7 +222,10 @@ fn test_enforce_issuance_terminal_class_blocked() {
 #[test]
 fn test_enforce_issuance_self_issue_blocked_for_non_root() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority));
+    reg.register(AuthorityPolicy::new(
+        "svc-1",
+        AuthorityClass::ServiceAuthority,
+    ));
     let err = enforce_issuance_policy("svc-1", "svc-1", 0, None, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::SelfIssuedCapability);
 }
@@ -210,28 +242,49 @@ fn test_enforce_issuance_self_issue_allowed_for_federation_root() {
 #[test]
 fn test_enforce_issuance_class_violation_delegated_to_service() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("del-1", AuthorityClass::DelegatedAuthority));
+    reg.register(AuthorityPolicy::new(
+        "del-1",
+        AuthorityClass::DelegatedAuthority,
+    ));
     let err = enforce_issuance_policy(
-        "del-1", "svc-1", 0, None, None,
-        Some(AuthorityClass::ServiceAuthority), &reg,
-    ).unwrap_err();
+        "del-1",
+        "svc-1",
+        0,
+        None,
+        None,
+        Some(AuthorityClass::ServiceAuthority),
+        &reg,
+    )
+    .unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::AuthorityClassViolation);
 }
 
 #[test]
 fn test_enforce_issuance_class_ok_root_to_execution() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     assert!(enforce_issuance_policy(
-        "root-1", "agent-1", 0, None, None,
-        Some(AuthorityClass::ExecutionAgent), &reg,
-    ).is_ok());
+        "root-1",
+        "agent-1",
+        0,
+        None,
+        None,
+        Some(AuthorityClass::ExecutionAgent),
+        &reg,
+    )
+    .is_ok());
 }
 
 #[test]
 fn test_enforce_issuance_delegation_metadata_required_at_depth_1() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     let err = enforce_issuance_policy("root-1", "agent-1", 1, None, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::DelegationMetadataIncomplete);
 }
@@ -239,18 +292,29 @@ fn test_enforce_issuance_delegation_metadata_required_at_depth_1() {
 #[test]
 fn test_enforce_issuance_delegation_metadata_ok() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     assert!(enforce_issuance_policy(
-        "root-1", "agent-1", 1,
-        Some("parent-jti-abc"), Some("parent-iss-xyz"),
-        None, &reg,
-    ).is_ok());
+        "root-1",
+        "agent-1",
+        1,
+        Some("parent-jti-abc"),
+        Some("parent-iss-xyz"),
+        None,
+        &reg,
+    )
+    .is_ok());
 }
 
 #[test]
 fn test_enforce_issuance_depth_0_no_metadata_ok() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority));
+    reg.register(AuthorityPolicy::new(
+        "svc-1",
+        AuthorityClass::ServiceAuthority,
+    ));
     assert!(enforce_issuance_policy("svc-1", "agent-1", 0, None, None, None, &reg).is_ok());
 }
 
@@ -259,7 +323,10 @@ fn test_enforce_issuance_depth_0_no_metadata_ok() {
 #[test]
 fn test_enforce_verification_terminal_blocked() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("exec-1", AuthorityClass::ExecutionAgent));
+    reg.register(AuthorityPolicy::new(
+        "exec-1",
+        AuthorityClass::ExecutionAgent,
+    ));
     let err = enforce_verification_policy("exec-1", "someone", 0, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::UnauthorizedIssuerClass);
 }
@@ -267,7 +334,10 @@ fn test_enforce_verification_terminal_blocked() {
 #[test]
 fn test_enforce_verification_self_issue_blocked() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("svc-1", AuthorityClass::ServiceAuthority));
+    reg.register(AuthorityPolicy::new(
+        "svc-1",
+        AuthorityClass::ServiceAuthority,
+    ));
     let err = enforce_verification_policy("svc-1", "svc-1", 0, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::SelfIssuedCapability);
 }
@@ -275,7 +345,10 @@ fn test_enforce_verification_self_issue_blocked() {
 #[test]
 fn test_enforce_verification_delegation_missing_at_depth_2() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     let err = enforce_verification_policy("root-1", "agent-1", 2, None, None, &reg).unwrap_err();
     assert_eq!(err.bytecode, SAACPBytecodes::DelegationMetadataIncomplete);
 }
@@ -283,16 +356,22 @@ fn test_enforce_verification_delegation_missing_at_depth_2() {
 #[test]
 fn test_enforce_verification_ok_root_to_agent() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
     assert!(enforce_verification_policy("root-1", "agent-1", 0, None, None, &reg).is_ok());
 }
 
 #[test]
 fn test_enforce_verification_ok_with_delegation_metadata() {
     let reg = AuthorityRegistry::new();
-    reg.register(AuthorityPolicy::new("root-1", AuthorityClass::RootAuthority));
-    assert!(enforce_verification_policy(
-        "root-1", "agent-1", 1,
-        Some("pjti"), Some("piss"), &reg,
-    ).is_ok());
+    reg.register(AuthorityPolicy::new(
+        "root-1",
+        AuthorityClass::RootAuthority,
+    ));
+    assert!(
+        enforce_verification_policy("root-1", "agent-1", 1, Some("pjti"), Some("piss"), &reg,)
+            .is_ok()
+    );
 }

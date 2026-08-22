@@ -221,7 +221,9 @@ impl Default for IevlEngine {
 impl IevlEngine {
     pub fn new() -> Self {
         Self {
-            shards: (0..IEVL_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..IEVL_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
         }
     }
 
@@ -233,7 +235,9 @@ impl IevlEngine {
     }
 
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, IntentDeclaration>> {
-        self.shards[ievl_shard_index(key)].lock().unwrap_or_else(|e| e.into_inner())
+        self.shards[ievl_shard_index(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Registration hook — called from `handler.rs`'s Gate 1.5 block, only for
@@ -261,7 +265,8 @@ impl IevlEngine {
                 // earned via `sweep_expired` moments later anyway, so evicting it
                 // here doesn't skip that consequence, just applies it slightly
                 // early.
-                let expired_keys: Vec<String> = shard.iter()
+                let expired_keys: Vec<String> = shard
+                    .iter()
                     .filter(|(_, d)| now - d.declared_at > RECEIPT_TTL_SECONDS)
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -279,11 +284,16 @@ impl IevlEngine {
                 // let the shard sit over its soft cap rather than silently drop
                 // that evidence.
                 if shard.len() >= IEVL_PER_SHARD_MAX_ENTRIES {
-                    let oldest_unlocked = shard.iter()
-                        .filter(|(_, d)| !TrustDecayEngine::global()
-                            .requires_reauth(&trust_key_for(&d.agent_id, &d.session_uuid)))
+                    let oldest_unlocked = shard
+                        .iter()
+                        .filter(|(_, d)| {
+                            !TrustDecayEngine::global()
+                                .requires_reauth(&trust_key_for(&d.agent_id, &d.session_uuid))
+                        })
                         .min_by(|(_, a), (_, b)| {
-                            a.declared_at.partial_cmp(&b.declared_at).unwrap_or(std::cmp::Ordering::Equal)
+                            a.declared_at
+                                .partial_cmp(&b.declared_at)
+                                .unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .map(|(k, _)| k.clone());
                     if let Some(k) = oldest_unlocked {
@@ -294,18 +304,24 @@ impl IevlEngine {
                 }
             }
 
-            shard.insert(id, IntentDeclaration {
-                declared_action,
-                action_class,
-                targets,
-                agent_id: agent_id.to_string(),
-                session_uuid: session_uuid.to_string(),
-                declared_at: now,
-            });
+            shard.insert(
+                id,
+                IntentDeclaration {
+                    declared_action,
+                    action_class,
+                    targets,
+                    agent_id: agent_id.to_string(),
+                    session_uuid: session_uuid.to_string(),
+                    declared_at: now,
+                },
+            );
         }
 
         for d in to_penalize {
-            TrustDecayEngine::global().penalize(&trust_key_for(&d.agent_id, &d.session_uuid), PenaltyKind::ReceiptTimeout);
+            TrustDecayEngine::global().penalize(
+                &trust_key_for(&d.agent_id, &d.session_uuid),
+                PenaltyKind::ReceiptTimeout,
+            );
         }
     }
 
@@ -354,13 +370,16 @@ impl IevlEngine {
         }
 
         let target_overlap = jaccard_overlap(&decl.targets, actual_targets);
-        let action_overlap = 1.0 - SAACPProtocolHandler::intent_divergence(&decl.declared_action, actual_action);
+        let action_overlap =
+            1.0 - SAACPProtocolHandler::intent_divergence(&decl.declared_action, actual_action);
 
         if target_overlap < TARGET_MINOR_DRIFT_THRESHOLD {
             VerificationVerdict::TargetViolation
         } else if action_overlap < TARGET_MINOR_DRIFT_THRESHOLD {
             VerificationVerdict::MajorDivergence
-        } else if target_overlap < TARGET_OVERLAP_THRESHOLD || action_overlap < TARGET_OVERLAP_THRESHOLD {
+        } else if target_overlap < TARGET_OVERLAP_THRESHOLD
+            || action_overlap < TARGET_OVERLAP_THRESHOLD
+        {
             VerificationVerdict::MinorDrift
         } else {
             VerificationVerdict::Consistent
@@ -375,7 +394,8 @@ impl IevlEngine {
 
         for shard_lock in &self.shards {
             let mut shard = shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let expired_keys: Vec<String> = shard.iter()
+            let expired_keys: Vec<String> = shard
+                .iter()
                 .filter(|(_, d)| now - d.declared_at > RECEIPT_TTL_SECONDS)
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -388,14 +408,20 @@ impl IevlEngine {
 
         let count = expired.len();
         for d in expired {
-            TrustDecayEngine::global().penalize(&trust_key_for(&d.agent_id, &d.session_uuid), PenaltyKind::ReceiptTimeout);
+            TrustDecayEngine::global().penalize(
+                &trust_key_for(&d.agent_id, &d.session_uuid),
+                PenaltyKind::ReceiptTimeout,
+            );
         }
         count
     }
 
     /// Number of declarations currently tracked (for observability/tests).
     pub fn tracked_count(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 
     /// Spawn a background OS thread that calls [`Self::sweep_expired`] every 60
@@ -419,7 +445,10 @@ impl IevlEngine {
 /// reported touched).
 fn jaccard_overlap(declared: &[String], actual: &[String]) -> f64 {
     let normalize = |v: &[String]| -> HashSet<String> {
-        v.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+        v.iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
     let a = normalize(declared);
     let b = normalize(actual);
@@ -441,7 +470,8 @@ fn jaccard_overlap(declared: &[String], actual: &[String]) -> f64 {
 /// none).
 pub fn extract_targets(payload_dict: &HashMap<String, JsonValue>) -> Vec<String> {
     match payload_dict.get("targets") {
-        Some(JsonValue::Array(items)) => items.iter()
+        Some(JsonValue::Array(items)) => items
+            .iter()
             .filter_map(|v| match v {
                 JsonValue::String(s) => Some(s.clone()),
                 _ => None,
@@ -466,7 +496,9 @@ pub fn extract_targets(payload_dict: &HashMap<String, JsonValue>) -> Vec<String>
 /// `JsonValue`s. Returns `None` on any type mismatch, mirroring
 /// `daemon.rs::decode_gossip_envelope`'s "drop and log nothing further"
 /// philosophy for malformed/adversarial peer traffic.
-fn decode_execution_receipt(payload_dict: &HashMap<String, JsonValue>) -> Option<(String, String, Vec<String>, String)> {
+fn decode_execution_receipt(
+    payload_dict: &HashMap<String, JsonValue>,
+) -> Option<(String, String, Vec<String>, String)> {
     let declaration_ref = match payload_dict.get("declaration_ref") {
         Some(JsonValue::String(s)) => s.clone(),
         _ => return None,
@@ -476,7 +508,8 @@ fn decode_execution_receipt(payload_dict: &HashMap<String, JsonValue>) -> Option
         _ => return None,
     };
     let actual_targets = match payload_dict.get("actual_targets") {
-        Some(JsonValue::Array(items)) => items.iter()
+        Some(JsonValue::Array(items)) => items
+            .iter()
             .filter_map(|v| match v {
                 JsonValue::String(s) => Some(s.clone()),
                 _ => None,
@@ -488,14 +521,23 @@ fn decode_execution_receipt(payload_dict: &HashMap<String, JsonValue>) -> Option
         Some(JsonValue::String(s)) => s.clone(),
         _ => return None,
     };
-    Some((declaration_ref, actual_action, actual_targets, receipt_signature))
+    Some((
+        declaration_ref,
+        actual_action,
+        actual_targets,
+        receipt_signature,
+    ))
 }
 
 /// Canonical length-prefixed encoding of a receipt's claimed fields — the same
 /// idiom `identity_binding.rs`'s transcript hash and `faitf.rs`'s
 /// `AgentCredential`/`SignedRevocationRecord` body bytes already use, so no two
 /// fields can ever be concatenation-ambiguous with each other.
-fn canonical_receipt_bytes(declaration_ref: &str, actual_action: &str, actual_targets: &[String]) -> Vec<u8> {
+fn canonical_receipt_bytes(
+    declaration_ref: &str,
+    actual_action: &str,
+    actual_targets: &[String],
+) -> Vec<u8> {
     fn encode_field(buf: &mut Vec<u8>, data: &[u8]) {
         buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
         buf.extend_from_slice(data);
@@ -543,17 +585,29 @@ pub fn verify_receipt_signature(
     signature_b64: &str,
 ) -> bool {
     let Some(pk_hex) = crate::identity_binding::DEFAULT_IDENTITY_REGISTRY
-        .get_by_session_id(session_uuid, |session| session.client_public_key_hex.clone())
+        .get_by_session_id(session_uuid, |session| {
+            session.client_public_key_hex.clone()
+        })
         .filter(|pk_hex| !pk_hex.is_empty())
     else {
         return false;
     };
-    let Ok(pk_bytes) = hex::decode(&pk_hex) else { return false; };
-    let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else { return false; };
-    let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_arr) else { return false; };
+    let Ok(pk_bytes) = hex::decode(&pk_hex) else {
+        return false;
+    };
+    let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
 
-    let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(signature_b64) else { return false; };
-    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else { return false; };
+    let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(signature_b64) else {
+        return false;
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return false;
+    };
     let sig = Signature::from_bytes(&sig_arr);
 
     let body = canonical_receipt_bytes(declaration_ref, actual_action, actual_targets);
@@ -580,7 +634,13 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
         return;
     };
 
-    if !verify_receipt_signature(&parsed.session_uuid, &declaration_ref, &actual_action, &actual_targets, &signature_b64) {
+    if !verify_receipt_signature(
+        &parsed.session_uuid,
+        &declaration_ref,
+        &actual_action,
+        &actual_targets,
+        &signature_b64,
+    ) {
         report_gate_rejection(
             "ievl_receipt",
             &parsed.source_agent,
@@ -593,7 +653,12 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
     }
 
     let trust_key = trust_key_for(&parsed.source_agent, &parsed.session_uuid);
-    let verdict = IevlEngine::global().process_receipt(&declaration_ref, &actual_action, &actual_targets, parsed.action_class);
+    let verdict = IevlEngine::global().process_receipt(
+        &declaration_ref,
+        &actual_action,
+        &actual_targets,
+        parsed.action_class,
+    );
 
     match verdict {
         VerificationVerdict::Consistent => {
@@ -721,11 +786,17 @@ mod tests {
     #[test]
     fn extract_targets_prefers_array() {
         let mut payload = HashMap::new();
-        payload.insert("targets".to_string(), JsonValue::Array(vec![
-            JsonValue::String("a".to_string()),
-            JsonValue::String("b".to_string()),
-        ]));
-        payload.insert("target".to_string(), JsonValue::String("ignored".to_string()));
+        payload.insert(
+            "targets".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::String("a".to_string()),
+                JsonValue::String("b".to_string()),
+            ]),
+        );
+        payload.insert(
+            "target".to_string(),
+            JsonValue::String("ignored".to_string()),
+        );
         assert_eq!(extract_targets(&payload), s(&["a", "b"]));
     }
 
@@ -748,8 +819,12 @@ mod tests {
     fn consistent_receipt_verified() {
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-a", 1, "agent-a",
-            "delete stale records".to_string(), 0x02, s(&["table-x"]),
+            "sess-a",
+            1,
+            "agent-a",
+            "delete stale records".to_string(),
+            0x02,
+            s(&["table-x"]),
         );
         let verdict = engine.process_receipt(
             &declaration_id("sess-a", 1),
@@ -764,8 +839,12 @@ mod tests {
     fn receipt_consumes_declaration_exactly_once() {
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-b", 1, "agent-b",
-            "delete stale records".to_string(), 0x02, s(&["table-x"]),
+            "sess-b",
+            1,
+            "agent-b",
+            "delete stale records".to_string(),
+            0x02,
+            s(&["table-x"]),
         );
         let id = declaration_id("sess-b", 1);
         let first = engine.process_receipt(&id, "delete stale records", &s(&["table-x"]), 0x02);
@@ -785,11 +864,18 @@ mod tests {
     fn class_escalation_detected_via_numeric_action_class() {
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-c", 1, "agent-c",
-            "read the report".to_string(), 0x01, s(&["report-1"]),
+            "sess-c",
+            1,
+            "agent-c",
+            "read the report".to_string(),
+            0x01,
+            s(&["report-1"]),
         );
         let verdict = engine.process_receipt(
-            &declaration_id("sess-c", 1), "read the report", &s(&["report-1"]), 0x02,
+            &declaration_id("sess-c", 1),
+            "read the report",
+            &s(&["report-1"]),
+            0x02,
         );
         assert_eq!(verdict, VerificationVerdict::ClassEscalation);
     }
@@ -803,8 +889,12 @@ mod tests {
         // documented default only ever registers IRREVERSIBLE declarations.
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-i", 1, "agent-i",
-            "archive the quarterly ledger".to_string(), 0x02, s(&["ledger-1"]),
+            "sess-i",
+            1,
+            "agent-i",
+            "archive the quarterly ledger".to_string(),
+            0x02,
+            s(&["ledger-1"]),
         );
         let verdict = engine.process_receipt(
             &declaration_id("sess-i", 1),
@@ -823,11 +913,18 @@ mod tests {
         // "relative to the declaration's own vocabulary" false-positive guard.
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-j", 1, "agent-j",
-            "delete stale test records".to_string(), 0x02, s(&["table-x"]),
+            "sess-j",
+            1,
+            "agent-j",
+            "delete stale test records".to_string(),
+            0x02,
+            s(&["table-x"]),
         );
         let verdict = engine.process_receipt(
-            &declaration_id("sess-j", 1), "delete stale test records", &s(&["table-x"]), 0x02,
+            &declaration_id("sess-j", 1),
+            "delete stale test records",
+            &s(&["table-x"]),
+            0x02,
         );
         assert_eq!(verdict, VerificationVerdict::Consistent);
     }
@@ -836,11 +933,18 @@ mod tests {
     fn target_violation_on_disjoint_targets() {
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-d", 1, "agent-d",
-            "delete stale records".to_string(), 0x02, s(&["table-x"]),
+            "sess-d",
+            1,
+            "agent-d",
+            "delete stale records".to_string(),
+            0x02,
+            s(&["table-x"]),
         );
         let verdict = engine.process_receipt(
-            &declaration_id("sess-d", 1), "delete stale records", &s(&["table-completely-different"]), 0x02,
+            &declaration_id("sess-d", 1),
+            "delete stale records",
+            &s(&["table-completely-different"]),
+            0x02,
         );
         assert_eq!(verdict, VerificationVerdict::TargetViolation);
     }
@@ -849,8 +953,12 @@ mod tests {
     fn major_divergence_on_unrelated_action_text_same_targets() {
         let engine = IevlEngine::new();
         engine.register_declaration(
-            "sess-e", 1, "agent-e",
-            "archive quarterly financial ledger entries".to_string(), 0x02, s(&["table-x"]),
+            "sess-e",
+            1,
+            "agent-e",
+            "archive quarterly financial ledger entries".to_string(),
+            0x02,
+            s(&["table-x"]),
         );
         let verdict = engine.process_receipt(
             &declaration_id("sess-e", 1),
@@ -877,14 +985,17 @@ mod tests {
         // Directly inject an already-stale declaration to avoid a real sleep.
         {
             let mut shard = engine.shard(&declaration_id("sess-g", 1));
-            shard.insert(declaration_id("sess-g", 1), IntentDeclaration {
-                declared_action: "task".to_string(),
-                action_class: 0x02,
-                targets: vec![],
-                agent_id: "agent-g".to_string(),
-                session_uuid: "sess-g".to_string(),
-                declared_at: now_secs() - RECEIPT_TTL_SECONDS - 1.0,
-            });
+            shard.insert(
+                declaration_id("sess-g", 1),
+                IntentDeclaration {
+                    declared_action: "task".to_string(),
+                    action_class: 0x02,
+                    targets: vec![],
+                    agent_id: "agent-g".to_string(),
+                    session_uuid: "sess-g".to_string(),
+                    declared_at: now_secs() - RECEIPT_TTL_SECONDS - 1.0,
+                },
+            );
         }
         engine.register_declaration("sess-h", 1, "agent-h", "fresh".to_string(), 0x02, vec![]);
 
@@ -897,12 +1008,24 @@ mod tests {
 
     #[test]
     fn verify_receipt_signature_fails_with_no_bound_session() {
-        assert!(!verify_receipt_signature("no-such-session", "ref", "action", &[], "not-base64!!"));
+        assert!(!verify_receipt_signature(
+            "no-such-session",
+            "ref",
+            "action",
+            &[],
+            "not-base64!!"
+        ));
     }
 
     #[test]
     fn verify_receipt_signature_fails_on_garbage_signature() {
-        assert!(!verify_receipt_signature("no-such-session", "ref", "action", &[], "AAAA"));
+        assert!(!verify_receipt_signature(
+            "no-such-session",
+            "ref",
+            "action",
+            &[],
+            "AAAA"
+        ));
     }
 
     #[test]
@@ -917,10 +1040,16 @@ mod tests {
         // test's use of the process-wide DEFAULT_IDENTITY_REGISTRY singleton.
         let sid = vec![0x1Eu8; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "receipt-signer", "server-x",
-            &client_pk_hex, &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "receipt-signer",
+            "server-x",
+            &client_pk_hex,
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let session_id_hex = session.session_id_hex();
         let thash = session.thash.clone();
@@ -928,11 +1057,20 @@ mod tests {
 
         let targets = s(&["table-x"]);
         let sig_b64 = sign_receipt(&signing_key, "decl-ref-1", "delete stale records", &targets);
-        let verified = verify_receipt_signature(&session_id_hex, "decl-ref-1", "delete stale records", &targets, &sig_b64);
+        let verified = verify_receipt_signature(
+            &session_id_hex,
+            "decl-ref-1",
+            "delete stale records",
+            &targets,
+            &sig_b64,
+        );
 
         DEFAULT_IDENTITY_REGISTRY.remove(&thash);
 
-        assert!(verified, "a correctly-signed receipt must verify against its session's bound public key");
+        assert!(
+            verified,
+            "a correctly-signed receipt must verify against its session's bound public key"
+        );
     }
 
     #[test]
@@ -945,22 +1083,42 @@ mod tests {
         let client_pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
         let sid = vec![0x1Fu8; 16];
         let session = TranscriptBoundSession::establish(
-            sid, "receipt-signer-2", "server-x",
-            &client_pk_hex, &"bb".repeat(32),
-            &"cc".repeat(16), &"dd".repeat(16),
-            "v1", "cs1", None,
+            sid,
+            "receipt-signer-2",
+            "server-x",
+            &client_pk_hex,
+            &"bb".repeat(32),
+            &"cc".repeat(16),
+            &"dd".repeat(16),
+            "v1",
+            "cs1",
+            None,
         );
         let session_id_hex = session.session_id_hex();
         let thash = session.thash.clone();
         DEFAULT_IDENTITY_REGISTRY.register(session);
 
-        let sig_b64 = sign_receipt(&signing_key, "decl-ref-1", "delete stale records", &s(&["table-x"]));
+        let sig_b64 = sign_receipt(
+            &signing_key,
+            "decl-ref-1",
+            "delete stale records",
+            &s(&["table-x"]),
+        );
         // Verify against a DIFFERENT actual_action than what was signed.
-        let verified = verify_receipt_signature(&session_id_hex, "decl-ref-1", "delete EVERYTHING", &s(&["table-x"]), &sig_b64);
+        let verified = verify_receipt_signature(
+            &session_id_hex,
+            "decl-ref-1",
+            "delete EVERYTHING",
+            &s(&["table-x"]),
+            &sig_b64,
+        );
 
         DEFAULT_IDENTITY_REGISTRY.remove(&thash);
 
-        assert!(!verified, "a signature over one action must not verify against a tampered action string");
+        assert!(
+            !verified,
+            "a signature over one action must not verify against a tampered action string"
+        );
     }
 
     #[test]
@@ -973,19 +1131,42 @@ mod tests {
     #[test]
     fn decode_execution_receipt_requires_all_fields() {
         let mut payload = HashMap::new();
-        payload.insert("declaration_ref".to_string(), JsonValue::String("r".to_string()));
+        payload.insert(
+            "declaration_ref".to_string(),
+            JsonValue::String("r".to_string()),
+        );
         assert!(decode_execution_receipt(&payload).is_none());
     }
 
     #[test]
     fn decode_execution_receipt_full_roundtrip() {
         let mut payload = HashMap::new();
-        payload.insert("declaration_ref".to_string(), JsonValue::String("r".to_string()));
-        payload.insert("actual_action".to_string(), JsonValue::String("a".to_string()));
-        payload.insert("actual_targets".to_string(), JsonValue::Array(vec![JsonValue::String("t".to_string())]));
-        payload.insert("receipt_signature".to_string(), JsonValue::String("sig".to_string()));
+        payload.insert(
+            "declaration_ref".to_string(),
+            JsonValue::String("r".to_string()),
+        );
+        payload.insert(
+            "actual_action".to_string(),
+            JsonValue::String("a".to_string()),
+        );
+        payload.insert(
+            "actual_targets".to_string(),
+            JsonValue::Array(vec![JsonValue::String("t".to_string())]),
+        );
+        payload.insert(
+            "receipt_signature".to_string(),
+            JsonValue::String("sig".to_string()),
+        );
         let decoded = decode_execution_receipt(&payload);
-        assert_eq!(decoded, Some(("r".to_string(), "a".to_string(), s(&["t"]), "sig".to_string())));
+        assert_eq!(
+            decoded,
+            Some((
+                "r".to_string(),
+                "a".to_string(),
+                s(&["t"]),
+                "sig".to_string()
+            ))
+        );
     }
 
     #[test]

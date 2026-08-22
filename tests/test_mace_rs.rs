@@ -38,11 +38,18 @@ fn ensure_wired() {
 }
 
 fn now_secs() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn reject(gate: &'static str, agent_id: &str, bytecode: SAACPBytecodes) {
-    saacp::telemetry::report_gate_rejection(gate, agent_id, &SAACPHardDrop::new(bytecode, "mace e2e test"));
+    saacp::telemetry::report_gate_rejection(
+        gate,
+        agent_id,
+        &SAACPHardDrop::new(bytecode, "mace e2e test"),
+    );
 }
 
 // ─── Sybil Cluster through the real alert-feed subscription ──────────────────
@@ -56,21 +63,36 @@ fn sybil_cluster_through_real_alert_feed_wiring_penalizes_and_revokes_both() {
     // Six identical rejection patterns each — well above SYBIL_MIN_OBSERVATIONS
     // (5) and a perfect 1.0 cosine match.
     for _ in 0..6 {
-        reject("gate_4_0_inject", agent_a, SAACPBytecodes::PromptInjectionDetected);
-        reject("gate_4_0_inject", agent_b, SAACPBytecodes::PromptInjectionDetected);
+        reject(
+            "gate_4_0_inject",
+            agent_a,
+            SAACPBytecodes::PromptInjectionDetected,
+        );
+        reject(
+            "gate_4_0_inject",
+            agent_b,
+            SAACPBytecodes::PromptInjectionDetected,
+        );
     }
 
     let before_a = TrustDecayEngine::global().score(&trust_key_for(agent_a, ""));
 
     let matches = MultiAgentCollusionEngine::global().detect_and_enforce_sybil_clusters();
     let found = matches.iter().any(|(a, b, sim)| {
-        ((a == agent_a && b == agent_b) || (a == agent_b && b == agent_a)) && *sim >= mace::SYBIL_COSINE_THRESHOLD
+        ((a == agent_a && b == agent_b) || (a == agent_b && b == agent_a))
+            && *sim >= mace::SYBIL_COSINE_THRESHOLD
     });
-    assert!(found, "the two agents driven through the REAL report_gate_rejection entry point \
-        must appear as a matched Sybil-cluster pair: {matches:?}");
+    assert!(
+        found,
+        "the two agents driven through the REAL report_gate_rejection entry point \
+        must appear as a matched Sybil-cluster pair: {matches:?}"
+    );
 
     let after_a = TrustDecayEngine::global().score(&trust_key_for(agent_a, ""));
-    assert!(after_a < before_a, "a confirmed Sybil match must penalize trust: before={before_a} after={after_a}");
+    assert!(
+        after_a < before_a,
+        "a confirmed Sybil match must penalize trust: before={before_a} after={after_a}"
+    );
     assert!(DistributedRevocationInfrastructure::global().is_revoked(agent_a, ""));
     assert!(DistributedRevocationInfrastructure::global().is_revoked(agent_b, ""));
 }
@@ -82,17 +104,24 @@ fn non_colluding_agents_through_real_alert_feed_wiring_not_flagged() {
     let agent_d = "mace-e2e-distinct-d";
 
     for _ in 0..6 {
-        reject("gate_4_0_inject", agent_c, SAACPBytecodes::PromptInjectionDetected);
+        reject(
+            "gate_4_0_inject",
+            agent_c,
+            SAACPBytecodes::PromptInjectionDetected,
+        );
     }
     for _ in 0..6 {
         reject("gate_9_0_schema", agent_d, SAACPBytecodes::SchemaMismatch);
     }
 
     let matches = MultiAgentCollusionEngine::global().detect_sybil_clusters();
-    let false_positive = matches.iter().any(|(a, b, _)| {
-        (a == agent_c && b == agent_d) || (a == agent_d && b == agent_c)
-    });
-    assert!(!false_positive, "agents rejected by completely disjoint gates must never be flagged as a Sybil pair");
+    let false_positive = matches
+        .iter()
+        .any(|(a, b, _)| (a == agent_c && b == agent_d) || (a == agent_d && b == agent_c));
+    assert!(
+        !false_positive,
+        "agents rejected by completely disjoint gates must never be flagged as a Sybil pair"
+    );
 }
 
 // ─── Coordinated Exhaustion through the real alert-feed subscription ─────────
@@ -103,7 +132,11 @@ fn coordinated_exhaustion_through_real_alert_feed_wiring() {
     let now = now_secs();
 
     for i in 0..mace::COORDINATED_EXHAUSTION_MIN_AGENTS {
-        reject("gate_pre_ratelimit", &format!("mace-e2e-exhaustion-{i}"), SAACPBytecodes::CircuitBreakerOpen);
+        reject(
+            "gate_pre_ratelimit",
+            &format!("mace-e2e-exhaustion-{i}"),
+            SAACPBytecodes::CircuitBreakerOpen,
+        );
     }
 
     let detected = MultiAgentCollusionEngine::global().detect_coordinated_exhaustion(now + 1.0);
@@ -124,7 +157,11 @@ fn distraction_cover_through_real_report_gate_rejection() {
     // through `report_gate_rejection` regardless of alert-feed wiring state.
     let around = now_secs();
     for i in 0..mace::DISTRACTION_COVER_MIN_LOW_SEVERITY {
-        reject("gate_9_0_schema", &format!("mace-e2e-distraction-{i}"), SAACPBytecodes::SchemaMismatch);
+        reject(
+            "gate_9_0_schema",
+            &format!("mace-e2e-distraction-{i}"),
+            SAACPBytecodes::SchemaMismatch,
+        );
     }
 
     assert!(
@@ -152,12 +189,20 @@ fn mace_sweep_and_enforce_through_real_maintenance_coordinator_revokes_sybil_pai
     let agent_a = "mace-e2e-sweep-sybil-a";
     let agent_b = "mace-e2e-sweep-sybil-b";
     for _ in 0..6 {
-        reject("gate_4_0_inject", agent_a, SAACPBytecodes::PromptInjectionDetected);
-        reject("gate_4_0_inject", agent_b, SAACPBytecodes::PromptInjectionDetected);
+        reject(
+            "gate_4_0_inject",
+            agent_a,
+            SAACPBytecodes::PromptInjectionDetected,
+        );
+        reject(
+            "gate_4_0_inject",
+            agent_b,
+            SAACPBytecodes::PromptInjectionDetected,
+        );
     }
 
-    let coordinator = MaintenanceCoordinator::new()
-        .with_custom("mace_global", saacp::mace::sweep_and_enforce);
+    let coordinator =
+        MaintenanceCoordinator::new().with_custom("mace_global", saacp::mace::sweep_and_enforce);
     coordinator.run_once();
 
     assert!(

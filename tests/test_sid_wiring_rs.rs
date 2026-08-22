@@ -24,7 +24,10 @@ use saacp::gateway::ZeroTrustGateway;
 use saacp::{SAACPBytecodes, SAACPProtocolHandler};
 
 fn now_u64() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Hand-rolled HMAC-PSK capability token wire builder — matches
@@ -71,7 +74,9 @@ fn build_frame(session: [u8; 16], secret: &[u8], payload: &[u8]) -> Vec<u8> {
         context_version: 0,
         w3c_traceparent: [0u8; 24],
     };
-    frame.encode_encrypted(payload, secret).expect("encode_encrypted must succeed")
+    frame
+        .encode_encrypted(payload, secret)
+        .expect("encode_encrypted must succeed")
 }
 
 /// Drive one READ_ONLY, fully-authorized text packet carrying `task_text`
@@ -98,7 +103,15 @@ fn drive_task_packet(
     let frame = build_frame(session, secret, payload.as_bytes());
 
     SAACPProtocolHandler::intercept_packet_full(
-        &frame, secret, target, false, Some(gw), None, None, None, None,
+        &frame,
+        secret,
+        target,
+        false,
+        Some(gw),
+        None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -118,11 +131,16 @@ fn sid_disabled_by_default_semantic_injection_passes_through_real_pipeline() {
     saacp::sid_set_required(false);
     let secret = [0x51u8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("sid-e2e-orchestrator-1", &secret).unwrap();
+    gw.register_issuer_key("sid-e2e-orchestrator-1", &secret)
+        .unwrap();
 
     let result = drive_task_packet(
-        &secret, &gw, "sid-e2e-orchestrator-1", "sid-e2e-worker-1",
-        SEMANTIC_INJECTION_TEXT, 0x51,
+        &secret,
+        &gw,
+        "sid-e2e-orchestrator-1",
+        "sid-e2e-worker-1",
+        SEMANTIC_INJECTION_TEXT,
+        0x51,
     );
     assert!(
         result.is_ok(),
@@ -137,11 +155,16 @@ fn sid_enabled_rejects_semantic_injection_through_real_pipeline() {
     saacp::sid_set_required(true);
     let secret = [0x52u8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("sid-e2e-orchestrator-2", &secret).unwrap();
+    gw.register_issuer_key("sid-e2e-orchestrator-2", &secret)
+        .unwrap();
 
     let result = drive_task_packet(
-        &secret, &gw, "sid-e2e-orchestrator-2", "sid-e2e-worker-2",
-        SEMANTIC_INJECTION_TEXT, 0x52,
+        &secret,
+        &gw,
+        "sid-e2e-orchestrator-2",
+        "sid-e2e-worker-2",
+        SEMANTIC_INJECTION_TEXT,
+        0x52,
     );
 
     saacp::sid_set_required(false);
@@ -159,11 +182,16 @@ fn sid_enabled_allows_benign_task_through_real_pipeline() {
     saacp::sid_set_required(true);
     let secret = [0x53u8; 32];
     let gw = ZeroTrustGateway::new();
-    gw.register_issuer_key("sid-e2e-orchestrator-3", &secret).unwrap();
+    gw.register_issuer_key("sid-e2e-orchestrator-3", &secret)
+        .unwrap();
 
     let result = drive_task_packet(
-        &secret, &gw, "sid-e2e-orchestrator-3", "sid-e2e-worker-3",
-        BENIGN_TASK_TEXT, 0x53,
+        &secret,
+        &gw,
+        "sid-e2e-orchestrator-3",
+        "sid-e2e-worker-3",
+        BENIGN_TASK_TEXT,
+        0x53,
     );
 
     saacp::sid_set_required(false);

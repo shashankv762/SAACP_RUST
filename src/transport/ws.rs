@@ -40,8 +40,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::daemon::{
-    PerIpConnectionGuard, SharedCircuitBreakers, MAX_CONNECTIONS,
-    MAX_CONNECTIONS_PER_IP, MAX_PAYLOAD_SIZE, SHUTDOWN_DRAIN_TIMEOUT_SECS,
+    PerIpConnectionGuard, SharedCircuitBreakers, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
+    MAX_PAYLOAD_SIZE, SHUTDOWN_DRAIN_TIMEOUT_SECS,
 };
 use crate::handler::ParsedPacket;
 use crate::measc::SessionEpochManager;
@@ -85,7 +85,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pub fn new(inner: WebSocketStream<S>) -> Self {
-        Self { inner, read_buf: BytesMut::new(), read_closed: false, pending_write_len: None }
+        Self {
+            inner,
+            read_buf: BytesMut::new(),
+            read_closed: false,
+            pending_write_len: None,
+        }
     }
 }
 
@@ -277,10 +282,7 @@ impl SAACPWebSocketDaemon {
 
     /// H-20 fix: observe every successfully-verified `ParsedPacket`. See
     /// `SAACPNetworkDaemon::with_on_delivered` — identical semantics.
-    pub fn with_on_delivered(
-        mut self,
-        callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>,
-    ) -> Self {
+    pub fn with_on_delivered(mut self, callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>) -> Self {
         self.on_delivered = Some(callback);
         self
     }
@@ -333,7 +335,8 @@ impl SAACPWebSocketDaemon {
     /// cancelled. M-37 fix: returns `Result` (propagates a bind failure) instead of
     /// panicking.
     pub async fn start(&self) -> std::io::Result<()> {
-        self.start_with_shutdown(tokio_util::sync::CancellationToken::new()).await
+        self.start_with_shutdown(tokio_util::sync::CancellationToken::new())
+            .await
     }
 
     /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
@@ -341,12 +344,22 @@ impl SAACPWebSocketDaemon {
     /// `daemon::SHUTDOWN_DRAIN_TIMEOUT_SECS`) before flushing the audit-log WAL
     /// (L-10) and returning. See `daemon::SAACPNetworkDaemon::start_with_shutdown` —
     /// identical shape.
-    pub async fn start_with_shutdown(&self, shutdown: tokio_util::sync::CancellationToken) -> std::io::Result<()> {
+    pub async fn start_with_shutdown(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
 
-        let auth_mode = if self.server_ed25519_seed.is_some() { "authenticated" } else { "unauthenticated" };
-        eprintln!("[SAACP Daemon/WS] Listening on {} ({} handshake)", addr, auth_mode);
+        let auth_mode = if self.server_ed25519_seed.is_some() {
+            "authenticated"
+        } else {
+            "unauthenticated"
+        };
+        eprintln!(
+            "[SAACP Daemon/WS] Listening on {} ({} handshake)",
+            addr, auth_mode
+        );
 
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -418,10 +431,11 @@ impl SAACPWebSocketDaemon {
 
         // Drain: let in-flight connections finish naturally, bounded by
         // SHUTDOWN_DRAIN_TIMEOUT_SECS, then hard-abort whatever's left.
-        let drained = tokio::time::timeout(
-            Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
-            async { while tasks.join_next().await.is_some() {} },
-        ).await;
+        let drained =
+            tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS), async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await;
         if drained.is_err() {
             eprintln!(
                 "[SAACP Daemon/WS] Drain timeout ({}s) exceeded — aborting {} in-flight connection(s)",
@@ -433,9 +447,12 @@ impl SAACPWebSocketDaemon {
 
         // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
         let flushed = tokio::task::spawn_blocking(|| {
-            crate::security::ImmutableAuditLog::global()
-                .flush(Duration::from_secs(crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
-        }).await.unwrap_or(false);
+            crate::security::ImmutableAuditLog::global().flush(Duration::from_secs(
+                crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS,
+            ))
+        })
+        .await
+        .unwrap_or(false);
         if !flushed {
             eprintln!("[SAACP Daemon/WS] WAL flush on shutdown did not confirm in time");
         }
@@ -479,20 +496,24 @@ async fn serve_ws_connection(
     // socket and then never completes (or trickles) the Upgrade request cannot hold a
     // spawned task / connection-semaphore permit / per-IP slot forever (slow-loris DoS).
     let upgrade = tokio_tungstenite::accept_async_with_config(raw, Some(ws_config));
-    let ws_stream = match tokio::time::timeout(Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS), upgrade).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("[SAACP Daemon/WS] Upgrade handshake failed from {}: {}", peer_addr, e);
-            return;
-        }
-        Err(_) => {
-            eprintln!(
-                "[SAACP Daemon/WS] Upgrade handshake from {} exceeded {}s — dropping",
-                peer_addr, WS_UPGRADE_TIMEOUT_SECS,
-            );
-            return;
-        }
-    };
+    let ws_stream =
+        match tokio::time::timeout(Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS), upgrade).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[SAACP Daemon/WS] Upgrade handshake failed from {}: {}",
+                    peer_addr, e
+                );
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "[SAACP Daemon/WS] Upgrade handshake from {} exceeded {}s — dropping",
+                    peer_addr, WS_UPGRADE_TIMEOUT_SECS,
+                );
+                return;
+            }
+        };
     let adapted = WsByteStream::new(ws_stream);
     // H-20 fix: forward the daemon's configured security opt-ins through to the shared
     // pipeline instead of hardcoding `None` — gives the WS transport full feature parity

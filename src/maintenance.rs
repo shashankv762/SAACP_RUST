@@ -216,14 +216,24 @@ impl MaintenanceCoordinator {
     /// Register an arbitrary zero-argument sweeper under `name` (used for diagnostics in
     /// `run_once`'s panic log, and by the other `with_*` methods above). Public so a caller
     /// can plug in a subsystem this module doesn't know about without forking it.
-    pub fn with_custom(self, name: &'static str, sweeper: impl Fn() + Send + Sync + 'static) -> Self {
-        self.sweepers.lock().unwrap_or_else(|e| e.into_inner()).push((name, Box::new(sweeper)));
+    pub fn with_custom(
+        self,
+        name: &'static str,
+        sweeper: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.sweepers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((name, Box::new(sweeper)));
         self
     }
 
     /// Number of subsystems currently registered.
     pub fn sweeper_count(&self) -> usize {
-        self.sweepers.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.sweepers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Run every registered sweeper exactly once, synchronously, in registration order.
@@ -355,7 +365,11 @@ mod tests {
         coordinator.run_once();
         panic::set_hook(prev_hook);
 
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "both non-panicking sweepers must still run");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "both non-panicking sweepers must still run"
+        );
     }
 
     #[test]
@@ -387,7 +401,11 @@ mod tests {
         assert_eq!(coordinator.sweeper_count(), 1);
         coordinator.run_once();
 
-        assert_eq!(registry.active_count(), 0, "stale session must be removed by the sweep cycle");
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "stale session must be removed by the sweep cycle"
+        );
     }
 
     /// opusplan.md 6.5: `with_trust_decay` must actually invoke
@@ -408,7 +426,11 @@ mod tests {
         let coordinator = MaintenanceCoordinator::new().with_trust_decay(Arc::clone(&engine));
         assert_eq!(coordinator.sweeper_count(), 1);
         coordinator.run_once(); // must not panic against real state
-        assert_eq!(engine.tracked_count(), 1, "a fresh entry must survive one sweep cycle");
+        assert_eq!(
+            engine.tracked_count(),
+            1,
+            "a fresh entry must survive one sweep cycle"
+        );
     }
 
     /// opusplan.md 6.5: `with_federated_memory` must actually invoke
@@ -426,7 +448,11 @@ mod tests {
         let coordinator = MaintenanceCoordinator::new().with_federated_memory(Arc::clone(&memory));
         assert_eq!(coordinator.sweeper_count(), 1);
         coordinator.run_once(); // must not panic against real state
-        assert_eq!(memory.count(), 1, "a fresh (non-expired) record must survive one sweep cycle");
+        assert_eq!(
+            memory.count(),
+            1,
+            "a fresh (non-expired) record must survive one sweep cycle"
+        );
     }
 
     /// H-28: `with_identity_prover` must actually invoke
@@ -463,10 +489,15 @@ mod tests {
         // (would be 0 either way) without a false negative if wiring were
         // simply absent, so assert the sweeper is registered and runs
         // without panicking against real state.
-        let coordinator = MaintenanceCoordinator::new().with_checkpointed_session(Arc::clone(&session));
+        let coordinator =
+            MaintenanceCoordinator::new().with_checkpointed_session(Arc::clone(&session));
         assert_eq!(coordinator.sweeper_count(), 1);
         coordinator.run_once();
-        assert_eq!(session.count(), 1, "a fresh checkpoint must survive one sweep cycle");
+        assert_eq!(
+            session.count(),
+            1,
+            "a fresh checkpoint must survive one sweep cycle"
+        );
     }
 
     #[test]
@@ -477,7 +508,8 @@ mod tests {
         }));
 
         let handle = Arc::clone(&coordinator).start_with_interval(Duration::from_millis(20));
-        rx.recv_timeout(Duration::from_secs(5)).expect("sweep cycle did not run in time");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("sweep cycle did not run in time");
 
         coordinator.stop();
         handle.join().expect("maintenance thread panicked");

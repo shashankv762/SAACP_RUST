@@ -304,9 +304,15 @@ impl RulePack {
         valid_until: f64,
     ) -> Vec<u8> {
         let mut map = Map::new();
-        map.insert("format".to_string(), Value::String(RULEPACK_FORMAT.to_string()));
+        map.insert(
+            "format".to_string(),
+            Value::String(RULEPACK_FORMAT.to_string()),
+        );
         map.insert("pack_id".to_string(), Value::String(pack_id.to_string()));
-        map.insert("issuer_id".to_string(), Value::String(issuer_id.to_string()));
+        map.insert(
+            "issuer_id".to_string(),
+            Value::String(issuer_id.to_string()),
+        );
         map.insert("version".to_string(), Value::Number(version.into()));
         map.insert("valid_from".to_string(), json_f64(valid_from));
         map.insert("valid_until".to_string(), json_f64(valid_until));
@@ -334,9 +340,7 @@ impl RulePack {
         let rules: Vec<Value> = self
             .rules
             .iter()
-            .map(|r| {
-                serde_json::json!({ "id": r.id, "pattern": r.pattern })
-            })
+            .map(|r| serde_json::json!({ "id": r.id, "pattern": r.pattern }))
             .collect();
         serde_json::json!({
             "format": RULEPACK_FORMAT,
@@ -477,7 +481,8 @@ impl RulePack {
             labels.push(rule.id.clone());
         }
 
-        let automaton = AhoCorasick::new(&patterns).map_err(|_| RulePackRejection::CompileFailed)?;
+        let automaton =
+            AhoCorasick::new(&patterns).map_err(|_| RulePackRejection::CompileFailed)?;
 
         Ok(CompiledRuleSet {
             automaton,
@@ -812,12 +817,23 @@ mod tests {
     }
 
     fn rule(id: &str, pattern: &str) -> InjectionRule {
-        InjectionRule { id: id.to_string(), pattern: pattern.to_string() }
+        InjectionRule {
+            id: id.to_string(),
+            pattern: pattern.to_string(),
+        }
     }
 
     fn fresh_pack(version: u64, rules: Vec<InjectionRule>, sk: &SigningKey) -> RulePack {
         let now = now_epoch_secs();
-        RulePack::create("test-pack", "test-issuer", version, rules, now - 1.0, now + 3600.0, sk)
+        RulePack::create(
+            "test-pack",
+            "test-issuer",
+            version,
+            rules,
+            now - 1.0,
+            now + 3600.0,
+            sk,
+        )
     }
 
     /// A store instance separate from the global one, so these tests do not
@@ -891,10 +907,18 @@ mod tests {
         let store = store_with_anchor(vk);
         let now = now_epoch_secs();
         let pack = RulePack::create(
-            "p", "someone-else", 1, vec![rule("r1", "zero day marker delta")],
-            now - 1.0, now + 3600.0, &sk,
+            "p",
+            "someone-else",
+            1,
+            vec![rule("r1", "zero day marker delta")],
+            now - 1.0,
+            now + 3600.0,
+            &sk,
         );
-        assert_eq!(store.install_inner(&pack).err(), Some(RulePackRejection::UntrustedIssuer));
+        assert_eq!(
+            store.install_inner(&pack).err(),
+            Some(RulePackRejection::UntrustedIssuer)
+        );
     }
 
     #[test]
@@ -904,16 +928,32 @@ mod tests {
         let now = now_epoch_secs();
 
         let expired = RulePack::create(
-            "p", "test-issuer", 1, vec![rule("r1", "zero day marker eps")],
-            now - 7200.0, now - 3600.0, &sk,
+            "p",
+            "test-issuer",
+            1,
+            vec![rule("r1", "zero day marker eps")],
+            now - 7200.0,
+            now - 3600.0,
+            &sk,
         );
-        assert_eq!(store.install_inner(&expired).err(), Some(RulePackRejection::Expired));
+        assert_eq!(
+            store.install_inner(&expired).err(),
+            Some(RulePackRejection::Expired)
+        );
 
         let future = RulePack::create(
-            "p", "test-issuer", 1, vec![rule("r1", "zero day marker eps")],
-            now + 3600.0, now + 7200.0, &sk,
+            "p",
+            "test-issuer",
+            1,
+            vec![rule("r1", "zero day marker eps")],
+            now + 3600.0,
+            now + 7200.0,
+            &sk,
         );
-        assert_eq!(store.install_inner(&future).err(), Some(RulePackRejection::NotYetValid));
+        assert_eq!(
+            store.install_inner(&future).err(),
+            Some(RulePackRejection::NotYetValid)
+        );
     }
 
     #[test]
@@ -922,10 +962,18 @@ mod tests {
         let store = store_with_anchor(vk);
         let now = now_epoch_secs();
         let pack = RulePack::create(
-            "p", "test-issuer", 1, vec![rule("r1", "zero day marker zeta")],
-            now - 1.0, now + MAX_PACK_LIFETIME_SECS + 60.0, &sk,
+            "p",
+            "test-issuer",
+            1,
+            vec![rule("r1", "zero day marker zeta")],
+            now - 1.0,
+            now + MAX_PACK_LIFETIME_SECS + 60.0,
+            &sk,
         );
-        assert_eq!(store.install_inner(&pack).err(), Some(RulePackRejection::LifetimeTooLong));
+        assert_eq!(
+            store.install_inner(&pack).err(),
+            Some(RulePackRejection::LifetimeTooLong)
+        );
     }
 
     #[test]
@@ -939,13 +987,17 @@ mod tests {
         assert_eq!(compiled.pack_rule_count(), 1);
         for (i, b) in builtins.iter().enumerate() {
             assert_eq!(
-                compiled.label_at(i), *b,
+                compiled.label_at(i),
+                *b,
                 "every built-in pattern must survive at its original index"
             );
         }
         // The built-in signature still fires under the recompiled automaton.
         assert!(
-            compiled.automaton().find("ignorepreviousinstructions").is_some(),
+            compiled
+                .automaton()
+                .find("ignorepreviousinstructions")
+                .is_some(),
             "a pack must never be able to remove a shipped signature"
         );
         // And so does the new rule, matched against normalized text.
@@ -995,7 +1047,12 @@ mod tests {
     #[test]
     fn an_overbroad_rule_is_refused() {
         let (sk, _vk) = keypair();
-        for pattern in ["a", "ab", "  x  ", "\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}"] {
+        for pattern in [
+            "a",
+            "ab",
+            "  x  ",
+            "\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}",
+        ] {
             let pack = fresh_pack(1, vec![rule("bad", pattern)], &sk);
             assert_eq!(
                 pack.compile().err(),
@@ -1009,7 +1066,9 @@ mod tests {
     fn a_rule_restating_a_builtin_is_deduped_not_rejected() {
         let (sk, _vk) = keypair();
         let pack = fresh_pack(1, vec![rule("dup", "ignore previous instructions")], &sk);
-        let compiled = pack.compile().expect("restating a built-in must be a no-op, not an error");
+        let compiled = pack
+            .compile()
+            .expect("restating a built-in must be a no-op, not an error");
         assert_eq!(compiled.pack_rule_count(), 0);
         assert_eq!(compiled.total_count(), compiled.builtin_count());
     }
@@ -1026,8 +1085,14 @@ mod tests {
 
     #[test]
     fn malformed_bodies_are_refused_structurally() {
-        assert_eq!(RulePack::from_json("not json").err(), Some(RulePackRejection::Malformed));
-        assert_eq!(RulePack::from_json("{}").err(), Some(RulePackRejection::Malformed));
+        assert_eq!(
+            RulePack::from_json("not json").err(),
+            Some(RulePackRejection::Malformed)
+        );
+        assert_eq!(
+            RulePack::from_json("{}").err(),
+            Some(RulePackRejection::Malformed)
+        );
         assert_eq!(
             RulePack::from_json(r#"{"format":"saacp-rulepack-v99"}"#).err(),
             Some(RulePackRejection::UnsupportedFormat)

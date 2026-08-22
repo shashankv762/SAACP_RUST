@@ -110,8 +110,12 @@ impl EasiEncryptor {
 mod tests {
     use super::*;
 
-    fn test_key() -> [u8; 32] { [0xABu8; 32] }
-    fn test_ctx_ref_id() -> [u8; 32] { [0x42u8; 32] }
+    fn test_key() -> [u8; 32] {
+        [0xABu8; 32]
+    }
+    fn test_ctx_ref_id() -> [u8; 32] {
+        [0x42u8; 32]
+    }
 
     // ── Basic encrypt/decrypt roundtrip ───────────────────────────────────────
 
@@ -123,7 +127,10 @@ mod tests {
         let encrypted = EasiEncryptor::encrypt(&plaintext, &key, 1, 100);
         let decrypted = EasiEncryptor::decrypt(&encrypted, &key, 1, 100);
 
-        assert_eq!(decrypted, plaintext, "roundtrip must recover plaintext exactly");
+        assert_eq!(
+            decrypted, plaintext,
+            "roundtrip must recover plaintext exactly"
+        );
     }
 
     #[test]
@@ -172,7 +179,10 @@ mod tests {
         let key2 = [0x22u8; 32];
         let pad1 = EasiEncryptor::derive_pad(&key1, 1, 1);
         let pad2 = EasiEncryptor::derive_pad(&key2, 1, 1);
-        assert_ne!(pad1, pad2, "different traffic_key must produce different pad");
+        assert_ne!(
+            pad1, pad2,
+            "different traffic_key must produce different pad"
+        );
     }
 
     #[test]
@@ -193,8 +203,10 @@ mod tests {
 
         let wrong_key = [0xFFu8; 32];
         let wrong_decrypted = EasiEncryptor::decrypt(&encrypted, &wrong_key, 1, 1);
-        assert_ne!(wrong_decrypted, plaintext,
-            "decryption with wrong key must not recover plaintext");
+        assert_ne!(
+            wrong_decrypted, plaintext,
+            "decryption with wrong key must not recover plaintext"
+        );
     }
 
     #[test]
@@ -204,8 +216,10 @@ mod tests {
         let encrypted = EasiEncryptor::encrypt(&plaintext, &key, 1, 100);
 
         let wrong_dec = EasiEncryptor::decrypt(&encrypted, &key, 1, 101);
-        assert_ne!(wrong_dec, plaintext,
-            "decryption with wrong PSN must not recover plaintext");
+        assert_ne!(
+            wrong_dec, plaintext,
+            "decryption with wrong PSN must not recover plaintext"
+        );
     }
 
     #[test]
@@ -215,8 +229,10 @@ mod tests {
         let encrypted = EasiEncryptor::encrypt(&plaintext, &key, 5, 1);
 
         let wrong_dec = EasiEncryptor::decrypt(&encrypted, &key, 6, 1);
-        assert_ne!(wrong_dec, plaintext,
-            "decryption with wrong epoch_id must not recover plaintext");
+        assert_ne!(
+            wrong_dec, plaintext,
+            "decryption with wrong epoch_id must not recover plaintext"
+        );
     }
 
     // ── XOR self-inverse property ─────────────────────────────────────────────
@@ -228,8 +244,10 @@ mod tests {
         let encrypted = EasiEncryptor::encrypt(&plaintext, &key, 7, 42);
         // Encrypting the ciphertext again == decrypting
         let recovered = EasiEncryptor::encrypt(&encrypted, &key, 7, 42);
-        assert_eq!(recovered, plaintext,
-            "XOR cipher: double-encrypt must recover plaintext");
+        assert_eq!(
+            recovered, plaintext,
+            "XOR cipher: double-encrypt must recover plaintext"
+        );
     }
 
     // ── Boundary conditions ───────────────────────────────────────────────────
@@ -241,7 +259,10 @@ mod tests {
         let psn = u64::MAX;
         let encrypted = EasiEncryptor::encrypt(&plaintext, &key, u32::MAX, psn);
         let decrypted = EasiEncryptor::decrypt(&encrypted, &key, u32::MAX, psn);
-        assert_eq!(decrypted, plaintext, "must work with maximum epoch/psn values");
+        assert_eq!(
+            decrypted, plaintext,
+            "must work with maximum epoch/psn values"
+        );
     }
 
     #[test]
@@ -265,8 +286,10 @@ mod tests {
         let enc_a = EasiEncryptor::encrypt(&ctx_a, &key, epoch_id, psn);
         let enc_b = EasiEncryptor::encrypt(&ctx_b, &key, epoch_id, psn);
 
-        assert_ne!(enc_a, enc_b,
-            "distinct plaintext context_ref_ids must produce distinct encrypted values");
+        assert_ne!(
+            enc_a, enc_b,
+            "distinct plaintext context_ref_ids must produce distinct encrypted values"
+        );
     }
 
     // ── HKDF_INFO constant ────────────────────────────────────────────────────
@@ -274,8 +297,14 @@ mod tests {
     #[test]
     fn hkdf_info_has_version_tag() {
         let info = std::str::from_utf8(EasiEncryptor::HKDF_INFO).unwrap();
-        assert!(info.contains("SAACP-EASI"), "info must contain protocol prefix");
-        assert!(info.contains("v1"), "info must contain version tag for algorithm agility");
+        assert!(
+            info.contains("SAACP-EASI"),
+            "info must contain protocol prefix"
+        );
+        assert!(
+            info.contains("v1"),
+            "info must contain version tag for algorithm agility"
+        );
     }
 
     // ── Large-scale uniqueness: 1000 distinct PSNs produce distinct pads ──────
@@ -291,8 +320,13 @@ mod tests {
         // No two pads should be identical
         for i in 0..pads.len() {
             for j in (i + 1)..pads.len() {
-                assert_ne!(pads[i], pads[j],
-                    "PSN {} and PSN {} must produce different pads", i + 1, j + 1);
+                assert_ne!(
+                    pads[i],
+                    pads[j],
+                    "PSN {} and PSN {} must produce different pads",
+                    i + 1,
+                    j + 1
+                );
             }
         }
     }
