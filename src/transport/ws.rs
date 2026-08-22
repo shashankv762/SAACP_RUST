@@ -54,6 +54,12 @@ use crate::measc::SessionEpochManager;
 /// path (bounded by `daemon::HANDSHAKE_TIMEOUT_SECS`), previously had no bound at all.
 const WS_UPGRADE_TIMEOUT_SECS: u64 = 5;
 
+/// C3 (wss://): bound on the TLS handshake before the WebSocket upgrade —
+/// same slow-loris class of defense as `WS_UPGRADE_TIMEOUT_SECS` (mirrors
+/// `transport::tls::TLS_HANDSHAKE_TIMEOUT_SECS`).
+#[cfg(feature = "transport-tls")]
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 // ─── WsByteStream ────────────────────────────────────────────────────────────
 
 /// Adapts a WebSocket binary-message stream into a plain byte stream.
@@ -234,6 +240,10 @@ pub struct SAACPWebSocketDaemon {
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     handshake_timeout_secs: Option<f64>,
+    /// C3: when set (feature `transport-wss`), every accepted TCP connection
+    /// is upgraded to TLS (wss://) before the WebSocket handshake.
+    #[cfg(feature = "transport-tls")]
+    tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
 }
 
 impl SAACPWebSocketDaemon {
@@ -256,7 +266,21 @@ impl SAACPWebSocketDaemon {
             gossip: None,
             cluster: None,
             handshake_timeout_secs: None,
+            #[cfg(feature = "transport-tls")]
+            tls_config: None,
         }
+    }
+
+    /// C3: serve `wss://` — wrap every accepted connection in TLS before the
+    /// WebSocket upgrade. Requires features `transport-ws` + `transport-tls`
+    /// (the `transport-wss` alias enables both). Build the config with
+    /// `crate::transport::tls::load_tls_config` /
+    /// `server_config_from_cert_and_key` (or `server_config_with_client_ca`
+    /// for mTLS).
+    #[cfg(feature = "transport-tls")]
+    pub fn with_tls(mut self, config: Arc<tokio_rustls::rustls::ServerConfig>) -> Self {
+        self.tls_config = Some(config);
+        self
     }
 
     /// See `SAACPNetworkDaemon::with_handshake_timeout` — identical semantics.
@@ -417,6 +441,9 @@ impl SAACPWebSocketDaemon {
                             let gossip          = self.gossip.clone();
                             let cluster         = self.cluster.clone();
                             let handshake_timeout_override = self.handshake_timeout_secs;
+                            #[cfg(feature = "transport-tls")]
+                            let tls_acceptor = self.tls_config.clone()
+                                .map(tokio_rustls::TlsAcceptor::from);
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -425,6 +452,51 @@ impl SAACPWebSocketDaemon {
                                 // `daemon::SAACPNetworkDaemon::start_with_shutdown`'s identical
                                 // fix for the TCP transport.
                                 let _conn_count_guard = crate::telemetry::ConnectionCountGuard::ws();
+                                // C3: wss:// — TLS-upgrade the TCP connection first
+                                // (bounded by the same slow-loris timeout class as the
+                                // WS upgrade below), then run the identical
+                                // WebSocket+SAACP pipeline over the TLS stream. The
+                                // pipeline fn is generic over the stream, so each arm
+                                // calls it with its own concrete stream type.
+                                #[cfg(feature = "transport-tls")]
+                                match tls_acceptor {
+                                    Some(acceptor) => {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                                            acceptor.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(tls_stream)) => {
+                                                serve_ws_connection(
+                                                    tls_stream, peer_addr, cbs, secret, seed,
+                                                    gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
+                                                    handshake_timeout_override,
+                                                ).await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                eprintln!(
+                                                    "[SAACP Daemon/WSS] TLS handshake failed from {}: {}",
+                                                    peer_addr, e
+                                                );
+                                            }
+                                            Err(_) => {
+                                                eprintln!(
+                                                    "[SAACP Daemon/WSS] TLS handshake from {} exceeded {}s — dropping",
+                                                    peer_addr, TLS_HANDSHAKE_TIMEOUT_SECS
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        serve_ws_connection(
+                                            stream, peer_addr, cbs, secret, seed,
+                                            gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
+                                            handshake_timeout_override,
+                                        ).await;
+                                    }
+                                }
+                                #[cfg(not(feature = "transport-tls"))]
                                 serve_ws_connection(
                                     stream, peer_addr, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
@@ -472,14 +544,19 @@ impl SAACPWebSocketDaemon {
     }
 }
 
-/// Accept one already-connected TCP socket, perform the WebSocket upgrade
+/// Accept one already-connected byte stream, perform the WebSocket upgrade
 /// handshake, and hand the resulting byte stream to the unmodified
 /// `daemon::handle_client` pipeline. Every MEASC frame is tunneled inside
 /// WebSocket binary messages — the ECDH handshake, AES-256-GCM crypto, replay
 /// window, and full 12-gate pipeline are byte-identical to the raw-TCP path.
+///
+/// C3: generic over the underlying stream `S` so the same function serves
+/// both `ws://` (plain `TcpStream`) and `wss://`
+/// (`tokio_rustls::server::TlsStream<TcpStream>`) — the WebSocket upgrade
+/// and everything above it are stream-agnostic.
 #[allow(clippy::too_many_arguments)]
-async fn serve_ws_connection(
-    raw: tokio::net::TcpStream,
+async fn serve_ws_connection<S>(
+    raw: S,
     peer_addr: SocketAddr,
     circuit_breakers: SharedCircuitBreakers,
     token_issuer_secret: Option<Vec<u8>>,
@@ -491,7 +568,9 @@ async fn serve_ws_connection(
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     handshake_timeout_override: Option<f64>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     // H-19 fix: cap the incoming WebSocket message/frame size at the same
     // `MAX_PAYLOAD_SIZE` the raw-TCP path already enforces for MEASC payloads (+1024
     // bytes slack for the 128-byte MEASC header and framing overhead), instead of

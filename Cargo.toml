@@ -106,12 +106,15 @@ default = []
 # plain TCP-only deployment never pulls in tokio-tungstenite.
 transport-ws = ["dep:tokio-tungstenite", "dep:bytes", "dep:futures-util"]
 # TLS-wrapped raw-TCP transport (src/transport/tls.rs) — deliberately raw TCP+TLS only,
-# not WebSocket-over-TLS (wss://); that's a distinct future combination requiring
-# `transport/ws.rs::serve_ws_connection` to be genericized over the stream type. Off by
-# default so a deployment that doesn't need in-protocol TLS termination (e.g. one that
+# not WebSocket-over-TLS (wss://); that's the separate `transport-wss` feature below. Off
+# by default so a deployment that doesn't need in-protocol TLS termination (e.g. one that
 # already terminates TLS at a reverse proxy in front of the raw MEASC listener) never
 # pulls in rustls.
 transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+# C3: WebSocket-over-TLS (wss://) — enables `SAACPWebSocketDaemon::with_tls`,
+# which upgrades each accepted TCP connection to TLS before the WebSocket
+# handshake. Requires both underlying transports.
+transport-wss = ["transport-ws", "transport-tls"]
 # Redis-backed StateBackend (src/state_backend.rs) — lets a horizontally
 # scaled fleet of SAACP gateways share rate-limiter/session/stream state
 # across nodes instead of each node holding an isolated in-memory view. Off
@@ -131,7 +134,7 @@ mpf = []
 # plain localhost HTTP/JSON, with zero SAACP protocol knowledge on the Python side. Off
 # by default so a library-only deployment never pulls in axum; also the first feature
 # to add a `[[bin]]` target to this otherwise library-only crate.
-sidecar = ["dep:axum"]
+sidecar = ["dep:axum", "mpf"]
 # SAACP Command Center dashboard backend (src/command_center.rs + the
 # `saacp-command-center` binary) — a REST + Server-Sent-Events API surfacing
 # live agent trust scores, the trust-mesh delegation graph, security alerts,

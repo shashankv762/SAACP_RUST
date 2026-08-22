@@ -6,6 +6,10 @@ const ALLOWED_META_KEYS: &[&str] = &[
     "_capability_token",
     "_cognitive_constraint",
     "_secondary_token",
+    // C4 (MPF): the Metadata Privacy Filter's bucket-padding filler field —
+    // ignored by every consumer exactly like the other underscore-prefixed
+    // metadata keys; its content is whitespace by construction.
+    "_mpf_pad",
 ];
 
 /// Schema definition holding an ID, human-readable name, required keys, and

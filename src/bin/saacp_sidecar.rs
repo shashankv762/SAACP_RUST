@@ -348,6 +348,10 @@ async fn main() {
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_MAX_CONCURRENT_SENDS: {e}"));
     }
+    // C4 (MPF): bucket-pad outbound payloads (opt-in, mirrors SAACP_ENABLE_MACE).
+    if let Ok(v) = std::env::var("SAACP_ENABLE_MPF") {
+        config.payload_padding = v == "1";
+    }
     if let Ok(v) = std::env::var("SAACP_SEND_RETRY_ATTEMPTS") {
         config.send_retry_attempts = v
             .parse()

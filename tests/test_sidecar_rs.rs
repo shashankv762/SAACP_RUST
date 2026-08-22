@@ -632,3 +632,146 @@ async fn run_without_shutdown_token_still_serves_normally() {
         .expect("healthz must succeed");
     assert_eq!(resp.status(), 200);
 }
+
+// ─── C2: outbound connection pooling ─────────────────────────────────────────
+
+/// C2 regression: two pooled sends to the same peer reuse ONE TCP+ECDH
+/// connection (dialed=1, reused=1) and both succeed — the peer daemon accepts
+/// the increasing-PSN frames of a long-lived session exactly like a fresh
+/// one-shot connection's.
+#[tokio::test]
+async fn c2_pool_reuses_connection_across_sends() {
+    use saacp::sidecar::SidecarConnectionPool;
+
+    let secret = [0xC2u8; 32];
+    let (saacp_addr, _http) = spawn_sidecar("agent-pool-recv", secret).await;
+
+    let pool = SidecarConnectionPool::new();
+    let allow: Vec<(std::net::IpAddr, u8)> = Vec::new();
+    let out1 = pool
+        .send(
+            &saacp_addr.to_string(),
+            "agent-pool-recv",
+            "agent-pool-send",
+            &secret,
+            "first task",
+            1,
+            0,
+            1,
+            &allow,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("first pooled send");
+    assert!(matches!(out1, saacp::sidecar::SendOutcome::Success));
+
+    let out2 = pool
+        .send(
+            &saacp_addr.to_string(),
+            "agent-pool-recv",
+            "agent-pool-send",
+            &secret,
+            "second task on the reused connection",
+            1,
+            0,
+            1,
+            &allow,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("second pooled send");
+    assert!(matches!(out2, saacp::sidecar::SendOutcome::Success));
+
+    let (dialed, reused) = pool.stats();
+    assert_eq!(dialed, 1, "exactly one dial for two sends");
+    assert_eq!(reused, 1, "second send must reuse the pooled connection");
+}
+
+/// C2 regression: idle connections past the TTL are reclaimed by sweep().
+#[tokio::test]
+async fn c2_pool_sweep_reclaims_idle_connections() {
+    use saacp::sidecar::SidecarConnectionPool;
+
+    let secret = [0xC3u8; 32];
+    let (saacp_addr, _http) = spawn_sidecar("agent-sweep-recv", secret).await;
+    let pool = SidecarConnectionPool::new().with_idle_ttl(std::time::Duration::from_millis(50));
+    let allow: Vec<(std::net::IpAddr, u8)> = Vec::new();
+    let _ = pool
+        .send(
+            &saacp_addr.to_string(),
+            "agent-sweep-recv",
+            "agent-sweep-send",
+            &secret,
+            "task",
+            1,
+            0,
+            1,
+            &allow,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("pooled send");
+    assert_eq!(pool.sweep(), 0, "fresh connection must not be swept");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert_eq!(pool.sweep(), 1, "idle-expired connection must be reclaimed");
+    let (dialed, _reused) = pool.stats();
+    assert_eq!(dialed, 1);
+}
+
+// ─── C4 (MPF): outbound payload bucket padding ───────────────────────────────
+
+/// C4 unit: the padded payload is valid JSON, carries the ignored `_mpf_pad`
+/// field, and lands EXACTLY on a power-of-two bucket boundary.
+#[test]
+fn c4_pad_payload_lands_on_bucket_and_stays_json() {
+    for base_len in [10usize, 100, 250, 700, 1500, 3000] {
+        let payload = format!("{{\"task\":\"{}\",\"n\":1}}", "x".repeat(base_len));
+        let padded = saacp::sidecar::pad_payload_to_bucket(payload.clone());
+        let v: serde_json::Value = serde_json::from_str(&padded)
+            .unwrap_or_else(|e| panic!("len {base_len}: padded payload must parse: {e}"));
+        assert!(v.get("_mpf_pad").is_some(), "padding field present");
+        assert_eq!(v["task"].as_str().unwrap().len(), base_len, "task intact");
+        let l = padded.len();
+        assert!(
+            l.is_power_of_two(),
+            "len {l} (base {base_len}) must be a power-of-two bucket"
+        );
+        assert!(l >= payload.len());
+    }
+}
+
+/// C4 integration: a padded pooled send still clears the full receiver gate
+/// pipeline (the `_mpf_pad` field is ignored exactly like `_capability_token`).
+#[tokio::test]
+async fn c4_padded_send_succeeds_end_to_end() {
+    use saacp::sidecar::SidecarConnectionPool;
+
+    let secret = [0xC4u8; 32];
+    let (saacp_addr, _http) = spawn_sidecar("agent-mpf-recv", secret).await;
+    let pool = SidecarConnectionPool::new();
+    let allow: Vec<(std::net::IpAddr, u8)> = Vec::new();
+    let out = pool
+        .send(
+            &saacp_addr.to_string(),
+            "agent-mpf-recv",
+            "agent-mpf-send",
+            &secret,
+            "padded task",
+            1,
+            0,
+            1,
+            &allow,
+            false,
+            None,
+            true,
+        )
+        .await
+        .expect("pooled padded send");
+    assert!(matches!(out, saacp::sidecar::SendOutcome::Success));
+}

@@ -647,26 +647,30 @@ fn attack_2_4_self_delegation_token() -> AttackResult {
         0x02,
         None,
     );
-    // Try to validate: orchestrator calling itself
-    let result = gw.validate_lateral_movement("orchestrator", &self_token, SECRET_KEY);
+    // C2 re-scope: an issuer presenting its own first-party token AS ITSELF
+    // (allow-list deliberately contains the issuer) is authentication, not
+    // escalation — required for the daemon's identity-pinned long-lived
+    // connections. The ESCALATION attack is presenting that token under a
+    // DIFFERENT agent's identity, which the allow-list scope check must block.
+    let result = gw.validate_lateral_movement("somebody-else", &self_token, SECRET_KEY);
     let lat = t0.elapsed();
     if result.is_err() {
         AttackResult::blocked(
-            "Self-Delegation Token (iss == target)",
+            "Self-Token Presented Under Another Identity",
             "Authentication",
-            "Gate 1.0 (self-issue guard)",
-            SAACPBytecodes::SelfIssuedCapability,
+            "Gate 1.0 (allow-list scope check)",
+            SAACPBytecodes::ScopeViolation,
             lat,
             "HIGH",
         )
     } else {
         AttackResult::breached(
-            "Self-Delegation Token",
+            "Self-Token Under Another Identity",
             "Authentication",
-            "agent authorized itself — privilege escalation path",
+            "agent acted as somebody-else — privilege escalation path",
             lat,
             "HIGH",
-            vec!["H-2 fix may not have caught this case".into()],
+            vec!["allow-list scope check may not have caught this case".into()],
         )
     }
 }

@@ -1345,11 +1345,25 @@ impl ZeroTrustGateway {
             ));
         }
 
-        // H-2 fix: Self-issue guard for the HMAC-PSK path.
-        // DelegationGuard exists but was never wired into validate_lateral_movement.
-        // A token where iss == target_agent grants an agent permission to call itself,
-        // which is semantically identical to no authorization check at all.
-        if source_agent == target_agent {
+        // H-2 fix, RE-SCOPED for C2 (connection pinning): the original
+        // unconditional `iss == target_agent` rejection is incompatible with
+        // the daemon's identity pinning (`daemon.rs` pins the token's real
+        // issuer after the first verified frame, so every subsequent frame on
+        // a long-lived connection is evaluated with target == iss BY DESIGN).
+        // As written, the guard made every long-lived/multi-frame connection
+        // structurally impossible — only one-shot connections (target stays
+        // the bootstrap "unknown") ever passed it.
+        //
+        // Semantics here: an issuer that deliberately lists ITSELF in the
+        // token's allow-list is issuing a first-party credential (the agent
+        // authenticating as itself) — it grants nothing beyond the issuer's
+        // own identity, and Gate 2.5 still caps its action class. That case
+        // must be accepted. The delegation-layer self-issue prohibition
+        // (an authority minting itself capabilities it should not have) lives
+        // where it belongs and stays enforced: ACSVAF's
+        // `enforce_issuance_policy`/`enforce_verification_policy` (only
+        // federation-root authorities may self-issue).
+        if source_agent == target_agent && !allow.contains(source_agent.as_str()) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SelfIssuedCapability,
                 format!(

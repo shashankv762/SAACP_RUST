@@ -189,6 +189,17 @@ pub struct SidecarConfig {
     /// API, not the SAACP wire protocol itself (already authenticated via
     /// `token_issuer_secret`/`peer_secrets`).
     pub http_bearer_token: Option<String>,
+    /// C2: reuse outbound TCP+ECDH connections across `/send` calls
+    /// (default `true`). `false` restores the v1 one-connection-per-send
+    /// behavior. See `SidecarConnectionPool` for why pooling preserves the
+    /// wire and gate semantics exactly.
+    pub connection_pooling: bool,
+    /// C4 (MPF): pad outbound task payloads to power-of-two bucket sizes
+    /// (`mpf::AdaptivePadding`) so ciphertext lengths leak only coarse
+    /// length buckets, defeating length-based traffic analysis between
+    /// mesh peers. Implemented as an ignored `_mpf_pad` JSON field, so
+    /// receivers need no change. Opt-in (default `false`).
+    pub payload_padding: bool,
 }
 
 impl SidecarConfig {
@@ -214,6 +225,8 @@ impl SidecarConfig {
             target_allowlist: Vec::new(),
             allow_private_targets: false,
             http_bearer_token: None,
+            connection_pooling: true,
+            payload_padding: false,
         }
     }
 }
@@ -480,6 +493,34 @@ async fn connect_with_retry(
     }
 }
 
+/// C4 (MPF): pad a serialized JSON-object payload to its target bucket by
+/// appending an `_mpf_pad` field of spaces before the closing brace. The
+/// field is ignored by the receiver's payload parsing (underscore-prefixed
+/// metadata, same convention as `_capability_token`), while the WIRE length
+/// (and therefore the AEAD ciphertext length) lands exactly on the bucket —
+/// observers between the peers see only the bucket, not the true length.
+/// Returns the padded payload; identical to `payload` when already at a
+/// bucket boundary (or one byte of overhead would overshoot into a
+/// uselessly wasteful bucket).
+pub fn pad_payload_to_bucket(payload: String) -> String {
+    let mpf = crate::mpf::AdaptivePadding::new();
+    let len = payload.len();
+    let mut target = mpf.target_length(len);
+    // The injection adds `,"_mpf_pad":""` (14 bytes) plus k spaces; if the
+    // overhead cannot fit the current bucket, jump to the next one.
+    const FIELD_OVERHEAD: usize = 14; // ,"_mpf_pad":""
+    while target < len + FIELD_OVERHEAD {
+        target = target.saturating_mul(2);
+    }
+    let spaces = target - len - FIELD_OVERHEAD;
+    let mut padded = String::with_capacity(target);
+    padded.push_str(&payload[..payload.len() - 1]); // everything but the closing '}'
+    padded.push_str(",\"_mpf_pad\":\"");
+    padded.push_str(&" ".repeat(spaces));
+    padded.push_str("\"}");
+    padded
+}
+
 /// Send one schema-1 ("Task") message to a peer's SAACP listener. Opens a fresh TCP
 /// connection (retrying transient connect failures up to `retry_attempts` times), performs
 /// a real X25519 ECDH handshake (`daemon::client_handshake`), issues a capability token
@@ -501,6 +542,7 @@ pub async fn send_message(
     target_allowlist: &[(IpAddr, u8)],
     allow_private_targets: bool,
     audit_log: Option<&ImmutableAuditLog>,
+    pad_payload: bool,
 ) -> Result<SendOutcome, SidecarError> {
     let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
 
@@ -584,6 +626,12 @@ pub async fn send_message(
         "_capability_token": token_str,
     })
     .to_string();
+    // C4 (MPF): opt-in bucket padding of the outbound payload.
+    let payload = if pad_payload {
+        pad_payload_to_bucket(payload)
+    } else {
+        payload
+    };
 
     let frame = epoch_mgr
         .with_epoch_mut(&session_id, epoch_id, |epoch| {
@@ -635,6 +683,360 @@ pub async fn send_message(
     }
 }
 
+// ─── C2: outbound connection pooling ─────────────────────────────────────────
+
+/// One reusable outbound connection: the TCP stream plus the client-side
+/// session state (epoch manager + session id) needed to keep building frames
+/// on it. Each pooled send advances the session's PSN, so a reused
+/// connection's frames pass the peer daemon's replay window exactly like a
+/// long-lived agent connection's would.
+struct PooledConn {
+    stream: tokio::net::TcpStream,
+    epoch_manager: std::sync::Arc<SessionEpochManager>,
+    session_id: [u8; 16],
+    epoch_id: u32,
+    last_used: std::time::Instant,
+    /// The handshake-derived session root key — needed to mint follow-on
+    /// sessions on the same connection (see `sends_on_session`).
+    root_key: zeroize::Zeroizing<[u8; 32]>,
+    /// Sends on the CURRENT session id. Rotated at 2 (one below CSCS's
+    /// oscillation threshold) so a pooled connection's legitimate task
+    /// stream can never be misread as a loop.
+    sends_on_session: u32,
+    /// Distinct sessions minted on this connection; bounded well under the
+    /// daemon's per-connection auto-create cap (16) — at the bound the
+    /// connection is retired instead of checked back in.
+    sessions_created: u32,
+}
+
+/// C2: reuse TCP+ECDH connections across `send_message` calls instead of
+/// dialing + handshaking per message. Semantics-preserving: the peer daemon's
+/// per-connection agent identity is fixed at handshake time ("unknown" for the
+/// plain handshake this sidecar speaks), so the `["unknown"]` token
+/// allow-list the sender issues stays correct on every pooled send; the peer's
+/// replay window sees a strictly increasing PSN per session, same as any
+/// long-lived connection.
+///
+/// Health checking is by-use: any I/O timeout/error while sending discards the
+/// connection and retries once on a fresh dial, so a pooled connection that
+/// died while idle is never surfaced to the caller as a failure. Idle
+/// connections are evicted on checkout (`idle_ttl`) and via [`Self::sweep`]
+/// for maintenance wiring.
+pub struct SidecarConnectionPool {
+    idle: parking_lot::Mutex<HashMap<String, std::collections::VecDeque<PooledConn>>>,
+    max_idle_per_target: usize,
+    idle_ttl: Duration,
+    dialed: std::sync::atomic::AtomicU64,
+    reused: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SidecarConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SidecarConnectionPool {
+    pub fn new() -> Self {
+        Self {
+            idle: parking_lot::Mutex::new(HashMap::new()),
+            max_idle_per_target: 2,
+            idle_ttl: Duration::from_secs(60),
+            dialed: std::sync::atomic::AtomicU64::new(0),
+            reused: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Override the idle TTL (maintenance/ops tuning and tests).
+    pub fn with_idle_ttl(mut self, ttl: Duration) -> Self {
+        self.idle_ttl = ttl;
+        self
+    }
+
+    /// `(dialed, reused)` counters — surfaced for observability so operators
+    /// can confirm pooling is actually engaged.
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.dialed.load(Relaxed), self.reused.load(Relaxed))
+    }
+
+    fn checkout(&self, key: &str) -> Option<PooledConn> {
+        let mut idle = self.idle.lock();
+        let q = idle.get_mut(key)?;
+        while let Some(conn) = q.pop_front() {
+            if conn.last_used.elapsed() <= self.idle_ttl {
+                self.reused
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(conn);
+            }
+            // Expired — drop it (closing the socket) and keep draining.
+        }
+        None
+    }
+
+    fn checkin(&self, key: &str, conn: PooledConn) {
+        let mut idle = self.idle.lock();
+        let q = idle.entry(key.to_string()).or_default();
+        while q.len() >= self.max_idle_per_target {
+            q.pop_front(); // evict oldest idle connection
+        }
+        q.push_back(conn);
+    }
+
+    /// Drop idle connections past `idle_ttl`. Register on
+    /// `MaintenanceCoordinator` for periodic reclamation.
+    pub fn sweep(&self) -> usize {
+        let mut idle = self.idle.lock();
+        let mut removed = 0usize;
+        for q in idle.values_mut() {
+            let before = q.len();
+            q.retain(|c| c.last_used.elapsed() <= self.idle_ttl);
+            removed += before - q.len();
+        }
+        removed
+    }
+
+    async fn dial(
+        &self,
+        validated: SocketAddr,
+        retry_attempts: u32,
+        timeout: Duration,
+    ) -> Result<PooledConn, SidecarError> {
+        self.dialed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut stream = connect_with_retry(validated, retry_attempts, timeout).await?;
+        let (session_key, _) = tokio::time::timeout(timeout, client_handshake(&mut stream, None))
+            .await
+            .map_err(|_| SidecarError::Timeout)?
+            .map_err(SidecarError::Handshake)?;
+        let session_id: [u8; 16] = rand::random();
+        let epoch_mgr = std::sync::Arc::new(SessionEpochManager::new());
+        epoch_mgr
+            .create_session(
+                session_id,
+                *session_key,
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .map_err(SidecarError::Session)?;
+        let epoch_id = epoch_mgr.get_current_epoch_id(&session_id).unwrap_or(0);
+        Ok(PooledConn {
+            stream,
+            epoch_manager: epoch_mgr,
+            session_id,
+            epoch_id,
+            last_used: std::time::Instant::now(),
+            root_key: zeroize::Zeroizing::new(*session_key),
+            sends_on_session: 0,
+            sessions_created: 1,
+        })
+    }
+
+    /// Pooled counterpart of [`send_message`] — identical SSRF validation,
+    /// token issuance, frame construction, and ack classification; reuses an
+    /// idle connection when one is available and falls back to (at most one)
+    /// fresh dial when the pooled connection turns out to be dead.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send(
+        &self,
+        target_addr: &str,
+        target_agent: &str,
+        from_agent: &str,
+        secret: &[u8; 32],
+        task: &str,
+        priority: i64,
+        action_class: u8,
+        retry_attempts: u32,
+        target_allowlist: &[(IpAddr, u8)],
+        allow_private_targets: bool,
+        audit_log: Option<&ImmutableAuditLog>,
+        pad_payload: bool,
+    ) -> Result<SendOutcome, SidecarError> {
+        let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
+        let validated = tokio::time::timeout(
+            timeout,
+            resolve_allowed_target(target_addr, target_allowlist, allow_private_targets),
+        )
+        .await
+        .map_err(|_| SidecarError::Timeout)??;
+        let key = validated.to_string();
+
+        // The token/payload half is identical for every attempt.
+        //
+        // Identity-pin aware allow-list: the FIRST frame on a fresh connection
+        // is evaluated against the connection's bootstrap identity ("unknown"),
+        // and once it clears, the peer daemon PINS the token's real issuer
+        // (`from_agent`) for the rest of the connection (identity-rotation
+        // defense, `daemon.rs`'s `pinned_agent`). Every subsequent pooled
+        // frame is therefore evaluated as `from_agent` — so the token must
+        // allow both, exactly like any long-lived agent connection's token
+        // would. (The one-shot `send_message` keeps allow=["unknown"] only
+        // because its connection never survives to a second frame.)
+        let gw = ZeroTrustGateway::new();
+        let token = gw.issue_capability_token(
+            secret,
+            from_agent,
+            &[BOOTSTRAP_AGENT, from_agent],
+            &[],
+            60,
+            None,
+            action_class,
+            None,
+        );
+        if let Some(log) = audit_log {
+            FAITFAuditLog::log_delegation(
+                log,
+                from_agent,
+                target_agent,
+                0,
+                "sidecar message capability",
+                None,
+                "",
+            );
+        }
+        let token_str = String::from_utf8(token).map_err(|_| {
+            SidecarError::Session(crate::errors::SAACPHardDrop::new(
+                crate::errors::SAACPBytecodes::SchemaMismatch,
+                "issued token was not valid UTF-8",
+            ))
+        })?;
+        let payload = serde_json::json!({
+            "task": task,
+            "priority": priority,
+            "_capability_token": token_str,
+        })
+        .to_string();
+        // C4 (MPF): opt-in bucket padding of the outbound payload.
+        let payload = if pad_payload {
+            pad_payload_to_bucket(payload)
+        } else {
+            payload
+        };
+
+        // At most two attempts: pooled (if any) then fresh dial.
+        let mut last_err: Option<SidecarError> = None;
+        for attempt in 0..2 {
+            let pooled = if attempt == 0 {
+                self.checkout(&key)
+            } else {
+                None
+            };
+            let mut conn = match pooled {
+                Some(c) => c,
+                None => match self.dial(validated, retry_attempts, timeout).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                },
+            };
+            let frame = conn
+                .epoch_manager
+                .with_epoch_mut(&conn.session_id, conn.epoch_id, |epoch| {
+                    MEASCFrame::build_frame(
+                        epoch,
+                        1,
+                        0x10,
+                        0,
+                        action_class,
+                        payload.as_bytes(),
+                        &[0u8; 32],
+                        &[0u8; 24],
+                        0,
+                    )
+                })
+                .ok_or_else(|| {
+                    SidecarError::Session(crate::errors::SAACPHardDrop::new(
+                        crate::errors::SAACPBytecodes::EpochExpired,
+                        "pooled session disappeared",
+                    ))
+                })?
+                .map_err(SidecarError::Session)?
+                .0;
+
+            let send_result: Result<SendOutcome, SidecarError> = async {
+                use tokio::io::AsyncReadExt;
+                use tokio::io::AsyncWriteExt;
+                tokio::time::timeout(timeout, conn.stream.write_all(&frame))
+                    .await
+                    .map_err(|_| SidecarError::Timeout)?
+                    .map_err(SidecarError::Io)?;
+                let mut response = [0u8; 128];
+                let n = tokio::time::timeout(timeout, conn.stream.read(&mut response))
+                    .await
+                    .map_err(|_| SidecarError::Timeout)?
+                    .map_err(SidecarError::Io)?;
+                if std::env::var("SAACP_POOL_DEBUG").is_ok() {
+                    eprintln!("[pool-debug] n={} bytes={:?}", n, &response[..n.min(16)]);
+                }
+                Ok(
+                    if &response[..n] == b"SUCCESS"
+                        || &response[..n] == b"STREAM_ACK"
+                        || &response[..n] == b"STREAM_END_ACK"
+                    {
+                        SendOutcome::Success
+                    } else {
+                        SendOutcome::Rejected
+                    },
+                )
+            }
+            .await;
+
+            match send_result {
+                Ok(outcome) => {
+                    // A protocol-level outcome (success OR rejection) means the
+                    // connection is still healthy. Rotate the session before
+                    // checking the connection back in when the current session
+                    // has carried 2 frames: CSCS's oscillation fingerprint is
+                    // (agent, session, action-class), so a pooled task stream
+                    // on ONE session would otherwise look like a loop at the
+                    // 3rd frame. A fresh session id on the same connection is
+                    // free (the peer auto-creates it from the handshake key)
+                    // and keeps every fingerprint count at <= 2.
+                    const POOL_SESSION_ROTATE_AT: u32 = 2;
+                    const POOL_SESSIONS_PER_CONNECTION: u32 = 12;
+                    conn.sends_on_session += 1;
+                    conn.last_used = std::time::Instant::now();
+                    if conn.sends_on_session >= POOL_SESSION_ROTATE_AT {
+                        if conn.sessions_created >= POOL_SESSIONS_PER_CONNECTION {
+                            // Close to the peer's per-connection session cap —
+                            // retire this connection; the next send dials fresh.
+                            return Ok(outcome);
+                        }
+                        let new_sid: [u8; 16] = rand::random();
+                        if conn
+                            .epoch_manager
+                            .create_session(
+                                new_sid,
+                                *conn.root_key,
+                                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                                None,
+                            )
+                            .is_ok()
+                        {
+                            conn.session_id = new_sid;
+                            conn.epoch_id = 0;
+                            conn.sends_on_session = 0;
+                            conn.sessions_created += 1;
+                        }
+                    }
+                    self.checkin(&key, conn);
+                    return Ok(outcome);
+                }
+                Err(e) => {
+                    // Transport-level failure — discard the connection and
+                    // retry once on a fresh dial.
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or(SidecarError::Timeout))
+    }
+}
+
 // ─── HTTP API ─────────────────────────────────────────────────────────────────
 
 struct SidecarState {
@@ -661,6 +1063,16 @@ struct SidecarState {
     /// the sidecar serving HTTP while silently unable to receive any peer traffic, and
     /// `/healthz` still reported `"ok"` — a half-dead sidecar that looked healthy.
     protocol_listener_healthy: Arc<AtomicBool>,
+    /// C2: outbound connection pool — shared across every `/send` request so
+    /// consecutive sends to the same peer reuse one TCP+ECDH connection
+    /// instead of dialing per message. Semantics-preserving (see
+    /// `SidecarConnectionPool`'s doc comment).
+    pool: Arc<SidecarConnectionPool>,
+    /// C2: kill switch for the pool — `false` falls back to per-send dialing
+    /// (`send_message`) for operators who want the v1 connection behavior.
+    connection_pooling: bool,
+    /// C4 (MPF): see `SidecarConfig::payload_padding`.
+    payload_padding: bool,
 }
 
 impl SidecarState {
@@ -722,21 +1134,44 @@ async fn handle_send(
     };
 
     let secret = state.secret_for(&req.to_agent);
-    match send_message(
-        &req.target_addr,
-        &req.to_agent,
-        &state.agent_id,
-        &secret,
-        &req.task,
-        req.priority,
-        req.action_class,
-        state.send_retry_attempts,
-        &state.target_allowlist,
-        state.allow_private_targets,
-        Some(ImmutableAuditLog::global()),
-    )
-    .await
-    {
+    // C2: pooled sends when enabled (default) — identical wire semantics,
+    // one TCP+ECDH handshake amortized across sends to the same peer.
+    let outcome = if state.connection_pooling {
+        state
+            .pool
+            .send(
+                &req.target_addr,
+                &req.to_agent,
+                &state.agent_id,
+                &secret,
+                &req.task,
+                req.priority,
+                req.action_class,
+                state.send_retry_attempts,
+                &state.target_allowlist,
+                state.allow_private_targets,
+                Some(ImmutableAuditLog::global()),
+                state.payload_padding,
+            )
+            .await
+    } else {
+        send_message(
+            &req.target_addr,
+            &req.to_agent,
+            &state.agent_id,
+            &secret,
+            &req.task,
+            req.priority,
+            req.action_class,
+            state.send_retry_attempts,
+            &state.target_allowlist,
+            state.allow_private_targets,
+            Some(ImmutableAuditLog::global()),
+            state.payload_padding,
+        )
+        .await
+    };
+    match outcome {
         Ok(SendOutcome::Success) => (
             StatusCode::OK,
             Json(SendResponse {
@@ -969,6 +1404,9 @@ pub async fn run_with_shutdown(
         http_bearer_token: config.http_bearer_token,
         protocol_listener_healthy,
         inbox_dropped,
+        pool: Arc::new(SidecarConnectionPool::new()),
+        connection_pooling: config.connection_pooling,
+        payload_padding: config.payload_padding,
     });
 
     // M-22 fix: `/send`/`/receive` sit behind bearer-token auth (opt-in, see

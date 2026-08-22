@@ -231,3 +231,91 @@ async fn ws_start_with_shutdown_returns_promptly_with_no_connections() {
         result
     );
 }
+
+// ─── C3: wss:// (WebSocket over TLS) ─────────────────────────────────────────
+
+/// C3 regression: a `SAACPWebSocketDaemon::with_tls` listener serves the
+/// identical SAACP pipeline over a TLS-wrapped WebSocket — cover traffic
+/// round-trips to WIRE_SUCCESS through wss:// exactly as it does through
+/// ws://. Only compiled when both transports are enabled
+/// (`--features transport-wss`).
+#[cfg(all(feature = "transport-ws", feature = "transport-tls"))]
+#[tokio::test]
+async fn c3_wss_tunnel_cover_traffic_roundtrip() {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use tokio_rustls::rustls;
+    use tokio_rustls::TlsConnector;
+
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("self-signed cert");
+    let cert_der = cert.der().clone();
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+    );
+    let server_config =
+        saacp::transport::tls::server_config_from_cert_and_key(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+
+    let port = free_port().await;
+    let daemon = SAACPWebSocketDaemon::new("127.0.0.1", port, None).with_tls(server_config);
+    tokio::spawn(async move {
+        let _ = daemon.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Client: manual TLS wrap + WebSocket client handshake over the TLS
+    // stream (client_async is transport-agnostic).
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).expect("add cert to roots");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("client protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+    let name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name")
+        .to_owned();
+    let tls_stream = connector
+        .connect(name, tcp)
+        .await
+        .expect("TLS handshake failed");
+
+    let (mut ws_stream, _resp) = tokio_tungstenite::client_async("wss://localhost/", tls_stream)
+        .await
+        .expect("wss client handshake failed");
+
+    let session_key = ws_client_handshake(&mut ws_stream).await;
+
+    let header = saacp::framing::MEASCFrame {
+        schema_id: 1,
+        status_code: 0x10,
+        flags: FLAG_COVER_TRAFFIC,
+        action_class: 0,
+        payload_length: 0,
+        session_id: [0xEEu8; 16],
+        epoch_id: 0,
+        psn: 0,
+        context_ref_id: [0u8; 32],
+        context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    let frame = header
+        .encode_encrypted(b"", &session_key)
+        .expect("encode_encrypted");
+    ws_stream
+        .send(Message::Binary(frame))
+        .await
+        .expect("send frame over wss");
+
+    let response = recv_exact(&mut ws_stream, 7).await;
+    assert_eq!(
+        &response, b"SUCCESS",
+        "cover traffic must ack with WIRE_SUCCESS over the wss:// tunnel"
+    );
+    let _ = ws_stream.close(None).await;
+}

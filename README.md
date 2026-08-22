@@ -525,7 +525,30 @@ for embedded targets.
 | `hrt-aws-kms` | **Hardware Root of Trust: AWS KMS.** `ECC_NIST_EDWARDS25519` keys; every signature lands in CloudTrail. | aws-sdk-kms, aws-config |
 | `hrt-gcp-kms` | **Hardware Root of Trust: Google Cloud KMS.** `EC_SIGN_ED25519` key versions. | gcloud-sdk |
 | `hrt-tpm` / `hrt-sgx` | Hardware Root of Trust seams for TPM 2.0 / Intel SGX (compile placeholders — return `NotImplemented`) | — |
+| `transport-wss` | `wss://` — WebSocket over TLS (`SAACPWebSocketDaemon::with_tls`) | (combines `transport-ws` + `transport-tls`) |
 | `unsafe-structural-only` | **Debug only.** Exposes unauthenticated structural header parsing. **Must never be enabled in production.** | — |
+
+**Hardware Root of Trust support matrix (honest status):**
+
+| Backend | Status | Key residency | Notes |
+|---------|--------|---------------|-------|
+| Software (`klms`) | ✅ production | process memory, zeroized on drop | default; full key lifecycle + rotation |
+| PKCS#11 (`hrt-pkcs11`) | ✅ production | HSM/token | Thales, Entrust, Utimaco, YubiHSM, SoftHSM2 |
+| AWS KMS (`hrt-aws-kms`) | ✅ production | AWS-managed KMS | `ECC_NIST_EDWARDS25519`, CloudTrail-audited |
+| GCP KMS (`hrt-gcp-kms`) | ✅ production | Google-managed KMS | `EC_SIGN_ED25519` versions |
+| TPM 2.0 (`hrt-tpm`) | ❌ `NotImplemented` | — | seam compiled in; returns `NotImplemented` — no fake claims |
+| Intel SGX (`hrt-sgx`) | ❌ `NotImplemented` | — | seam compiled in; returns `NotImplemented` — no fake claims |
+
+**Sidecar peer identity resolution (C5):** the receiving daemon evaluates the
+first frame of a connection against the bootstrap identity (`unknown`), then
+**pins** the capability token's real issuer (`iss`) for the connection's
+lifetime (identity-rotation defense). From the second frame onward the peer —
+and every audit entry — sees the sender's real agent identity. First-party
+tokens (issuer deliberately listing itself in the allow-list) are valid
+authentication for the pinned identity; presenting a token under a DIFFERENT
+identity than it allows remains a hard `ScopeViolation`. Delegation-layer
+self-issue prohibitions live in ACSVAF's authority policy (only
+federation-root authorities may self-issue).
 
 Release profile is tuned for performance: `lto = "thin"`, `codegen-units = 1`,
 `opt-level = 3`. `panic = "abort"` is deliberately **not** set — a long-lived network

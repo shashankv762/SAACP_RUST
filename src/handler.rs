@@ -1940,14 +1940,14 @@ impl SAACPProtocolHandler {
     /// chain nor the token-signature fallback need the exact rotating key that encrypted
     /// this particular frame, only *a* shared secret.
     ///
-    /// V1 scope limit: `STREAM_CONTINUATION`/`STREAM_END` are rejected outright rather than
-    /// routed to `handle_stream_continuation`/`handle_stream_end`, since those two handlers
-    /// each call `gate_0_crypto_integrity` internally, which derives its AES-256-GCM key
-    /// from the static `secret_key` rather than this path's per-epoch traffic key —
-    /// routing an encrypted frame there would authenticate against the wrong key material
-    /// and always fail closed (not silently accept ciphertext as plaintext, but the two
-    /// paths are still not interchangeable). Mirroring them onto the encrypted path is
-    /// real, scoped-out follow-up work.
+    /// C1: `STREAM_CONTINUATION`/`STREAM_END` are routed to the key-material-
+    /// agnostic stream cores (`stream_continuation_core`/`stream_end_core`)
+    /// after this path's own Gate 0 — the per-epoch AEAD verification replaces
+    /// the static-secret decryption the plain handlers perform, and every
+    /// post-Gate-0 stream gate (capability expiry/revocation, kinetic
+    /// firewall, sequence monotonicity, per-frame audit) runs unchanged. The
+    /// v1 blanket rejection of stream frames here was a scope limit, now
+    /// closed.
     #[allow(clippy::too_many_arguments)]
     pub fn intercept_packet_encrypted(
         packet: &[u8],
@@ -2000,15 +2000,28 @@ impl SAACPProtocolHandler {
             report_gate_rejection("gate_0_crypto", current_agent_name, e);
         })
         .and_then(|parsed| {
-            if parsed.status_code == SAACPBytecodes::StreamContinuation as u8
-                || parsed.status_code == SAACPBytecodes::StreamEnd as u8
-            {
-                return Err(SAACPHardDrop::new(
-                    SAACPBytecodes::SchemaMismatch,
-                    "STREAM_CONTINUATION/STREAM_END are not yet supported over the \
-                         encrypted transport path (v1 scope limit) — see \
-                         intercept_packet_encrypted's doc comment.",
-                ));
+            // C1: stream frames now ride the encrypted transport — Gate 0 has
+            // already AEAD-verified this frame against the per-epoch traffic
+            // key, so hand the parsed frame to the same post-Gate-0 stream
+            // cores the static-secret path uses (capability expiry/revocation,
+            // kinetic firewall, sequence monotonicity, audit).
+            if parsed.status_code == SAACPBytecodes::StreamContinuation as u8 {
+                return Self::stream_continuation_core(
+                    parsed,
+                    current_agent_name,
+                    audit_secret,
+                    gateway,
+                    audit_log,
+                );
+            }
+            if parsed.status_code == SAACPBytecodes::StreamEnd as u8 {
+                return Self::stream_end_core(
+                    parsed,
+                    current_agent_name,
+                    audit_secret,
+                    gateway,
+                    audit_log,
+                );
             }
             Self::run_gates_1_through_12(
                 parsed,
@@ -2939,7 +2952,22 @@ impl SAACPProtocolHandler {
         audit_log: Option<&ImmutableAuditLog>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
-        let mut parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        Self::stream_continuation_core(parsed, current_agent_name, secret_key, gateway, audit_log)
+    }
+
+    /// C1: key-material-agnostic continuation core — every gate after Gate 0.
+    /// The static-secret path decrypts above; the encrypted-transport path
+    /// (`intercept_packet_encrypted`) reaches this core with a frame already
+    /// AEAD-verified and replay-checked against the per-epoch traffic key by
+    /// `gate_0_crypto_integrity_encrypted`.
+    fn stream_continuation_core(
+        mut parsed: ParsedPacket,
+        current_agent_name: &str,
+        audit_secret: &[u8],
+        gateway: Option<&ZeroTrustGateway>,
+        audit_log: Option<&ImmutableAuditLog>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
         let stream_id = parsed.session_uuid.clone();
         // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
         let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
@@ -3074,7 +3102,7 @@ impl SAACPProtocolHandler {
             None => ImmutableAuditLog::global(),
         };
         log.append_event(
-            secret_key,
+            audit_secret,
             &stream_source_agent,
             current_agent_name,
             &token_sig_hash,
@@ -3118,7 +3146,19 @@ impl SAACPProtocolHandler {
         audit_log: Option<&ImmutableAuditLog>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
-        let mut parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
+        Self::stream_end_core(parsed, current_agent_name, secret_key, gateway, audit_log)
+    }
+
+    /// C1: key-material-agnostic END core — every gate after Gate 0 (see
+    /// `stream_continuation_core`'s doc comment for the two entry paths).
+    fn stream_end_core(
+        mut parsed: ParsedPacket,
+        current_agent_name: &str,
+        audit_secret: &[u8],
+        gateway: Option<&ZeroTrustGateway>,
+        audit_log: Option<&ImmutableAuditLog>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
         let stream_id = parsed.session_uuid.clone();
         // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
         let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
@@ -3223,7 +3263,7 @@ impl SAACPProtocolHandler {
             .map(|l| l as &ImmutableAuditLog)
             .unwrap_or_else(|| ImmutableAuditLog::global());
         log.append_event(
-            secret_key,
+            audit_secret,
             &source_agent,
             current_agent_name,
             "stream_end",
@@ -3820,5 +3860,78 @@ mod tests {
 
         // Non-cost-estimate status → skip
         assert!(SAACPProtocolHandler::gate_financial_cb(0x00, &pd).is_ok());
+    }
+
+    /// C1 regression: STREAM_CONTINUATION now rides the encrypted transport
+    /// (per-epoch AEAD traffic key) — previously rejected outright with the
+    /// v1 scope limit. Must still fail closed for an UNREGISTERED stream, and
+    /// pass the full continuation gate set once the stream exists.
+    #[test]
+    fn c1_stream_continuation_rides_encrypted_transport() {
+        use crate::measc::MEASCFrame;
+        use crate::streaming::StreamRegistry;
+
+        let mgr = SessionEpochManager::new();
+        let sid = [0xC1u8; 16];
+        let secret = [0x5Cu8; 32];
+        mgr.create_session(sid, secret, 1_000_000, 3600.0, None)
+            .expect("create_session");
+        let eid = mgr.get_current_epoch_id(&sid).expect("epoch");
+        let stream_key = hex::encode(sid);
+
+        let build_cont_frame = || {
+            mgr.with_epoch_mut(&sid, eid, |epoch| {
+                MEASCFrame::build_frame(
+                    epoch,
+                    1,
+                    SAACPBytecodes::StreamContinuation as u8,
+                    FLAG_BINARY_STREAM,
+                    0,
+                    b"chunk-data",
+                    &[0u8; 32],
+                    &[0u8; 24],
+                    0,
+                )
+            })
+            .expect("with_epoch_mut")
+            .expect("build_frame")
+            .0
+        };
+
+        // 1. Unregistered stream → fail closed (not the v1 blanket rejection).
+        let frame = build_cont_frame();
+        let err = SAACPProtocolHandler::intercept_packet_encrypted(
+            &frame, &mgr, &secret, "agent-c1", false, None, None, None,
+        )
+        .expect_err("continuation for an unregistered stream must fail");
+        assert!(
+            err.message.contains("No active stream"),
+            "expected no-active-stream rejection, got: {}",
+            err.message
+        );
+
+        // 2. Registered stream → the full continuation gate set runs and the
+        //    frame is accepted over the encrypted path.
+        StreamRegistry::global()
+            .start_stream(&stream_key, "agent-c1", "agent-c1")
+            .expect("start_stream");
+        let frame2 = build_cont_frame();
+        let parsed = SAACPProtocolHandler::intercept_packet_encrypted(
+            &frame2, &mgr, &secret, "agent-c1", false, None, None, None,
+        )
+        .expect("encrypted continuation must be accepted for a live stream");
+        assert_eq!(parsed.status_code, SAACPBytecodes::StreamContinuation as u8);
+
+        // 3. Replay of the SAME wire frame (same psn) → rejected by the
+        //    epoch replay window even though the stream is live.
+        let replay = SAACPProtocolHandler::intercept_packet_encrypted(
+            &frame2, &mgr, &secret, "agent-c1", false, None, None, None,
+        );
+        assert!(
+            replay.is_err(),
+            "replayed continuation frame must be rejected"
+        );
+
+        StreamRegistry::global().abort_stream(&stream_key);
     }
 }
