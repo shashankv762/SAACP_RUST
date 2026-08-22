@@ -600,7 +600,7 @@ packet is dropped, never partially processed.
 |--------|-----------------|
 | Passive eavesdropping | Per-frame AES-256-GCM |
 | Frame tampering / bit-flipping | GCM auth tag over ciphertext + 128-byte header as AAD |
-| Replay | 4096-entry PSN sliding window + nonce tracking (pre-decryption) |
+| Replay | 4096-entry PSN sliding window + nonce tracking (post-authentication insert, pre-auth read-only check) |
 | Key compromise (past/future traffic) | Forward-secret epoch key ratchet (HKDF) |
 | Capability forgery | Ed25519-signed tokens, verified against a key registry |
 | Privilege escalation | Gate 2.5 action-class ceiling + audit-health gating |
@@ -615,6 +615,43 @@ packet is dropped, never partially processed.
 | Timing side-channels | Constant-time comparisons on signature/checksum paths |
 | Collusion / Sybil | MACE collusion engine |
 | Error-message information leakage | PECF opaque fixed-size wire errors |
+| **Pre-auth replay-state poisoning** (unauthenticated frames consuming PSNs / advancing the replay window / filling the nonce tracker) | **`measc::parse_frame` accepts a PSN only after the AES-GCM tag verifies (read-only `peek` pre-auth); `SAACPFrame::parse_header` inserts nonces only post-auth (`contains_scoped` read-only pre-check)** |
+| Degenerate X25519 handshake keys (identity / low-order points) | Contributory check — all-zero DH shared secrets rejected in both handshake directions |
+| Mis-configured "secure" deployments | `SAACPNetworkDaemon::secure(...)` one-call hardened profile + construction-time suite-policy downgrade guard; legacy builder prints a startup warning enumerating disabled protections |
+
+### Hardening addenda (0.1-beta2 security audit)
+
+* **F1 — post-authentication replay acceptance (`measc.rs`).** `parse_frame` now
+  gates the PSN with a read-only `ReplayWindow::peek` *before* decryption and
+  performs the authoritative atomic `check_and_accept` *after* AES-GCM
+  verification. Previously the window was mutated pre-authentication, letting a
+  keyless active injector pre-mark the sender's next (predictable) PSNs —
+  causing legitimate frames to be rejected as duplicates — or walk
+  `highest_psn` forward and lock the session out. C-1 TOCTOU atomicity is
+  preserved: acceptance is still one atomic check-and-mark under the epoch
+  mutex, and only key-holders can reach it.
+* **F2 — post-authentication nonce recording (`framing.rs`, `security.rs`).**
+  `SAACPFrame::parse_header` now uses a read-only `NonceTracker::contains_scoped`
+  pre-check and records nonces (`track_scoped`) only after the AEAD tag
+  verifies, so an unauthenticated flood can no longer fill the tracker's
+  capacity and circuit-break legitimate traffic.
+* **F3 — secure-by-default daemon profile (`daemon.rs`).** New
+  `SAACPNetworkDaemon::secure(...)` composes server authentication + C-3
+  identity binding + AEAD Gate 0 + real Gate 1.0 token verification in one
+  call, validates the configured suite list against the production
+  crypto-governance policy at construction time (downgrade guard), and records
+  the validation transcript in a `CryptoTransparencyLedger`. Daemons built via
+  the legacy constructor now print a startup warning enumerating exactly which
+  protections are off.
+* **F4 — 96-bit IV derivation (`framing.rs`).** `SAACPFrame::derive_iv` now
+  mixes `sequence_id` into the hash input (`nonce‖session_uuid‖sequence_id`),
+  raising the IV birthday-collision space from 64 to 96 bits for long-lived
+  high-rate sessions. Wire header unchanged; the legacy Python-parity
+  derivation is retained as `derive_iv_v1` for explicit v1 interop.
+* **F5 — X25519 contributory check (`daemon.rs`).** Both handshake directions
+  reject all-zero shared secrets (degenerate/low-order peer keys), preventing a
+  substituted identity point from downgrading HKDF to an attacker-computable
+  key.
 
 > **Status:** this is a `0.1-beta2` research/engineering implementation. It has an
 > extensive adversarial test suite and fuzz harness, but has not undergone an external

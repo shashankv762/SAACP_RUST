@@ -13,20 +13,20 @@
 //! (opt in via [`ENV_AUDIT_ARCHIVE_DIR`] or [`ImmutableAuditLog::with_paths_and_archival_sink`]).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
-use sha2::{Sha256, Digest};
-use hmac::{Hmac, Mac};
-use hkdf::Hkdf;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
@@ -247,6 +247,30 @@ impl NonceTracker {
         self.track_key(Self::composite_key(session_id, nonce))
     }
 
+    /// F2 fix (PRE-AUTH-NONCE-FLOOD): read-only replay pre-check.
+    ///
+    /// Reports whether `nonce` is currently recorded WITHOUT inserting it.
+    /// Wire-parsing code calls this BEFORE authentication so an obvious replay
+    /// is cheaply rejected while unauthenticated junk — which must never be
+    /// able to pollute the tracker — is not. The authoritative, state-mutating
+    /// `track`/`track_scoped` call happens only AFTER the frame's AEAD tag
+    /// verifies, so only authenticated traffic can consume tracker capacity
+    /// (pre-fix, a flood of unauthenticated frames with random nonces filled
+    /// `max_entries` and tripped the capacity circuit-breaker for everyone).
+    pub fn contains(&self, nonce: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .seen_nonces
+            .contains_key(&nonce)
+    }
+
+    /// Session-scoped variant of [`contains`] — same key composition as
+    /// `track_scoped`, read-only.
+    pub fn contains_scoped(&self, session_id: &str, nonce: u64) -> bool {
+        self.contains(Self::composite_key(session_id, nonce))
+    }
+
     /// Derive a session-scoped `u64` key from `(session_id, nonce)` via
     /// SHA-256 truncated to its first 8 bytes (big-endian). Collision
     /// probability is cryptographically negligible for any realistic number
@@ -256,7 +280,11 @@ impl NonceTracker {
         hasher.update(session_id.as_bytes());
         hasher.update(nonce.to_be_bytes());
         let digest = hasher.finalize();
-        u64::from_be_bytes(digest[0..8].try_into().expect("SHA-256 digest is >= 8 bytes"))
+        u64::from_be_bytes(
+            digest[0..8]
+                .try_into()
+                .expect("SHA-256 digest is >= 8 bytes"),
+        )
     }
 
     /// Shared atomic check-and-insert-with-pruning logic backing both
@@ -280,7 +308,9 @@ impl NonceTracker {
         // Prune expired nonces to prevent OOM memory leaks
         if inner.seen_nonces.len() > inner.max_entries {
             let max_age = inner.max_age_seconds;
-            inner.seen_nonces.retain(|_, &mut t| (current_time - t) <= max_age);
+            inner
+                .seen_nonces
+                .retain(|_, &mut t| (current_time - t) <= max_age);
 
             // If STILL over capacity after time-based eviction, we are under
             // sustained flood attack.
@@ -589,9 +619,12 @@ impl AuditRecord {
     /// exactly how [`CanonicalAuditRecord`] reproduces byte-identical v1 output.
     fn v2_fields(&self) -> (Option<u16>, Option<u64>, Option<u64>, Option<u8>) {
         match (self.shard_id, self.shard_seq, self.anchor_epoch) {
-            (Some(sid), Some(sseq), Some(ep)) => {
-                (Some(sid), Some(sseq), Some(ep), Some(AUDIT_RECORD_VERSION_V2))
-            }
+            (Some(sid), Some(sseq), Some(ep)) => (
+                Some(sid),
+                Some(sseq),
+                Some(ep),
+                Some(AUDIT_RECORD_VERSION_V2),
+            ),
             _ => (None, None, None, None),
         }
     }
@@ -896,7 +929,10 @@ impl ImmutableAuditLog {
         } else if let Ok(test_log_dir) = std::env::var("SAACP_TEST_LOG_DIR") {
             let path = Path::new(&log_file);
             if path.is_relative() {
-                Path::new(&test_log_dir).join(path).to_string_lossy().to_string()
+                Path::new(&test_log_dir)
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 log_file.to_string()
             }
@@ -909,7 +945,10 @@ impl ImmutableAuditLog {
         } else if let Ok(test_log_dir) = std::env::var("SAACP_TEST_LOG_DIR") {
             let path = Path::new(&count_file);
             if path.is_relative() {
-                Path::new(&test_log_dir).join(path).to_string_lossy().to_string()
+                Path::new(&test_log_dir)
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 count_file.to_string()
             }
@@ -1004,7 +1043,10 @@ impl ImmutableAuditLog {
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing the ability to append/verify the audit chain.
     pub fn subscribe(&self, cb: Arc<dyn Fn(&AuditRecord) + Send + Sync>) {
-        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(cb);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cb);
     }
 
     /// Create a new audit log with default file path (reads from env vars). C-4: also
@@ -1012,10 +1054,9 @@ impl ImmutableAuditLog {
     /// are moved into that directory via [`FilesystemArchivalSink`]; when unset, the
     /// compressed `.bak.gz` is simply left beside the live WAL ([`NoopArchivalSink`]).
     pub fn with_default_path() -> Self {
-        let log_file = std::env::var(ENV_AUDIT_LOG)
-            .unwrap_or_else(|_| AUDIT_LOG_FILE.to_string());
-        let count_file = std::env::var(ENV_COUNT_FILE)
-            .unwrap_or_else(|_| AUDIT_COUNT_FILE.to_string());
+        let log_file = std::env::var(ENV_AUDIT_LOG).unwrap_or_else(|_| AUDIT_LOG_FILE.to_string());
+        let count_file =
+            std::env::var(ENV_COUNT_FILE).unwrap_or_else(|_| AUDIT_COUNT_FILE.to_string());
         let archival_sink: Arc<dyn ArchivalSink> = match std::env::var(ENV_AUDIT_ARCHIVE_DIR) {
             Ok(dir) if !dir.is_empty() => Arc::new(FilesystemArchivalSink::new(dir)),
             _ => Arc::new(NoopArchivalSink),
@@ -1112,7 +1153,10 @@ impl ImmutableAuditLog {
         for i in 0..AUDIT_SHARDS {
             let (hash, shard_seq) = match &heads[i] {
                 Some((h, s)) => (h.clone(), *s),
-                None => (self.migration_seed_hash(i as u16, final_v1_hash.as_deref()), 0),
+                None => (
+                    self.migration_seed_hash(i as u16, final_v1_hash.as_deref()),
+                    0,
+                ),
             };
             {
                 let mut shard = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
@@ -1211,7 +1255,9 @@ impl ImmutableAuditLog {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
-                self.shards[shard_idx].lock().unwrap_or_else(|e| e.into_inner())
+                self.shards[shard_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
@@ -1283,7 +1329,12 @@ impl ImmutableAuditLog {
 
         self.enqueue_wal_line(entry_json);
 
-        for cb in self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for cb in self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
             cb(&record_for_subscribers);
         }
     }
@@ -1336,7 +1387,11 @@ impl ImmutableAuditLog {
         let _ = self
             .health
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                if cur == AuditHealth::Fatal as u8 { None } else { Some(level as u8) }
+                if cur == AuditHealth::Fatal as u8 {
+                    None
+                } else {
+                    Some(level as u8)
+                }
             });
     }
 
@@ -1544,9 +1599,9 @@ impl ImmutableAuditLog {
                 // dropping or rewriting a shard's records detectable: the shard
                 // head would no longer match what the anchor committed to.
                 for (i, head) in anchor.heads.iter().enumerate() {
-                    let actual = expected_v2[i]
-                        .clone()
-                        .unwrap_or_else(|| self.migration_seed_hash(i as u16, final_v1_hash.as_deref()));
+                    let actual = expected_v2[i].clone().unwrap_or_else(|| {
+                        self.migration_seed_hash(i as u16, final_v1_hash.as_deref())
+                    });
                     if &actual != head {
                         return false;
                     }
@@ -1569,13 +1624,34 @@ impl ImmutableAuditLog {
             // malformed/missing field fails the parse explicitly (fail-closed)
             // instead of silently serializing as `null` and merely producing a
             // mismatching HMAC.
-            let intent = match rec["intent"].as_str() { Some(v) => v, None => return false };
-            let seq = match rec["seq"].as_u64() { Some(v) => v, None => return false };
-            let source = match rec["source"].as_str() { Some(v) => v, None => return false };
-            let target = match rec["target"].as_str() { Some(v) => v, None => return false };
-            let timestamp = match rec["timestamp"].as_f64() { Some(v) => v, None => return false };
-            let token_signature = match rec["token_signature"].as_str() { Some(v) => v, None => return false };
-            let traceparent = match rec["traceparent"].as_str() { Some(v) => v, None => return false };
+            let intent = match rec["intent"].as_str() {
+                Some(v) => v,
+                None => return false,
+            };
+            let seq = match rec["seq"].as_u64() {
+                Some(v) => v,
+                None => return false,
+            };
+            let source = match rec["source"].as_str() {
+                Some(v) => v,
+                None => return false,
+            };
+            let target = match rec["target"].as_str() {
+                Some(v) => v,
+                None => return false,
+            };
+            let timestamp = match rec["timestamp"].as_f64() {
+                Some(v) => v,
+                None => return false,
+            };
+            let token_signature = match rec["token_signature"].as_str() {
+                Some(v) => v,
+                None => return false,
+            };
+            let traceparent = match rec["traceparent"].as_str() {
+                Some(v) => v,
+                None => return false,
+            };
 
             // ---- Branch 2: v2 (sharded) record ----
             if let Some(shard_id_raw) = rec.get("shard_id").and_then(|v| v.as_u64()) {
@@ -1600,8 +1676,9 @@ impl ImmutableAuditLog {
 
                 // Seed this shard on first sight, folding in the final v1 hash
                 // if the file has a v1 region — this is the migration boundary.
-                let expected = expected_v2[shard_id as usize]
-                    .get_or_insert_with(|| self.migration_seed_hash(shard_id, final_v1_hash.as_deref()));
+                let expected = expected_v2[shard_id as usize].get_or_insert_with(|| {
+                    self.migration_seed_hash(shard_id, final_v1_hash.as_deref())
+                });
                 if prev_hash != expected.as_str() {
                     return false;
                 }
@@ -1619,7 +1696,8 @@ impl ImmutableAuditLog {
                     token_signature,
                     traceparent,
                     v: Some(AUDIT_RECORD_VERSION_V2),
-                }).unwrap_or_default();
+                })
+                .unwrap_or_default();
 
                 let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
                 mac.update(record_json.as_bytes());
@@ -1659,7 +1737,8 @@ impl ImmutableAuditLog {
                 token_signature,
                 traceparent,
                 v: None,
-            }).unwrap_or_default();
+            })
+            .unwrap_or_default();
 
             let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
             mac.update(record_json.as_bytes());
@@ -1778,7 +1857,9 @@ impl ImmutableAuditLog {
     /// are not lost just because this call couldn't confirm the very latest ones in
     /// time. Callers should log a warning on `false`, not treat it as fatal.
     pub fn flush(&self, timeout: Duration) -> bool {
-        let Some(ref tx) = self.wal_tx else { return false };
+        let Some(ref tx) = self.wal_tx else {
+            return false;
+        };
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
         if tx.send(WalMessage::Flush(ack_tx)).is_err() {
             return false; // worker thread gone (channel disconnected)
@@ -1809,10 +1890,8 @@ impl ImmutableAuditLog {
     /// the chain hash will still verify.  Use `append_event()` with a real secret key
     /// for any security-critical log entries.  This method is kept only for non-security
     /// diagnostic messages (e.g. daemon startup banners).
-    #[deprecated(
-        note = "Uses a publicly-known sentinel key. \
-                Call append_event() with a real secret for security-critical entries."
-    )]
+    #[deprecated(note = "Uses a publicly-known sentinel key. \
+                Call append_event() with a real secret for security-critical entries.")]
     pub fn append(&self, message: String) {
         self.append_event(
             b"SAACP-AUDIT-DIAGNOSTIC-ONLY-NOT-SECRET",
@@ -1843,7 +1922,12 @@ impl ImmutableAuditLog {
     ) {
         let encrypted = encrypt_intent(issuer_secret, evaluated_intent);
         self.append_event(
-            issuer_secret, source_agent, target_agent, token_signature, &encrypted, traceparent,
+            issuer_secret,
+            source_agent,
+            target_agent,
+            token_signature,
+            &encrypted,
+            traceparent,
         );
     }
 
@@ -1922,7 +2006,9 @@ pub struct FilesystemArchivalSink {
 
 impl FilesystemArchivalSink {
     pub fn new(target_dir: impl Into<std::path::PathBuf>) -> Self {
-        Self { target_dir: target_dir.into() }
+        Self {
+            target_dir: target_dir.into(),
+        }
     }
 }
 
@@ -1930,7 +2016,10 @@ impl ArchivalSink for FilesystemArchivalSink {
     fn archive(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(&self.target_dir)?;
         let file_name = path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "archival source path has no file name")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archival source path has no file name",
+            )
         })?;
         fs::rename(path, self.target_dir.join(file_name))
     }
@@ -2054,7 +2143,10 @@ impl WalWriter {
                 );
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
         self.size = 0;
         Ok(())
@@ -2062,10 +2154,18 @@ impl WalWriter {
 
     /// Write one entry. Errors propagate to the caller (Fix 2) instead of
     /// being silently swallowed.
-    fn write_entry(&mut self, entry_json: &str, event_count: u64, count_file: &str) -> io::Result<()> {
+    fn write_entry(
+        &mut self,
+        entry_json: &str,
+        event_count: u64,
+        count_file: &str,
+    ) -> io::Result<()> {
         self.maybe_rotate()?;
         {
-            let w = self.writer.as_mut().expect("writer present after maybe_rotate");
+            let w = self
+                .writer
+                .as_mut()
+                .expect("writer present after maybe_rotate");
             writeln!(w, "{entry_json}")?;
         }
         self.size += entry_json.len() as u64 + 1;
@@ -2158,10 +2258,7 @@ fn build_anchor_line(
     prev_root: &str,
     event_count: u64,
 ) -> Option<AnchorLine> {
-    let heads: Vec<String> = shard_heads
-        .iter()
-        .map(|h| h.load().hash.clone())
-        .collect();
+    let heads: Vec<String> = shard_heads.iter().map(|h| h.load().hash.clone()).collect();
     let leaves: Vec<[u8; 32]> = heads
         .iter()
         .enumerate()
@@ -2249,7 +2346,10 @@ fn run_wal_worker(
     for msg in wal_rx.iter() {
         queue_len.fetch_sub(1, Ordering::Relaxed);
         match msg {
-            WalMessage::Entry { entry_json, event_count } => {
+            WalMessage::Entry {
+                entry_json,
+                event_count,
+            } => {
                 if let Err(e) = wal.write_entry(&entry_json, event_count, count_file) {
                     // Fix 3: an atomic counter, not an inline eprintln! on this loop
                     // — a sustained disk fault must not reintroduce the original
@@ -2277,13 +2377,13 @@ fn run_wal_worker(
                 if events_since_anchor >= AUDIT_ANCHOR_EVERY_N_EVENTS
                     || last_anchor.elapsed() >= AUDIT_ANCHOR_INTERVAL
                 {
-                    if let Some(line) = build_anchor_line(
-                        shard_heads,
-                        anchor_epoch,
-                        &prev_root,
-                        event_count,
-                    ) {
-                        if wal.write_entry(&line.json, event_count, count_file).is_err() {
+                    if let Some(line) =
+                        build_anchor_line(shard_heads, anchor_epoch, &prev_root, event_count)
+                    {
+                        if wal
+                            .write_entry(&line.json, event_count, count_file)
+                            .is_err()
+                        {
                             wal_write_failures.fetch_add(1, Ordering::Relaxed);
                         } else {
                             prev_root = line.root;
@@ -2436,8 +2536,22 @@ mod tests {
         let log = test_audit_log("append_verify");
         let secret = b"audit_secret_key";
 
-        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
-        log.append_event(secret, "agent-b", "agent-c", "sig-002", "write:data", "trace-002");
+        log.append_event(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            "read:data",
+            "trace-001",
+        );
+        log.append_event(
+            secret,
+            "agent-b",
+            "agent-c",
+            "sig-002",
+            "write:data",
+            "trace-002",
+        );
 
         assert_eq!(log.event_count(), 2);
         assert!(log.verify_chain(secret));
@@ -2456,7 +2570,14 @@ mod tests {
 
         let target = AUDIT_MAX_IN_MEMORY_ENTRIES + (AUDIT_MAX_IN_MEMORY_ENTRIES / 5) + 25;
         for i in 0..target {
-            log.append_event(secret, "agent-a", "agent-b", "sig", "read:data", &format!("t{i}"));
+            log.append_event(
+                secret,
+                "agent-a",
+                "agent-b",
+                "sig",
+                "read:data",
+                &format!("t{i}"),
+            );
         }
 
         // Retention bound: never exceeds the cap.
@@ -2486,13 +2607,21 @@ mod tests {
 
         for i in 0..5 {
             log.append_event(
-                secret, "agent-a", "agent-b", &format!("sig-{i}"), "read:data", &format!("trace-{i}"),
+                secret,
+                "agent-a",
+                "agent-b",
+                &format!("sig-{i}"),
+                "read:data",
+                &format!("trace-{i}"),
             );
         }
 
         // Before an explicit flush, the periodic cadence (200 entries / 50ms) may not
         // have fired yet — `flush()` forces it and blocks until acked.
-        assert!(log.flush(Duration::from_secs(2)), "flush() should confirm within 2s");
+        assert!(
+            log.flush(Duration::from_secs(2)),
+            "flush() should confirm within 2s"
+        );
         assert_eq!(log.queue_len(), 0);
 
         // On-disk line count must match the appended event count once flush() has
@@ -2511,7 +2640,14 @@ mod tests {
         // (acked with nothing to sync) rather than blocking until `timeout`.
         let log = ImmutableAuditLog::new("");
         let secret = b"audit_secret_key";
-        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+        log.append_event(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            "read:data",
+            "trace-001",
+        );
 
         let start = Instant::now();
         assert!(log.flush(Duration::from_secs(2)));
@@ -2532,13 +2668,20 @@ mod tests {
 
         for i in 0..3 {
             log.append_event(
-                secret, "agent-a", "agent-b", &format!("sig-{i}"), "read:data", &format!("trace-{i}"),
+                secret,
+                "agent-a",
+                "agent-b",
+                &format!("sig-{i}"),
+                "read:data",
+                &format!("trace-{i}"),
             );
         }
         assert!(log.flush(Duration::from_secs(2)));
 
-        let count_file = resolve_test_log_path(&format!("test_audit_{}.sentinel", "sentinel_atomic"));
-        let sentinel = fs::read_to_string(&count_file).expect("sentinel file should exist after flush");
+        let count_file =
+            resolve_test_log_path(&format!("test_audit_{}.sentinel", "sentinel_atomic"));
+        let sentinel =
+            fs::read_to_string(&count_file).expect("sentinel file should exist after flush");
         assert_eq!(sentinel.trim().parse::<u64>().unwrap(), 3);
 
         let tmp_leftover = format!("{count_file}.tmp-{}", std::process::id());
@@ -2561,7 +2704,14 @@ mod tests {
             received2.lock().unwrap().push(record.clone());
         }));
 
-        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+        log.append_event(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            "read:data",
+            "trace-001",
+        );
 
         let recs = received.lock().unwrap();
         assert_eq!(recs.len(), 1);
@@ -2580,8 +2730,22 @@ mod tests {
         let secret = b"audit_secret_key";
         log.subscribe(Arc::new(|_record: &AuditRecord| {}));
 
-        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
-        log.append_event(secret, "agent-b", "agent-c", "sig-002", "write:data", "trace-002");
+        log.append_event(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            "read:data",
+            "trace-001",
+        );
+        log.append_event(
+            secret,
+            "agent-b",
+            "agent-c",
+            "sig-002",
+            "write:data",
+            "trace-002",
+        );
 
         assert!(log.verify_chain(secret));
         log.reset();
@@ -2596,10 +2760,21 @@ mod tests {
         let count_b = Arc::new(Mutex::new(0u32));
         let ca = Arc::clone(&count_a);
         let cb = Arc::clone(&count_b);
-        log.subscribe(Arc::new(move |_record: &AuditRecord| { *ca.lock().unwrap() += 1; }));
-        log.subscribe(Arc::new(move |_record: &AuditRecord| { *cb.lock().unwrap() += 1; }));
+        log.subscribe(Arc::new(move |_record: &AuditRecord| {
+            *ca.lock().unwrap() += 1;
+        }));
+        log.subscribe(Arc::new(move |_record: &AuditRecord| {
+            *cb.lock().unwrap() += 1;
+        }));
 
-        log.append_event(secret, "agent-a", "agent-b", "sig-001", "read:data", "trace-001");
+        log.append_event(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            "read:data",
+            "trace-001",
+        );
 
         assert_eq!(*count_a.lock().unwrap(), 1);
         assert_eq!(*count_b.lock().unwrap(), 1);
@@ -2671,7 +2846,14 @@ mod tests {
         expected_lines: usize,
     ) {
         thread::sleep(Duration::from_millis(AUDIT_WAL_FLUSH_INTERVAL_MS + 20));
-        log.append_event(secret, "__flush__", "__flush__", "__flush__", "__flush__", "__flush__");
+        log.append_event(
+            secret,
+            "__flush__",
+            "__flush__",
+            "__flush__",
+            "__flush__",
+            "__flush__",
+        );
         for _ in 0..500 {
             if let Ok(content) = fs::read_to_string(log_file) {
                 if content.lines().filter(|l| !l.is_empty()).count() >= expected_lines {
@@ -2807,7 +2989,8 @@ mod tests {
         assert!(log.flush(Duration::from_secs(2)));
         assert_eq!(log.queue_len(), 0);
         assert_eq!(
-            log.health(), AuditHealth::Saturated,
+            log.health(),
+            AuditHealth::Saturated,
             "a dropped audit record must pin health at Saturated even with an empty \
              queue, so Gate 2.5 stays fail-closed on IRREVERSIBLE_ACTION"
         );
@@ -2815,7 +2998,8 @@ mod tests {
         // Only an explicit operator acknowledgement clears it.
         log.acknowledge_dropped_audits();
         assert_eq!(
-            log.health(), AuditHealth::Healthy,
+            log.health(),
+            AuditHealth::Healthy,
             "acknowledge_dropped_audits must release the floor on a log with no \
              underlying Fatal condition"
         );
@@ -2876,8 +3060,22 @@ mod tests {
         let secret = b"confidential_audit_secret_key!!!";
         let plaintext_intent = "delete all records matching filter X";
 
-        log.append_event_confidential(secret, "agent-a", "agent-b", "sig-001", plaintext_intent, "trace-001");
-        log.append_event(secret, "agent-b", "agent-c", "sig-002", "ordinary plaintext intent", "trace-002");
+        log.append_event_confidential(
+            secret,
+            "agent-a",
+            "agent-b",
+            "sig-001",
+            plaintext_intent,
+            "trace-001",
+        );
+        log.append_event(
+            secret,
+            "agent-b",
+            "agent-c",
+            "sig-002",
+            "ordinary plaintext intent",
+            "trace-002",
+        );
 
         // Chain integrity (HMAC over whatever string is in `intent`) is
         // completely unaffected by whether that string is ciphertext or
@@ -2898,7 +3096,10 @@ mod tests {
             shard.entries[0].record.intent.clone()
         };
         assert_ne!(stored_intent, plaintext_intent);
-        assert_eq!(decrypt_intent(secret, &stored_intent).unwrap(), plaintext_intent);
+        assert_eq!(
+            decrypt_intent(secret, &stored_intent).unwrap(),
+            plaintext_intent
+        );
 
         log.reset();
     }
@@ -2921,7 +3122,10 @@ mod tests {
         assert!(Path::new(dst).exists(), "compressed .gz file must exist");
 
         let compressed = fs::read(dst).unwrap();
-        assert!(compressed.len() < content.len(), "gzip output should be smaller than repetitive input");
+        assert!(
+            compressed.len() < content.len(),
+            "gzip output should be smaller than repetitive input"
+        );
         let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).unwrap();
@@ -2949,9 +3153,13 @@ mod tests {
         fs::write(src_path, b"compressed-ish content").unwrap();
 
         let sink = FilesystemArchivalSink::new(target_dir);
-        sink.archive(Path::new(src_path)).expect("archive must succeed");
+        sink.archive(Path::new(src_path))
+            .expect("archive must succeed");
 
-        assert!(!Path::new(src_path).exists(), "source must be moved, not copied");
+        assert!(
+            !Path::new(src_path).exists(),
+            "source must be moved, not copied"
+        );
         let dest = Path::new(target_dir).join(src_path);
         assert!(dest.exists(), "compressed file must land in target_dir");
         assert_eq!(fs::read(&dest).unwrap(), b"compressed-ish content");

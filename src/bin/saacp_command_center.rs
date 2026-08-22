@@ -1,3 +1,6 @@
+// Same security invariant as the library crate: safe Rust only, enforced.
+#![forbid(unsafe_code)]
+
 //! saacp-command-center — standalone dashboard backend for `saacp::command_center`.
 //!
 //! Runs the Command Center's REST+SSE HTTP API. By default it also stands up a bare,
@@ -140,7 +143,9 @@ async fn main() -> std::io::Result<()> {
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_DEMO_DAEMON_ADDR: {e}"));
         let daemon = SAACPNetworkDaemon::new(&demo_addr.ip().to_string(), demo_addr.port(), None);
-        tokio::spawn(async move { let _ = daemon.start().await; });
+        tokio::spawn(async move {
+            let _ = daemon.start().await;
+        });
         eprintln!("[SAACP Command Center] Demo daemon listening on {demo_addr} (set SAACP_DISABLE_DEMO_DAEMON=1 to skip)");
 
         // A listening daemon with no client connecting to it generates zero packets, so the

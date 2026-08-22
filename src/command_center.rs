@@ -231,7 +231,9 @@ pub struct TrustMeshStore {
 impl TrustMeshStore {
     fn new(max_edges: usize) -> Self {
         Self {
-            inner: Mutex::new(TrustMeshInner { edges: HashMap::new() }),
+            inner: Mutex::new(TrustMeshInner {
+                edges: HashMap::new(),
+            }),
             max_edges: max_edges.max(1),
         }
     }
@@ -245,15 +247,29 @@ impl TrustMeshStore {
         let now = now_epoch_secs();
 
         if !inner.edges.contains_key(&key) && inner.edges.len() >= self.max_edges {
-            if let Some(oldest_key) = inner.edges.iter()
-                .min_by(|a, b| a.1.last_seen.partial_cmp(&b.1.last_seen).unwrap_or(std::cmp::Ordering::Equal))
+            if let Some(oldest_key) = inner
+                .edges
+                .iter()
+                .min_by(|a, b| {
+                    a.1.last_seen
+                        .partial_cmp(&b.1.last_seen)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|(k, _)| k.clone())
             {
                 inner.edges.remove(&oldest_key);
             }
         }
 
-        inner.edges.insert(key, TrustMeshEdge { source, target, depth, last_seen: now });
+        inner.edges.insert(
+            key,
+            TrustMeshEdge {
+                source,
+                target,
+                depth,
+                last_seen: now,
+            },
+        );
     }
 
     /// Current `(nodes, edges)` snapshot for `/api/trust-mesh`.
@@ -279,7 +295,8 @@ fn parse_delegation_depth(record: &AuditRecord) -> Option<u32> {
         return None;
     }
     Some(
-        record.token_signature
+        record
+            .token_signature
             .strip_prefix("depth:")
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0),
@@ -295,9 +312,21 @@ fn parse_delegation_depth(record: &AuditRecord) -> Option<u32> {
 #[serde(tag = "type")]
 pub enum DashboardEvent {
     InjectionAlert(SecurityAlert),
-    DelegationEdge { source: String, target: String, depth: u32 },
-    TrustSignal { agent_id: String, score: f64, event: TrustEvent },
-    AuditEntry { source: String, target: String, intent_prefix: String },
+    DelegationEdge {
+        source: String,
+        target: String,
+        depth: u32,
+    },
+    TrustSignal {
+        agent_id: String,
+        score: f64,
+        event: TrustEvent,
+    },
+    AuditEntry {
+        source: String,
+        target: String,
+        intent_prefix: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -367,11 +396,15 @@ impl HotReloadableConfig {
     }
 
     fn dollars_per_token(&self) -> f64 {
-        f64::from_bits(self.dollars_per_token_bits.load(std::sync::atomic::Ordering::Relaxed))
+        f64::from_bits(
+            self.dollars_per_token_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn max_recent_alerts(&self) -> usize {
-        self.max_recent_alerts.load(std::sync::atomic::Ordering::Relaxed)
+        self.max_recent_alerts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn max_agents(&self) -> usize {
@@ -387,18 +420,21 @@ impl HotReloadableConfig {
         if let Ok(v) = std::env::var("SAACP_DOLLARS_PER_TOKEN") {
             if let Ok(parsed) = v.parse::<f64>() {
                 if parsed.is_finite() && parsed >= 0.0 {
-                    self.dollars_per_token_bits.store(parsed.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    self.dollars_per_token_bits
+                        .store(parsed.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
         if let Ok(v) = std::env::var("SAACP_MAX_RECENT_ALERTS") {
             if let Ok(parsed) = v.parse::<usize>() {
-                self.max_recent_alerts.store(parsed, std::sync::atomic::Ordering::Relaxed);
+                self.max_recent_alerts
+                    .store(parsed, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Ok(v) = std::env::var("SAACP_MAX_AGENTS") {
             if let Ok(parsed) = v.parse::<usize>() {
-                self.max_agents.store(parsed, std::sync::atomic::Ordering::Relaxed);
+                self.max_agents
+                    .store(parsed, std::sync::atomic::Ordering::Relaxed);
             }
         }
         ReloadedConfig {
@@ -425,13 +461,21 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn unauthorized_response() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 /// Applied via `route_layer` to every `/api/*` route (never `/healthz`,
 /// never `/events` — see [`handle_events`]'s own inline check, since
 /// `EventSource` can't set headers).
-async fn require_auth(State(state): State<Arc<CommandCenterState>>, request: Request, next: Next) -> Response {
+async fn require_auth(
+    State(state): State<Arc<CommandCenterState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let authorized = bearer_token(request.headers())
         .map(|tok| constant_time_eq(tok.as_bytes(), state.dashboard_token_hex.as_bytes()))
         .unwrap_or(false);
@@ -470,7 +514,11 @@ async fn require_auth(State(state): State<Arc<CommandCenterState>>, request: Req
 /// - CORS is purely a browser-side control layered on top of — never a
 ///   replacement for — `require_auth`. A non-browser client (curl/reqwest, LB
 ///   probe) sends no `Origin` and is passed through untouched.
-async fn cors_layer(State(state): State<Arc<CommandCenterState>>, request: Request, next: Next) -> Response {
+async fn cors_layer(
+    State(state): State<Arc<CommandCenterState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     // The request's `Origin`, if it's a well-formed header AND on the allowlist.
     let allowed_origin: Option<String> = request
         .headers()
@@ -497,7 +545,10 @@ async fn cors_layer(State(state): State<Arc<CommandCenterState>>, request: Reque
         // `unwrap()` to keep this middleware panic-free on any future edit.
         if let Ok(val) = axum::http::HeaderValue::from_str(&origin) {
             headers.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, val);
-            headers.insert(axum::http::header::VARY, axum::http::HeaderValue::from_static("Origin"));
+            headers.insert(
+                axum::http::header::VARY,
+                axum::http::HeaderValue::from_static("Origin"),
+            );
             if is_preflight {
                 headers.insert(
                     axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -518,7 +569,9 @@ async fn cors_layer(State(state): State<Arc<CommandCenterState>>, request: Reque
     response
 }
 
-async fn handle_agents(State(state): State<Arc<CommandCenterState>>) -> Json<Vec<AgentTrustSnapshot>> {
+async fn handle_agents(
+    State(state): State<Arc<CommandCenterState>>,
+) -> Json<Vec<AgentTrustSnapshot>> {
     Json(TrustDecayEngine::global().snapshot(state.hot_config.max_agents()))
 }
 
@@ -528,7 +581,9 @@ struct TrustMeshResponse {
     edges: Vec<TrustMeshEdge>,
 }
 
-async fn handle_trust_mesh(State(state): State<Arc<CommandCenterState>>) -> Json<TrustMeshResponse> {
+async fn handle_trust_mesh(
+    State(state): State<Arc<CommandCenterState>>,
+) -> Json<TrustMeshResponse> {
     let (nodes, edges) = state.trust_mesh.snapshot();
     Json(TrustMeshResponse { nodes, edges })
 }
@@ -538,7 +593,9 @@ struct AlertsQuery {
     #[serde(default = "default_alert_limit")]
     limit: usize,
 }
-fn default_alert_limit() -> usize { 100 }
+fn default_alert_limit() -> usize {
+    100
+}
 
 async fn handle_alerts(
     State(state): State<Arc<CommandCenterState>>,
@@ -654,10 +711,19 @@ async fn handle_readyz(State(state): State<Arc<CommandCenterState>>) -> Json<Rea
     let gate_latencies = t
         .gate_latency_summary()
         .into_iter()
-        .map(|(gate, avg_seconds, count)| ReadyzGateLatency { gate, avg_seconds, count })
+        .map(|(gate, avg_seconds, count)| ReadyzGateLatency {
+            gate,
+            avg_seconds,
+            count,
+        })
         .collect();
 
-    Json(ReadyzResponse { audit_health, connections, trust_stats, gate_latencies })
+    Json(ReadyzResponse {
+        audit_health,
+        connections,
+        trust_stats,
+        gate_latencies,
+    })
 }
 
 /// R-4: `POST /api/config/reload` re-reads `SAACP_DOLLARS_PER_TOKEN` /
@@ -667,7 +733,9 @@ async fn handle_readyz(State(state): State<Arc<CommandCenterState>>) -> Json<Rea
 /// as every other `/api/*` route (this endpoint is deliberately NOT exempted like
 /// `/healthz` — see `HotReloadableConfig`'s doc comment for why security-critical
 /// config is excluded from this mechanism entirely rather than gated differently).
-async fn handle_config_reload(State(state): State<Arc<CommandCenterState>>) -> Json<ReloadedConfig> {
+async fn handle_config_reload(
+    State(state): State<Arc<CommandCenterState>>,
+) -> Json<ReloadedConfig> {
     Json(state.hot_config.reload_from_env())
 }
 
@@ -817,8 +885,7 @@ fn mint_sse_ticket_in(tickets: &Mutex<HashMap<String, f64>>, now: f64) -> String
     tickets.retain(|_, &mut exp| now < exp);
     // Hard cap: if still full, evict the soonest-to-expire entries until under cap.
     if tickets.len() >= SSE_TICKET_MAX_OUTSTANDING {
-        let mut by_exp: Vec<(f64, String)> =
-            tickets.iter().map(|(k, &v)| (v, k.clone())).collect();
+        let mut by_exp: Vec<(f64, String)> = tickets.iter().map(|(k, &v)| (v, k.clone())).collect();
         by_exp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let evict = tickets.len() + 1 - SSE_TICKET_MAX_OUTSTANDING;
         for (_, k) in by_exp.into_iter().take(evict) {
@@ -836,11 +903,7 @@ fn consume_sse_ticket(state: &CommandCenterState, ticket: &str) -> bool {
 }
 
 /// Core of [`consume_sse_ticket`], parameterized for unit testing.
-fn consume_sse_ticket_in(
-    tickets: &Mutex<HashMap<String, f64>>,
-    ticket: &str,
-    now: f64,
-) -> bool {
+fn consume_sse_ticket_in(tickets: &Mutex<HashMap<String, f64>>, ticket: &str, now: f64) -> bool {
     let mut tickets = tickets.lock().unwrap_or_else(|e| e.into_inner());
     match tickets.remove(ticket) {
         Some(exp) => now < exp,
@@ -887,7 +950,9 @@ async fn handle_events(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Start the Command Center dashboard backend. Runs forever. See module doc
@@ -904,7 +969,8 @@ async fn handle_events(
 /// unwinding the whole process via `panic!`.
 pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
     let trust_mesh = Arc::new(TrustMeshStore::new(config.max_trust_mesh_edges));
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<DashboardEvent>(DASHBOARD_EVENT_CHANNEL_CAPACITY);
+    let (event_tx, _rx) =
+        tokio::sync::broadcast::channel::<DashboardEvent>(DASHBOARD_EVENT_CHANNEL_CAPACITY);
 
     // ── Permanent, process-wide subscriptions ────────────────────────────
     // Registered exactly once here, NOT per-SSE-connection — none of
@@ -974,7 +1040,10 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
         .route("/api/rules", get(handle_rules_status))
         .route("/api/rules/reload", post(handle_rules_reload))
         .route("/api/events/ticket", post(handle_events_ticket))
-        .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_auth));
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_auth,
+        ));
 
     let app = Router::new()
         .route("/healthz", get(handle_healthz))
@@ -984,12 +1053,18 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
         // Outermost layer: runs before `require_auth` so browser CORS preflights
         // (unauthenticated `OPTIONS`) are answered directly instead of 401'd. See
         // `cors_layer`'s doc comment for why this ordering is load-bearing.
-        .layer(middleware::from_fn_with_state(Arc::clone(&state), cors_layer))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            cors_layer,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
 
-    eprintln!("[SAACP Command Center] HTTP API listening on {}", config.listen_addr);
+    eprintln!(
+        "[SAACP Command Center] HTTP API listening on {}",
+        config.listen_addr
+    );
     axum::serve(listener, app).await
 }
 
@@ -1027,7 +1102,11 @@ mod tests {
 
         // An expired ticket is rejected (consumed after TTL elapsed).
         let t2 = mint_sse_ticket_in(&tickets, now);
-        assert!(!consume_sse_ticket_in(&tickets, &t2, now + SSE_TICKET_TTL_SECS + 1.0));
+        assert!(!consume_sse_ticket_in(
+            &tickets,
+            &t2,
+            now + SSE_TICKET_TTL_SECS + 1.0
+        ));
     }
 
     /// S-7 fix: minting sweeps expired tickets so the outstanding-ticket map stays
@@ -1082,6 +1161,10 @@ mod tests {
             traceparent: "".into(),
             prev_hash: "".into(),
             seq: 0,
+            // Synthetic v1-style record — no Phase-6 shard/anchor fields.
+            shard_id: None,
+            shard_seq: None,
+            anchor_epoch: None,
         };
         assert_eq!(parse_delegation_depth(&rec), Some(3));
     }
@@ -1097,13 +1180,21 @@ mod tests {
             traceparent: "".into(),
             prev_hash: "".into(),
             seq: 0,
+            // Synthetic v1-style record — no Phase-6 shard/anchor fields.
+            shard_id: None,
+            shard_seq: None,
+            anchor_epoch: None,
         };
         assert_eq!(parse_delegation_depth(&rec), None);
     }
 
     #[test]
     fn dashboard_event_serializes_with_type_tag() {
-        let ev = DashboardEvent::DelegationEdge { source: "a".into(), target: "b".into(), depth: 1 };
+        let ev = DashboardEvent::DelegationEdge {
+            source: "a".into(),
+            target: "b".into(),
+            depth: 1,
+        };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"DelegationEdge\""));
         assert!(json.contains("\"source\":\"a\""));

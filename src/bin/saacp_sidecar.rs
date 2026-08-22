@@ -1,3 +1,6 @@
+// Same security invariant as the library crate: safe Rust only, enforced.
+#![forbid(unsafe_code)]
+
 //! saacp-sidecar — standalone local HTTP proxy for `saacp::sidecar`.
 //!
 //! Run one instance per agent. Configuration is via environment variables so the binary
@@ -99,7 +102,9 @@ fn read_token_secret() -> [u8; 32] {
         return parse_token_secret(raw.trim());
     }
     let raw = std::env::var("SAACP_TOKEN_SECRET").unwrap_or_else(|_| {
-        panic!("either SAACP_TOKEN_SECRET or SAACP_TOKEN_SECRET_FILE environment variable is required")
+        panic!(
+            "either SAACP_TOKEN_SECRET or SAACP_TOKEN_SECRET_FILE environment variable is required"
+        )
     });
     parse_token_secret(&raw)
 }
@@ -278,7 +283,12 @@ async fn main() {
         }
     }
 
-    let mut config = SidecarConfig::new(agent_id, token_issuer_secret, saacp_listen_addr, http_listen_addr);
+    let mut config = SidecarConfig::new(
+        agent_id,
+        token_issuer_secret,
+        saacp_listen_addr,
+        http_listen_addr,
+    );
     config.peer_secrets = peer_secrets;
     config.http_bearer_token = http_bearer_token;
     if let Ok(v) = std::env::var("SAACP_MAX_CONCURRENT_SENDS") {

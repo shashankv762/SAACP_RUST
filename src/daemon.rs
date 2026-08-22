@@ -103,10 +103,10 @@ const CONNECTION_BUFFER_STEADY_STATE_CAP: usize = 65_536;
 const HEADER_SIZE: usize = 128;
 
 /// Wire response strings (must match Python daemon.py exactly).
-const WIRE_SUCCESS: &[u8]        = b"SUCCESS";
-const WIRE_STREAM_ACK: &[u8]     = b"STREAM_ACK";
+const WIRE_SUCCESS: &[u8] = b"SUCCESS";
+const WIRE_STREAM_ACK: &[u8] = b"STREAM_ACK";
 const WIRE_STREAM_END_ACK: &[u8] = b"STREAM_END_ACK";
-const WIRE_YIELD_ASYNC: &[u8]    = b"YIELD_ASYNC";
+const WIRE_YIELD_ASYNC: &[u8] = b"YIELD_ASYNC";
 
 // ─── CircuitBreakerEntry ─────────────────────────────────────────────────────
 
@@ -163,7 +163,9 @@ impl CircuitBreakerEntry {
         // whatever escalation streak it had built up no longer reflects an ongoing
         // problem. Checked BEFORE `last_activity` is overwritten below, using the
         // still-stale timestamp from the last call.
-        if now.duration_since(self.last_activity).as_secs_f64() >= CIRCUIT_BREAKER_RECOVERY_PERIOD_SECS {
+        if now.duration_since(self.last_activity).as_secs_f64()
+            >= CIRCUIT_BREAKER_RECOVERY_PERIOD_SECS
+        {
             self.consecutive_lockouts = 0;
         }
 
@@ -186,7 +188,7 @@ impl CircuitBreakerEntry {
             // unchanged) — only the SECOND and later lockouts of the same IP grow.
             let lockout_secs = (CIRCUIT_BREAKER_LOCKOUT_SECS
                 * 2f64.powi(self.consecutive_lockouts.min(20) as i32))
-                .min(CIRCUIT_BREAKER_MAX_LOCKOUT_SECS);
+            .min(CIRCUIT_BREAKER_MAX_LOCKOUT_SECS);
             self.lockout_until = Some(now + Duration::from_secs_f64(lockout_secs));
         }
 
@@ -225,7 +227,10 @@ impl PerIpConnectionGuard {
         }
         *count += 1;
         drop(guard);
-        Some(Self { counts: Arc::clone(counts), ip })
+        Some(Self {
+            counts: Arc::clone(counts),
+            ip,
+        })
     }
 }
 
@@ -419,6 +424,67 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// F3 fix (SECURE-BY-DEFAULT): one-call hardened daemon profile.
+    ///
+    /// Composes every opt-in protection this daemon supports —
+    /// [`with_identity_binding`] (mutually-authenticated ECDH: server signs its
+    /// X25519 share, every client presents a CA-signed
+    /// `AgentIdentityCertificate` + proof-of-possession),
+    /// [`with_encrypted_transport`] (real AEAD Gate 0 via `measc::parse_frame`)
+    /// and [`with_gateway`] (real Gate 1.0 token signature verification) — so a
+    /// production deployment cannot silently miss one.
+    ///
+    /// `supported_suites` is this daemon's configured suite list and is
+    /// validated against the active PRODUCTION crypto-governance policy at
+    /// construction time via
+    /// [`crate::crypto_governance::SuiteNegotiator::negotiate`] (downgrade
+    /// guard): a list missing the mandatory `ed25519` baseline, or naming a
+    /// non-approved algorithm, refuses to construct. The negotiation transcript
+    /// is recorded in a `CryptoTransparencyLedger`. Peer-advertised suite
+    /// negotiation requires a future wire version — this check governs the
+    /// daemon's OWN configuration.
+    ///
+    /// # Errors
+    /// `Err` iff `supported_suites` violates the production policy.
+    pub fn secure(
+        host: &str,
+        port: u16,
+        token_issuer_secret: Option<Vec<u8>>,
+        server_ed25519_seed: [u8; 32],
+        server_agent_id: &str,
+        ca_keys: &[(&str, ed25519_dalek::VerifyingKey)],
+        supported_suites: &[&str],
+        gateway: Arc<crate::gateway::ZeroTrustGateway>,
+        epoch_manager: Arc<SessionEpochManager>,
+    ) -> Result<Self, String> {
+        use crate::crypto_governance::{CryptoTransparencyLedger, SuiteNegotiator};
+
+        // Config-time downgrade guard — refuses to construct a "secure" daemon
+        // whose suite configuration the production policy rejects. The
+        // all-zeros session anchor marks this as a validation transcript, not a
+        // live session; it is what the ledger entry hangs off.
+        let ledger = CryptoTransparencyLedger::new();
+        SuiteNegotiator::negotiate(
+            supported_suites,
+            supported_suites,
+            &[0u8; 16],
+            None,
+            None,
+            &ledger,
+        )
+        .map_err(|e| {
+            format!(
+                "SAACPNetworkDaemon::secure: suite configuration rejected by \
+                 crypto governance: {e}"
+            )
+        })?;
+
+        Ok(Self::new(host, port, token_issuer_secret)
+            .with_identity_binding(server_ed25519_seed, server_agent_id, ca_keys)
+            .with_gateway(gateway)
+            .with_encrypted_transport(epoch_manager))
+    }
+
     /// Opt in to real Gate 1.0 capability-token signature verification
     /// (`ZeroTrustGateway::validate_lateral_movement`) instead of the structural-only
     /// presence check every connection gets by default. See the `gateway` field doc comment.
@@ -437,10 +503,7 @@ impl SAACPNetworkDaemon {
 
     /// Observe every successfully-verified `ParsedPacket` (see the `on_delivered` field doc
     /// comment).
-    pub fn with_on_delivered(
-        mut self,
-        callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>,
-    ) -> Self {
+    pub fn with_on_delivered(mut self, callback: Arc<dyn Fn(ParsedPacket) + Send + Sync>) -> Self {
         self.on_delivered = Some(callback);
         self
     }
@@ -487,19 +550,55 @@ impl SAACPNetworkDaemon {
     /// equivalent to `start_with_shutdown` with a token that's never cancelled. M-37
     /// fix: returns `Result` (propagates a bind failure) instead of panicking.
     pub async fn start(&self) -> std::io::Result<()> {
-        self.start_with_shutdown(tokio_util::sync::CancellationToken::new()).await
+        self.start_with_shutdown(tokio_util::sync::CancellationToken::new())
+            .await
     }
 
     /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
     /// `shutdown` is cancelled, then drains in-flight connections (bounded by
     /// `SHUTDOWN_DRAIN_TIMEOUT_SECS`, after which any still-open connections are
     /// hard-aborted) before flushing the audit-log WAL (L-10) and returning.
-    pub async fn start_with_shutdown(&self, shutdown: tokio_util::sync::CancellationToken) -> std::io::Result<()> {
+    pub async fn start_with_shutdown(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
 
-        let auth_mode = if self.server_ed25519_seed.is_some() { "authenticated" } else { "unauthenticated" };
-        eprintln!("[SAACP Daemon] Listening on {} ({} handshake)", addr, auth_mode);
+        let auth_mode = if self.server_ed25519_seed.is_some() {
+            "authenticated"
+        } else {
+            "unauthenticated"
+        };
+        eprintln!(
+            "[SAACP Daemon] Listening on {} ({} handshake)",
+            addr, auth_mode
+        );
+
+        // F3 fix (SECURE-BY-DEFAULT nudge): the legacy builder leaves every
+        // protection opt-in, so a deployment can silently miss one. Enumerate
+        // exactly what is OFF, every single start, until the operator has seen
+        // it — and point at the one-call hardened profile.
+        if self.server_ed25519_seed.is_none()
+            || self.epoch_manager.is_none()
+            || self.gateway.is_none()
+        {
+            eprintln!("[SAACP Daemon] ══════════ SECURITY WARNING ══════════");
+            eprintln!("[SAACP Daemon]  This daemon is running with protections DISABLED:");
+            if self.server_ed25519_seed.is_none() {
+                eprintln!("[SAACP Daemon]   - Server authentication OFF: the ECDH handshake is unauthenticated (active MITM can substitute its key)");
+            }
+            if self.epoch_manager.is_none() {
+                eprintln!("[SAACP Daemon]   - Encrypted transport OFF: Gate 0 is structural-only, incoming packets are not AEAD-decrypted or replay-checked");
+            }
+            if self.gateway.is_none() {
+                eprintln!("[SAACP Daemon]   - Gateway token verification OFF: Gate 1.0 grants tokens without HMAC/Ed25519 signature validation");
+            }
+            eprintln!(
+                "[SAACP Daemon]  Use SAACPNetworkDaemon::secure(...) for the hardened profile."
+            );
+            eprintln!("[SAACP Daemon] ════════════════════════════════════");
+        }
 
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -574,14 +673,16 @@ impl SAACPNetworkDaemon {
 
         // Drain: let in-flight connections finish naturally, bounded by
         // SHUTDOWN_DRAIN_TIMEOUT_SECS, then hard-abort whatever's left.
-        let drained = tokio::time::timeout(
-            Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
-            async { while tasks.join_next().await.is_some() {} },
-        ).await;
+        let drained =
+            tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS), async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await;
         if drained.is_err() {
             eprintln!(
                 "[SAACP Daemon] Drain timeout ({}s) exceeded — aborting {} in-flight connection(s)",
-                SHUTDOWN_DRAIN_TIMEOUT_SECS, tasks.len(),
+                SHUTDOWN_DRAIN_TIMEOUT_SECS,
+                tasks.len(),
             );
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
@@ -590,9 +691,12 @@ impl SAACPNetworkDaemon {
         // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
         // `ImmutableAuditLog::flush` is a std blocking call — run it off the async executor.
         let flushed = tokio::task::spawn_blocking(|| {
-            crate::security::ImmutableAuditLog::global()
-                .flush(Duration::from_secs(crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS))
-        }).await.unwrap_or(false);
+            crate::security::ImmutableAuditLog::global().flush(Duration::from_secs(
+                crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS,
+            ))
+        })
+        .await
+        .unwrap_or(false);
         if !flushed {
             eprintln!("[SAACP Daemon] WAL flush on shutdown did not confirm in time");
         }
@@ -604,9 +708,8 @@ impl SAACPNetworkDaemon {
     /// Returns `None` if server auth is not configured.
     pub fn server_verifying_key(&self) -> Option<[u8; 32]> {
         use ed25519_dalek::SigningKey;
-        self.server_ed25519_seed.map(|seed| {
-            SigningKey::from_bytes(&seed).verifying_key().to_bytes()
-        })
+        self.server_ed25519_seed
+            .map(|seed| SigningKey::from_bytes(&seed).verifying_key().to_bytes())
     }
 }
 
@@ -644,8 +747,7 @@ pub(crate) async fn handle_client<S>(
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     // Active-Active clustering: see the `cluster` field doc comment on `SAACPNetworkDaemon`.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
-)
-where
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let ip_key = peer_addr.ip().to_string();
@@ -703,7 +805,9 @@ where
     let (session_key, verified_identity) = match timeout(
         Duration::from_secs_f64(handshake_timeout_secs),
         ecdh_handshake(&mut stream, server_ed25519_seed, server_agent_id.as_deref()),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(k)) => k,
         _ => {
             record_error(&circuit_breakers, &ip_key);
@@ -715,7 +819,10 @@ where
     // `None` unless this daemon opted into identity binding (`with_identity_binding`).
     let bound_session_id: Option<[u8; 16]> = verified_identity.as_ref().map(|v| v.session_id);
     if let Some(ref v) = verified_identity {
-        eprintln!("[SAACP Daemon] {peer_addr}: C-3 identity-bound as agent '{}'", v.agent_id);
+        eprintln!(
+            "[SAACP Daemon] {peer_addr}: C-3 identity-bound as agent '{}'",
+            v.agent_id
+        );
     }
 
     // Identity pinning state (VULN-04) — deliberately NOT pre-seeded from
@@ -728,7 +835,7 @@ where
     // enforced independently and unconditionally in `handler.rs`'s Gate 1.0 — by comparing
     // the token's claimed `source_agent` against the `TranscriptBoundSession` registered
     // for this connection's session_id — so bootstrap pinning here is untouched.
-    let mut pinned_agent: Option<String>       = None;
+    let mut pinned_agent: Option<String> = None;
     let mut last_validated_at: Option<Instant> = None;
     // Track the revocation epoch at the time of last successful validation.
     // If the global epoch advances (i.e. all tokens are revoked), this connection
@@ -782,12 +889,16 @@ where
         }
 
         // 2b. Parse payload_length from header bytes [12..16]
-        let payload_length = u32::from_be_bytes(
-            header_buf[12..16].try_into().unwrap_or([0u8; 4])
-        ) as usize;
+        let payload_length =
+            u32::from_be_bytes(header_buf[12..16].try_into().unwrap_or([0u8; 4])) as usize;
 
         if payload_length > MAX_PAYLOAD_SIZE {
-            send_hard_drop(&mut stream, SAACPBytecodes::PayloadTooLarge, "Payload exceeds 10MB MTU").await;
+            send_hard_drop(
+                &mut stream,
+                SAACPBytecodes::PayloadTooLarge,
+                "Payload exceeds 10MB MTU",
+            )
+            .await;
             record_error(&circuit_breakers, &ip_key);
             break;
         }
@@ -807,16 +918,26 @@ where
             payload_buf.shrink_to(CONNECTION_BUFFER_STEADY_STATE_CAP);
         }
         payload_buf.resize(needed_len, 0);
-        let mut bytes_read  = 0usize;
+        let mut bytes_read = 0usize;
 
         while bytes_read < payload_buf.len() {
             if assembly_start.elapsed().as_secs_f64() > MAX_ASSEMBLY_TIME {
-                send_hard_drop(&mut stream, SAACPBytecodes::TemporalTimeout, "MTU assembly timeout").await;
+                send_hard_drop(
+                    &mut stream,
+                    SAACPBytecodes::TemporalTimeout,
+                    "MTU assembly timeout",
+                )
+                .await;
                 record_error(&circuit_breakers, &ip_key);
                 return;
             }
-            match timeout(Duration::from_secs(1), stream.read(&mut payload_buf[bytes_read..])).await {
-                Ok(Ok(0)) => break,   // EOF
+            match timeout(
+                Duration::from_secs(1),
+                stream.read(&mut payload_buf[bytes_read..]),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => bytes_read += n,
                 _ => break,
             }
@@ -835,13 +956,15 @@ where
         // `handler.rs` (which looks up the registered `TranscriptBoundSession` by
         // session_id: an unregistered session_id simply skips the check).
         if let Some(bound_sid) = bound_session_id {
-            let packet_sid: Option<[u8; 16]> = full_packet.get(16..32).and_then(|s| s.try_into().ok());
+            let packet_sid: Option<[u8; 16]> =
+                full_packet.get(16..32).and_then(|s| s.try_into().ok());
             if packet_sid != Some(bound_sid) {
                 send_hard_drop(
                     &mut stream,
                     SAACPBytecodes::SessionSpliceDetected,
                     "Packet session_id does not match identity-bound handshake session_id",
-                ).await;
+                )
+                .await;
                 record_error(&circuit_breakers, &ip_key);
                 break;
             }
@@ -858,7 +981,8 @@ where
                     &mut stream,
                     SAACPBytecodes::KeyRevoked,
                     "Global token revocation — reconnect and re-authenticate",
-                ).await;
+                )
+                .await;
                 break;
             }
             // Periodic re-validation timestamp update
@@ -876,7 +1000,7 @@ where
         // and the injection scanner (up to 3.1ms at 50KB) are all synchronous CPU work.
         let start = Instant::now();
         let agent_name = pinned_agent.as_deref().unwrap_or("unknown").to_string();
-        let is_pinned  = pinned_agent.is_some();
+        let is_pinned = pinned_agent.is_some();
 
         // DAEMON-NO-AEAD / DAEMON-NO-TOKEN-VERIFY fix: when the daemon was built with
         // `.with_encrypted_transport(...)`/`.with_gateway(...)`, lazily create the epoch-0
@@ -920,7 +1044,8 @@ where
         // guarantee real for any future implementation too.
         let on_delivered_for_task = on_delivered.clone();
         let intercept_result = if let Some(epoch_mgr) = epoch_manager.clone() {
-            let session_id: [u8; 16] = full_packet.get(16..32)
+            let session_id: [u8; 16] = full_packet
+                .get(16..32)
                 .and_then(|s| <[u8; 16]>::try_from(s).ok())
                 .unwrap_or([0u8; 16]);
             if epoch_mgr.get_current_epoch_id(&session_id).is_none() {
@@ -953,17 +1078,28 @@ where
                     }
                 }
                 result
-            }).await
+            })
+            .await
         } else {
             let gw_for_task = gateway.clone();
             tokio::task::spawn_blocking(move || {
                 let result = match gw_for_task.as_deref() {
                     Some(gw) => SAACPProtocolHandler::intercept_packet_full(
-                        &full_packet, &gate_secret, &agent_name, is_pinned,
-                        Some(gw), None, None, None, None,
+                        &full_packet,
+                        &gate_secret,
+                        &agent_name,
+                        is_pinned,
+                        Some(gw),
+                        None,
+                        None,
+                        None,
+                        None,
                     ),
                     None => SAACPProtocolHandler::intercept_packet(
-                        &full_packet, &session_key_bytes, &agent_name, is_pinned,
+                        &full_packet,
+                        &session_key_bytes,
+                        &agent_name,
+                        is_pinned,
                     ),
                 };
                 if let Ok(parsed) = &result {
@@ -972,7 +1108,8 @@ where
                     }
                 }
                 result
-            }).await
+            })
+            .await
         };
         // Flatten JoinError (panic in gate pipeline) into SAACPHardDrop
         let intercept_result = match intercept_result {
@@ -1045,7 +1182,7 @@ where
                     // `parsed.source_agent` is `Arc<str>` (Phase 3 / M-13-style fix); this
                     // event fires at most once per connection (guarded by `pinned_agent.is_none()`),
                     // so a `.to_string()` here is a one-time allocation, not a per-packet cost.
-                    pinned_agent    = Some(parsed.source_agent.to_string());
+                    pinned_agent = Some(parsed.source_agent.to_string());
                     last_validated_at = Some(Instant::now());
                     // Snapshot the current revocation epoch so future revocations
                     // trigger disconnect (C1 fix).
@@ -1060,10 +1197,16 @@ where
                     // `"authenticated"`, which is not one of the six canonical
                     // phases and silently failed every single time (see the
                     // removed connection-init call above for the same bug).
-                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
-                        .advance(&parsed.source_agent, &parsed.session_uuid, "IDENTITY_VERIFIED");
-                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
-                        .advance(&parsed.source_agent, &parsed.session_uuid, "AUTHORIZED");
+                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
+                        &parsed.source_agent,
+                        &parsed.session_uuid,
+                        "IDENTITY_VERIFIED",
+                    );
+                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
+                        &parsed.source_agent,
+                        &parsed.session_uuid,
+                        "AUTHORIZED",
+                    );
                 }
 
                 // Route response by status code
@@ -1071,9 +1214,9 @@ where
                     WIRE_SUCCESS
                 } else {
                     match parsed.status_code {
-                        0x17 => WIRE_STREAM_ACK,       // STREAM_START / CONTINUATION
+                        0x17 => WIRE_STREAM_ACK, // STREAM_START / CONTINUATION
                         0x18 => WIRE_STREAM_ACK,
-                        0x19 => WIRE_STREAM_END_ACK,   // STREAM_END
+                        0x19 => WIRE_STREAM_END_ACK, // STREAM_END
                         0x08 => {
                             // INPUT_REQUIRED → yield + close
                             let _ = stream.write_all(WIRE_YIELD_ASYNC).await;
@@ -1090,7 +1233,7 @@ where
             Err(drop) => {
                 // PECF error translation + SREL timing equalization
                 SREL::equalize_timing(start).await;
-                let ext  = internal_to_external_raw(drop.bytecode as u8);
+                let ext = internal_to_external_raw(drop.bytecode as u8);
                 // Wire format requires a real 32-hex-char correlation ID (spec §9.3);
                 // an empty string both violates that contract and previously produced
                 // a zero-filled correlation_id region on the wire (silently in release
@@ -1098,15 +1241,17 @@ where
                 let wire = SREL::normalize_response(ext, &generate_correlation_id());
                 let _ = stream.write_all(&wire).await;
                 // Clear pinned state on hard drops
-                pinned_agent       = None;
-                last_validated_at  = None;
+                pinned_agent = None;
+                last_validated_at = None;
                 record_error(&circuit_breakers, &ip_key);
                 // IP-level trust penalty (identity-rotation defense — see the
                 // Step 0b comment above): applied unconditionally on every
                 // hard drop, independent of whatever identity this packet
                 // claimed, so switching identities cannot reset it.
-                let _ = crate::trust_decay::TrustDecayEngine::global()
-                    .penalize(&ip_trust_key, crate::trust_decay::PenaltyKind::GenericHardDrop);
+                let _ = crate::trust_decay::TrustDecayEngine::global().penalize(
+                    &ip_trust_key,
+                    crate::trust_decay::PenaltyKind::GenericHardDrop,
+                );
                 // Most hard drops are non-fatal; loop continues.
                 // Fatal drops (epoch expired, etc.) close the connection.
                 match drop.bytecode {
@@ -1169,25 +1314,30 @@ async fn ecdh_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
     use rand::rngs::OsRng;
-    use ed25519_dalek::{SigningKey, Signer, Signature, VerifyingKey, Verifier};
 
     // Step 1: Read client's nonce (32B) + X25519 public key (32B)
     let mut client_msg = [0u8; 64];
-    stream.read_exact(&mut client_msg).await.map_err(|_| SAACPHardDrop::new(
-        SAACPBytecodes::MalformedHeader, "Handshake read (nonce+key) failed",
-    ))?;
-    let client_nonce: [u8; 32]   = client_msg[0..32].try_into().unwrap();
+    stream.read_exact(&mut client_msg).await.map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            "Handshake read (nonce+key) failed",
+        )
+    })?;
+    let client_nonce: [u8; 32] = client_msg[0..32].try_into().unwrap();
     let peer_pub_bytes: [u8; 32] = client_msg[32..64].try_into().unwrap();
 
     // Step 1b: When identity binding is required, read the extended identity block and
     // verify the certificate + proof-of-possession before proceeding with the DH exchange.
     let pending_identity = if let Some(server_agent_id) = identity_binding_server_agent_id {
         let mut fixed = [0u8; 16 + 4];
-        stream.read_exact(&mut fixed).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityBindingMissing,
-            "Identity handshake block (session_id + cert_len) missing",
-        ))?;
+        stream.read_exact(&mut fixed).await.map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                "Identity handshake block (session_id + cert_len) missing",
+            )
+        })?;
         let session_id: [u8; 16] = fixed[0..16].try_into().unwrap();
         let cert_len = u32::from_le_bytes(fixed[16..20].try_into().unwrap()) as usize;
 
@@ -1201,21 +1351,33 @@ where
         }
 
         let mut cert_buf = vec![0u8; cert_len];
-        stream.read_exact(&mut cert_buf).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityBindingMissing, "Identity certificate read failed",
-        ))?;
+        stream.read_exact(&mut cert_buf).await.map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                "Identity certificate read failed",
+            )
+        })?;
         let mut pop_sig_buf = [0u8; 64];
-        stream.read_exact(&mut pop_sig_buf).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityBindingMissing, "Proof-of-possession signature read failed",
-        ))?;
+        stream.read_exact(&mut pop_sig_buf).await.map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                "Proof-of-possession signature read failed",
+            )
+        })?;
 
-        let cert_json = std::str::from_utf8(&cert_buf).map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityBindingMissing, "Identity certificate is not valid UTF-8",
-        ))?;
+        let cert_json = std::str::from_utf8(&cert_buf).map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityBindingMissing,
+                "Identity certificate is not valid UTF-8",
+            )
+        })?;
         let cert = crate::identity_binding::AgentIdentityCertificate::from_json(cert_json)
-            .map_err(|_| SAACPHardDrop::new(
-                SAACPBytecodes::IdentityBindingMissing, "Identity certificate is malformed",
-            ))?;
+            .map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::IdentityBindingMissing,
+                    "Identity certificate is malformed",
+                )
+            })?;
 
         // Verify the CA signature, expiry, and revocation status.
         crate::identity_binding::DEFAULT_IDENTITY_VERIFIER.verify_certificate(&cert)?;
@@ -1228,12 +1390,18 @@ where
         let cert_pk_bytes: [u8; 32] = hex::decode(&cert.public_key_hex)
             .ok()
             .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| SAACPHardDrop::new(
-                SAACPBytecodes::IdentityMisbinding, "Identity certificate public key malformed",
-            ))?;
-        let cert_vk = VerifyingKey::from_bytes(&cert_pk_bytes).map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityMisbinding, "Identity certificate public key invalid",
-        ))?;
+            .ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::IdentityMisbinding,
+                    "Identity certificate public key malformed",
+                )
+            })?;
+        let cert_vk = VerifyingKey::from_bytes(&cert_pk_bytes).map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "Identity certificate public key invalid",
+            )
+        })?;
         let mut pop_transcript = Vec::with_capacity(64 + 16);
         pop_transcript.extend_from_slice(&client_nonce);
         pop_transcript.extend_from_slice(&peer_pub_bytes);
@@ -1253,15 +1421,15 @@ where
 
     // Step 2: Generate our ephemeral X25519 keypair
     let local_secret = EphemeralSecret::random_from_rng(OsRng);
-    let local_pub    = PublicKey::from(&local_secret);
+    let local_pub = PublicKey::from(&local_secret);
 
     // Step 3: Send server's public key (with optional Ed25519 authentication)
     if let Some(seed) = server_ed25519_seed {
         // Sign client_nonce || server_x25519_pub so the signature is fresh and
         // bound to this specific client interaction (replay resistance).
-        let signing_key   = SigningKey::from_bytes(&seed);
+        let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
-        let mut to_sign   = Vec::with_capacity(64);
+        let mut to_sign = Vec::with_capacity(64);
         to_sign.extend_from_slice(&client_nonce);
         to_sign.extend_from_slice(local_pub.as_bytes());
         let sig = signing_key.sign(&to_sign);
@@ -1271,18 +1439,33 @@ where
         auth_msg.extend_from_slice(&sig.to_bytes());
         auth_msg.extend_from_slice(verifying_key.as_bytes());
 
-        stream.write_all(&auth_msg).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::MalformedHeader, "Authenticated handshake write failed",
-        ))?;
+        stream.write_all(&auth_msg).await.map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                "Authenticated handshake write failed",
+            )
+        })?;
     } else {
-        stream.write_all(local_pub.as_bytes()).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::MalformedHeader, "Handshake write failed",
-        ))?;
+        stream.write_all(local_pub.as_bytes()).await.map_err(|_| {
+            SAACPHardDrop::new(SAACPBytecodes::MalformedHeader, "Handshake write failed")
+        })?;
     }
 
     // Step 4: X25519 key agreement
     let peer_pub = PublicKey::from(peer_pub_bytes);
-    let shared   = local_secret.diffie_hellman(&peer_pub);
+    let shared = local_secret.diffie_hellman(&peer_pub);
+
+    // F5 fix (contributory check): an all-zero shared secret means the peer's
+    // X25519 public key was a degenerate/low-order point (e.g. the identity).
+    // HKDF over an all-zero IKM derives a key the ATTACKER can compute without
+    // holding any discrete log — silently downgrading the exchange to no
+    // secrecy at all. Reject instead of deriving from it.
+    if !shared.was_contributory() {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "X25519 shared secret was not contributory (degenerate peer public key)",
+        ));
+    }
 
     // Step 5: HKDF-SHA256 key derivation.
     // Use the client nonce as salt so that even if the DH shared secret were
@@ -1323,10 +1506,16 @@ where
         let agent_id = cert.agent_id.clone();
         let session_id_hex = hex::encode(session_id);
         crate::identity_binding::DEFAULT_IDENTITY_REGISTRY.register(session);
-        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE
-            .advance(&agent_id, &session_id_hex, "IDENTITY_VERIFIED");
+        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
+            &agent_id,
+            &session_id_hex,
+            "IDENTITY_VERIFIED",
+        );
 
-        Some(VerifiedClientIdentity { agent_id, session_id })
+        Some(VerifiedClientIdentity {
+            agent_id,
+            session_id,
+        })
     } else {
         None
     };
@@ -1383,8 +1572,8 @@ pub async fn client_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
     use rand::rngs::OsRng;
-    use ed25519_dalek::{Signature, Signer, VerifyingKey, Verifier};
 
     let client_nonce: [u8; 32] = rand::random();
     let client_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -1419,21 +1608,27 @@ where
         None
     };
 
-    stream.write_all(&client_msg).await.map_err(|_| SAACPHardDrop::new(
-        SAACPBytecodes::MalformedHeader, "client_handshake: write failed",
-    ))?;
+    stream.write_all(&client_msg).await.map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            "client_handshake: write failed",
+        )
+    })?;
 
     let server_pub_bytes: [u8; 32] = if let Some(cfg) = identity {
         // Identity-bound mode implies the daemon was built with `with_identity_binding`,
         // which always enables server auth — read and verify the full authenticated
         // response rather than silently trusting an unauthenticated server pubkey.
         let mut auth_msg = [0u8; 128];
-        stream.read_exact(&mut auth_msg).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::MalformedHeader, "client_handshake: read authenticated server response failed",
-        ))?;
+        stream.read_exact(&mut auth_msg).await.map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                "client_handshake: read authenticated server response failed",
+            )
+        })?;
         let server_pub_bytes: [u8; 32] = auth_msg[0..32].try_into().unwrap();
-        let sig_bytes: [u8; 64]        = auth_msg[32..96].try_into().unwrap();
-        let vk_bytes: [u8; 32]         = auth_msg[96..128].try_into().unwrap();
+        let sig_bytes: [u8; 64] = auth_msg[32..96].try_into().unwrap();
+        let vk_bytes: [u8; 32] = auth_msg[96..128].try_into().unwrap();
 
         if vk_bytes != cfg.expected_server_verifying_key {
             return Err(SAACPHardDrop::new(
@@ -1441,9 +1636,12 @@ where
                 "client_handshake: server verifying key does not match pinned expectation",
             ));
         }
-        let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::IdentityMisbinding, "client_handshake: server verifying key invalid",
-        ))?;
+        let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server verifying key invalid",
+            )
+        })?;
         let mut to_verify = Vec::with_capacity(64);
         to_verify.extend_from_slice(&client_nonce);
         to_verify.extend_from_slice(&server_pub_bytes);
@@ -1457,14 +1655,30 @@ where
         server_pub_bytes
     } else {
         let mut server_pub_bytes = [0u8; 32];
-        stream.read_exact(&mut server_pub_bytes).await.map_err(|_| SAACPHardDrop::new(
-            SAACPBytecodes::MalformedHeader, "client_handshake: read server pubkey failed",
-        ))?;
+        stream
+            .read_exact(&mut server_pub_bytes)
+            .await
+            .map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::MalformedHeader,
+                    "client_handshake: read server pubkey failed",
+                )
+            })?;
         server_pub_bytes
     };
     let server_pub = PublicKey::from(server_pub_bytes);
 
     let shared = client_secret.diffie_hellman(&server_pub);
+    // F5 fix (contributory check): see `ecdh_handshake`'s Step 4 — a server
+    // public key that yields an all-zero shared secret means the "server" is
+    // a degenerate/low-order point an attacker substituted; deriving a key
+    // from it would hand the attacker the session. Reject.
+    if !shared.was_contributory() {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "client_handshake: X25519 shared secret was not contributory (degenerate server public key)",
+        ));
+    }
     let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
     let mut session_key = [0u8; 32];
     hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
@@ -1529,7 +1743,9 @@ fn record_error(cbs: &SharedCircuitBreakers, ip: &str) {
             map.remove(&k);
         }
     }
-    map.entry(ip.to_string()).or_insert_with(CircuitBreakerEntry::new).record_error();
+    map.entry(ip.to_string())
+        .or_insert_with(CircuitBreakerEntry::new)
+        .record_error();
 }
 
 /// Decode a schema_id=11 (`Gossip Envelope`, `schemas.rs`) packet's already-validated
@@ -1543,7 +1759,9 @@ fn record_error(cbs: &SharedCircuitBreakers, ip: &str) {
 /// for malformed/adversarial peer traffic) on any decode failure rather than propagating an
 /// error — a malformed gossip envelope from a misbehaving or malicious peer must never be
 /// able to disrupt this connection's otherwise-successful packet delivery.
-fn decode_gossip_envelope(payload_dict: &HashMap<String, JsonValue>) -> Option<crate::gossip::GossipEnvelope> {
+fn decode_gossip_envelope(
+    payload_dict: &HashMap<String, JsonValue>,
+) -> Option<crate::gossip::GossipEnvelope> {
     use base64::Engine;
 
     let gossip_record_b64 = match payload_dict.get("gossip_record") {
@@ -1563,10 +1781,17 @@ fn decode_gossip_envelope(payload_dict: &HashMap<String, JsonValue>) -> Option<c
         _ => return None,
     };
 
-    let wire = base64::engine::general_purpose::STANDARD.decode(gossip_record_b64).ok()?;
+    let wire = base64::engine::general_purpose::STANDARD
+        .decode(gossip_record_b64)
+        .ok()?;
     let record = crate::faitf::SignedRevocationRecord::from_wire(&wire).ok()?;
 
-    Some(crate::gossip::GossipEnvelope { record, hop_count, origin_id, revocation_id })
+    Some(crate::gossip::GossipEnvelope {
+        record,
+        hop_count,
+        origin_id,
+        revocation_id,
+    })
 }
 
 /// Decode a schema_id=12 (`Cluster Envelope`, `schemas.rs`) packet's already-validated
@@ -1608,7 +1833,7 @@ async fn send_hard_drop<S>(stream: &mut S, bc: SAACPBytecodes, _msg: &str)
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let ext  = internal_to_external_raw(bc as u8);
+    let ext = internal_to_external_raw(bc as u8);
     // Wire format requires a real 32-hex-char correlation ID (spec §9.3); see the
     // matching fix in the main connection-loop error arm above for the full rationale.
     let wire = SREL::normalize_response(ext, &generate_correlation_id());
@@ -1638,14 +1863,19 @@ mod tests {
         {
             let mut map = cbs.lock();
             for i in 0..MAX_CIRCUIT_BREAKER_IPS {
-                map.insert(format!("10.0.{}.{}", i / 256, i % 256), CircuitBreakerEntry::new());
+                map.insert(
+                    format!("10.0.{}.{}", i / 256, i % 256),
+                    CircuitBreakerEntry::new(),
+                );
             }
         }
         assert_eq!(cbs.lock().len(), MAX_CIRCUIT_BREAKER_IPS);
         // Adding a new IP should trigger eviction
         record_error(&cbs, "192.168.1.1");
-        assert!(cbs.lock().len() < MAX_CIRCUIT_BREAKER_IPS + 1,
-            "OOM guard must prevent unbounded growth");
+        assert!(
+            cbs.lock().len() < MAX_CIRCUIT_BREAKER_IPS + 1,
+            "OOM guard must prevent unbounded growth"
+        );
     }
 
     /// M-16 regression: an entry with an ACTIVE (not-yet-expired) lockout
@@ -1664,13 +1894,19 @@ mod tests {
             for _ in 0..CIRCUIT_BREAKER_ERROR_THRESHOLD {
                 locked_entry.record_error();
             }
-            assert!(locked_entry.is_locked(), "test setup: entry must actually be locked");
+            assert!(
+                locked_entry.is_locked(),
+                "test setup: entry must actually be locked"
+            );
             map.insert(LOCKED_IP.to_string(), locked_entry);
 
             // Fill the rest of capacity with plain, never-errored (no lockout)
             // entries — all strictly safer to evict than the locked one above.
             for i in 1..MAX_CIRCUIT_BREAKER_IPS {
-                map.insert(format!("10.0.{}.{}", i / 256, i % 256), CircuitBreakerEntry::new());
+                map.insert(
+                    format!("10.0.{}.{}", i / 256, i % 256),
+                    CircuitBreakerEntry::new(),
+                );
             }
         }
         assert_eq!(cbs.lock().len(), MAX_CIRCUIT_BREAKER_IPS);
@@ -1684,7 +1920,10 @@ mod tests {
             "M-16: the actively-locked entry must survive eviction while \
              unlocked entries are still available to drop"
         );
-        assert!(map.len() < MAX_CIRCUIT_BREAKER_IPS + 1, "OOM guard must still bound growth");
+        assert!(
+            map.len() < MAX_CIRCUIT_BREAKER_IPS + 1,
+            "OOM guard must still bound growth"
+        );
     }
 
     #[test]
@@ -1703,7 +1942,7 @@ mod tests {
         // own per-agent TrustDecayEngine bucket each time), but the shared
         // IP-level bucket still accumulates penalties across every identity
         // it ever claimed and eventually requires reauth regardless.
-        use crate::trust_decay::{TrustDecayEngine, PenaltyKind};
+        use crate::trust_decay::{PenaltyKind, TrustDecayEngine};
         let engine = TrustDecayEngine::new();
         let ip_key = ip_trust_key("203.0.113.7");
 
@@ -1735,5 +1974,106 @@ mod tests {
         let secret = vec![0u8; 32];
         let d = SAACPNetworkDaemon::new("0.0.0.0", 9901, Some(secret.clone()));
         assert_eq!(d.token_issuer_secret.unwrap(), secret);
+    }
+
+    /// F3 (SECURE-BY-DEFAULT): the one-call hardened profile must compose
+    /// server authentication + identity binding + AEAD Gate 0 + real Gate 1.0
+    /// token verification — no protection left to forget.
+    #[test]
+    fn test_secure_profile_enables_all_protections() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use std::sync::Arc as StdArc;
+
+        let server_sk = SigningKey::from_bytes(&[0x5Eu8; 32]);
+        let ca_vk: VerifyingKey = SigningKey::from_bytes(&[0x7Fu8; 32]).verifying_key();
+
+        let d = SAACPNetworkDaemon::secure(
+            "127.0.0.1",
+            9902,
+            Some(vec![0x33u8; 32]),
+            server_sk.to_bytes(),
+            "server-1",
+            &[("ca-1", ca_vk)],
+            &["ed25519", "AES-256-GCM-HKDF-SHA256"],
+            StdArc::new(crate::gateway::ZeroTrustGateway::new()),
+            StdArc::new(SessionEpochManager::new()),
+        )
+        .expect("secure() must accept the mandatory production suites");
+
+        assert!(d.server_ed25519_seed.is_some(), "server auth must be on");
+        assert_eq!(
+            d.server_agent_id.as_deref(),
+            Some("server-1"),
+            "identity binding must be on"
+        );
+        assert!(d.gateway.is_some(), "gateway token verification must be on");
+        assert!(
+            d.epoch_manager.is_some(),
+            "AEAD encrypted transport must be on"
+        );
+    }
+
+    /// F3 (SECURE-BY-DEFAULT): the construction-time downgrade guard — a suite
+    /// configuration without the mandatory `ed25519` baseline must refuse to
+    /// construct rather than start silently weakened.
+    #[test]
+    fn test_secure_profile_rejects_downgraded_suite_config() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use std::sync::Arc as StdArc;
+
+        let server_sk = SigningKey::from_bytes(&[0x5Eu8; 32]);
+        let ca_vk: VerifyingKey = SigningKey::from_bytes(&[0x7Fu8; 32]).verifying_key();
+
+        let err = SAACPNetworkDaemon::secure(
+            "127.0.0.1",
+            9903,
+            None,
+            server_sk.to_bytes(),
+            "server-1",
+            &[("ca-1", ca_vk)],
+            &["AES-256-GCM-HKDF-SHA256"], // missing the mandatory ed25519 baseline
+            StdArc::new(crate::gateway::ZeroTrustGateway::new()),
+            StdArc::new(SessionEpochManager::new()),
+        );
+        assert!(
+            err.is_err(),
+            "suite config missing the mandatory baseline must be rejected"
+        );
+    }
+
+    /// F5 (contributory check): a client presenting the all-zero X25519 public
+    /// key (the identity point) must be rejected — pre-fix, HKDF over the
+    /// resulting all-zero shared secret derived a session key the attacker can
+    /// compute without holding any key at all.
+    #[tokio::test]
+    async fn test_ecdh_handshake_rejects_all_zero_peer_key() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        // Client sends a 32-byte nonce followed by the all-zero "public key".
+        client.write_all(&[0x11u8; 32]).await.unwrap();
+        client.write_all(&[0u8; 32]).await.unwrap();
+        let result = ecdh_handshake(&mut server, None, None).await;
+        assert!(
+            result.is_err(),
+            "all-zero peer public key must be rejected (contributory check)"
+        );
+    }
+
+    /// F5 (contributory check), initiator side: an "server" whose X25519 public
+    /// key is the identity point must be rejected by `client_handshake`.
+    #[tokio::test]
+    async fn test_client_handshake_rejects_all_zero_server_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let client_task = tokio::spawn(async move { client_handshake(&mut client, None).await });
+        // Consume the client's nonce+pubkey, then answer with the all-zero key.
+        let mut sink = [0u8; 64];
+        server.read_exact(&mut sink).await.unwrap();
+        server.write_all(&[0u8; 32]).await.unwrap();
+        let result = client_task.await.expect("client task must not panic");
+        assert!(
+            result.is_err(),
+            "all-zero server public key must be rejected (contributory check)"
+        );
     }
 }

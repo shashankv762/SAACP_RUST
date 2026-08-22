@@ -35,39 +35,45 @@ pub const SAACPFRAME_FIXED_OVERHEAD: usize = 121;
 
 // ── Flag-bit constants (authenticated header byte 7) ─────────────────────────
 /// M-8 fix: cover traffic; also aliases FLAG_EXTERNAL_INPUT (same bit, context-dependent)
-pub const FLAG_COVER_TRAFFIC: u8  = 0x80;
+pub const FLAG_COVER_TRAFFIC: u8 = 0x80;
 /// Forces FULL gate tier when action_class != 0xFF
 pub const FLAG_EXTERNAL_INPUT: u8 = 0x80;
 /// Payload carries a capability token
-pub const FLAG_HAS_TOKEN: u8      = 0x01;
+pub const FLAG_HAS_TOKEN: u8 = 0x01;
 /// C-2 fix: non-text binary stream — skip Gate 4.0 injection scan
-pub const FLAG_BINARY_STREAM: u8  = 0x02;
+pub const FLAG_BINARY_STREAM: u8 = 0x02;
 /// Frame payload is AES-256-GCM encrypted (always set post-handshake)
-pub const FLAG_ENCRYPTED: u8      = 0x10;
+pub const FLAG_ENCRYPTED: u8 = 0x10;
 /// Payload is zlib-compressed (before encryption)
-pub const FLAG_COMPRESSED: u8     = 0x20;
+pub const FLAG_COMPRESSED: u8 = 0x20;
 /// Packet belongs to a StreamSession
-pub const FLAG_STREAMING: u8      = 0x40;
+pub const FLAG_STREAMING: u8 = 0x40;
 
 // ── Action class constants ────────────────────────────────────────────────────
-pub const ACTION_CLASS_READ_ONLY: u8    = 0x00;
-pub const ACTION_CLASS_REVERSIBLE: u8   = 0x01;
+pub const ACTION_CLASS_READ_ONLY: u8 = 0x00;
+pub const ACTION_CLASS_REVERSIBLE: u8 = 0x01;
 pub const ACTION_CLASS_IRREVERSIBLE: u8 = 0x02;
 
 // ── Compile-time frame size invariants (spec §3.1 / §3.2) ────────────────────
 // "The struct.Struct computed size MUST be asserted equal to N at module load time."
-const _: () = assert!(MEASC_HEADER_SIZE == 128,
-    "MEASC header MUST be exactly 128 bytes");
-const _: () = assert!(SAACPFRAME_PREFIX_SIZE == 101,
-    "SAACPFrame prefix MUST be exactly 101 bytes (matching Python PREFIX_FORMAT)");
-const _: () = assert!(SAACPFRAME_FIXED_OVERHEAD == SAACPFRAME_PREFIX_SIZE + 16 + 4,
-    "SAACPFrame fixed overhead = prefix(101) + auth_tag(16) + adler32(4) = 121");
+const _: () = assert!(
+    MEASC_HEADER_SIZE == 128,
+    "MEASC header MUST be exactly 128 bytes"
+);
+const _: () = assert!(
+    SAACPFRAME_PREFIX_SIZE == 101,
+    "SAACPFrame prefix MUST be exactly 101 bytes (matching Python PREFIX_FORMAT)"
+);
+const _: () = assert!(
+    SAACPFRAME_FIXED_OVERHEAD == SAACPFRAME_PREFIX_SIZE + 16 + 4,
+    "SAACPFrame fixed overhead = prefix(101) + auth_tag(16) + adler32(4) = 121"
+);
 
 // ── Status codes for schema-exempt stream frames ──────────────────────────────
 /// STREAM_CONTINUATION (0x18) — binary stream chunk; exempt from JSON schema validation
 pub const STATUS_STREAM_CONTINUATION: u8 = 0x18;
 /// STREAM_END (0x19) — binary stream terminator; exempt from JSON schema validation
-pub const STATUS_STREAM_END: u8          = 0x19;
+pub const STATUS_STREAM_END: u8 = 0x19;
 
 /// Returns true iff this status code carries a non-JSON binary payload.
 /// Authorization Invariance: exemption determined solely by the authenticated
@@ -170,12 +176,12 @@ impl SAACPFrame {
                 "SAACPFrame: invalid magic bytes",
             ));
         }
-        let schema_id       = u16::from_be_bytes([data[4], data[5]]);
-        let status_code     = data[6];
-        let flags           = data[7];
-        let action_class    = data[8];
-        let payload_length  = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
-        let sequence_id     = u32::from_be_bytes([data[13], data[14], data[15], data[16]]);
+        let schema_id = u16::from_be_bytes([data[4], data[5]]);
+        let status_code = data[6];
+        let flags = data[7];
+        let action_class = data[8];
+        let payload_length = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
+        let sequence_id = u32::from_be_bytes([data[13], data[14], data[15], data[16]]);
         let mut session_uuid = [0u8; 16];
         session_uuid.copy_from_slice(&data[17..33]);
         let mut traceparent = [0u8; 24];
@@ -184,19 +190,57 @@ impl SAACPFrame {
         context_state_id.copy_from_slice(&data[57..89]);
         let context_version = u32::from_be_bytes([data[89], data[90], data[91], data[92]]);
         let nonce = u64::from_be_bytes([
-            data[93], data[94], data[95], data[96],
-            data[97], data[98], data[99], data[100],
+            data[93], data[94], data[95], data[96], data[97], data[98], data[99], data[100],
         ]);
         Ok(Self {
-            schema_id, status_code, flags, action_class, payload_length,
-            sequence_id, session_uuid, traceparent, context_state_id,
-            context_version, nonce,
+            schema_id,
+            status_code,
+            flags,
+            action_class,
+            payload_length,
+            sequence_id,
+            session_uuid,
+            traceparent,
+            context_state_id,
+            context_version,
+            nonce,
         })
     }
 
-    /// Derive 96-bit AES-GCM IV: SHA-256(nonce_be8 || session_uuid)[:12]
-    /// Matches Python: hashlib.sha256(nonce.to_bytes(8,"big") + session_uuid).digest()[:12]
-    pub fn derive_iv(nonce: u64, session_uuid: &[u8; 16]) -> [u8; 12] {
+    /// Derive 96-bit AES-GCM IV: SHA-256(nonce_be8 || session_uuid || sequence_id_be4)[:12]
+    ///
+    /// F4 fix (IV-COLLISION): the v1 derivation hashed only (nonce, session_uuid)
+    /// — 64 bits of per-frame entropy, so a long-lived session at high packet
+    /// rates approached non-negligible birthday odds of an AES-GCM IV (and with
+    /// it, implied keystream) reuse. Including `sequence_id` in the hash input
+    /// raises the varying-input space to 96 bits, keeping the collision odds
+    /// negligible even at 10^9+ frames per session. The wire header is
+    /// unchanged — this is derivation-only.
+    ///
+    /// For interoperating with an implementation that still derives the legacy
+    /// Python-parity IV `SHA-256(nonce_be8 || session_uuid)[:12]`, see
+    /// [`Self::derive_iv_v1`].
+    pub fn derive_iv(nonce: u64, session_uuid: &[u8; 16], sequence_id: u32) -> [u8; 12] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(nonce.to_be_bytes());
+        hasher.update(session_uuid);
+        hasher.update(sequence_id.to_be_bytes());
+        let digest = hasher.finalize();
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&digest[..12]);
+        iv
+    }
+
+    /// Legacy v1 IV derivation: SHA-256(nonce_be8 || session_uuid)[:12].
+    ///
+    /// Matches the original Python reference
+    /// `hashlib.sha256(nonce.to_bytes(8,"big") + session_uuid).digest()[:12]`.
+    /// Superseded by [`Self::derive_iv`] (F4 fix) for its 64-bit birthday
+    /// collision space; retained and public so tooling that must interoperate
+    /// with a v1-era peer can derive the same IV explicitly. Do NOT use for
+    /// new sessions.
+    pub fn derive_iv_v1(nonce: u64, session_uuid: &[u8; 16]) -> [u8; 12] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(nonce.to_be_bytes());
@@ -214,10 +258,16 @@ impl SAACPFrame {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, [u8; 16]), SAACPHardDrop> {
-        use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, Payload}};
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Key, Nonce,
+        };
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
         let nonce_obj = Nonce::from_slice(iv);
-        let payload_obj = Payload { msg: plaintext, aad };
+        let payload_obj = Payload {
+            msg: plaintext,
+            aad,
+        };
         let encrypted = cipher.encrypt(nonce_obj, payload_obj).map_err(|e| {
             SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
@@ -239,14 +289,20 @@ impl SAACPFrame {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, SAACPHardDrop> {
-        use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, Payload}};
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Key, Nonce,
+        };
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
         let nonce_obj = Nonce::from_slice(iv);
         // Reconstruct ciphertext+tag blob that aes_gcm expects
         let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + 16);
         ct_with_tag.extend_from_slice(ciphertext);
         ct_with_tag.extend_from_slice(auth_tag);
-        let payload_obj = Payload { msg: &ct_with_tag, aad };
+        let payload_obj = Payload {
+            msg: &ct_with_tag,
+            aad,
+        };
         cipher.decrypt(nonce_obj, payload_obj).map_err(|_| {
             SAACPHardDrop::new(
                 SAACPBytecodes::InvalidSignature,
@@ -260,7 +316,8 @@ impl SAACPFrame {
     /// Output: [101-byte prefix] [16-byte auth_tag] [4-byte adler32] [ciphertext]
     ///
     /// The payload is AES-256-GCM encrypted with the 101-byte prefix as AAD.
-    /// The IV is derived as SHA-256(nonce_be8 || session_uuid)[:12].
+    /// The IV is derived as SHA-256(nonce_be8 || session_uuid || sequence_id_be4)[:12]
+    /// (F4 fix — see [`Self::derive_iv`]).
     #[allow(clippy::too_many_arguments)]
     pub fn build_frame(
         schema_id: u16,
@@ -298,19 +355,27 @@ impl SAACPFrame {
         };
 
         let frame = Self {
-            schema_id, status_code, flags, action_class,
+            schema_id,
+            status_code,
+            flags,
+            action_class,
             // payload_to_encrypt.len() <= MAX_PAYLOAD_SIZE (10 MB) — fits in u32.
             payload_length: payload_to_encrypt.len() as u32,
-            sequence_id, session_uuid, traceparent, context_state_id,
-            context_version, nonce: nonce_val,
+            sequence_id,
+            session_uuid,
+            traceparent,
+            context_state_id,
+            context_version,
+            nonce: nonce_val,
         };
         let prefix_bytes = frame.encode_prefix();
 
-        // Derive IV from nonce + session_uuid
-        let iv = Self::derive_iv(nonce_val, &session_uuid);
+        // Derive IV from nonce + session_uuid + sequence_id (F4: 96-bit varying input)
+        let iv = Self::derive_iv(nonce_val, &session_uuid, sequence_id);
 
         // Encrypt: AAD = prefix_bytes
-        let (ciphertext, auth_tag) = Self::aes_gcm_encrypt(secret_key, &iv, &prefix_bytes, &payload_to_encrypt)?;
+        let (ciphertext, auth_tag) =
+            Self::aes_gcm_encrypt(secret_key, &iv, &prefix_bytes, &payload_to_encrypt)?;
 
         // Adler-32 over (prefix || auth_tag || ciphertext) — streamed directly
         // into the hasher (Phase 3 / P-7), no intermediate concatenation buffer.
@@ -331,9 +396,17 @@ impl SAACPFrame {
     ///   1. Minimum length check
     ///   2. Magic bytes validation
     ///   3. Payload length limit (RGC Gate 1 pre-decryption)
-    ///   4. Nonce tracking — C-2 fix: BEFORE decryption
+    ///   4. Nonce replay PRE-CHECK — read-only (F2 fix): an already-recorded
+    ///      nonce is cheaply rejected WITHOUT inserting anything; unauthenticated
+    ///      junk cannot consume tracker capacity
     ///   5. Adler-32 fast corruption filter
     ///   6. AES-256-GCM decryption + authentication tag verification
+    ///   6.5. Nonce TRACK (F2 fix): authoritative, state-mutating replay
+    ///      recording — runs ONLY after the AEAD tag verified, so only
+    ///      authenticated frames can fill the tracker (C-2's replay property
+    ///      is preserved: the second occurrence of a nonce is rejected — now
+    ///      at the step-4 pre-check for the recorded case, and at step 6.5 for
+    ///      a concurrent same-nonce race)
     ///   7. Schema validation (skipped for STREAM_CONTINUATION/END binary frames)
     pub fn parse_header(
         buffer: &[u8],
@@ -347,14 +420,15 @@ impl SAACPFrame {
                 SAACPBytecodes::MalformedHeader,
                 format!(
                     "SAACPFrame buffer too short: need at least {} bytes, got {}",
-                    SAACPFRAME_FIXED_OVERHEAD, buffer.len()
+                    SAACPFRAME_FIXED_OVERHEAD,
+                    buffer.len()
                 ),
             ));
         }
 
-        let prefix_bytes    = &buffer[0..SAACPFRAME_PREFIX_SIZE];
-        let auth_tag_slice  = &buffer[SAACPFRAME_PREFIX_SIZE..SAACPFRAME_PREFIX_SIZE + 16];
-        let checksum_slice  = &buffer[SAACPFRAME_PREFIX_SIZE + 16..SAACPFRAME_PREFIX_SIZE + 20];
+        let prefix_bytes = &buffer[0..SAACPFRAME_PREFIX_SIZE];
+        let auth_tag_slice = &buffer[SAACPFRAME_PREFIX_SIZE..SAACPFRAME_PREFIX_SIZE + 16];
+        let checksum_slice = &buffer[SAACPFRAME_PREFIX_SIZE + 16..SAACPFRAME_PREFIX_SIZE + 20];
 
         // 2. Decode + magic check
         let frame = Self::decode_prefix(prefix_bytes)?;
@@ -379,10 +453,21 @@ impl SAACPFrame {
             ));
         }
 
-        // 4. C-2 FIX: Nonce tracking BEFORE decryption.
-        // The nonce is in the plaintext header. Checking after decrypt allows
-        // an attacker to force the same AES-GCM IV twice before the check fires.
-        nonce_tracker.track(frame.nonce)?;
+        // 4. F2 FIX (PRE-AUTH-NONCE-FLOOD): read-only replay pre-check.
+        // The nonce is in the plaintext header. The pre-fix code called
+        // `track()` here, INSERTING every incoming nonce before authentication
+        // — so an unauthenticated flood of random nonces filled the tracker's
+        // 100k capacity and tripped its circuit-breaker, rejecting legitimate
+        // traffic for everyone sharing the tracker. `contains_scoped` gives
+        // the same cheap rejection of already-recorded nonces (the C-2 replay
+        // property) without letting junk consume capacity; the authoritative
+        // insertion moved to step 6.5, after the AEAD tag verifies.
+        if nonce_tracker.contains_scoped(&hex::encode(frame.session_uuid), frame.nonce) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::InvalidSignature,
+                "REPLAY ATTACK DETECTED: Nonce already used.",
+            ));
+        }
 
         // Locate ciphertext
         let ciphertext_end = SAACPFRAME_PREFIX_SIZE + 20 + frame.payload_length as usize;
@@ -398,7 +483,10 @@ impl SAACPFrame {
         // Streamed directly into the hasher (Phase 3 / P-7), no intermediate buffer.
         let expected_checksum = adler32_checksum_multi(&[prefix_bytes, auth_tag_slice, ciphertext]);
         let actual_checksum = u32::from_be_bytes([
-            checksum_slice[0], checksum_slice[1], checksum_slice[2], checksum_slice[3],
+            checksum_slice[0],
+            checksum_slice[1],
+            checksum_slice[2],
+            checksum_slice[3],
         ]);
         // Constant-time comparison
         if !constant_time_eq_u32(expected_checksum, actual_checksum) {
@@ -409,12 +497,24 @@ impl SAACPFrame {
         }
 
         // 6. AES-256-GCM decryption + authentication
-        let iv = Self::derive_iv(frame.nonce, &frame.session_uuid);
+        let iv = Self::derive_iv(frame.nonce, &frame.session_uuid, frame.sequence_id);
         let mut auth_tag = [0u8; 16];
         auth_tag.copy_from_slice(auth_tag_slice);
-        let decrypted_payload = Self::aes_gcm_decrypt(
-            secret_key, &iv, &auth_tag, prefix_bytes, ciphertext,
-        )?;
+        let decrypted_payload =
+            Self::aes_gcm_decrypt(secret_key, &iv, &auth_tag, prefix_bytes, ciphertext)?;
+
+        // 6.5. F2 FIX: authoritative nonce recording — AFTER authentication.
+        // Only a frame whose AEAD tag verified can insert into the tracker, so
+        // an unauthenticated flood can no longer exhaust its capacity. Burning
+        // the nonce here (before decompression/schema validation) is correct:
+        // the sender must never reuse a nonce even for a frame the receiver
+        // ends up rejecting later in the pipeline. A concurrent same-nonce
+        // race is still caught — the loser's `track_scoped` returns Err — and
+        // for identical ciphertext that double-decrypt leaks nothing (identical
+        // plaintext); for differing ciphertext under one IV, only the sender's
+        // own random-nonce collision can produce it, which the step-4 pre-check
+        // then rejects for every subsequent attempt.
+        nonce_tracker.track_scoped(&hex::encode(frame.session_uuid), frame.nonce)?;
 
         // 6.5. Decompression (COMPRESS-IMPL): if FLAG_COMPRESSED is set, decompress
         //      the plaintext AFTER AES-GCM authentication but BEFORE schema validation.
@@ -431,26 +531,28 @@ impl SAACPFrame {
         if !is_schema_exempt(frame.status_code) {
             crate::rgc::ResourceGovernanceParser::check(&decrypted_payload, Some(rgc_policy))?;
             // Parse JSON for schema validation
-            let json_val: serde_json::Value = serde_json::from_slice(&decrypted_payload)
-                .map_err(|e| SAACPHardDrop::new(
-                    SAACPBytecodes::MalformedHeader,
-                    format!("SAACPFrame: payload is not valid JSON: {}", e),
-                ))?;
+            let json_val: serde_json::Value =
+                serde_json::from_slice(&decrypted_payload).map_err(|e| {
+                    SAACPHardDrop::new(
+                        SAACPBytecodes::MalformedHeader,
+                        format!("SAACPFrame: payload is not valid JSON: {}", e),
+                    )
+                })?;
             crate::schemas::PreCompiledSchemas::validate_payload(frame.schema_id, &json_val)?;
         }
 
         Ok(ParsedSAACPFrame {
-            schema_id:        frame.schema_id,
-            status_code:      frame.status_code,
-            flags:            frame.flags,
-            action_class:     frame.action_class,
-            sequence_id:      frame.sequence_id,
-            session_uuid:     frame.session_uuid,
-            traceparent:      frame.traceparent,
+            schema_id: frame.schema_id,
+            status_code: frame.status_code,
+            flags: frame.flags,
+            action_class: frame.action_class,
+            sequence_id: frame.sequence_id,
+            session_uuid: frame.session_uuid,
+            traceparent: frame.traceparent,
             context_state_id: frame.context_state_id,
-            context_version:  frame.context_version,
-            nonce:            frame.nonce,
-            payload:          decrypted_payload,
+            context_version: frame.context_version,
+            nonce: frame.nonce,
+            payload: decrypted_payload,
         })
     }
 }
@@ -462,18 +564,18 @@ impl SAACPFrame {
 /// Fully-parsed and decrypted application-layer packet.
 #[derive(Debug, Clone)]
 pub struct ParsedSAACPFrame {
-    pub schema_id:        u16,
-    pub status_code:      u8,
-    pub flags:            u8,
-    pub action_class:     u8,
-    pub sequence_id:      u32,
-    pub session_uuid:     [u8; 16],
-    pub traceparent:      [u8; 24],
+    pub schema_id: u16,
+    pub status_code: u8,
+    pub flags: u8,
+    pub action_class: u8,
+    pub sequence_id: u32,
+    pub session_uuid: [u8; 16],
+    pub traceparent: [u8; 24],
     pub context_state_id: [u8; 32],
-    pub context_version:  u32,
-    pub nonce:            u64,
+    pub context_version: u32,
+    pub nonce: u64,
     /// Decrypted plaintext payload bytes.
-    pub payload:          Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 impl ParsedSAACPFrame {
@@ -574,7 +676,6 @@ impl Default for MEASCFrame {
 }
 
 impl MEASCFrame {
-
     /// Serialize to exactly 128 bytes (big-endian).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = vec![0u8; MEASC_HEADER_SIZE];
@@ -614,7 +715,8 @@ impl MEASCFrame {
                 SAACPBytecodes::MalformedHeader,
                 format!(
                     "MEASCFrame too short: expected {} bytes, got {}",
-                    MEASC_HEADER_SIZE, data.len()
+                    MEASC_HEADER_SIZE,
+                    data.len()
                 ),
             ));
         }
@@ -623,22 +725,22 @@ impl MEASCFrame {
                 SAACPBytecodes::MalformedHeader,
                 format!(
                     "MEASCFrame: invalid magic bytes: expected {:?}, got {:?}",
-                    MEASC_MAGIC, &data[0..4]
+                    MEASC_MAGIC,
+                    &data[0..4]
                 ),
             ));
         }
-        let schema_id      = u16::from_be_bytes([data[4], data[5]]);
-        let status_code    = data[6];
-        let flags          = data[7];
-        let action_class   = data[8];
+        let schema_id = u16::from_be_bytes([data[4], data[5]]);
+        let status_code = data[6];
+        let flags = data[7];
+        let action_class = data[8];
         // Skip padding1 at offset 9..12
         let payload_length = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
         let mut session_id = [0u8; 16];
         session_id.copy_from_slice(&data[16..32]);
         let epoch_id = u32::from_be_bytes([data[32], data[33], data[34], data[35]]);
         let psn = u64::from_be_bytes([
-            data[36], data[37], data[38], data[39],
-            data[40], data[41], data[42], data[43],
+            data[36], data[37], data[38], data[39], data[40], data[41], data[42], data[43],
         ]);
         let mut context_ref_id = [0u8; 32];
         context_ref_id.copy_from_slice(&data[44..76]);
@@ -646,8 +748,17 @@ impl MEASCFrame {
         let mut w3c_traceparent = [0u8; 24];
         w3c_traceparent.copy_from_slice(&data[80..104]);
         Ok(Self {
-            schema_id, status_code, flags, action_class, payload_length,
-            session_id, epoch_id, psn, context_ref_id, context_version, w3c_traceparent,
+            schema_id,
+            status_code,
+            flags,
+            action_class,
+            payload_length,
+            session_id,
+            epoch_id,
+            psn,
+            context_ref_id,
+            context_version,
+            w3c_traceparent,
         })
     }
 
@@ -744,7 +855,8 @@ impl MEASCFrame {
                 SAACPBytecodes::MalformedHeader,
                 format!(
                     "MEASCFrame: packet too short for tag+payload: need {} bytes, got {}",
-                    ciphertext_end, packet.len()
+                    ciphertext_end,
+                    packet.len()
                 ),
             ));
         }
@@ -760,18 +872,18 @@ impl MEASCFrame {
         tag.copy_from_slice(tag_slice);
         let payload = SAACPFrame::aes_gcm_decrypt(&key, &iv, &tag, header_bytes, ciphertext)?;
 
-        let session_uuid     = hex::encode(frame.session_id);
+        let session_uuid = hex::encode(frame.session_id);
         let context_state_id = hex::encode(frame.context_ref_id);
-        let traceparent      = frame.w3c_traceparent.to_vec();
+        let traceparent = frame.w3c_traceparent.to_vec();
         Ok(ParsedFrame {
-            schema_id:        frame.schema_id,
-            status_code:      frame.status_code,
-            flags:            frame.flags,
-            action_class:     frame.action_class,
+            schema_id: frame.schema_id,
+            status_code: frame.status_code,
+            flags: frame.flags,
+            action_class: frame.action_class,
             session_uuid,
-            sequence_id:      frame.psn,
+            sequence_id: frame.psn,
             context_state_id,
-            context_version:  frame.context_version as u64,
+            context_version: frame.context_version as u64,
             traceparent,
             payload,
         })
@@ -800,29 +912,30 @@ impl MEASCFrame {
             ));
         }
         let payload_start = MEASC_HEADER_SIZE;
-        let payload_end   = payload_start + frame.payload_length as usize;
+        let payload_end = payload_start + frame.payload_length as usize;
         if packet.len() < payload_end {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::MalformedHeader,
                 format!(
                     "MEASCFrame: packet too short for payload: need {} bytes, got {}",
-                    payload_end, packet.len()
+                    payload_end,
+                    packet.len()
                 ),
             ));
         }
-        let payload          = packet[payload_start..payload_end].to_vec();
-        let session_uuid     = hex::encode(frame.session_id);
+        let payload = packet[payload_start..payload_end].to_vec();
+        let session_uuid = hex::encode(frame.session_id);
         let context_state_id = hex::encode(frame.context_ref_id);
-        let traceparent      = frame.w3c_traceparent.to_vec();
+        let traceparent = frame.w3c_traceparent.to_vec();
         Ok(ParsedFrame {
-            schema_id:        frame.schema_id,
-            status_code:      frame.status_code,
-            flags:            frame.flags,
-            action_class:     frame.action_class,
+            schema_id: frame.schema_id,
+            status_code: frame.status_code,
+            flags: frame.flags,
+            action_class: frame.action_class,
             session_uuid,
-            sequence_id:      frame.psn,
+            sequence_id: frame.psn,
             context_state_id,
-            context_version:  frame.context_version as u64,
+            context_version: frame.context_version as u64,
             traceparent,
             payload,
         })
@@ -841,7 +954,11 @@ impl MEASCFrame {
     ///
     /// Note: unlike `measc::MEASCFrame::build_frame`, this does NOT EASI-encrypt
     /// `context_ref_id` — that field is carried in the header as-is.
-    pub fn encode_encrypted(&self, payload: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, SAACPHardDrop> {
+    pub fn encode_encrypted(
+        &self,
+        payload: &[u8],
+        secret_key: &[u8],
+    ) -> Result<Vec<u8>, SAACPHardDrop> {
         if payload.len() > MAX_PAYLOAD_SIZE {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::PayloadTooLarge,
@@ -859,7 +976,8 @@ impl MEASCFrame {
             Self::derive_frame_key_iv(secret_key, &hdr.session_id, hdr.epoch_id, hdr.psn);
         let (ciphertext, tag) = SAACPFrame::aes_gcm_encrypt(&key, &iv, &header, payload)?;
 
-        let mut wire = Vec::with_capacity(MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE + ciphertext.len());
+        let mut wire =
+            Vec::with_capacity(MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE + ciphertext.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&tag);
         wire.extend_from_slice(&ciphertext);
@@ -870,16 +988,16 @@ impl MEASCFrame {
 /// Parsed transport-layer packet.
 #[derive(Debug, Clone)]
 pub struct ParsedFrame {
-    pub schema_id:        u16,
-    pub status_code:      u8,
-    pub flags:            u8,
-    pub action_class:     u8,
-    pub session_uuid:     String,
-    pub sequence_id:      u64,
+    pub schema_id: u16,
+    pub status_code: u8,
+    pub flags: u8,
+    pub action_class: u8,
+    pub session_uuid: String,
+    pub sequence_id: u64,
     pub context_state_id: String,
-    pub context_version:  u64,
-    pub traceparent:      Vec<u8>,
-    pub payload:          Vec<u8>,
+    pub context_version: u64,
+    pub traceparent: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 // ── Pre-decryption payload size gate ─────────────────────────────────────────
@@ -901,19 +1019,23 @@ pub fn check_payload_size(size: usize) -> Result<(), SAACPHardDrop> {
 ///
 /// Used by build_frame when FLAG_COMPRESSED is set.
 pub fn compress_zlib(data: &[u8]) -> Result<Vec<u8>, SAACPHardDrop> {
-    use flate2::Compression;
     use flate2::write::ZlibEncoder;
+    use flate2::Compression;
     use std::io::Write;
 
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(6));
-    enc.write_all(data).map_err(|e| SAACPHardDrop::new(
-        SAACPBytecodes::MalformedHeader,
-        format!("Compression failed: {e}"),
-    ))?;
-    enc.finish().map_err(|e| SAACPHardDrop::new(
-        SAACPBytecodes::MalformedHeader,
-        format!("Compression finish failed: {e}"),
-    ))
+    enc.write_all(data).map_err(|e| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            format!("Compression failed: {e}"),
+        )
+    })?;
+    enc.finish().map_err(|e| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            format!("Compression finish failed: {e}"),
+        )
+    })
 }
 
 /// zlib-decompress a byte slice.
@@ -1007,83 +1129,135 @@ fn constant_time_eq_u32(a: u32, b: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::NonceTracker;
     use crate::rgc::RGCPolicy;
+    use crate::security::NonceTracker;
 
-    fn test_key() -> [u8; 32] { [0xABu8; 32] }
+    fn test_key() -> [u8; 32] {
+        [0xABu8; 32]
+    }
 
     #[test]
     fn test_prefix_size_is_101() {
         let frame = SAACPFrame {
-            schema_id: 1, status_code: 0, flags: FLAG_HAS_TOKEN,
-            action_class: 0, payload_length: 42, sequence_id: 1,
-            session_uuid: [0u8; 16], traceparent: [0u8; 24],
-            context_state_id: [0u8; 32], context_version: 1,
+            schema_id: 1,
+            status_code: 0,
+            flags: FLAG_HAS_TOKEN,
+            action_class: 0,
+            payload_length: 42,
+            sequence_id: 1,
+            session_uuid: [0u8; 16],
+            traceparent: [0u8; 24],
+            context_state_id: [0u8; 32],
+            context_version: 1,
             nonce: 0x123456789ABCDEF0,
         };
         let prefix = frame.encode_prefix();
-        assert_eq!(prefix.len(), 101, "SAACPFrame prefix MUST be exactly 101 bytes");
+        assert_eq!(
+            prefix.len(),
+            101,
+            "SAACPFrame prefix MUST be exactly 101 bytes"
+        );
         assert_eq!(SAACPFRAME_PREFIX_SIZE, 101);
     }
 
     #[test]
     fn test_prefix_magic() {
         let frame = SAACPFrame {
-            schema_id: 1, status_code: 0, flags: 0, action_class: 0,
-            payload_length: 0, sequence_id: 0, session_uuid: [0u8; 16],
-            traceparent: [0u8; 24], context_state_id: [0u8; 32],
-            context_version: 0, nonce: 0,
+            schema_id: 1,
+            status_code: 0,
+            flags: 0,
+            action_class: 0,
+            payload_length: 0,
+            sequence_id: 0,
+            session_uuid: [0u8; 16],
+            traceparent: [0u8; 24],
+            context_state_id: [0u8; 32],
+            context_version: 0,
+            nonce: 0,
         };
         assert_eq!(&frame.encode_prefix()[0..4], b"SACP");
     }
 
     #[test]
     fn test_prefix_field_offsets() {
-        let session_uuid     = [0x11u8; 16];
-        let traceparent      = [0x22u8; 24];
+        let session_uuid = [0x11u8; 16];
+        let traceparent = [0x22u8; 24];
         let context_state_id = [0x33u8; 32];
         let frame = SAACPFrame {
-            schema_id: 0xABCD, status_code: 0x05,
+            schema_id: 0xABCD,
+            status_code: 0x05,
             flags: FLAG_HAS_TOKEN | FLAG_ENCRYPTED,
             action_class: ACTION_CLASS_REVERSIBLE,
-            payload_length: 0x00001234, sequence_id: 0x00000099,
-            session_uuid, traceparent, context_state_id,
-            context_version: 0x00000007, nonce: 0x0102030405060708,
+            payload_length: 0x00001234,
+            sequence_id: 0x00000099,
+            session_uuid,
+            traceparent,
+            context_state_id,
+            context_version: 0x00000007,
+            nonce: 0x0102030405060708,
         };
         let p = frame.encode_prefix();
         // Offsets per Python PREFIX_FORMAT = ">4s H B B B I I 16s 24s 32s I Q"
-        assert_eq!(&p[0..4], b"SACP",                            "offset 0: magic");
-        assert_eq!(u16::from_be_bytes([p[4],p[5]]),    0xABCD,   "offset 4: schema_id");
-        assert_eq!(p[6],                               0x05,      "offset 6: status_code");
-        assert_eq!(p[7],  FLAG_HAS_TOKEN|FLAG_ENCRYPTED,          "offset 7: flags");
-        assert_eq!(p[8],  ACTION_CLASS_REVERSIBLE,                "offset 8: action_class");
-        assert_eq!(u32::from_be_bytes([p[9],p[10],p[11],p[12]]),  0x00001234, "offset 9: payload_length");
-        assert_eq!(u32::from_be_bytes([p[13],p[14],p[15],p[16]]), 0x00000099, "offset 13: sequence_id");
-        assert_eq!(&p[17..33], &session_uuid,                     "offset 17: session_uuid");
-        assert_eq!(&p[33..57], &traceparent,                      "offset 33: traceparent");
-        assert_eq!(&p[57..89], &context_state_id,                 "offset 57: context_state_id");
-        assert_eq!(u32::from_be_bytes([p[89],p[90],p[91],p[92]]), 0x00000007, "offset 89: context_version");
-        assert_eq!(u64::from_be_bytes([p[93],p[94],p[95],p[96],p[97],p[98],p[99],p[100]]),
-                   0x0102030405060708, "offset 93: nonce");
+        assert_eq!(&p[0..4], b"SACP", "offset 0: magic");
+        assert_eq!(
+            u16::from_be_bytes([p[4], p[5]]),
+            0xABCD,
+            "offset 4: schema_id"
+        );
+        assert_eq!(p[6], 0x05, "offset 6: status_code");
+        assert_eq!(p[7], FLAG_HAS_TOKEN | FLAG_ENCRYPTED, "offset 7: flags");
+        assert_eq!(p[8], ACTION_CLASS_REVERSIBLE, "offset 8: action_class");
+        assert_eq!(
+            u32::from_be_bytes([p[9], p[10], p[11], p[12]]),
+            0x00001234,
+            "offset 9: payload_length"
+        );
+        assert_eq!(
+            u32::from_be_bytes([p[13], p[14], p[15], p[16]]),
+            0x00000099,
+            "offset 13: sequence_id"
+        );
+        assert_eq!(&p[17..33], &session_uuid, "offset 17: session_uuid");
+        assert_eq!(&p[33..57], &traceparent, "offset 33: traceparent");
+        assert_eq!(&p[57..89], &context_state_id, "offset 57: context_state_id");
+        assert_eq!(
+            u32::from_be_bytes([p[89], p[90], p[91], p[92]]),
+            0x00000007,
+            "offset 89: context_version"
+        );
+        assert_eq!(
+            u64::from_be_bytes([p[93], p[94], p[95], p[96], p[97], p[98], p[99], p[100]]),
+            0x0102030405060708,
+            "offset 93: nonce"
+        );
     }
 
     #[test]
     fn test_build_and_parse_roundtrip() {
-        let key          = test_key();
-        let nonce_t      = NonceTracker::new();
-        let rgc          = RGCPolicy::default();
+        let key = test_key();
+        let nonce_t = NonceTracker::new();
+        let rgc = RGCPolicy::default();
         // Use schema_id=0 (Raw Binary) — no JSON schema field validation.
         // Framing tests exercise crypto/wire correctness, not schema policy.
-        let payload      = b"{\"task\": \"hello world\"}";
+        let payload = b"{\"task\": \"hello world\"}";
         let session_uuid = [0x01u8; 16];
-        let traceparent  = [0x02u8; 24];
-        let ctx_id       = [0x03u8; 32];
+        let traceparent = [0x02u8; 24];
+        let ctx_id = [0x03u8; 32];
 
         let wire = SAACPFrame::build_frame(
-            0, 0x00, FLAG_HAS_TOKEN | FLAG_ENCRYPTED,
-            ACTION_CLASS_READ_ONLY, payload, 1,
-            session_uuid, traceparent, ctx_id, &key, 1,
-        ).expect("build_frame should succeed");
+            0,
+            0x00,
+            FLAG_HAS_TOKEN | FLAG_ENCRYPTED,
+            ACTION_CLASS_READ_ONLY,
+            payload,
+            1,
+            session_uuid,
+            traceparent,
+            ctx_id,
+            &key,
+            1,
+        )
+        .expect("build_frame should succeed");
 
         assert!(wire.len() >= SAACPFRAME_FIXED_OVERHEAD + payload.len());
 
@@ -1099,41 +1273,120 @@ mod tests {
 
     #[test]
     fn test_nonce_replay_rejected() {
-        let key     = test_key();
+        let key = test_key();
         let nonce_t = NonceTracker::new();
-        let rgc     = RGCPolicy::default();
+        let rgc = RGCPolicy::default();
 
         // schema_id=0: Raw Binary, no JSON schema validation
         let wire = SAACPFrame::build_frame(
-            0, 0x00, FLAG_ENCRYPTED, ACTION_CLASS_READ_ONLY,
-            b"{\"task\":\"x\"}", 1, [0x10u8; 16], [0u8; 24], [0u8; 32], &key, 1,
-        ).unwrap();
+            0,
+            0x00,
+            FLAG_ENCRYPTED,
+            ACTION_CLASS_READ_ONLY,
+            b"{\"task\":\"x\"}",
+            1,
+            [0x10u8; 16],
+            [0u8; 24],
+            [0u8; 32],
+            &key,
+            1,
+        )
+        .unwrap();
 
         // First parse: OK
         SAACPFrame::parse_header(&wire, &key, &nonce_t, &rgc).unwrap();
         // Second parse: replay must be rejected (C-2 fix: nonce tracked BEFORE decryption)
         let result = SAACPFrame::parse_header(&wire, &key, &nonce_t, &rgc);
-        assert!(result.is_err(), "C-2 fix: second nonce use must be rejected");
+        assert!(
+            result.is_err(),
+            "C-2 fix: second nonce use must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_unauthenticated_flood_cannot_fill_nonce_tracker() {
+        // F2 regression (PRE-AUTH-NONCE-FLOOD): frames that fail AES-GCM
+        // authentication must never insert into the NonceTracker. Pre-fix,
+        // each incoming nonce was recorded before the tag verified, so an
+        // unauthenticated flood of random nonces filled the tracker's
+        // capacity and its circuit-breaker then rejected legitimate traffic.
+        let key = test_key();
+        let wrong = [0xCDu8; 32];
+        let nonce_t = NonceTracker::new();
+        let rgc = RGCPolicy::default();
+
+        let wires: Vec<Vec<u8>> = (0..64u32)
+            .map(|i| {
+                SAACPFrame::build_frame(
+                    0,
+                    0x00,
+                    FLAG_ENCRYPTED,
+                    ACTION_CLASS_READ_ONLY,
+                    format!("{{\"task\":\"{i}\"}}").as_bytes(),
+                    i + 1,
+                    [0x40u8; 16],
+                    [0u8; 24],
+                    [0u8; 32],
+                    &key,
+                    1,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Flood: every frame fails authentication under the wrong key.
+        for w in &wires {
+            let err = SAACPFrame::parse_header(w, &wrong, &nonce_t, &rgc).unwrap_err();
+            assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+        }
+        assert_eq!(
+            nonce_t.count(),
+            0,
+            "unauthenticated frames must not consume nonce-tracker capacity"
+        );
+
+        // The identical frames then parse cleanly under the right key — the
+        // flood did not burn their nonces either.
+        for w in &wires {
+            SAACPFrame::parse_header(w, &key, &nonce_t, &rgc)
+                .expect("authenticated frame must parse after flood");
+        }
+        assert_eq!(nonce_t.count(), 64);
     }
 
     #[test]
     fn test_tamper_rejected() {
-        let key     = test_key();
+        let key = test_key();
         let nonce_t = NonceTracker::new();
-        let rgc     = RGCPolicy::default();
+        let rgc = RGCPolicy::default();
 
         // schema_id=0: bypass JSON schema validation to focus on AES-GCM tamper detection
         let mut wire = SAACPFrame::build_frame(
-            0, 0x00, FLAG_ENCRYPTED, ACTION_CLASS_READ_ONLY,
-            b"{\"task\":\"tamper\"}", 1, [0x20u8; 16], [0u8; 24], [0u8; 32], &key, 1,
-        ).unwrap();
+            0,
+            0x00,
+            FLAG_ENCRYPTED,
+            ACTION_CLASS_READ_ONLY,
+            b"{\"task\":\"tamper\"}",
+            1,
+            [0x20u8; 16],
+            [0u8; 24],
+            [0u8; 32],
+            &key,
+            1,
+        )
+        .unwrap();
 
         // Flip a ciphertext byte (after prefix+tag+checksum)
         let off = SAACPFRAME_FIXED_OVERHEAD + 3;
-        if wire.len() > off { wire[off] ^= 0xFF; }
+        if wire.len() > off {
+            wire[off] ^= 0xFF;
+        }
 
         let result = SAACPFrame::parse_header(&wire, &key, &nonce_t, &rgc);
-        assert!(result.is_err(), "Tampered ciphertext must fail AES-GCM auth");
+        assert!(
+            result.is_err(),
+            "Tampered ciphertext must fail AES-GCM auth"
+        );
     }
 
     #[test]
@@ -1163,9 +1416,9 @@ mod tests {
     #[test]
     fn test_measc_encode_decode() {
         let mut f = MEASCFrame::new();
-        f.schema_id     = 42;
-        f.epoch_id      = 7;
-        f.psn           = 12345678;
+        f.schema_id = 42;
+        f.epoch_id = 7;
+        f.psn = 12345678;
         f.context_ref_id = [0xAAu8; 32];
 
         let enc = f.encode();
@@ -1183,17 +1436,26 @@ mod tests {
 
     // ── CRIT-1 fix: MEASCFrame::parse_header real AES-256-GCM verification ──
 
-    fn measc_test_secret() -> [u8; 32] { [0x5Au8; 32] }
+    fn measc_test_secret() -> [u8; 32] {
+        [0x5Au8; 32]
+    }
 
     fn measc_valid_frame(payload: &[u8]) -> Vec<u8> {
         let f = MEASCFrame {
-            schema_id: 1, status_code: 0x10, flags: 0, action_class: 0,
+            schema_id: 1,
+            status_code: 0x10,
+            flags: 0,
+            action_class: 0,
             payload_length: 0, // auto-corrected by encode_encrypted
-            session_id: [0x11u8; 16], epoch_id: 3, psn: 42,
-            context_ref_id: [0x22u8; 32], context_version: 1,
+            session_id: [0x11u8; 16],
+            epoch_id: 3,
+            psn: 42,
+            context_ref_id: [0x22u8; 32],
+            context_version: 1,
             w3c_traceparent: [0x33u8; 24],
         };
-        f.encode_encrypted(payload, &measc_test_secret()).expect("encode_encrypted must succeed")
+        f.encode_encrypted(payload, &measc_test_secret())
+            .expect("encode_encrypted must succeed")
     }
 
     #[test]
@@ -1248,7 +1510,8 @@ mod tests {
         f.payload_length = 5;
         let mut packet = f.encode();
         packet.extend_from_slice(b"junk!"); // NOT valid ciphertext/tag -- no crypto involved
-        let parsed = MEASCFrame::parse_header_structural(&packet).expect("structural parse ignores crypto");
+        let parsed =
+            MEASCFrame::parse_header_structural(&packet).expect("structural parse ignores crypto");
         assert_eq!(parsed.payload, b"junk!");
         // Confirm the REAL parse_header rejects the identical bytes (no valid tag):
         assert!(MEASCFrame::parse_header(&packet, &[0u8; 32]).is_err());
@@ -1256,28 +1519,51 @@ mod tests {
 
     #[test]
     fn test_schema_exempt_codes() {
-        assert!(is_schema_exempt(0x18), "STREAM_CONTINUATION=0x18 must be exempt");
+        assert!(
+            is_schema_exempt(0x18),
+            "STREAM_CONTINUATION=0x18 must be exempt"
+        );
         assert!(is_schema_exempt(0x19), "STREAM_END=0x19 must be exempt");
-        assert!(!is_schema_exempt(0x00), "Normal success frames must not be exempt");
-        assert!(!is_schema_exempt(0x17), "STREAM_START must not be exempt — it carries JSON");
+        assert!(
+            !is_schema_exempt(0x00),
+            "Normal success frames must not be exempt"
+        );
+        assert!(
+            !is_schema_exempt(0x17),
+            "STREAM_START must not be exempt — it carries JSON"
+        );
     }
 
     #[test]
     fn test_flag_binary_stream_gate4_exemption() {
         let p = ParsedSAACPFrame {
-            schema_id: 1, status_code: STATUS_STREAM_CONTINUATION,
+            schema_id: 1,
+            status_code: STATUS_STREAM_CONTINUATION,
             flags: FLAG_STREAMING | FLAG_BINARY_STREAM,
-            action_class: 0, sequence_id: 0,
-            session_uuid: [0u8; 16], traceparent: [0u8; 24],
-            context_state_id: [0u8; 32], context_version: 0,
-            nonce: 0, payload: vec![],
+            action_class: 0,
+            sequence_id: 0,
+            session_uuid: [0u8; 16],
+            traceparent: [0u8; 24],
+            context_state_id: [0u8; 32],
+            context_version: 0,
+            nonce: 0,
+            payload: vec![],
         };
         assert!(p.is_binary_stream(), "FLAG_BINARY_STREAM must be detected");
-        assert!(p.is_schema_exempt(), "STREAM_CONTINUATION must be schema-exempt");
+        assert!(
+            p.is_schema_exempt(),
+            "STREAM_CONTINUATION must be schema-exempt"
+        );
 
         // LLM text stream: FLAG_STREAMING set, FLAG_BINARY_STREAM NOT set
-        let text = ParsedSAACPFrame { flags: FLAG_STREAMING, ..p.clone() };
-        assert!(!text.is_binary_stream(), "LLM text stream MUST NOT set FLAG_BINARY_STREAM");
+        let text = ParsedSAACPFrame {
+            flags: FLAG_STREAMING,
+            ..p.clone()
+        };
+        assert!(
+            !text.is_binary_stream(),
+            "LLM text stream MUST NOT set FLAG_BINARY_STREAM"
+        );
     }
 
     #[test]
@@ -1289,9 +1575,38 @@ mod tests {
     fn test_iv_derivation_deterministic() {
         let nonce = 0xDEADBEEFCAFEBABEu64;
         let session_uuid = [0xFFu8; 16];
-        let iv1 = SAACPFrame::derive_iv(nonce, &session_uuid);
-        let iv2 = SAACPFrame::derive_iv(nonce, &session_uuid);
+        let iv1 = SAACPFrame::derive_iv(nonce, &session_uuid, 7);
+        let iv2 = SAACPFrame::derive_iv(nonce, &session_uuid, 7);
         assert_eq!(iv1, iv2, "IV derivation must be deterministic");
         assert_eq!(iv1.len(), 12, "IV must be 12 bytes (96 bits) for AES-GCM");
+    }
+
+    /// F4 (IV-COLLISION): the same (nonce, session_uuid) pair with different
+    /// sequence_ids must derive different IVs — this is what pushes the
+    /// birthday-collision space from 64 to 96 bits for a long-lived session.
+    #[test]
+    fn test_iv_derivation_separates_sequence_ids() {
+        let nonce = 0x0102030405060708u64;
+        let session_uuid = [0x77u8; 16];
+        let a = SAACPFrame::derive_iv(nonce, &session_uuid, 1);
+        let b = SAACPFrame::derive_iv(nonce, &session_uuid, 2);
+        assert_ne!(a, b, "distinct sequence_id must derive a distinct IV");
+        // And the v2 derivation must itself differ from the v1 legacy form.
+        assert_ne!(a, SAACPFrame::derive_iv_v1(nonce, &session_uuid));
+    }
+
+    /// The legacy derivation stays byte-exact with the original Python
+    /// reference formula — pinned so external v1 interop tooling can rely on it.
+    #[test]
+    fn test_iv_derivation_v1_matches_python_formula() {
+        let nonce = 0x1122334455667788u64;
+        let session_uuid = [0x42u8; 16];
+        let iv = SAACPFrame::derive_iv_v1(nonce, &session_uuid);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(nonce.to_be_bytes());
+        h.update(session_uuid);
+        let expect = &h.finalize()[..12];
+        assert_eq!(&iv[..], expect);
     }
 }
