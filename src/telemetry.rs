@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -33,11 +33,24 @@ fn now_epoch_secs() -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Process-wide telemetry collector.
-pub static GLOBAL_TELEMETRY: OnceLock<TelemetryCollector> = OnceLock::new();
+///
+/// Phase 4: holds an `Arc<TelemetryCollector>` so a [`crate::context::
+/// SaacpContext`] default instance can share the EXACT same collector (not a
+/// copy) while hermetic contexts own their own. Method calls through the
+/// static (`GLOBAL_TELEMETRY.record_*()`) keep working unchanged via `Arc`'s
+/// Deref.
+pub static GLOBAL_TELEMETRY: LazyLock<Arc<TelemetryCollector>> =
+    LazyLock::new(|| Arc::new(TelemetryCollector::new()));
 
 /// Initialise and return the global collector (idempotent).
 pub fn global_telemetry() -> &'static TelemetryCollector {
-    GLOBAL_TELEMETRY.get_or_init(TelemetryCollector::new)
+    &GLOBAL_TELEMETRY
+}
+
+/// Phase 4: an `Arc` handle to the global collector — for
+/// `SaacpContext::shared_default()` to alias the same instance.
+pub fn global_telemetry_arc() -> Arc<TelemetryCollector> {
+    Arc::clone(&GLOBAL_TELEMETRY)
 }
 
 /// Subscribe the global telemetry collector to `TrustDecayEngine::global()`'s
@@ -1812,7 +1825,7 @@ pub struct SecurityAlertFeed {
 }
 
 impl SecurityAlertFeed {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ring: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -1821,8 +1834,14 @@ impl SecurityAlertFeed {
 
     /// Process-wide singleton.
     pub fn global() -> &'static SecurityAlertFeed {
-        static GLOBAL: OnceLock<SecurityAlertFeed> = OnceLock::new();
-        GLOBAL.get_or_init(SecurityAlertFeed::new)
+        Self::global_arc()
+    }
+
+    /// Phase 4: see `TrustDecayEngine::global_arc` (context aliasing).
+    pub fn global_arc() -> &'static Arc<SecurityAlertFeed> {
+        static GLOBAL: LazyLock<Arc<SecurityAlertFeed>> =
+            LazyLock::new(|| Arc::new(SecurityAlertFeed::new()));
+        &GLOBAL
     }
 
     /// Record one alert: push to the bounded ring, then notify subscribers.

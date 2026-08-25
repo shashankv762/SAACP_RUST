@@ -16,7 +16,7 @@
 //! number of concurrent stream sessions.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -666,8 +666,14 @@ impl StreamRegistry {
 
     /// Global process-wide singleton StreamRegistry.
     pub fn global() -> &'static StreamRegistry {
-        static GLOBAL: OnceLock<StreamRegistry> = OnceLock::new();
-        GLOBAL.get_or_init(StreamRegistry::new)
+        Self::global_arc()
+    }
+
+    /// Phase 4: see `TrustDecayEngine::global_arc` (context aliasing).
+    pub fn global_arc() -> &'static std::sync::Arc<StreamRegistry> {
+        static GLOBAL: std::sync::LazyLock<std::sync::Arc<StreamRegistry>> =
+            std::sync::LazyLock::new(|| std::sync::Arc::new(StreamRegistry::new()));
+        &GLOBAL
     }
 
     /// Register a STREAM_START and return a mutable ref snapshot.

@@ -280,6 +280,10 @@ pub struct SAACPTlsDaemon {
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     /// See `SAACPNetworkDaemon`'s field of the same name — identical semantics.
     handshake_timeout_secs: Option<f64>,
+    /// Phase 4: explicit pipeline context. `None` runs on
+    /// `SaacpContext::shared_default()` — byte-identical to the pre-Phase-4
+    /// global behavior. See `SAACPNetworkDaemon::with_context`.
+    context: Option<Arc<crate::context::SaacpContext>>,
 }
 
 impl SAACPTlsDaemon {
@@ -308,7 +312,16 @@ impl SAACPTlsDaemon {
             gossip: None,
             cluster: None,
             handshake_timeout_secs: None,
+            context: None,
         }
+    }
+
+    /// Phase 4: run this daemon's gate pipeline on an explicit
+    /// [`crate::context::SaacpContext`] instead of the process-wide shared
+    /// default. See `SAACPNetworkDaemon::with_context` — identical semantics.
+    pub fn with_context(mut self, context: Arc<crate::context::SaacpContext>) -> Self {
+        self.context = Some(context);
+        self
     }
 
     /// See `SAACPNetworkDaemon::with_handshake_timeout` — identical semantics.
@@ -472,13 +485,14 @@ impl SAACPTlsDaemon {
                             let gossip          = self.gossip.clone();
                             let cluster         = self.cluster.clone();
                             let handshake_timeout_override = self.handshake_timeout_secs;
+                            let daemon_context  = self.context.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
                                 serve_tls_connection(
                                     stream, peer_addr, tls_acceptor, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
-                                    handshake_timeout_override,
+                                    handshake_timeout_override, daemon_context,
                                 ).await;
                             });
                         }
@@ -543,6 +557,7 @@ async fn serve_tls_connection(
     gossip: Option<Arc<crate::gossip::GossipEngine>>,
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     handshake_timeout_override: Option<f64>,
+    context: Option<Arc<crate::context::SaacpContext>>,
 ) {
     // H-18-equivalent fix: bound the TLS handshake itself, so a peer that opens the TCP
     // socket and then never completes (or trickles) ClientHello cannot hold a spawned task
@@ -584,6 +599,7 @@ async fn serve_tls_connection(
         gossip,
         cluster,
         handshake_timeout_override,
+        context,
     )
     .await;
 }

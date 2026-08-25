@@ -52,6 +52,7 @@ fn wire_session_id_hex(packet: &[u8]) -> String {
 }
 
 use crate::aegf::AEGFGovernor;
+use crate::context::SaacpContext;
 use crate::cscs::CSCSLoopDetector;
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::framing::{MEASCFrame, ParsedFrame, FLAG_BINARY_STREAM, FLAG_COVER_TRAFFIC};
@@ -60,12 +61,10 @@ use crate::measc::SessionEpochManager;
 use crate::memory::FederatedMemory;
 use crate::schemas::PreCompiledSchemas;
 use crate::security::ImmutableAuditLog;
-use crate::streaming::StreamRegistry;
 use crate::telemetry::report_gate_rejection;
 use crate::temporal::DeadMansSwitch;
 use crate::trust_decay::{
-    trust_key_for, IntentDriftTracker, PenaltyKind, RewardKind, TrustDecayEngine,
-    CHAIN_DRIFT_CEILING,
+    trust_key_for, IntentDriftTracker, PenaltyKind, RewardKind, CHAIN_DRIFT_CEILING,
 };
 
 /// Wrap a gate call expression with latency instrumentation (Phase 5
@@ -1784,8 +1783,38 @@ impl SAACPProtocolHandler {
     /// Full gate pipeline with optional injectable dependencies.
     /// Use `intercept_packet()` for the standard API; this method allows
     /// tests and the daemon to inject specific security components.
+    /// Phase 4: shared-default entry point — see
+    /// [`Self::intercept_packet_full_with_ctx`].
     #[allow(clippy::too_many_arguments)]
     pub fn intercept_packet_full(
+        packet: &[u8],
+        secret_key: &[u8],
+        current_agent_name: &str,
+        is_pinned: bool,
+        gateway: Option<&ZeroTrustGateway>,
+        rate_limiter: Option<&AgentRateLimiter>,
+        audit_log: Option<&ImmutableAuditLog>,
+        _aegf_governor: Option<&AEGFGovernor>,
+        _cscs: Option<&CSCSLoopDetector>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
+        Self::intercept_packet_full_with_ctx(
+            SaacpContext::shared_default(),
+            packet,
+            secret_key,
+            current_agent_name,
+            is_pinned,
+            gateway,
+            rate_limiter,
+            audit_log,
+            _aegf_governor,
+            _cscs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn intercept_packet_full_with_ctx(
+        ctx: &SaacpContext,
+
         packet: &[u8],
         secret_key: &[u8],
         current_agent_name: &str,
@@ -1841,7 +1870,7 @@ impl SAACPProtocolHandler {
         // session_id is read straight off the (still-encrypted) wire header since no
         // `ParsedPacket` exists yet at this pre-Gate-0 checkpoint.
         let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
-        if TrustDecayEngine::global().requires_reauth_at(&trust_key, pregate_now) {
+        if ctx.trust.requires_reauth_at(&trust_key, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -1854,6 +1883,7 @@ impl SAACPProtocolHandler {
 
         // Wrap the pipeline so we can record errors for the rate limiter.
         let result = Self::_intercept_packet_inner(
+            ctx,
             packet,
             secret_key,
             current_agent_name,
@@ -1882,10 +1912,10 @@ impl SAACPProtocolHandler {
             // `LateralMovementBlocked` covers both Gate 3.0 and an unrelated
             // missing-token failure), so bytecode identity is not a reliable
             // signal for "was this already penalized more specifically."
-            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::GenericHardDrop);
-            crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
+            let _ = ctx.trust.penalize(&trust_key, PenaltyKind::GenericHardDrop);
+            ctx.telemetry.record_packet_rejected(current_agent_name);
         } else {
-            crate::telemetry::global_telemetry().record_packet_accepted();
+            ctx.telemetry.record_packet_accepted();
         }
 
         // ── Python parity: auto-register STREAM_START in StreamRegistry ───────
@@ -1897,17 +1927,16 @@ impl SAACPProtocolHandler {
                 let stream_id = &parsed.session_uuid;
                 let source_agent = &parsed.source_agent;
                 // Start the stream session (idempotent if already registered).
-                let _ = crate::streaming::StreamRegistry::global().start_stream(
-                    stream_id,
-                    source_agent,
-                    current_agent_name,
-                );
+                let _ = ctx
+                    .streams
+                    .start_stream(stream_id, source_agent, current_agent_name);
                 // Register token sig hash, expiry, and max_action_class (CRIT-2 fix)
                 // for Gate 1.0 / Gate 2.5 on continuations.
                 if let Some(JsonValue::String(ref cap_tok)) =
                     parsed.payload_dict.get("_capability_token")
                 {
-                    Self::register_stream_start_token(
+                    Self::register_stream_start_token_with_ctx(
+                        ctx,
                         stream_id,
                         cap_tok,
                         &parsed.token_sig_hash,
@@ -1948,8 +1977,37 @@ impl SAACPProtocolHandler {
     /// firewall, sequence monotonicity, per-frame audit) runs unchanged. The
     /// v1 blanket rejection of stream frames here was a scope limit, now
     /// closed.
+    /// Phase 4: the shared-default entry point — identical to
+    /// [`Self::intercept_packet_encrypted_with_ctx`] on the process-wide
+    /// default context.
     #[allow(clippy::too_many_arguments)]
     pub fn intercept_packet_encrypted(
+        packet: &[u8],
+        epoch_manager: &SessionEpochManager,
+        audit_secret: &[u8],
+        current_agent_name: &str,
+        is_pinned: bool,
+        gateway: Option<&ZeroTrustGateway>,
+        rate_limiter: Option<&AgentRateLimiter>,
+        audit_log: Option<&ImmutableAuditLog>,
+    ) -> Result<ParsedPacket, SAACPHardDrop> {
+        Self::intercept_packet_encrypted_with_ctx(
+            SaacpContext::shared_default(),
+            packet,
+            epoch_manager,
+            audit_secret,
+            current_agent_name,
+            is_pinned,
+            gateway,
+            rate_limiter,
+            audit_log,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn intercept_packet_encrypted_with_ctx(
+        ctx: &SaacpContext,
+
         packet: &[u8],
         epoch_manager: &SessionEpochManager,
         audit_secret: &[u8],
@@ -1981,7 +2039,7 @@ impl SAACPProtocolHandler {
 
         // S-2 fix: see the identical comment in `intercept_packet_full` above.
         let trust_key = trust_key_for(current_agent_name, &wire_session_id_hex(packet));
-        if TrustDecayEngine::global().requires_reauth_at(&trust_key, pregate_now) {
+        if ctx.trust.requires_reauth_at(&trust_key, pregate_now) {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TrustReauthRequired,
                 format!(
@@ -2007,6 +2065,7 @@ impl SAACPProtocolHandler {
             // kinetic firewall, sequence monotonicity, audit).
             if parsed.status_code == SAACPBytecodes::StreamContinuation as u8 {
                 return Self::stream_continuation_core(
+                    ctx,
                     parsed,
                     current_agent_name,
                     audit_secret,
@@ -2016,6 +2075,7 @@ impl SAACPProtocolHandler {
             }
             if parsed.status_code == SAACPBytecodes::StreamEnd as u8 {
                 return Self::stream_end_core(
+                    ctx,
                     parsed,
                     current_agent_name,
                     audit_secret,
@@ -2024,6 +2084,7 @@ impl SAACPProtocolHandler {
                 );
             }
             Self::run_gates_1_through_12(
+                ctx,
                 parsed,
                 packet,
                 audit_secret,
@@ -2039,25 +2100,24 @@ impl SAACPProtocolHandler {
 
         if result.is_err() {
             let _ = effective_rl.record_error(current_agent_name);
-            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::GenericHardDrop);
-            crate::telemetry::global_telemetry().record_packet_rejected(current_agent_name);
+            let _ = ctx.trust.penalize(&trust_key, PenaltyKind::GenericHardDrop);
+            ctx.telemetry.record_packet_rejected(current_agent_name);
         } else {
-            crate::telemetry::global_telemetry().record_packet_accepted();
+            ctx.telemetry.record_packet_accepted();
         }
 
         if let Ok(ref parsed) = result {
             if parsed.status_code == SAACPBytecodes::StreamStart as u8 {
                 let stream_id = &parsed.session_uuid;
                 let source_agent = &parsed.source_agent;
-                let _ = crate::streaming::StreamRegistry::global().start_stream(
-                    stream_id,
-                    source_agent,
-                    current_agent_name,
-                );
+                let _ = ctx
+                    .streams
+                    .start_stream(stream_id, source_agent, current_agent_name);
                 if let Some(JsonValue::String(ref cap_tok)) =
                     parsed.payload_dict.get("_capability_token")
                 {
-                    Self::register_stream_start_token(
+                    Self::register_stream_start_token_with_ctx(
+                        ctx,
                         stream_id,
                         cap_tok,
                         &parsed.token_sig_hash,
@@ -2081,6 +2141,7 @@ impl SAACPProtocolHandler {
     /// duplicating all eleven downstream gates a second time.
     #[allow(clippy::too_many_arguments)]
     fn _intercept_packet_inner(
+        ctx: &SaacpContext,
         packet: &[u8],
         secret_key: &[u8],
         current_agent_name: &str,
@@ -2100,6 +2161,7 @@ impl SAACPProtocolHandler {
             report_gate_rejection("gate_0_crypto", current_agent_name, e);
         })?;
         Self::run_gates_1_through_12(
+            ctx,
             parsed,
             packet,
             secret_key,
@@ -2119,8 +2181,9 @@ impl SAACPProtocolHandler {
     /// doc comment for why this is split out.
     #[allow(clippy::too_many_arguments)]
     fn run_gates_1_through_12(
+        ctx: &SaacpContext,
         mut parsed: ParsedPacket,
-        packet: &[u8],
+        _packet: &[u8],
         secret_key: &[u8],
         current_agent_name: &str,
         is_pinned: bool,
@@ -2134,27 +2197,38 @@ impl SAACPProtocolHandler {
         // key instead of the bare `current_agent_name` — see `trust_key_for`'s doc comment.
         let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
 
+        // Phase 4: with no explicitly-injected audit log, THIS context's audit
+        // chain is the fallback (not the process global) — Gate 2.5's health
+        // check and Gate 6.0's checkpoint then land on the tenant's own chain.
+        let audit_log = audit_log.or_else(|| Some(ctx.audit.as_ref()));
+
         // ── Stream fast-path routing (P1-1) ──────────────────────────────────
         // Route STREAM_CONTINUATION and STREAM_END to their dedicated handlers.
         // CRIT-2 fix: these handlers now enforce the full minimum gate set
         // (Authorization Invariance, opusplan.md Part 1.4/CRIT-2) — Gate 0,
         // Gate 1.0 (expiry + revocation), Gate 2.5 (kinetic firewall), sequence
         // monotonicity, Gate 4.0 (text streams), and Gate 6.0 (audit, every frame).
+        // Phase 4: route straight into the ctx-aware cores — `parsed` has
+        // already cleared Gate 0 on `packet`+`secret_key` here, so this is
+        // exactly `handle_stream_continuation`/`handle_stream_end` minus their
+        // redundant Gate-0 re-run, and without dropping to the shared-default
+        // context those public entry points pin.
         if parsed.status_code == SAACPBytecodes::StreamContinuation as u8 {
-            return Self::handle_stream_continuation(
-                packet,
-                secret_key,
+            return Self::stream_continuation_core(
+                ctx,
+                parsed,
                 current_agent_name,
+                secret_key,
                 gateway,
-                rate_limiter,
                 audit_log,
             );
         }
         if parsed.status_code == SAACPBytecodes::StreamEnd as u8 {
-            return Self::handle_stream_end(
-                packet,
-                secret_key,
+            return Self::stream_end_core(
+                ctx,
+                parsed,
                 current_agent_name,
+                secret_key,
                 gateway,
                 audit_log,
             );
@@ -2194,7 +2268,7 @@ impl SAACPProtocolHandler {
                     &traceparent_hex,
                 );
             } else {
-                ImmutableAuditLog::global().append_event(
+                ctx.audit.as_ref().append_event(
                     secret_key,
                     "[COVER_TRAFFIC]",
                     current_agent_name,
@@ -2349,7 +2423,7 @@ impl SAACPProtocolHandler {
         // authorization ceiling from, so Gate 2.5/3.0/etc. all inherit the
         // downgrade for free without needing their own trust-aware branch.
         // The token itself is untouched; this is a runtime-only cap.
-        let max_action_class_from_token = match TrustDecayEngine::global().scope_cap(&trust_key) {
+        let max_action_class_from_token = match ctx.trust.scope_cap(&trust_key) {
             Some(cap) => token_result.max_action_class.min(cap),
             None => token_result.max_action_class,
         };
@@ -2386,7 +2460,7 @@ impl SAACPProtocolHandler {
                     source_agent, mismatch,
                 ),
             );
-            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
+            let _ = ctx.trust.penalize(&trust_key, PenaltyKind::ScopeViolation);
             report_gate_rejection("gate_1_0_identity_binding", current_agent_name, &e);
             return Err(e);
         }
@@ -2442,7 +2516,7 @@ impl SAACPProtocolHandler {
             "aca_attestation",
             crate::aca::enforce_attestation(&source_agent, parsed.action_class)
         ) {
-            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
+            let _ = ctx.trust.penalize(&trust_key, PenaltyKind::ScopeViolation);
             report_gate_rejection("aca_attestation", current_agent_name, &e);
             return Err(e);
         }
@@ -2457,7 +2531,8 @@ impl SAACPProtocolHandler {
                 "gate_1_5_intent",
                 Self::enforce_root_intent(rint, &parsed.payload_dict)
             ) {
-                let _ = TrustDecayEngine::global()
+                let _ = ctx
+                    .trust
                     .penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
@@ -2471,7 +2546,8 @@ impl SAACPProtocolHandler {
                 "gate_1_5_intent",
                 Self::gate_1_5c_dangerous_action_consistency(rint, &parsed.payload_dict)
             ) {
-                let _ = TrustDecayEngine::global()
+                let _ = ctx
+                    .trust
                     .penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
@@ -2487,7 +2563,8 @@ impl SAACPProtocolHandler {
                     &parsed.session_uuid,
                 )
             ) {
-                let _ = TrustDecayEngine::global()
+                let _ = ctx
+                    .trust
                     .penalize(&trust_key, PenaltyKind::IntentDriftCeiling);
                 report_gate_rejection("gate_1_5_intent", current_agent_name, &e);
                 return Err(e);
@@ -2572,7 +2649,7 @@ impl SAACPProtocolHandler {
             "gate_3_0_lateral",
             Self::gate_3_0_lateral_movement(parsed.flags, &parsed.payload_dict)
         ) {
-            let _ = TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ScopeViolation);
+            let _ = ctx.trust.penalize(&trust_key, PenaltyKind::ScopeViolation);
             report_gate_rejection("gate_3_0_lateral", current_agent_name, &e);
             return Err(e);
         }
@@ -2592,8 +2669,9 @@ impl SAACPProtocolHandler {
                 "gate_4_0_inject",
                 Self::gate_4_0_injection_scan_map_tiered(&parsed.payload_dict, full_scan)
             ) {
-                let _ =
-                    TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                let _ = ctx
+                    .trust
+                    .penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
@@ -2610,8 +2688,9 @@ impl SAACPProtocolHandler {
                 "sid_semantic",
                 crate::sid::enforce_semantic_injection(&parsed.payload_dict)
             ) {
-                let _ =
-                    TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                let _ = ctx
+                    .trust
+                    .penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("sid_semantic", current_agent_name, &e);
                 return Err(e);
             }
@@ -2622,8 +2701,9 @@ impl SAACPProtocolHandler {
             "gate_5_0_epistemic",
             Self::gate_5_0_epistemic_cb(parsed.schema_id, &parsed.payload_dict)
         ) {
-            let _ =
-                TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
+            let _ = ctx
+                .trust
+                .penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
             report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
             return Err(e);
         }
@@ -2638,7 +2718,8 @@ impl SAACPProtocolHandler {
                     root_intent_hash.as_deref()
                 )
             ) {
-                let _ = TrustDecayEngine::global()
+                let _ = ctx
+                    .trust
                     .penalize(&trust_key, PenaltyKind::EpistemicOverclaim);
                 report_gate_rejection("gate_5_0_epistemic", current_agent_name, &e);
                 return Err(e);
@@ -2673,7 +2754,7 @@ impl SAACPProtocolHandler {
             );
         } else {
             // Use the global audit log when none injected.
-            ImmutableAuditLog::global().append_event(
+            ctx.audit.as_ref().append_event(
                 secret_key,
                 &source_agent,
                 current_agent_name,
@@ -2911,7 +2992,7 @@ impl SAACPProtocolHandler {
         // `RewardKind::CleanPassage` documents. IRREVERSIBLE-class actions (>= 0x02)
         // earn the doubled reward — clean handling of the riskiest action class is
         // stronger positive evidence than a READ_ONLY passage.
-        TrustDecayEngine::global().reward(
+        ctx.trust.reward(
             &trust_key,
             RewardKind::CleanPassage,
             parsed.action_class >= 0x02,
@@ -2953,7 +3034,14 @@ impl SAACPProtocolHandler {
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
         let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
-        Self::stream_continuation_core(parsed, current_agent_name, secret_key, gateway, audit_log)
+        Self::stream_continuation_core(
+            SaacpContext::shared_default(),
+            parsed,
+            current_agent_name,
+            secret_key,
+            gateway,
+            audit_log,
+        )
     }
 
     /// C1: key-material-agnostic continuation core — every gate after Gate 0.
@@ -2962,6 +3050,7 @@ impl SAACPProtocolHandler {
     /// AEAD-verified and replay-checked against the per-epoch traffic key by
     /// `gate_0_crypto_integrity_encrypted`.
     fn stream_continuation_core(
+        ctx: &SaacpContext,
         mut parsed: ParsedPacket,
         current_agent_name: &str,
         audit_secret: &[u8],
@@ -2971,9 +3060,11 @@ impl SAACPProtocolHandler {
         let stream_id = parsed.session_uuid.clone();
         // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
         let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
+        // Phase 4: audit fallback is this context's chain, not the global.
+        let audit_log = audit_log.or_else(|| Some(ctx.audit.as_ref()));
 
         // Verify the stream exists and its originating token hasn't been revoked
-        let session_info = StreamRegistry::global().get_stream_info(&stream_id);
+        let session_info = ctx.streams.get_stream_info(&stream_id);
         let (token_exp, token_sig_hash, last_seq, max_action_class, stream_source_agent) =
             match session_info {
                 Some(info) => info,
@@ -2991,7 +3082,7 @@ impl SAACPProtocolHandler {
             .unwrap_or_default()
             .as_secs_f64();
         if token_exp > 0.0 && now > token_exp {
-            StreamRegistry::global().abort_stream(&stream_id);
+            ctx.streams.abort_stream(&stream_id);
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TokenExpired,
                 "Stream aborted: originating capability token has EXPIRED.",
@@ -3007,7 +3098,7 @@ impl SAACPProtocolHandler {
             let global_gw = crate::gateway::ZeroTrustGateway::global();
             let effective_gw: &crate::gateway::ZeroTrustGateway = gateway.unwrap_or(global_gw);
             if effective_gw.is_token_revoked(&token_sig_hash) {
-                StreamRegistry::global().abort_stream(&stream_id);
+                ctx.streams.abort_stream(&stream_id);
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::LateralMovementBlocked,
                     "Stream aborted: originating token has been REVOKED.",
@@ -3025,7 +3116,7 @@ impl SAACPProtocolHandler {
         if let Err(e) =
             Self::gate_2_5_kinetic_firewall(parsed.action_class, max_action_class, audit_log)
         {
-            StreamRegistry::global().abort_stream(&stream_id);
+            ctx.streams.abort_stream(&stream_id);
             report_gate_rejection("gate_2_5_kinetic", current_agent_name, &e);
             return Err(e);
         }
@@ -3044,8 +3135,7 @@ impl SAACPProtocolHandler {
                 // which shares this branch but is comparatively weak
                 // evidence) — penalize regardless, ReplaySuspicion already
                 // reflects the stronger end of the weight scale.
-                let _ =
-                    TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::ReplaySuspicion);
+                let _ = ctx.trust.penalize(&trust_key, PenaltyKind::ReplaySuspicion);
                 return Err(SAACPHardDrop::new(
                     code,
                     format!(
@@ -3081,8 +3171,9 @@ impl SAACPProtocolHandler {
                 // Parity with Gate 4.0's penalty in run_gates_1_through_12 — a
                 // detected injection costs behavioral trust regardless of which
                 // pipeline caught it.
-                let _ =
-                    TrustDecayEngine::global().penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                let _ = ctx
+                    .trust
+                    .penalize(&trust_key, PenaltyKind::InjectionAttempt);
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
@@ -3099,7 +3190,7 @@ impl SAACPProtocolHandler {
         );
         let log: &ImmutableAuditLog = match audit_log {
             Some(l) => l,
-            None => ImmutableAuditLog::global(),
+            None => ctx.audit.as_ref(),
         };
         log.append_event(
             audit_secret,
@@ -3111,11 +3202,9 @@ impl SAACPProtocolHandler {
         );
 
         // Advance stream state only after all security gates have passed.
-        let _ = StreamRegistry::global().continue_stream(
-            &stream_id,
-            parsed.sequence_id,
-            actual_data_len,
-        );
+        let _ = ctx
+            .streams
+            .continue_stream(&stream_id, parsed.sequence_id, actual_data_len);
 
         // Last use of stream_text in this function — move instead of clone. The
         // earlier clone (line ~1529, inside the conditional injection-scan branch)
@@ -3147,12 +3236,20 @@ impl SAACPProtocolHandler {
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── Gate 0: Cryptographic integrity ──────────────────────────────────
         let parsed = Self::gate_0_crypto_integrity(packet, secret_key)?;
-        Self::stream_end_core(parsed, current_agent_name, secret_key, gateway, audit_log)
+        Self::stream_end_core(
+            SaacpContext::shared_default(),
+            parsed,
+            current_agent_name,
+            secret_key,
+            gateway,
+            audit_log,
+        )
     }
 
     /// C1: key-material-agnostic END core — every gate after Gate 0 (see
     /// `stream_continuation_core`'s doc comment for the two entry paths).
     fn stream_end_core(
+        ctx: &SaacpContext,
         mut parsed: ParsedPacket,
         current_agent_name: &str,
         audit_secret: &[u8],
@@ -3162,8 +3259,10 @@ impl SAACPProtocolHandler {
         let stream_id = parsed.session_uuid.clone();
         // S-2 fix: see `trust_key_for`'s doc comment / `run_gates_1_through_12`.
         let trust_key = trust_key_for(current_agent_name, &parsed.session_uuid);
+        // Phase 4: audit fallback is this context's chain, not the global.
+        let audit_log = audit_log.or_else(|| Some(ctx.audit.as_ref()));
 
-        let session_info = StreamRegistry::global().get_stream_info(&stream_id);
+        let session_info = ctx.streams.get_stream_info(&stream_id);
         if let Some((
             token_exp,
             token_sig_hash,
@@ -3178,7 +3277,7 @@ impl SAACPProtocolHandler {
                 .unwrap_or_default()
                 .as_secs_f64();
             if *token_exp > 0.0 && now > *token_exp {
-                StreamRegistry::global().abort_stream(&stream_id);
+                ctx.streams.abort_stream(&stream_id);
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::TokenExpired,
                     "Stream aborted at END: originating capability token has EXPIRED.",
@@ -3193,7 +3292,7 @@ impl SAACPProtocolHandler {
                 let global_gw = crate::gateway::ZeroTrustGateway::global();
                 let effective_gw: &crate::gateway::ZeroTrustGateway = gateway.unwrap_or(global_gw);
                 if effective_gw.is_token_revoked(token_sig_hash) {
-                    StreamRegistry::global().abort_stream(&stream_id);
+                    ctx.streams.abort_stream(&stream_id);
                     return Err(SAACPHardDrop::new(
                         SAACPBytecodes::LateralMovementBlocked,
                         "Stream aborted at END: originating token has been REVOKED.",
@@ -3208,7 +3307,7 @@ impl SAACPProtocolHandler {
             if let Err(e) =
                 Self::gate_2_5_kinetic_firewall(parsed.action_class, *max_action_class, audit_log)
             {
-                StreamRegistry::global().abort_stream(&stream_id);
+                ctx.streams.abort_stream(&stream_id);
                 report_gate_rejection("gate_2_5_kinetic", current_agent_name, &e);
                 return Err(e);
             }
@@ -3226,7 +3325,8 @@ impl SAACPProtocolHandler {
                     JsonValue::String(end_text),
                 )]);
                 if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
-                    let _ = TrustDecayEngine::global()
+                    let _ = ctx
+                        .trust
                         .penalize(&trust_key, PenaltyKind::InjectionAttempt);
                     report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                     return Err(e);
@@ -3235,15 +3335,14 @@ impl SAACPProtocolHandler {
         }
 
         // Finalize stream
-        let (total_bytes, frame_count, source_agent) =
-            match StreamRegistry::global().end_stream(&stream_id) {
-                Some(session) => (
-                    session.total_bytes,
-                    session.frame_count,
-                    session.source_agent,
-                ),
-                None => (0, 0, String::new()),
-            };
+        let (total_bytes, frame_count, source_agent) = match ctx.streams.end_stream(&stream_id) {
+            Some(session) => (
+                session.total_bytes,
+                session.frame_count,
+                session.source_agent,
+            ),
+            None => (0, 0, String::new()),
+        };
 
         parsed.payload_dict.insert(
             "_stream_data".to_string(),
@@ -3261,7 +3360,7 @@ impl SAACPProtocolHandler {
         );
         let log = audit_log
             .map(|l| l as &ImmutableAuditLog)
-            .unwrap_or_else(|| ImmutableAuditLog::global());
+            .unwrap_or_else(|| ctx.audit.as_ref());
         log.append_event(
             audit_secret,
             &source_agent,
@@ -3284,6 +3383,9 @@ impl SAACPProtocolHandler {
     /// 1.0's already-validated, trust-decay-capped ceiling — see
     /// `run_gates_1_through_12`), registers them on the StreamSession for enforcement
     /// on all subsequent continuation/end frames (CRIT-2 fix).
+    ///
+    /// Phase 4: shared-default entry point — see
+    /// [`Self::register_stream_start_token_with_ctx`].
     pub fn register_stream_start_token(
         stream_id: &str,
         capability_token_b64: &str,
@@ -3291,8 +3393,29 @@ impl SAACPProtocolHandler {
         source_agent: &str,
         max_action_class: u8,
     ) {
+        Self::register_stream_start_token_with_ctx(
+            SaacpContext::shared_default(),
+            stream_id,
+            capability_token_b64,
+            token_sig_hash,
+            source_agent,
+            max_action_class,
+        );
+    }
+
+    /// Phase 4: ctx-aware counterpart — registers on `ctx.streams` instead of
+    /// the process-global registry, so multi-tenant pipelines keep each
+    /// tenant's stream-token metadata in its own [`SaacpContext`].
+    pub fn register_stream_start_token_with_ctx(
+        ctx: &SaacpContext,
+        stream_id: &str,
+        capability_token_b64: &str,
+        token_sig_hash: &str,
+        source_agent: &str,
+        max_action_class: u8,
+    ) {
         let token_exp = extract_token_exp(capability_token_b64.as_bytes());
-        StreamRegistry::global().set_stream_token_info(
+        ctx.streams.set_stream_token_info(
             stream_id,
             token_sig_hash,
             token_exp,

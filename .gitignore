@@ -33,6 +33,13 @@ imp_plan*
 /scripts/
 /.tmp-target-build/
 
+# Local working/analysis docs and tooling state (same class as opusplan/imp_plan
+# above): the kimiplan assessment is responded to normatively in
+# KIMIPLAN_RESPONSE.md, which quotes what it needs.
+/kimiplan
+/.zcode/
+/.rbxsync-trash/
+
 # Benchmark run artifacts (regenerable from `cargo bench`) — the curated,
 # human-readable results live in benchmark_results.md instead.
 /bench_raw_output.txt

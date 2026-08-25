@@ -20,9 +20,10 @@
 // context, acceptable only here. Run with:
 //   cargo test --test breakit -- --nocapture
 //
-// Platform notes: The "survived" check may be flaky under some allocators or
-// in release builds with aggressive stack/register reuse. Run 50 iterations
-// and report the survival rate, not just pass/fail.
+// Platform notes: the survival check requires the FULL 32-byte marker to be
+// intact after drop (see the comment inside `key_survives_after_drop` for why
+// single-byte matching was a false-positive generator under allocator reuse).
+// Run 50 iterations and report the survival rate, not just pass/fail.
 
 use saacp::{KeyAlgorithm, KeyCategory, KeyDescriptor, KeyStatus};
 
@@ -97,11 +98,20 @@ fn key_survives_after_drop(heap_pressure_vecs: usize) -> bool {
     // checking whether the bytes were physically overwritten.
     let post_drop_bytes = unsafe { std::slice::from_raw_parts(raw_ptr, 32) };
 
-    // Check if ANY marker byte survived at its original position
-    let survived = post_drop_bytes
-        .iter()
-        .zip(MARKER_KEY.iter())
-        .any(|(a, b)| a == b);
+    // Survival criterion: the FULL 32-byte marker sequence must be intact.
+    //
+    // The earlier "any single marker byte survives" criterion was a false
+    // positive generator: once the Vec is freed, the allocator is free to
+    // reuse the block, and any byte it writes has a 1/256 chance of
+    // coincidentally equaling the marker byte at that position (~12%
+    // per-trial false-positive ceiling across 32 positions when reuse
+    // occurs; observed ~2% under load). A single matching byte is also
+    // forensically meaningless — it tells an attacker nothing about the
+    // key. The full-sequence check still catches exactly the regression
+    // this file guards (pre-ZeroizeOnDrop, the entire key survives drop,
+    // a full match) while being false-positive-proof: the allocator would
+    // have to rewrite all 32 marker bytes verbatim (~2^-256).
+    let survived = post_drop_bytes == MARKER_KEY;
 
     survived
 }

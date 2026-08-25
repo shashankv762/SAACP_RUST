@@ -364,6 +364,13 @@ pub struct SAACPNetworkDaemon {
     /// Ed25519 signature against the cluster `TrustStore` and enforces roster membership,
     /// freshness, and replay protection before a single field reaches the membership view.
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
+    /// Phase 4: explicit pipeline context (trust engine, audit log, stream
+    /// registry, rulepacks). `None` runs the pipeline on
+    /// [`crate::context::SaacpContext::shared_default`] — byte-identical to
+    /// the pre-Phase-4 global behavior. Set via [`Self::with_context`] for
+    /// multi-tenant deployments where this daemon's trust/audit universe must
+    /// be isolated from other tenants in the same process.
+    context: Option<std::sync::Arc<crate::context::SaacpContext>>,
     /// F12: per-deployment override for the plain-mode ECDH handshake timeout
     /// (seconds). `None` uses [`HANDSHAKE_TIMEOUT_SECS`] (2.0s). Set via
     /// [`SAACPNetworkDaemon::with_handshake_timeout`] — e.g. 10.0 for
@@ -431,7 +438,16 @@ impl SAACPNetworkDaemon {
             gossip: None,
             cluster: None,
             handshake_timeout_secs: None,
+            context: None,
         }
+    }
+
+    /// Phase 4: run this daemon's gate pipeline on an explicit
+    /// [`SaacpContext`] instead of the process-wide shared default. See the
+    /// `context` field doc.
+    pub fn with_context(mut self, context: std::sync::Arc<crate::context::SaacpContext>) -> Self {
+        self.context = Some(context);
+        self
     }
 
     /// Override the plain-mode ECDH handshake timeout (seconds). See the
@@ -730,6 +746,7 @@ impl SAACPNetworkDaemon {
                             let gossip        = self.gossip.clone();
                             let cluster       = self.cluster.clone();
                             let handshake_timeout_override = self.handshake_timeout_secs;
+                            let daemon_context = self.context.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -742,7 +759,7 @@ impl SAACPNetworkDaemon {
                                 handle_client(
                                     stream, peer_addr, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
-                                    handshake_timeout_override,
+                                    handshake_timeout_override, daemon_context,
                                 ).await;
                             });
                         }
@@ -832,6 +849,8 @@ pub(crate) async fn handle_client<S>(
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     // F12: per-deployment handshake-timeout override; `None` = const defaults.
     handshake_timeout_override: Option<f64>,
+    // Phase 4: explicit pipeline context; `None` = shared default.
+    context: Option<Arc<crate::context::SaacpContext>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -1174,8 +1193,12 @@ pub(crate) async fn handle_client<S>(
                 }
             }
             let gw_for_task = gateway.clone();
+            let ctx_for_task = context.clone().unwrap_or_else(|| {
+                std::sync::Arc::clone(crate::context::SaacpContext::shared_default_arc())
+            });
             tokio::task::spawn_blocking(move || {
-                let result = SAACPProtocolHandler::intercept_packet_encrypted(
+                let result = SAACPProtocolHandler::intercept_packet_encrypted_with_ctx(
+                    &ctx_for_task,
                     &full_packet,
                     &epoch_mgr,
                     &gate_secret,
@@ -1195,9 +1218,17 @@ pub(crate) async fn handle_client<S>(
             .await
         } else {
             let gw_for_task = gateway.clone();
+            let ctx_for_task = context.clone().unwrap_or_else(|| {
+                std::sync::Arc::clone(crate::context::SaacpContext::shared_default_arc())
+            });
             tokio::task::spawn_blocking(move || {
+                // Phase 4: both structural arms run on the daemon's context.
+                // The `None`-gateway arm passes all-None injection params,
+                // which is exactly `intercept_packet`'s contract, so no
+                // separate `intercept_packet_with_ctx` shim is needed.
                 let result = match gw_for_task.as_deref() {
-                    Some(gw) => SAACPProtocolHandler::intercept_packet_full(
+                    Some(gw) => SAACPProtocolHandler::intercept_packet_full_with_ctx(
+                        &ctx_for_task,
                         &full_packet,
                         &gate_secret,
                         &agent_name,
@@ -1208,11 +1239,17 @@ pub(crate) async fn handle_client<S>(
                         None,
                         None,
                     ),
-                    None => SAACPProtocolHandler::intercept_packet(
+                    None => SAACPProtocolHandler::intercept_packet_full_with_ctx(
+                        &ctx_for_task,
                         &full_packet,
                         &session_key_bytes,
                         &agent_name,
                         is_pinned,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ),
                 };
                 if let Ok(parsed) = &result {

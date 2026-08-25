@@ -587,7 +587,7 @@ pub struct RulePackStore {
 }
 
 impl RulePackStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             anchor: OnceLock::new(),
             current: arc_swap::ArcSwapOption::empty(),
@@ -598,8 +598,14 @@ impl RulePackStore {
     /// The process-wide store. Follows the crate's `OnceLock` → `&'static`
     /// singleton idiom (`ImmutableAuditLog::global`, `TrustDecayEngine::global`).
     pub fn global() -> &'static RulePackStore {
-        static GLOBAL: OnceLock<RulePackStore> = OnceLock::new();
-        GLOBAL.get_or_init(RulePackStore::new)
+        Self::global_arc()
+    }
+
+    /// Phase 4: see `TrustDecayEngine::global_arc` (context aliasing).
+    pub fn global_arc() -> &'static std::sync::Arc<RulePackStore> {
+        static GLOBAL: std::sync::LazyLock<std::sync::Arc<RulePackStore>> =
+            std::sync::LazyLock::new(|| std::sync::Arc::new(RulePackStore::new()));
+        &GLOBAL
     }
 
     /// Provision the one key that may sign rule packs for this process, together

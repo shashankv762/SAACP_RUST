@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1088,8 +1088,17 @@ impl ImmutableAuditLog {
     /// Process-wide global singleton ImmutableAuditLog.
     /// Initializes from `SAACP_AUDIT_LOG` and `SAACP_COUNT_FILE` env vars.
     pub fn global() -> &'static ImmutableAuditLog {
-        static GLOBAL: OnceLock<ImmutableAuditLog> = OnceLock::new();
-        GLOBAL.get_or_init(ImmutableAuditLog::with_default_path)
+        Self::global_arc()
+    }
+
+    /// Phase 4: see `TrustDecayEngine::global_arc` (context aliasing). The
+    /// default path/env handling is identical to `global()`'s.
+    pub fn global_arc() -> &'static std::sync::Arc<ImmutableAuditLog> {
+        static GLOBAL: std::sync::LazyLock<std::sync::Arc<ImmutableAuditLog>> =
+            std::sync::LazyLock::new(
+                || std::sync::Arc::new(ImmutableAuditLog::with_default_path()),
+            );
+        &GLOBAL
     }
 
     /// Initialize the chain from an existing log file (re-reads disk state).

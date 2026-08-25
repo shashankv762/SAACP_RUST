@@ -75,7 +75,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -484,8 +484,16 @@ impl TrustDecayEngine {
     /// Process-wide singleton, matching `AgentRateLimiter::global()` /
     /// `ZeroTrustGateway::global()`'s established pattern.
     pub fn global() -> &'static TrustDecayEngine {
-        static GLOBAL: OnceLock<TrustDecayEngine> = OnceLock::new();
-        GLOBAL.get_or_init(TrustDecayEngine::new)
+        Self::global_arc()
+    }
+
+    /// Phase 4: `Arc` handle to the process-wide engine — lets a
+    /// `crate::context::SaacpContext` default instance alias the exact same
+    /// engine (not a copy) while hermetic contexts own their own.
+    pub fn global_arc() -> &'static Arc<TrustDecayEngine> {
+        static GLOBAL: LazyLock<Arc<TrustDecayEngine>> =
+            LazyLock::new(|| Arc::new(TrustDecayEngine::new()));
+        &GLOBAL
     }
 
     /// Register a callback invoked synchronously on every trust-state
@@ -981,8 +989,14 @@ impl IntentDriftTracker {
 
     /// Process-wide singleton.
     pub fn global() -> &'static IntentDriftTracker {
-        static GLOBAL: OnceLock<IntentDriftTracker> = OnceLock::new();
-        GLOBAL.get_or_init(IntentDriftTracker::new)
+        Self::global_arc()
+    }
+
+    /// Phase 4: see `TrustDecayEngine::global_arc`.
+    pub fn global_arc() -> &'static Arc<IntentDriftTracker> {
+        static GLOBAL: LazyLock<Arc<IntentDriftTracker>> =
+            LazyLock::new(|| Arc::new(IntentDriftTracker::new()));
+        &GLOBAL
     }
 
     /// Add `divergence` to the running total for `session_uuid` and return the

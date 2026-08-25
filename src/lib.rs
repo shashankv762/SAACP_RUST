@@ -10,6 +10,7 @@ pub mod acsvaf_audit;
 pub mod acsvaf_authority;
 pub mod aegf;
 pub mod cluster;
+pub mod context;
 pub mod crypto_governance;
 pub mod cryptosuite;
 pub mod cscs;
@@ -92,6 +93,7 @@ pub use cluster::{
     CLUSTER_SCHEMA_ID, DEFAULT_DEAD_TIMEOUT, DEFAULT_LEASE_TTL, DEFAULT_MESSAGE_MAX_AGE,
     DEFAULT_SUSPECT_TIMEOUT, LEASE_KEY_PREFIX,
 };
+pub use context::SaacpContext;
 pub use crypto_governance::{
     get_active_policy, lab_policy, production_policy, ApprovedSuitePolicy, CryptoLedgerEntry,
     CryptoTransparencyLedger, NegotiationTranscript, SuiteNegotiator, SuiteStatus,
