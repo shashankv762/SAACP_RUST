@@ -33,11 +33,12 @@ agent's business logic.
 8. [Python Integration (`saacp.wrap`)](#python-integration-saacpwrap)
 9. [The Command Center Dashboard](#the-command-center-dashboard)
 10. [Cargo Feature Flags](#cargo-feature-flags)
-11. [Testing & Fuzzing](#testing--fuzzing)
-12. [Benchmarks](#benchmarks)
-13. [Security Model & Threat Coverage](#security-model--threat-coverage)
-14. [Project Layout](#project-layout)
-15. [License](#license)
+11. [Deployment Guide (Fleets & Load Balancers)](#deployment-guide-fleets--load-balancers)
+12. [Testing & Fuzzing](#testing--fuzzing)
+13. [Benchmarks](#benchmarks)
+14. [Security Model & Threat Coverage](#security-model--threat-coverage)
+15. [Project Layout](#project-layout)
+16. [License](#license)
 
 ---
 
@@ -575,7 +576,106 @@ attacker-triggered panic on one connection into a whole-process crash.
 
 ---
 
-## Testing & Fuzzing
+## Deployment Guide (Fleets & Load Balancers)
+
+Everything in this section is **required configuration** when running more than
+one SAACP node behind a load balancer. Getting it wrong degrades security
+guarantees silently rather than erroring loudly — and Phase 3 adds the
+detection/visibility to prove it.
+
+### 1. Session affinity is mandatory (M11 / R7)
+
+The 4096-entry PSN replay window is **node-local by design** (see
+`state_backend.rs`'s "out of scope" section). A session whose packets are
+spread across nodes by a non-affine load balancer loses replay protection to
+per-connection granularity. Your LB must pin a client to one node:
+
+- **Nginx**: `ip_hash;` in the `upstream` block.
+- **HAProxy (L4)**: `balance source` (or `balance leastconn` + stick tables on
+  `src`).
+- **Kubernetes**: `sessionAffinity: ClientIP` on the Service (or an L7
+  ingress with source-IP affinity).
+
+Phase 3 makes the misconfiguration **detectable**: each node with
+`.with_node_id(...)` (or `.with_affinity_tracker(node_id, tracker)` for shared
+state) checks every packet's header session_id against the node that first
+recorded it.
+
+- **Default — `AlertOnly`**: violation logged (once per connection), counted in
+  the `session_affinity_violations` telemetry counter, alerted on the
+  `SecurityAlertFeed` (gate `session_affinity`), and fed to the per-IP error
+  counter so a persistently mis-routed peer trips the existing IP circuit
+  breaker. The packet is still processed.
+- **Hardened — `HardDrop`**: additionally terminates the connection with a
+  hard drop (fail closed). Recommended posture for fleets that have verified
+  LB affinity (or single-node deployments that still want detection):
+
+  ```rust
+  use saacp::session_affinity::AffinityViolationPolicy;
+  daemon.with_node_id("node-1")
+      .affinity_violation_policy(AffinityViolationPolicy::HardDrop)
+  ```
+
+Affinity health is surfaced on `/readyz`:
+
+```json
+"session_affinity": { "tracked": true, "violations": 0 }
+```
+
+A non-zero `violations` that keeps climbing under `AlertOnly` is your signal
+to fix the LB config — or flip to `HardDrop` to make it loud.
+
+### 2. Audit-chain node designation (R8 / finding H)
+
+The tamper-evident audit chain of record lives on **one designated node** per
+fleet (an operations decision — R8). Phase 3 makes the designation visible:
+
+- Set `SAACP_AUDIT_NODE=1` on exactly one node (or call `.audit_node(true)`).
+- The designated node logs it at startup and sets the
+  `saacp_audit_chain_designated_node` Prometheus gauge to 1.
+- Every node reports `"audit_chain_role": "designated"` or
+  `"non_designated"` on `/healthz`.
+
+**Scope is visibility only** — no consensus or routing logic keys off the
+designation (documented finding H): the operator chooses the audit node; the
+protocol does not elect one. Exactly one node per fleet should be designated;
+the audit-ack endpoint below is served there.
+
+### 3. Operator audit acknowledgements (`POST /api/audit/ack`)
+
+When a WAL drop occurs, audit health pins at `Saturated` (sticky floor) and
+Gate 2.5 keeps rejecting IRREVERSIBLE actions until an operator acknowledges
+the loss (fail-closed by design — see `test_gate6_backpressure_rs.rs`).
+Phase 3 exposes that acknowledgement over HTTP on the health endpoint:
+
+```
+POST /api/audit/ack
+Authorization: Bearer <token>
+```
+
+- **Always bearer-gated** (unlike `/metrics`, which is only gated when a token
+  is configured). With no token configured the endpoint answers **503**
+  (disabled) — an unauthenticated caller must never be able to release a
+  fail-closed safety floor.
+- On success it returns `{"acknowledged": true, "released": <count>}`,
+  appends the acknowledgement to the audit chain (who/when/count, HMAC-bound
+  with the daemon's `token_issuer_secret` so `verify_chain` covers it), and
+  records a `SecurityAlert` (gate `audit_ack`).
+- A `Fatal` WAL-write state is **not** cleared by the acknowledgement, and the
+  lifetime dropped-audits total is never reset.
+
+### 4. Health probes
+
+| Endpoint | Auth | Use |
+|---|---|---|
+| `/healthz` | none | liveness probe (503 on `Fatal` audit state) |
+| `/readyz` | none | readiness probe (503 on `Saturated`/`Fatal`); includes `session_affinity` |
+| `/metrics` | bearer on non-loopback | Prometheus (`saacp_session_affinity_violations` rides the security-events series; `saacp_audit_chain_designated_node` is a gauge) |
+| `/api/audit/ack` | bearer always | operator audit acknowledgement |
+
+Suggested alert rules: `rate(saacp_security_events_total{event="session_affinity_violations"}[5m]) > 0`
+(mis-routed traffic), and `saacp_audit_chain_designated_node == 0` on the node
+you *believe* is the audit node (designation drifted).
 
 The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
 **56 integration/adversarial test files** under `tests/`, and **5 fuzz targets**.

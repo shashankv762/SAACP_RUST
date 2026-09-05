@@ -68,3 +68,30 @@ impl Default for SessionAffinityTracker {
         Self::new()
     }
 }
+
+/// M11 hardening (Phase 3): what a daemon does when the affinity tracker
+/// reports a violation.
+///
+/// - [`AffinityViolationPolicy::AlertOnly`] (the default) preserves today's
+///   behavior byte-for-byte: the violation is logged once per connection and
+///   fed to the per-IP error counter (so a persistently mis-routed peer trips
+///   the existing IP circuit breaker), the packet itself is still processed.
+///   Detection must not become a self-inflicted outage before the operator
+///   has seen the signal.
+/// - [`AffinityViolationPolicy::HardDrop`] additionally terminates the
+///   connection with a hard drop (fail closed). Intended for fleets that have
+///   already verified LB affinity (or run one node) and want a mis-routing to
+///   be loud rather than silently replay-degrading.
+///
+/// The policy is a runtime configuration knob only — it never touches wire
+/// format bytes. The hard drop reuses the existing `SessionSpliceDetected`
+/// bytecode (same PECF external class: session terminated), so no protocol
+/// surface changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AffinityViolationPolicy {
+    /// Log once per connection + per-IP error counter; process the packet.
+    #[default]
+    AlertOnly,
+    /// Additionally hard-drop the connection (fail closed).
+    HardDrop,
+}

@@ -223,6 +223,17 @@ pub struct Counters {
     // per-agent, to keep this bounded-cardinality like the trust-penalty
     // counters above.
     pub financial_tokens_rejected: AtomicU64,
+    /// M11 (R7) hardening: session-affinity violations detected by the
+    /// per-node tracker (a session_id appearing on a node that did not create
+    /// it — proof a load balancer is not session-affine). Recorded on every
+    /// violation regardless of the configured `AffinityViolationPolicy`; the
+    /// policy only decides whether the connection is additionally hard-dropped.
+    pub session_affinity_violations: AtomicU64,
+    /// R8 (finding H): 1 when this process is the designated audit-chain node
+    /// (`SAACP_AUDIT_NODE=1` / `DaemonBuilder::audit_node(true)`), 0
+    /// otherwise. Visibility only — no consensus or routing logic keys off
+    /// this (see the audit-node designation docs in README.md).
+    pub audit_chain_designated_node: AtomicU64,
 }
 
 impl Counters {
@@ -302,6 +313,8 @@ impl Counters {
             trust_rewards_clean_passage: z!(),
             trust_rewards_valid_receipt: z!(),
             financial_tokens_rejected: z!(),
+            session_affinity_violations: z!(),
+            audit_chain_designated_node: z!(),
         }
     }
 }
@@ -1180,6 +1193,26 @@ impl TelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// M11 (R7) hardening: record a session-affinity violation detected by
+    /// the per-node tracker. Recorded under BOTH `AffinityViolationPolicy`
+    /// variants — the policy only decides whether the connection is
+    /// additionally hard-dropped, never whether the detection is counted.
+    pub fn record_session_affinity_violation(&self) {
+        self.counters
+            .session_affinity_violations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R8 (finding H): set the audit-chain designation gauge (1 = this
+    /// process is the designated audit-chain node, 0 = not). Called once at
+    /// daemon startup from the `SAACP_AUDIT_NODE` env var / `audit_node(true)`
+    /// builder. Pure visibility — see README's audit-node designation notes.
+    pub fn set_audit_chain_designated_node(&self, designated: bool) {
+        self.counters
+            .audit_chain_designated_node
+            .store(u64::from(designated), Ordering::Relaxed);
+    }
+
     pub fn record_trust_penalty(&self, kind: crate::trust_decay::PenaltyKind) {
         use crate::trust_decay::PenaltyKind;
         match kind {
@@ -1366,6 +1399,8 @@ impl TelemetryCollector {
         snap!("trust_rewards_clean_passage", c.trust_rewards_clean_passage);
         snap!("trust_rewards_valid_receipt", c.trust_rewards_valid_receipt);
         snap!("financial_tokens_rejected", c.financial_tokens_rejected);
+        snap!("session_affinity_violations", c.session_affinity_violations);
+        snap!("audit_chain_designated_node", c.audit_chain_designated_node);
         m
     }
 
@@ -1460,6 +1495,7 @@ impl TelemetryCollector {
             "rulepack_installs_total",
             "rulepack_rejections_total",
             "rulepack_expirations_total",
+            "session_affinity_violations",
         ] {
             out.push_str(&format!(
                 "saacp_security_events_total{{event=\"{event}\"}} {}\n",
@@ -1476,6 +1512,19 @@ impl TelemetryCollector {
         out.push_str(&format!(
             "saacp_injection_rules_active {}\n",
             snap.get("rulepack_active_rules").copied().unwrap_or(0)
+        ));
+
+        // ── Audit-chain designation (R8 / finding H) ─────────────────────────
+        // Gauge: 1 when this process is the designated audit-chain node.
+        out.push_str(
+            "# HELP saacp_audit_chain_designated_node 1 when this process is the designated audit-chain node (SAACP_AUDIT_NODE / audit_node(true)), 0 otherwise. Visibility only.\n",
+        );
+        out.push_str("# TYPE saacp_audit_chain_designated_node gauge\n");
+        out.push_str(&format!(
+            "saacp_audit_chain_designated_node {}\n",
+            snap.get("audit_chain_designated_node")
+                .copied()
+                .unwrap_or(0)
         ));
 
         // ── Trust Decay Engine ────────────────────────────────────────────────
@@ -1780,6 +1829,8 @@ impl TelemetryCollector {
         rst!(c.trust_rewards_clean_passage);
         rst!(c.trust_rewards_valid_receipt);
         rst!(c.financial_tokens_rejected);
+        rst!(c.session_affinity_violations);
+        rst!(c.audit_chain_designated_node);
         self.agent_errors
             .lock()
             .unwrap_or_else(|e| e.into_inner())

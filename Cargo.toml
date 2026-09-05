@@ -284,6 +284,13 @@ name = "test_command_center_rs"
 path = "tests/test_command_center_rs.rs"
 required-features = ["command-center"]
 
+# Phase 3 §2.4: operator audit-ack endpoint test — needs the axum-backed
+# health router (see src/health.rs's feature gate).
+[[test]]
+name = "test_audit_ack_endpoint_rs"
+path = "tests/test_audit_ack_endpoint_rs.rs"
+required-features = ["health-endpoint"]
+
 # The crate's first binary target — a standalone local HTTP sidecar proxy so
 # non-Rust (e.g. Python) agents can get SAACP's security guarantees over plain
 # HTTP/JSON without any SAACP protocol knowledge. See src/sidecar.rs.

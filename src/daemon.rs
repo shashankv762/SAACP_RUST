@@ -422,6 +422,16 @@ pub struct SAACPNetworkDaemon {
     /// that first recorded it — a violation proves a non-affine load balancer is
     /// degrading the node-local replay-window guarantee (AlertOnly enforcement).
     session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
+    /// M11 hardening (Phase 3): enforcement policy for affinity violations.
+    /// Defaults to [`crate::session_affinity::AffinityViolationPolicy::AlertOnly`]
+    /// (byte-identical to the pre-Phase-3 behavior); set via
+    /// [`Self::affinity_violation_policy`].
+    affinity_violation_policy: crate::session_affinity::AffinityViolationPolicy,
+    /// R8 (finding H): whether this process is the fleet's designated
+    /// audit-chain node. Visibility ONLY — no consensus/routing logic reads
+    /// this (documented scope). Initialized from `SAACP_AUDIT_NODE` and
+    /// overridable via [`Self::audit_node`].
+    audit_node_designated: bool,
 }
 
 impl SAACPNetworkDaemon {
@@ -489,6 +499,10 @@ impl SAACPNetworkDaemon {
             pipeline_semaphore: None,
             node_id: None,
             session_affinity_tracker: None,
+            affinity_violation_policy: Default::default(),
+            audit_node_designated: std::env::var("SAACP_AUDIT_NODE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -738,6 +752,56 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// M11 hardening (Phase 3): set the enforcement policy applied when the
+    /// session-affinity tracker reports a violation.
+    ///
+    /// - [`AffinityViolationPolicy::AlertOnly`] (the default) preserves
+    ///   today's behavior exactly: once-per-connection log, per-IP error
+    ///   counter (feeding the existing IP circuit breaker), packet processed.
+    /// - [`AffinityViolationPolicy::HardDrop`] additionally terminates the
+    ///   connection with a hard drop (fail closed) — for fleets that have
+    ///   verified LB affinity and want mis-routing to be loud.
+    ///
+    /// No-op when no tracker is configured (`with_node_id` never called):
+    /// without tracking there is nothing to enforce, and the default remains
+    /// byte-identical.
+    pub fn affinity_violation_policy(
+        mut self,
+        policy: crate::session_affinity::AffinityViolationPolicy,
+    ) -> Self {
+        self.affinity_violation_policy = policy;
+        self
+    }
+
+    /// M11 hardening (Phase 3): like [`Self::with_node_id`], but accepts a
+    /// caller-constructed tracker. Needed when the tracker's state is shared
+    /// across daemon instances (in-process fleets, tests, or a future shared
+    /// state backend): a violation is only detectable when the tracker has
+    /// already seen the session under a DIFFERENT node id, which a fresh
+    /// per-daemon tracker can never observe.
+    pub fn with_affinity_tracker(
+        mut self,
+        node_id: impl Into<String>,
+        tracker: Arc<crate::session_affinity::SessionAffinityTracker>,
+    ) -> Self {
+        self.node_id = Some(node_id.into());
+        self.session_affinity_tracker = Some(tracker);
+        self
+    }
+
+    /// R8 (finding H): mark this process as the fleet's designated audit-chain
+    /// node (the node holding the chain of record and serving the operator
+    /// `POST /api/audit/ack` acknowledgement). Visibility only — one-time
+    /// startup log + the `saacp_audit_chain_designated_node` gauge + the
+    /// `audit_chain_role` field on `/healthz`. No consensus or routing logic
+    /// keys off this (documented scope, finding H). The `SAACP_AUDIT_NODE=1`
+    /// environment variable sets the same flag at construction; this builder
+    /// overrides it explicitly.
+    pub fn audit_node(mut self, designated: bool) -> Self {
+        self.audit_node_designated = designated;
+        self
+    }
+
     /// Opt in to the revocation gossip mesh (Phase 6 / item 4, see the `gossip` field doc
     /// comment). The caller constructs the `GossipEngine` itself (wiring its own
     /// `GossipTransport`, `DistributedRevocationInfrastructure`, and `TrustStore` — see
@@ -803,6 +867,13 @@ impl SAACPNetworkDaemon {
 
         let audit = self.audit_log_for_health();
         let telemetry_arc = self.telemetry_for_health();
+        // Phase 3: the alert feed the audit-ack endpoint records its
+        // SecurityAlert into (per-tenant when a context is configured,
+        // process-global otherwise — mirrors the two helpers above).
+        let ctx_alerts_for_health =
+            crate::context::SaacpContext::or_shared_default(self.context.as_deref())
+                .alerts
+                .clone();
         // TODO(2b-followup): wire a real per-daemon connection counter.
         // The current `AtomicU64(0)` is honest about its scope — the
         // value is process-wide-zero until a future change passes the
@@ -813,6 +884,19 @@ impl SAACPNetworkDaemon {
         let mut state = crate::health::HealthState::new(audit, telemetry_arc);
         if let Some(tok) = &self.health_bearer_token {
             state = state.with_bearer_token(tok.as_ref());
+        }
+        // Phase 3: surface session-affinity health on /readyz, the audit-chain
+        // designation role on /healthz, and hand the audit-ack endpoint the
+        // stable issuer secret it needs to append its acknowledgement record
+        // to the audit chain (same secret the gate pipeline HMAC-binds
+        // audit entries with — see handle_client's `gate_secret`).
+        if let Some(tracker) = &self.session_affinity_tracker {
+            state = state.with_session_affinity_tracker(Arc::clone(tracker));
+        }
+        state = state.with_audit_node_designated(self.audit_node_designated);
+        state = state.with_alerts_feed(ctx_alerts_for_health.clone());
+        if let Some(secret) = &self.token_issuer_secret {
+            state = state.with_audit_issuer_secret(Arc::new(secret.clone()));
         }
 
         let router = crate::health::health_router(state);
@@ -912,6 +996,30 @@ impl SAACPNetworkDaemon {
             addr, auth_mode
         );
 
+        // R8 (finding H): audit-chain designation visibility. One-time
+        // startup log + the `saacp_audit_chain_designated_node` gauge.
+        // Visibility ONLY — no consensus or routing logic keys off this
+        // (documented scope, finding H).
+        {
+            let ctx_startup =
+                crate::context::SaacpContext::or_shared_default(self.context.as_deref());
+            ctx_startup
+                .telemetry
+                .set_audit_chain_designated_node(self.audit_node_designated);
+        }
+        if self.audit_node_designated {
+            eprintln!(
+                "[SAACP Daemon] This node IS the audit-chain designated node — the chain of \
+                 record and operator audit acknowledgements (POST /api/audit/ack) live here."
+            );
+        } else {
+            eprintln!(
+                "[SAACP Daemon] This node is NOT the audit-chain designated node (visibility \
+                 only, no consensus impact — R8/finding H). Set SAACP_AUDIT_NODE=1 or call \
+                 .audit_node(true) on exactly one fleet node."
+            );
+        }
+
         // F3 fix (SECURE-BY-DEFAULT nudge): the legacy builder leaves every
         // protection opt-in, so a deployment can silently miss one. Enumerate
         // exactly what is OFF, every single start, until the operator has seen
@@ -991,6 +1099,7 @@ impl SAACPNetworkDaemon {
                             let pipeline_semaphore = self.pipeline_semaphore.clone();
                             let node_id = self.node_id.clone();
                             let session_affinity_tracker = self.session_affinity_tracker.clone();
+                            let affinity_violation_policy = self.affinity_violation_policy;
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -1005,6 +1114,7 @@ impl SAACPNetworkDaemon {
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                     handshake_timeout_override, daemon_context,
                                     inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
+                                    affinity_violation_policy,
                                 ).await;
                             });
                         }
@@ -1117,6 +1227,8 @@ pub(crate) async fn handle_client<S>(
     node_id: Option<String>,
     // M11 (R7 / opusreview.md): session-affinity tracker (AlertOnly enforcement).
     session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
+    // M11 hardening (Phase 3): what to do when the tracker reports a violation.
+    affinity_violation_policy: crate::session_affinity::AffinityViolationPolicy,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -1382,26 +1494,62 @@ pub(crate) async fn handle_client<S>(
             }
         }
 
-        // M11 (R7): session-affinity record/check — AlertOnly policy. When this
-        // node has a node_id + tracker configured (fleet deployment), every
-        // packet's header session_id (bytes 16..32) is checked against the node
-        // that first recorded it. A mismatch proves a non-affine load balancer
-        // is silently degrading replay protection (the 4096-entry PSN window is
-        // node-local BY DESIGN — see state_backend.rs's "out of scope" section).
-        // AlertOnly: log once per connection + feed the per-IP error counter so
-        // a persistently mis-routed peer trips the existing IP circuit breaker;
-        // the packet itself is still processed (detection must not become a
-        // self-inflicted outage before the operator has seen the signal).
+        // M11 (R7): session-affinity record/check — policy per
+        // `AffinityViolationPolicy` (Phase 3). When this node has a node_id +
+        // tracker configured (fleet deployment), every packet's header
+        // session_id (bytes 16..32) is checked against the node that first
+        // recorded it. A mismatch proves a non-affine load balancer is
+        // silently degrading replay protection (the 4096-entry PSN window is
+        // node-local BY DESIGN — see state_backend.rs's "out of scope"
+        // section).
+        // AlertOnly (default): log once per connection + feed the per-IP
+        // error counter so a persistently mis-routed peer trips the existing
+        // IP circuit breaker; the packet itself is still processed (detection
+        // must not become a self-inflicted outage before the operator has
+        // seen the signal). HardDrop: additionally terminate the connection
+        // (fail closed).
         if let (Some(tracker), Some(node)) = (session_affinity_tracker.as_ref(), node_id.as_deref())
         {
             if let Some(sid_bytes) = full_packet.get(16..32) {
                 if let Ok(sid) = <[u8; 16]>::try_from(sid_bytes) {
                     if let Err(violation) = tracker.record_session(&sid, node) {
+                        // Count + alert under BOTH policies (Phase 3): the
+                        // policy only decides whether the connection is
+                        // additionally hard-dropped, never whether the
+                        // detection is counted or surfaced.
+                        let ctx =
+                            crate::context::SaacpContext::or_shared_default(context.as_deref());
+                        ctx.telemetry.record_session_affinity_violation();
+                        ctx.alerts.record(crate::telemetry::SecurityAlert {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or_default(),
+                            agent_id: peer_addr.to_string(),
+                            gate: "session_affinity",
+                            bytecode: SAACPBytecodes::SessionSpliceDetected.to_string(),
+                            estimated_cost: None,
+                        });
                         if !affinity_violation_reported {
                             affinity_violation_reported = true;
                             eprintln!("[SAACP Daemon] {peer_addr}: {violation}");
                         }
                         record_error(&circuit_breakers, &ip_key);
+                        if affinity_violation_policy
+                            == crate::session_affinity::AffinityViolationPolicy::HardDrop
+                        {
+                            // Reuses the existing SessionSpliceDetected
+                            // bytecode (same PECF external class: session
+                            // terminated) — no wire-format surface changes.
+                            send_hard_drop(
+                                &mut stream,
+                                SAACPBytecodes::SessionSpliceDetected,
+                                "Session affinity violation — this node did not create the \
+                                 session; reconnect via the session-affine entry node",
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             }

@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M11 hardening — affinity-violation enforcement policy** (Phase 3):
+  `session_affinity::AffinityViolationPolicy` (`AlertOnly` default =
+  byte-identical to prior behavior; `HardDrop` = fail closed) selectable via
+  `SAACPNetworkDaemon::affinity_violation_policy` (TCP, WS, and TLS daemons),
+  plus `with_affinity_tracker(node_id, tracker)` for shared-tracker fleets.
+  Violations are now counted in the new `session_affinity_violations`
+  telemetry counter and alerted (gate `session_affinity`) under BOTH
+  policies. Regression-tested in `tests/test_session_affinity_policy_rs.rs`.
+- **Session-affinity health on `/readyz`** (Phase 3):
+  `session_affinity: { tracked, violations }`.
+- **Audit-chain node designation** (R8 / finding H, Phase 3): `SAACP_AUDIT_NODE=1`
+  env var or `SAACPNetworkDaemon::audit_node(bool)`; one-time startup log,
+  `saacp_audit_chain_designated_node` Prometheus gauge, and `audit_chain_role`
+  on `/healthz`. Visibility only — no consensus logic (documented scope).
+- **Operator audit-ack endpoint** (Phase 3): `POST /api/audit/ack` on the
+  health router, ALWAYS bearer-gated (503 when no token is configured),
+  wrapping `ImmutableAuditLog::acknowledge_dropped_audits()`; the
+  acknowledgement is appended to the audit chain (HMAC-bound with the
+  daemon's issuer secret) and a `SecurityAlert` recorded. Fail-closed
+  semantics untouched. Regression-tested in
+  `tests/test_audit_ack_endpoint_rs.rs` (`health-endpoint` feature).
+- **Deployment guide** (Phase 3): new README section covering required LB
+  affinity config (`ip_hash` / L4 `sourceIP` / k8s `sessionAffinity: ClientIP`),
+  the `HardDrop` fleet posture, affinity health on `/readyz`, and audit-node
+  designation.
+
+### Changed
 - **Pinned CI toolchain** (audit G7): every non-nightly CI job now runs
   `1.96.0` — the same version as `rust-toolchain.toml` — instead of a moving
   `stable`, so a fresh stable release shipping a new lint can no longer break

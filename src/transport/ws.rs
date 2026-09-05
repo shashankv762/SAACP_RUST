@@ -254,6 +254,9 @@ pub struct SAACPWebSocketDaemon {
     node_id: Option<String>,
     /// M11 (R7 / opusreview.md): session affinity tracker.
     session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
+    /// M11 hardening (Phase 3): enforcement policy for affinity violations
+    /// (default `AlertOnly` — see `session_affinity::AffinityViolationPolicy`).
+    affinity_violation_policy: crate::session_affinity::AffinityViolationPolicy,
     /// C3: when set (feature `transport-wss`), every accepted TCP connection
     /// is upgraded to TLS (wss://) before the WebSocket handshake.
     #[cfg(feature = "transport-tls")]
@@ -285,6 +288,7 @@ impl SAACPWebSocketDaemon {
             pipeline_semaphore: None,
             node_id: None,
             session_affinity_tracker: None,
+            affinity_violation_policy: Default::default(),
             #[cfg(feature = "transport-tls")]
             tls_config: None,
         }
@@ -318,6 +322,31 @@ impl SAACPWebSocketDaemon {
         let tracker = crate::session_affinity::SessionAffinityTracker::new();
         self.node_id = Some(node_id);
         self.session_affinity_tracker = Some(Arc::new(tracker));
+        self
+    }
+
+    /// M11 hardening (Phase 3): set the affinity-violation enforcement policy
+    /// (default `AlertOnly` — see
+    /// `session_affinity::AffinityViolationPolicy`). `HardDrop` additionally
+    /// terminates the connection on a violation, after the usual log +
+    /// per-IP error counter.
+    pub fn affinity_violation_policy(
+        mut self,
+        policy: crate::session_affinity::AffinityViolationPolicy,
+    ) -> Self {
+        self.affinity_violation_policy = policy;
+        self
+    }
+
+    /// M11 hardening (Phase 3): like [`Self::with_node_id`], but accepts a
+    /// caller-constructed tracker (shared-state fleets / tests).
+    pub fn with_affinity_tracker(
+        mut self,
+        node_id: impl Into<String>,
+        tracker: Arc<crate::session_affinity::SessionAffinityTracker>,
+    ) -> Self {
+        self.node_id = Some(node_id.into());
+        self.session_affinity_tracker = Some(tracker);
         self
     }
 
@@ -496,6 +525,7 @@ impl SAACPWebSocketDaemon {
                             let pipeline_semaphore = self.pipeline_semaphore.clone();
                             let node_id = self.node_id.clone();
                             let session_affinity_tracker = self.session_affinity_tracker.clone();
+                            let affinity_violation_policy = self.affinity_violation_policy;
                             #[cfg(feature = "transport-tls")]
                             let tls_acceptor = self.tls_config.clone()
                                 .map(tokio_rustls::TlsAcceptor::from);
@@ -528,6 +558,7 @@ impl SAACPWebSocketDaemon {
                                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                                     handshake_timeout_override, daemon_context,
                                                     inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
+                                                    affinity_violation_policy,
                                                 ).await;
                                             }
                                             Ok(Err(e)) => {
@@ -550,6 +581,7 @@ impl SAACPWebSocketDaemon {
                                             gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                             handshake_timeout_override, daemon_context,
                                             inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
+                                            affinity_violation_policy,
                                         ).await;
                                     }
                                 }
@@ -560,6 +592,7 @@ impl SAACPWebSocketDaemon {
                                     handshake_timeout_override,
                                     daemon_context,
                                     inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
+                                    affinity_violation_policy,
                                 ).await;
                             });
                         }
@@ -632,6 +665,8 @@ async fn serve_ws_connection<S>(
     pipeline_semaphore: Option<Arc<Semaphore>>,
     node_id: Option<String>,
     session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
+    // M11 hardening (Phase 3): affinity-violation enforcement policy.
+    affinity_violation_policy: crate::session_affinity::AffinityViolationPolicy,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -692,6 +727,7 @@ async fn serve_ws_connection<S>(
         pipeline_semaphore,
         node_id,
         session_affinity_tracker,
+        affinity_violation_policy,
     )
     .await;
 }

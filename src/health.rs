@@ -9,12 +9,21 @@
 //!
 //! # Routes
 //!
-//! | Route       | Auth          | Purpose                                              |
-//! |-------------|---------------|------------------------------------------------------|
-//! | `/healthz`  | None          | Liveness. 200 if the daemon is alive, 503 on Fatal.  |
-//! | `/readyz`   | None          | Readiness. 200 unless AuditHealth is Saturated/Fatal.|
-//! | `/metrics`  | Bearer if     | Prometheus text exposition.                          |
-//! |             | non-loopback  |                                                      |
+//! | Route             | Auth          | Purpose                                              |
+//! |-------------------|---------------|------------------------------------------------------|
+//! | `/healthz`        | None          | Liveness. 200 if the daemon is alive, 503 on Fatal.  |
+//! | `/readyz`         | None          | Readiness. 200 unless AuditHealth is Saturated/Fatal.|
+//! | `/metrics`        | Bearer if     | Prometheus text exposition.                          |
+//! |                   | non-loopback  |                                                      |
+//! | `/api/audit/ack`  | Bearer always | Operator acknowledgement of dropped audits (Phase 3).|
+//!
+//! `/api/audit/ack` is an *operator action* endpoint, not a probe: it releases
+//! the sticky Gate 2.5 audit drop floor (see
+//! `ImmutableAuditLog::acknowledge_dropped_audits`), appends the
+//! acknowledgement to the audit chain, and records a `SecurityAlert`. Because
+//! an unauthenticated caller must never be able to release a fail-closed
+//! safety floor, it requires a bearer token in ALL cases — when no token is
+//! configured the endpoint answers 503 (disabled), never 200.
 //!
 //! The default bind is **loopback only** (`127.0.0.1:9091`). Bind a
 //! non-loopback address to expose the endpoint on a pod IP — in that
@@ -40,12 +49,13 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::security::{AuditHealth, ImmutableAuditLog};
-use crate::telemetry::TelemetryCollector;
+use crate::session_affinity::SessionAffinityTracker;
+use crate::telemetry::{SecurityAlert, SecurityAlertFeed, TelemetryCollector};
 
 /// Bearer-token-expected value passed to [`HealthServer::with_bearer_token`].
 /// If `Some`, any non-loopback bind requires `Authorization: Bearer <token>`
@@ -92,6 +102,24 @@ pub struct HealthState {
     /// Optional bearer token. When `Some`, non-loopback binds require
     /// the token on `/metrics` only.
     pub bearer_token: Option<BearerToken>,
+    /// Phase 3: this node's session-affinity tracker, when configured
+    /// (`with_node_id` / `with_affinity_tracker`). `None` (single-node /
+    /// library use) reports `session_affinity.tracked == false` on `/readyz`.
+    pub session_affinity_tracker: Option<Arc<SessionAffinityTracker>>,
+    /// Phase 3 (R8 / finding H): whether this process is the fleet's
+    /// designated audit-chain node. Visibility only.
+    pub audit_node_designated: bool,
+    /// Phase 3: the alert feed the `/api/audit/ack` endpoint records its
+    /// `SecurityAlert` into (per-tenant when a context is configured,
+    /// process-global otherwise).
+    pub alerts: Arc<SecurityAlertFeed>,
+    /// Phase 3: the stable issuer secret used to HMAC-bind the operator
+    /// acknowledgement record appended to the audit chain by
+    /// `/api/audit/ack`. Should be the same `token_issuer_secret` the gate
+    /// pipeline binds audit entries with, so `verify_chain(secret)` covers
+    /// the acknowledgement. `None` binds with an empty secret (still
+    /// chain-linked, but verify with the same empty secret).
+    pub audit_issuer_secret: Option<Arc<Vec<u8>>>,
 }
 
 impl HealthState {
@@ -102,6 +130,10 @@ impl HealthState {
             audit_log,
             telemetry,
             bearer_token: None,
+            session_affinity_tracker: None,
+            audit_node_designated: false,
+            alerts: SecurityAlertFeed::global_arc().clone(),
+            audit_issuer_secret: None,
         }
     }
 
@@ -110,6 +142,42 @@ impl HealthState {
         self.bearer_token = Some(BearerToken(Arc::new(token.into())));
         self
     }
+
+    /// Phase 3: attach the session-affinity tracker surfaced on `/readyz`.
+    pub fn with_session_affinity_tracker(mut self, tracker: Arc<SessionAffinityTracker>) -> Self {
+        self.session_affinity_tracker = Some(tracker);
+        self
+    }
+
+    /// Phase 3: set the audit-chain designation role reported on `/healthz`.
+    pub fn with_audit_node_designated(mut self, designated: bool) -> Self {
+        self.audit_node_designated = designated;
+        self
+    }
+
+    /// Phase 3: attach the alert feed the audit-ack endpoint records into
+    /// (defaults to the process-global feed).
+    pub fn with_alerts_feed(mut self, feed: Arc<SecurityAlertFeed>) -> Self {
+        self.alerts = feed;
+        self
+    }
+
+    /// Phase 3: attach the issuer secret the audit-ack endpoint uses to
+    /// HMAC-bind its acknowledgement record into the audit chain.
+    pub fn with_audit_issuer_secret(mut self, secret: Arc<Vec<u8>>) -> Self {
+        self.audit_issuer_secret = Some(secret);
+        self
+    }
+}
+
+/// Phase 3: session-affinity health surfaced on `/readyz` (M11 / R7).
+#[derive(Serialize)]
+pub struct SessionAffinityStatus {
+    /// Whether a session-affinity tracker is configured on this node.
+    pub tracked: bool,
+    /// Lifetime violation count (a session_id appearing on a node that did
+    /// not create it — proof the load balancer is not session-affine).
+    pub violations: u64,
 }
 
 /// JSON shape of `/healthz` and `/readyz` responses. Stable; the command
@@ -130,6 +198,12 @@ pub struct HealthResponse {
     pub dropped_audits: u64,
     /// Approximate number of currently active TCP connections.
     pub active_connections: u64,
+    /// Phase 3: session-affinity tracking health (M11 / R7).
+    pub session_affinity: SessionAffinityStatus,
+    /// Phase 3 (R8 / finding H): `"designated"` when this process is the
+    /// fleet's audit-chain node, `"non_designated"` otherwise. Visibility
+    /// only — no consensus or routing logic keys off this.
+    pub audit_chain_role: String,
 }
 
 /// Build the health-endpoint axum router. Bind via
@@ -140,6 +214,7 @@ pub fn health_router(state: HealthState) -> Router {
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics))
+        .route("/api/audit/ack", post(audit_ack))
         .with_state(state)
 }
 
@@ -197,13 +272,114 @@ fn health_body(state: &HealthState, health: AuditHealth) -> HealthResponse {
         AuditHealth::Saturated => "saturated",
         AuditHealth::Fatal => "fatal",
     };
+    let violations = state
+        .telemetry
+        .snapshot()
+        .get("session_affinity_violations")
+        .copied()
+        .unwrap_or(0);
     HealthResponse {
         status: status_str.to_string(),
         audit_health: status_str.to_string(),
         wal_queue_depth: state.audit_log.queue_len(),
         dropped_audits: state.audit_log.dropped_audit_count(),
         active_connections: state.connection_count.load(Ordering::Relaxed),
+        session_affinity: SessionAffinityStatus {
+            tracked: state.session_affinity_tracker.is_some(),
+            violations,
+        },
+        audit_chain_role: if state.audit_node_designated {
+            "designated".to_string()
+        } else {
+            "non_designated".to_string()
+        },
     }
+}
+
+/// Phase 3: operator acknowledgement of dropped audit events.
+///
+/// Wraps [`ImmutableAuditLog::acknowledge_dropped_audits`] — the explicit
+/// operator action the sticky-floor design requires before Gate 2.5 resumes
+/// authorizing IRREVERSIBLE actions after a WAL drop. The acknowledgement
+/// itself is appended to the audit chain (who/when/count) so the
+/// reconciliation is tamper-evidently on the record, and a `SecurityAlert` is
+/// recorded so dashboards and subscribers see it live. Fail-closed semantics
+/// are untouched: a `Fatal` health state is NOT cleared by the acknowledgement
+/// (only constructing a fresh log clears that), and the lifetime
+/// `dropped_audits` total is never reset.
+///
+/// ALWAYS bearer-gated (unlike `/metrics`, which is only gated when a token
+/// is configured). When no token is configured the endpoint is disabled
+/// (503) — an unauthenticated caller must never be able to release a
+/// fail-closed safety floor.
+async fn audit_ack(State(state): State<HealthState>, headers: HeaderMap) -> Response {
+    let Some(token) = &state.bearer_token else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit-ack endpoint requires a bearer token — configure \
+             with_health_endpoint(bind, Some(token))",
+        )
+            .into_response();
+    };
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !token.matches(provided) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", "Bearer")],
+            "missing or invalid bearer token",
+        )
+            .into_response();
+    }
+
+    // Release the sticky drop floor. This is the explicit operator
+    // acknowledgement — Gate 2.5's fail-closed behavior for the window
+    // BEFORE this call is the design working as intended.
+    let released = state.audit_log.acknowledge_dropped_audits();
+
+    // Append the acknowledgement to the audit chain (who/when/count). Bound
+    // with the same issuer secret the gate pipeline uses so verify_chain
+    // covers it; without a configured secret an empty one is used (documented
+    // on HealthState::audit_issuer_secret).
+    let secret: &[u8] = state
+        .audit_issuer_secret
+        .as_deref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    state.audit_log.append_event(
+        secret,
+        "operator",
+        "audit-chain",
+        "audit-ack",
+        &format!(
+            "DROPPED_AUDITS_ACKNOWLEDGED released_count={released} \
+             by=health-endpoint route=/api/audit/ack"
+        ),
+        "",
+    );
+
+    // Live alert so dashboards/subscribers observe the acknowledgement.
+    state.alerts.record(SecurityAlert {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default(),
+        agent_id: "operator".to_string(),
+        gate: "audit_ack",
+        bytecode: "AuditDropsAcknowledged".to_string(),
+        estimated_cost: None,
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "acknowledged": true,
+            "released": released,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
