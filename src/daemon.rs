@@ -2120,6 +2120,149 @@ where
     client_handshake_inner(stream, identity, pinned_server_verifying_key).await
 }
 
+/// S5 "prefer-pinned" client handshake: attempt the authenticated pinned-server
+/// exchange, and transparently fall back to the plain (v1) ECDH handshake when
+/// the responder speaks only the legacy 32-byte wire format.
+///
+/// Wire detection: both formats share the same 64-byte client hello and the
+/// same first 32 response bytes (the server's X25519 public key). The
+/// authenticated format appends `[ed25519_sig(64) || ed25519_vk(32)]`; the
+/// plain format sends nothing further. After reading the shared 32 bytes, the
+/// remaining 96 bytes are awaited with a short timeout — if they arrive, the
+/// Ed25519 signature is verified AND the verifying key is pinned exactly like
+/// [`client_handshake_with_pinned_server`]; if they do not, the plain
+/// derivation (byte-identical to `client_handshake_inner`'s `None` branch,
+/// including the F5 contributory check) runs on the bytes already read.
+///
+/// SECURITY (documented downgrade posture): a responder that suppresses the
+/// authenticated suffix forces the plain fallback — an active attacker CAN do
+/// this. `PreferPinned` is therefore a migration-window mode only: it guards
+/// against passive eavesdropping against pinned peers while remaining
+/// interoperable with legacy peers, and callers MUST surface a WARN + fallback
+/// counter per connection (the sidecar does). `RequirePinned`
+/// ([`client_handshake_with_pinned_server`], no fallback) is the production
+/// posture once every peer speaks the authenticated format.
+///
+/// Returns `(session_key, peer_authenticated)` — `peer_authenticated == false`
+/// means the plain fallback was exercised (see the downgrade posture above).
+///
+/// # Format-detection window
+/// How long this function waits for the authenticated response's remaining 96
+/// bytes before concluding the responder speaks only the legacy plain wire
+/// format. A legacy plain server sends exactly 32 bytes and nothing more, so
+/// the timeout is the format detector; a real authenticated server
+/// reassembles the 96-byte suffix well inside it on any LAN-class link.
+/// Tunable const, not config: a value too small would mis-detect
+/// slow-but-honest authed peers into the WEAKER plain fallback.
+const HANDSHAKE_AUTH_RESPONSE_DETECT_MS: u64 = 500;
+
+pub async fn client_handshake_with_pinned_server_or_plain<S>(
+    stream: &mut S,
+    pinned_server_verifying_key: &[u8; 32],
+) -> Result<(Zeroizing<[u8; 32]>, bool), SAACPHardDrop>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use rand::rngs::OsRng;
+
+    let client_nonce: [u8; 32] = rand::random();
+    let client_secret = EphemeralSecret::random_from_rng(OsRng);
+    let client_pub = PublicKey::from(&client_secret);
+
+    let mut client_msg = Vec::with_capacity(64);
+    client_msg.extend_from_slice(&client_nonce);
+    client_msg.extend_from_slice(client_pub.as_bytes());
+    stream.write_all(&client_msg).await.map_err(|_| {
+        SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            "client_handshake: write failed",
+        )
+    })?;
+
+    // The 32 bytes both wire formats share: the server's X25519 public key.
+    let mut server_pub_bytes = [0u8; 32];
+    stream
+        .read_exact(&mut server_pub_bytes)
+        .await
+        .map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                "client_handshake: read server pubkey failed",
+            )
+        })?;
+
+    // Format detection: does the authenticated 96-byte suffix arrive in time?
+    let mut suffix = [0u8; 96];
+    let authed = match timeout(
+        Duration::from_millis(HANDSHAKE_AUTH_RESPONSE_DETECT_MS),
+        stream.read_exact(&mut suffix),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                format!("client_handshake: read authenticated response failed: {e}"),
+            ));
+        }
+        Err(_) => false, // elapsed — plain-format responder, fall back
+    };
+
+    if authed {
+        // Reassemble the full 128-byte authenticated response from the two
+        // reads and run the exact same verification discipline as
+        // `read_and_verify_authed_server_response` (pin check + Ed25519 over
+        // `client_nonce || server_x25519_pub`) so the two paths cannot drift.
+        let mut auth_msg = [0u8; 128];
+        auth_msg[..32].copy_from_slice(&server_pub_bytes);
+        auth_msg[32..].copy_from_slice(&suffix);
+        let sig_bytes: [u8; 64] = auth_msg[32..96].try_into().expect("64-byte sig slice");
+        let vk_bytes: [u8; 32] = auth_msg[96..128].try_into().expect("32-byte vk slice");
+        if vk_bytes != *pinned_server_verifying_key {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server verifying key does not match pinned expectation",
+            ));
+        }
+        let server_vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server verifying key invalid",
+            )
+        })?;
+        let mut to_verify = Vec::with_capacity(64);
+        to_verify.extend_from_slice(&client_nonce);
+        to_verify.extend_from_slice(&server_pub_bytes);
+        let sig = Signature::from_bytes(&sig_bytes);
+        if server_vk.verify(&to_verify, &sig).is_err() {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::IdentityMisbinding,
+                "client_handshake: server signature verification failed",
+            ));
+        }
+    }
+
+    // Identical derivation for both branches: the plain path uses the legacy
+    // responder's key, the authenticated path the (verified, pinned) server's
+    // key — which is the same X25519 share either way.
+    let server_pub = PublicKey::from(server_pub_bytes);
+    let shared = client_secret.diffie_hellman(&server_pub);
+    // F5 contributory check — see `client_handshake_inner`'s matching comment.
+    if !shared.was_contributory() {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            "client_handshake: X25519 shared secret was not contributory (degenerate server public key)",
+        ));
+    }
+    let hk = Hkdf::<Sha256>::new(Some(&client_nonce), shared.as_bytes());
+    let mut session_key = [0u8; 32];
+    hk.expand(b"SAACP-daemon-handshake-v1", &mut session_key)
+        .map_err(|_| SAACPHardDrop::new(SAACPBytecodes::InvalidSignature, "HKDF expand failed"))?;
+    Ok((Zeroizing::new(session_key), authed))
+}
+
 async fn client_handshake_inner<S>(
     stream: &mut S,
     identity: Option<&ClientIdentityConfig>,

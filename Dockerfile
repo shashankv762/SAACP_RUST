@@ -3,12 +3,18 @@
 # Runtime stage: distroless image with just the binaries
 
 # ── Build stage ────────────────────────────────────────────────────────────
-FROM rust:1.79-slim-bookworm AS builder
+# Toolchain pin MUST match the crate's real MSRV floor: the code uses
+# language features stable only in 1.80+ (see the rust-version note in
+# Cargo.toml); rust:1.79 predates them and fails to compile. 1.96 matches
+# rust-toolchain.toml.
+FROM rust:1.96-slim-bookworm AS builder
 
-# Install build dependencies
+# Install build dependencies. No libssl-dev: every TLS path in this crate is
+# rustls-based and `cargo tree -i openssl -e normal` for the release bins
+# resolves to nothing — OpenSSL only enters the lockfile via dev-dependencies,
+# which `cargo build --bins` never compiles.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/saacp

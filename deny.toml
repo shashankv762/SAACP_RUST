@@ -30,29 +30,49 @@ multiple-versions = "deny"
 
 # Dependencies that are allowed to appear multiple times. Each entry is a
 # reviewed exception — see the inline justification.
+#
+# ── Review policy (audit R7 mitigation) ─────────────────────────────────────
+# Every `skip` entry below carries a `reviewed:` date. A duplicate-version
+# exception is a *debt marker*, not a permanent grant: when a security fix
+# ships in only the newer copy of a duplicated crate, the older copy in the
+# same tree silently misses the advisory fix (cargo-deny can only exempt what
+# it is told to). Each entry must be re-justified at least once per quarter —
+# if the upstream unification tracked in opusreview.md §2.8 / M21 lands
+# first, delete the entry entirely.
 skip = [
     # `rand 0.10.2` is the new version; `rand 0.8.6` is required by
     # `ed25519-dalek 2.x` for its `rand_core` feature. The old version
     # is only used in dev-dependencies and test utilities, never in
     # production code paths. Tracked in opusreview.md §2.8.
+    # reviewed: 2026-09-05 — no rand 0.8.x-only advisory; unification blocked
+    # on ed25519-dalek's rand_core 0.2 dependency (upstream, not ours).
     { name = "rand" },
 
     # `axum 0.7.9` and `axum 0.8.9` coexist because the `sidecar` and
     # `command-center` features use different major versions. Unification
     # is tracked in opusreview.md §2.8 / M21.
+    # reviewed: 2026-09-05 — no 0.7.x-only advisory; both majors are
+    # maintained lines, neither is EOL.
     { name = "axum" },
 
     # `rustls 0.21.12` is pulled in transitively by `aws-smithy-runtime`
     # when `hrt-aws-kms` is enabled. Upgrading the AWS SDK is tracked
     # in opusreview.md §2.8 / M21.
+    # reviewed: 2026-09-05 — rustls 0.21 is EOL upstream; this is the
+    # HIGHEST-priority entry to re-check quarterly. If any rustls 0.21
+    # advisory lands, `hrt-aws-kms` must be treated as affected until the
+    # AWS SDK unification ships.
     { name = "rustls" },
 
     # `tokio-rustls 0.24.1` accompanies `rustls 0.21` via the same
     # transitive path. Same remediation as above.
+    # reviewed: 2026-09-05 — same EOL exposure as the rustls 0.21 entry.
     { name = "tokio-rustls" },
 
     # `hyper 0.14` and `h2 0.3` enter through `aws-smithy-runtime` →
     # `hyper-rustls 0.24.2` when `hrt-aws-kms` is enabled.
+    # reviewed: 2026-09-05 — h2 0.3 has had past advisories (HTTP/2
+    # rapid-reset family); re-check this entry on every h2 advisory.
     { name = "hyper" },
     { name = "h2" },
 ]

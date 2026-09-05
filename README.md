@@ -667,6 +667,7 @@ packet is dropped, never partially processed.
 | PSK-only compromise (config-file leak) | Opt-in forward-secrecy root ratchet (`SessionEpochManager::with_root_ratchet`): the root is re-derived per rotation mixing the epoch traffic key, which is destroyed at grace expiry |
 | TLS-only deployments | mTLS: `transport::tls::server_config_with_client_ca` requires CA-signed client certs; `client_handshake_with_pinned_server` pins the server key in plain mode |
 | Unauthenticated local sidecar HTTP | Bearer auth ON by default (token generated + printed once, or written 0600 via `SAACP_HTTP_TOKEN_OUT_FILE`); `SAACP_ALLOW_UNAUTHENTICATED_HTTP=1` is the explicit legacy escape |
+| Sidecar MITM on the peer leg (unauthenticated ECDH to other sidecars) | `SAACP_HANDSHAKE_MODE`: the `saacp-sidecar` binary defaults to `PREFER_PINNED` (Ed25519-authenticated 128-byte handshake when the peer speaks it; plain downgrade only with a loud WARN + `handshake_fallback_total` counter) and `REQUIRE_PINNED` refuses plain peers outright. Peers pinned via `SAACP_PEER_PINS_FILE`, server identity via `SAACP_SERVER_SEED_FILE`, outcomes on `/healthz` (M1/R1) |
 
 ### Operational security notes (secrets handling)
 

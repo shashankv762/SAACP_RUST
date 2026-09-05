@@ -75,7 +75,10 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::daemon::{client_handshake, SAACPNetworkDaemon};
+use crate::daemon::{
+    client_handshake, client_handshake_with_pinned_server,
+    client_handshake_with_pinned_server_or_plain, SAACPNetworkDaemon,
+};
 use crate::faitf_audit::FAITFAuditLog;
 use crate::gateway::ZeroTrustGateway;
 use crate::handler::{JsonValue, ParsedPacket};
@@ -265,10 +268,11 @@ impl SidecarConfig {
             connection_pooling: true,
             payload_padding: false,
             // Plan item 3: default to LegacyOnly so the sidecar is a
-            // drop-in replacement for any pre-plan mesh. Operators
-            // opt into a more secure posture via the
-            // `SAACP_HANDSHAKE_MODE` env var (added in a follow-up) or
-            // by setting the field directly in code.
+            // drop-in replacement for any pre-plan mesh (an embedded
+            // `SidecarConfig` consumer keeps v1 wire compatibility).
+            // The `saacp-sidecar` binary defaults its OWN posture to
+            // PreferPinned via the `SAACP_HANDSHAKE_MODE` env var;
+            // library callers opt in by setting the field directly.
             handshake_mode: SidecarHandshakeMode::LegacyOnly,
             server_seed: None,
             pinned_peers: HashMap::new(),
@@ -479,6 +483,10 @@ pub enum SidecarError {
     /// retried, since it indicates a live but misbehaving/slow peer, not a transient
     /// connect failure.
     Timeout,
+    /// M1 (R1): handshake-posture misconfiguration — `RequirePinned` without a
+    /// `server_seed` at startup, or dialing a peer that has no pinned verifying
+    /// key. Never retried; the configuration must be fixed first.
+    Config(String),
     /// H-21 (SSRF) fix: `target_addr` resolved to an address in a blocked range (RFC
     /// 1918 / link-local) with no matching allowlist entry and `allow_private_targets`
     /// unset. Carries the offending IP for diagnostics. No socket is ever opened for a
@@ -495,6 +503,7 @@ impl std::fmt::Display for SidecarError {
             Self::Session(e) => write!(f, "session setup failed: {}", e.message),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Timeout => write!(f, "timed out waiting for a response"),
+            Self::Config(m) => write!(f, "configuration error: {m}"),
             Self::TargetForbidden(ip) => {
                 write!(
                     f,
@@ -566,14 +575,143 @@ pub fn pad_payload_to_bucket(payload: String) -> String {
     padded
 }
 
-/// Send one schema-1 ("Task") message to a peer's SAACP listener. Opens a fresh TCP
-/// connection (retrying transient connect failures up to `retry_attempts` times), performs
-/// a real X25519 ECDH handshake (`daemon::client_handshake`), issues a capability token
-/// signed with `secret` (the mesh-wide shared secret, or a peer-specific one — see this
-/// module's "per-peer issuer secrets" doc section), builds a real AES-256-GCM frame
-/// (`measc::MEASCFrame::build_frame`), and classifies the peer's ack. See this module's doc
-/// comment for why the token's `allow` list is always `["unknown"]` rather than
-/// `target_agent`.
+// ─── M1 (R1): handshake-outcome telemetry ─────────────────────────────────────
+
+/// Lifetime count of outbound handshakes that completed under the
+/// AUTHENTICATED 128-byte server response format with the pin verified —
+/// a `PreferPinned` dial to an upgraded peer, or any successful
+/// `RequirePinned` dial. Surfaced on `/healthz` as `handshake_pinned_ok`.
+static HANDSHAKE_PINNED_OK: AtomicU64 = AtomicU64::new(0);
+
+/// Lifetime count of `PreferPinned` dials downgraded to the plain v1 ECDH
+/// handshake because the peer answered the 32-byte legacy format. Every unit
+/// here is a connection still on the unauthenticated wire — the
+/// migration-progress signal that tells an operator when the mesh is ready
+/// for `REQUIRE_PINNED`. Surfaced on `/healthz` as `handshake_fallback_total`.
+static HANDSHAKE_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Lifetime count of outbound dials refused or failed closed under the pinned
+/// posture: a `RequirePinned` dial without a configured pin (operator error —
+/// refuse rather than silently downgrade) and a `RequirePinned` dial whose
+/// pin/signature verification failed (suspected MITM). Surfaced on `/healthz`
+/// as `handshake_reject_total`.
+static HANDSHAKE_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-global handshake-outcome counters surfaced on
+/// `/healthz` as `handshake_pinned_ok` / `handshake_fallback_total` /
+/// `handshake_reject_total`. Returns `(pinned_ok, fallback_total,
+/// reject_total)`. Process-global (not per-`SidecarState`) because the
+/// counters are incremented inside the free-fn dial path, and a sidecar
+/// process runs exactly one sidecar.
+pub fn handshake_telemetry() -> (u64, u64, u64) {
+    (
+        HANDSHAKE_PINNED_OK.load(Ordering::Relaxed),
+        HANDSHAKE_FALLBACK_TOTAL.load(Ordering::Relaxed),
+        HANDSHAKE_REJECT_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+/// `/healthz`-facing name of a [`SidecarHandshakeMode`] — the same
+/// SCREAMING_SNAKE spellings the `SAACP_HANDSHAKE_MODE` env var accepts.
+fn handshake_mode_name(mode: SidecarHandshakeMode) -> &'static str {
+    match mode {
+        SidecarHandshakeMode::LegacyOnly => "LEGACY_ONLY",
+        SidecarHandshakeMode::PreferPinned => "PREFER_PINNED",
+        SidecarHandshakeMode::RequirePinned => "REQUIRE_PINNED",
+    }
+}
+
+/// Dial one connection to a peer's SAACP listener and perform the
+/// posture-resolved handshake (M1/R1). The caller (`send_message` /
+/// `SidecarConnectionPool::send`) then issues the capability token signed
+/// with `secret` (the mesh-wide shared secret, or a peer-specific one — see
+/// this module's "per-peer issuer secrets" doc section), builds the real
+/// AES-256-GCM frame (`measc::MEASCFrame::build_frame`), and classifies the
+/// peer's ack. See this module's doc comment for why the token's `allow` list
+/// is always `["unknown"]` rather than `target_agent`.
+/// M1 (R1): resolve the outbound handshake posture for one dial, per
+/// [`SidecarHandshakeMode`]:
+///
+/// - `LegacyOnly` — plain ECDH, byte-identical to the v1 behavior.
+/// - `PreferPinned` — with a pin: the negotiating handshake (authed when the
+///   peer answers the 128-byte format, plain fallback otherwise — the fallback
+///   is WARN-logged here so migration progress and downgrade pressure are
+///   visible). Without a pin: plain, same as `LegacyOnly`.
+/// - `RequirePinned` — with a pin: the strict authenticated handshake, no
+///   fallback. Without a pin: `Err(SidecarError::Config)` — refuse rather than
+///   silently downgrade.
+async fn dial_handshake<S>(
+    stream: &mut S,
+    mode: SidecarHandshakeMode,
+    pinned_vk: Option<&[u8; 32]>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, SidecarError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
+    let outcome = tokio::time::timeout(timeout, async {
+        // Error type inside the block: SidecarError (so the Config arm can
+        // return Err directly); handshake errors map to SidecarError::Handshake.
+        match mode {
+            SidecarHandshakeMode::LegacyOnly => client_handshake(stream, None)
+                .await
+                .map_err(SidecarError::Handshake),
+            SidecarHandshakeMode::PreferPinned => match pinned_vk {
+                Some(vk) => {
+                    let (key, authenticated) =
+                        client_handshake_with_pinned_server_or_plain(stream, vk)
+                            .await
+                            .map_err(SidecarError::Handshake)?;
+                    if !authenticated {
+                        // M1 (R1) telemetry: a plain downgrade is exactly what
+                        // an operator watching `handshake_fallback_total` is for.
+                        HANDSHAKE_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[SAACP Sidecar] WARNING: peer answered the LEGACY plain handshake \
+                             despite a pinned verifying key — connection downgraded to plain \
+                             ECDH (PreferPinned). Move this peer to REQUIRE_PINNED posture once \
+                             it is upgraded."
+                        );
+                    } else {
+                        HANDSHAKE_PINNED_OK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok((key, None))
+                }
+                None => client_handshake(stream, None)
+                    .await
+                    .map_err(SidecarError::Handshake),
+            },
+            SidecarHandshakeMode::RequirePinned => {
+                let Some(vk) = pinned_vk else {
+                    // Refuse rather than silently downgrade — and make the
+                    // refusal visible (operator misconfiguration).
+                    HANDSHAKE_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    return Err(SidecarError::Config(
+                        "handshake_mode=RequirePinned but this peer has no pinned verifying \
+                         key — add it to `pinned_peers` (SAACP_PEER_PINS_FILE)"
+                            .to_string(),
+                    ));
+                };
+                match client_handshake_with_pinned_server(stream, None, Some(*vk)).await {
+                    Ok(key) => {
+                        HANDSHAKE_PINNED_OK.fetch_add(1, Ordering::Relaxed);
+                        Ok(key)
+                    }
+                    Err(e) => {
+                        // Pin mismatch / bad signature / transport failure under
+                        // the strict posture: fail closed AND make it visible.
+                        HANDSHAKE_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        Err(SidecarError::Handshake(e))
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| SidecarError::Timeout)??;
+    Ok(outcome.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     target_addr: &str,
@@ -588,6 +726,12 @@ pub async fn send_message(
     allow_private_targets: bool,
     audit_log: Option<&ImmutableAuditLog>,
     pad_payload: bool,
+    // M1 (R1): outbound handshake posture — see [`SidecarHandshakeMode`].
+    handshake_mode: SidecarHandshakeMode,
+    // M1 (R1): this peer's pinned Ed25519 verifying key, when configured.
+    // Required (non-`None`) under `RequirePinned`; optional under
+    // `PreferPinned`; ignored under `LegacyOnly`.
+    pinned_vk: Option<&[u8; 32]>,
 ) -> Result<SendOutcome, SidecarError> {
     let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
 
@@ -602,11 +746,8 @@ pub async fn send_message(
 
     let mut stream = connect_with_retry(validated_target, retry_attempts, timeout).await?;
 
-    let (session_key, _identity_session_id) =
-        tokio::time::timeout(timeout, client_handshake(&mut stream, None))
-            .await
-            .map_err(|_| SidecarError::Timeout)?
-            .map_err(SidecarError::Handshake)?;
+    // M1 (R1): posture-resolved handshake (plain / prefer-pinned / require-pinned).
+    let session_key = dial_handshake(&mut stream, handshake_mode, pinned_vk).await?;
 
     let session_id: [u8; 16] = rand::random();
     let epoch_mgr = SessionEpochManager::new();
@@ -898,14 +1039,14 @@ impl SidecarConnectionPool {
         validated: SocketAddr,
         retry_attempts: u32,
         timeout: Duration,
+        handshake_mode: SidecarHandshakeMode,
+        pinned_vk: Option<&[u8; 32]>,
     ) -> Result<PooledConn, SidecarError> {
         self.dialed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut stream = connect_with_retry(validated, retry_attempts, timeout).await?;
-        let (session_key, _) = tokio::time::timeout(timeout, client_handshake(&mut stream, None))
-            .await
-            .map_err(|_| SidecarError::Timeout)?
-            .map_err(SidecarError::Handshake)?;
+        // M1 (R1): posture-resolved handshake (plain / prefer-pinned / require-pinned).
+        let session_key = dial_handshake(&mut stream, handshake_mode, pinned_vk).await?;
         let session_id: [u8; 16] = rand::random();
         let epoch_mgr = std::sync::Arc::new(SessionEpochManager::new());
         epoch_mgr
@@ -949,6 +1090,10 @@ impl SidecarConnectionPool {
         allow_private_targets: bool,
         audit_log: Option<&ImmutableAuditLog>,
         pad_payload: bool,
+        // M1 (R1): outbound handshake posture — see [`SidecarHandshakeMode`].
+        handshake_mode: SidecarHandshakeMode,
+        // M1 (R1): this peer's pinned Ed25519 verifying key, when configured.
+        pinned_vk: Option<&[u8; 32]>,
     ) -> Result<SendOutcome, SidecarError> {
         let timeout = Duration::from_secs(SIDECAR_SEND_TIMEOUT_SECS);
         let validated = tokio::time::timeout(
@@ -1021,7 +1166,16 @@ impl SidecarConnectionPool {
             };
             let mut conn = match pooled {
                 Some(c) => c,
-                None => match self.dial(validated, retry_attempts, timeout).await {
+                None => match self
+                    .dial(
+                        validated,
+                        retry_attempts,
+                        timeout,
+                        handshake_mode,
+                        pinned_vk,
+                    )
+                    .await
+                {
                     Ok(c) => c,
                     Err(e) => {
                         last_err = Some(e);
@@ -1138,6 +1292,10 @@ struct SidecarState {
     allow_private_targets: bool,
     /// M-22 fix — see `SidecarConfig::http_bearer_token`.
     http_bearer_token: Option<String>,
+    /// M1 (R1) — see `SidecarConfig::handshake_mode`.
+    handshake_mode: SidecarHandshakeMode,
+    /// M1 (R1) — see `SidecarConfig::pinned_peers`.
+    pinned_peers: HashMap<String, [u8; 32]>,
     /// Count of inbound deliveries dropped because the inbox was at
     /// `SIDECAR_INBOX_CAPACITY` (see its "Delivery contract" doc). Surfaced on
     /// `/healthz` as `inbox_dropped` so a local agent that stopped polling long
@@ -1237,6 +1395,8 @@ async fn handle_send(
                 state.allow_private_targets,
                 Some(ImmutableAuditLog::global()),
                 state.payload_padding,
+                state.handshake_mode,
+                state.pinned_peers.get(&req.to_agent),
             )
             .await
     } else {
@@ -1253,6 +1413,8 @@ async fn handle_send(
             state.allow_private_targets,
             Some(ImmutableAuditLog::global()),
             state.payload_padding,
+            state.handshake_mode,
+            state.pinned_peers.get(&req.to_agent),
         )
         .await
     };
@@ -1328,6 +1490,8 @@ async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Response {
     // A dead inner protocol listener means the sidecar can serve HTTP but cannot receive
     // any peer traffic — report it as unhealthy (503) rather than a misleading "ok".
     let protocol_healthy = state.protocol_listener_healthy.load(Ordering::Relaxed);
+    let (handshake_pinned_ok, handshake_fallback_total, handshake_reject_total) =
+        handshake_telemetry();
     let body = serde_json::json!({
         "status": if protocol_healthy { "ok" } else { "degraded" },
         "protocol_listener": if protocol_healthy { "up" } else { "down" },
@@ -1339,6 +1503,15 @@ async fn handle_healthz(State(state): State<Arc<SidecarState>>) -> Response {
         // see `SIDECAR_INBOX_CAPACITY`'s delivery contract.
         "inbox_dropped": state.inbox_dropped.load(Ordering::Relaxed),
         "peers_configured": state.peer_secrets.len(),
+        // M1 (R1): outbound handshake posture + lifetime handshake-outcome
+        // counters (see `handshake_telemetry`). `handshake_fallback_total` > 0
+        // means some peer still speaks only the unauthenticated v1 wire format;
+        // `handshake_reject_total` > 0 means pinned dials were refused —
+        // investigate before it becomes an outage.
+        "handshake_mode": handshake_mode_name(state.handshake_mode),
+        "handshake_pinned_ok": handshake_pinned_ok,
+        "handshake_fallback_total": handshake_fallback_total,
+        "handshake_reject_total": handshake_reject_total,
     });
     let code = if protocol_healthy {
         StatusCode::OK
@@ -1394,7 +1567,9 @@ async fn require_bearer_auth(
 /// process is killed) — equivalent to `run_with_shutdown` with a token that's never
 /// cancelled.
 pub async fn run(config: SidecarConfig) {
-    run_with_shutdown(config, tokio_util::sync::CancellationToken::new()).await
+    if let Err(e) = run_with_shutdown(config, tokio_util::sync::CancellationToken::new()).await {
+        panic!("saacp-sidecar: {e}");
+    }
 }
 
 /// M-15 fix: same as `run`, but both the inner SAACP protocol listener
@@ -1409,7 +1584,26 @@ pub async fn run(config: SidecarConfig) {
 pub async fn run_with_shutdown(
     config: SidecarConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> Result<(), SidecarError> {
+    // M1 (R1): startup posture validation — fail before any listener binds.
+    if config.handshake_mode == SidecarHandshakeMode::RequirePinned && config.server_seed.is_none()
+    {
+        return Err(SidecarError::Config(
+            "handshake_mode=RequirePinned requires `server_seed` \
+             (SAACP_SERVER_SEED_FILE): the authenticated inbound handshake \
+             needs a stable Ed25519 server identity clients can pin"
+                .to_string(),
+        ));
+    }
+    if config.handshake_mode == SidecarHandshakeMode::LegacyOnly {
+        eprintln!(
+            "[SAACP Sidecar] WARNING: handshake_mode=LegacyOnly — outbound ECDH handshakes \
+             are UNAUTHENTICATED (an active MITM can read and rewrite every task). Prefer \
+             SAACP_HANDSHAKE_MODE=PREFER_PINNED during migration and REQUIRE_PINNED in \
+             production."
+        );
+    }
+
     let (tx, rx) = mpsc::channel::<DeliveredMessage>(SIDECAR_INBOX_CAPACITY);
 
     let gateway = Arc::new(ZeroTrustGateway::new());
@@ -1441,13 +1635,29 @@ pub async fn run_with_shutdown(
     // AEAD encrypted transport + gateway token verification layered on
     // immediately after; authenticated handshake for the sidecar mesh lands
     // with C5 peer-identity work.
-    let daemon = SAACPNetworkDaemon::insecure_for_testing(
-        &config.saacp_listen_addr.ip().to_string(),
-        config.saacp_listen_addr.port(),
-        Some(config.token_issuer_secret.to_vec()),
-    )
-    .with_gateway(Arc::clone(&gateway))
-    .with_encrypted_transport(Arc::clone(&epoch_manager))
+    let daemon = {
+        // M1 (R1): under `RequirePinned` the inbound listener answers the
+        // authenticated 128-byte response (stable Ed25519 identity from
+        // `server_seed`, validated above) so pinned clients can verify it —
+        // that is the mode's explicit contract ("refuse to fall back, both
+        // sides"). `LegacyOnly`/`PreferPinned` keep the v1 plain response
+        // byte-for-byte: `PreferPinned` is a client-side-only posture
+        // (enabling the authed response here would desync every v1 peer
+        // still dialing us).
+        let base = SAACPNetworkDaemon::insecure_for_testing(
+            &config.saacp_listen_addr.ip().to_string(),
+            config.saacp_listen_addr.port(),
+            Some(config.token_issuer_secret.to_vec()),
+        )
+        .with_gateway(Arc::clone(&gateway))
+        .with_encrypted_transport(Arc::clone(&epoch_manager));
+        match config.handshake_mode {
+            SidecarHandshakeMode::RequirePinned => {
+                base.with_server_auth(config.server_seed.expect("validated above"))
+            }
+            SidecarHandshakeMode::LegacyOnly | SidecarHandshakeMode::PreferPinned => base,
+        }
+    }
     .with_on_delivered(Arc::new(move |parsed: ParsedPacket| {
         if let Some(msg) = DeliveredMessage::from_parsed(&parsed) {
             // Synchronous, non-blocking — called from inside `spawn_blocking` (see
@@ -1487,6 +1697,8 @@ pub async fn run_with_shutdown(
         target_allowlist: config.target_allowlist,
         allow_private_targets: config.allow_private_targets,
         http_bearer_token: config.http_bearer_token,
+        handshake_mode: config.handshake_mode,
+        pinned_peers: config.pinned_peers,
         protocol_listener_healthy,
         inbox_dropped,
         pool: Arc::new(SidecarConnectionPool::new()),
@@ -1513,12 +1725,12 @@ pub async fn run_with_shutdown(
 
     let listener = tokio::net::TcpListener::bind(config.http_listen_addr)
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "saacp-sidecar: bind HTTP {} failed: {}",
-                config.http_listen_addr, e
-            )
-        });
+        .map_err(|e| {
+            SidecarError::Io(std::io::Error::new(
+                e.kind(),
+                format!("bind HTTP {} failed: {e}", config.http_listen_addr),
+            ))
+        })?;
 
     eprintln!(
         "[SAACP Sidecar] HTTP API listening on {}",
@@ -1527,7 +1739,8 @@ pub async fn run_with_shutdown(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
-        .unwrap_or_else(|e| panic!("saacp-sidecar: HTTP server failed: {}", e));
+        .map_err(SidecarError::Io)?;
+    Ok(())
 }
 
 #[cfg(test)]

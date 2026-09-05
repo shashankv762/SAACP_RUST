@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Pinned CI toolchain** (audit G7): every non-nightly CI job now runs
+  `1.96.0` — the same version as `rust-toolchain.toml` — instead of a moving
+  `stable`, so a fresh stable release shipping a new lint can no longer break
+  `-D warnings` CI with no local repro. Nightly fuzz jobs remain on nightly
+  (cargo-fuzz requires it).
+
+### Changed
+- **MSRV declared** (audit G7): `Cargo.toml` now declares
+  `rust-version = "1.96.0"`, resolving the previous "intentionally not
+  declared" TODO. Verified empirically: `cargo clippy --all-targets` (default
+  and feature matrices) fires no `clippy::incompatible_msrv` at this floor.
+- **SECURITY.md supported-versions table** (audit G6): updated to list 0.2.x
+  as supported (0.1.x marked superseded); previously still listed only 0.1.x.
+- **deny.toml exception review policy** (audit R7): every duplicate-version
+  `skip` entry now carries a dated (`reviewed: 2026-09-05`) justification and
+  a quarterly re-review requirement, with the EOL `rustls 0.21` entry flagged
+  as the highest-priority re-check.
+
+### Fixed
+- **`saacp-sidecar` binary did not compile** (audit G1/R1): missing
+  `use sha2::Digest;` in `src/bin/saacp_sidecar.rs`.
+- **`tests/test_sidecar_rs.rs` did not compile** (audit G1): 4 stale
+  `SidecarConnectionPool::send()` call sites migrated to the 14-argument
+  signature (handshake mode + pinned-vk parameters from the R1 hardening).
+- **Dockerfile could not build** (audit G6/R1): builder image was
+  `rust:1.79`, below the crate's real language-feature floor (1.80+); bumped
+  to `rust:1.96-slim-bookworm` matching `rust-toolchain.toml`, and dropped
+  the unused `libssl-dev` build dep (all TLS paths are rustls; `cargo tree
+  -i openssl -e normal` resolves to nothing for the release bins).
+- **`cargo fmt --check` failed at HEAD** (audit G7): 7 pre-existing rustfmt
+  violations across `src/bin/saacp_sidecar.rs`, `src/daemon.rs`,
+  `src/sidecar.rs`, and the sidecar tests, all in the R1 handshake-hardening
+  code; repo is now fmt-clean.
+- **Fuzz CI silently swallowed every finding** (audit G7): the fuzz job's
+  `|| true` made crashes non-blocking. PR/push CI now runs a blocking
+  10s/target smoke pass over all 5 fuzz targets; a new `fuzz-nightly` job
+  (cron + manual dispatch) does the 30s/target deep pass and uploads crash
+  artifacts.
+
 - **CI pipeline** (`.github/workflows/ci.yml`): full feature-matrix CI running
   `fmt --check`, `clippy -D warnings`, `test`, `cargo deny check` across 12
   feature combinations (default, sidecar, command-center, transport-ws/tls/wss,
@@ -21,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CHANGELOG.md** (this file).
 
 ### Security
+- **M1 / R1 — sidecar authenticated handshake (active-MITM closure)**: the
+  sidecar's outbound (and inbound) ECDH handshakes are now posture-controlled
+  via `SidecarHandshakeMode`. The library default stays `LegacyOnly`
+  (byte-identical v1 wire compat); the `saacp-sidecar` binary defaults to
+  `PREFER_PINNED` and accepts `SAACP_HANDSHAKE_MODE=REQUIRE_PINNED` for the
+  production posture, per-peer Ed25519 pins via `SAACP_PEER_PINS_FILE`, and a
+  stable server identity via `SAACP_SERVER_SEED_FILE`. A wrong pin is rejected
+  (never downgraded silently), `REQUIRE_PINNED` refuses plain peers and fails
+  startup without a seed, `PREFER_PINNED` downgrades only with a loud WARN,
+  and all three outcomes are visible on `/healthz` (`handshake_pinned_ok` /
+  `handshake_fallback_total` / `handshake_reject_total`). Regression-tested in
+  `tests/test_sidecar_mitm_rs.rs`.
 - **M6 / R13**: Added `overflow-checks = true` to `[profile.release]` in
   `Cargo.toml`. Without this, release builds silently wrapped on integer
   overflow while debug/test builds panicked — giving parser arithmetic

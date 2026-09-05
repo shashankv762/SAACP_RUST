@@ -78,7 +78,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use saacp::maintenance::MaintenanceCoordinator;
-use saacp::sidecar::{run_with_shutdown, SidecarConfig};
+use saacp::sidecar::{run_with_shutdown, SidecarConfig, SidecarHandshakeMode};
+use sha2::Digest;
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -525,6 +526,20 @@ async fn main() {
             .unwrap_or_else(|e| panic!("invalid SAACP_SEND_RETRY_ATTEMPTS: {e}"));
     }
 
+    // M1 (R1): outbound handshake posture. The BINARY defaults to
+    // `PreferPinned` (authenticated handshake with an explicit, WARN-logged
+    // plain fallback for legacy peers) — the library default stays
+    // `LegacyOnly` so embedded `SidecarConfig` consumers keep v1 wire
+    // compatibility. `SAACP_HANDSHAKE_MODE=LEGACY_ONLY` restores v1 exactly.
+    config.handshake_mode =
+        parse_handshake_mode(std::env::var("SAACP_HANDSHAKE_MODE").ok().as_deref());
+    if let Ok(path) = std::env::var("SAACP_SERVER_SEED_FILE") {
+        config.server_seed = Some(parse_server_seed_file(&path));
+    }
+    if let Ok(path) = std::env::var("SAACP_PEER_PINS_FILE") {
+        config.pinned_peers = parse_peer_pins_file(&path);
+    }
+
     // R-6 fix: same rationale as `saacp_command_center.rs`'s identical wiring — this
     // binary's inner `SAACPNetworkDaemon` (constructed inside `sidecar::run_with_shutdown`)
     // drives packets through the same `handler.rs` gate pipeline, which mutates the same
@@ -595,7 +610,103 @@ async fn main() {
     });
     let _maintenance_handle = Arc::clone(&maintenance).start();
 
-    run_with_shutdown(config, tokio_util::sync::CancellationToken::new()).await;
+    run_with_shutdown(config, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[saacp-sidecar] fatal: {e}");
+            std::process::exit(1);
+        });
+}
+
+/// M1 (R1): parse `SAACP_HANDSHAKE_MODE`. Unset defaults to `PreferPinned`
+/// (binary posture — see the call site); recognized values are the Debug
+/// spellings and their SCREAMING_SNAKE aliases.
+fn parse_handshake_mode(raw: Option<&str>) -> SidecarHandshakeMode {
+    match raw {
+        None => SidecarHandshakeMode::PreferPinned,
+        Some("LegacyOnly" | "LEGACY_ONLY" | "legacy_only") => SidecarHandshakeMode::LegacyOnly,
+        Some("PreferPinned" | "PREFER_PINNED" | "prefer_pinned") => {
+            SidecarHandshakeMode::PreferPinned
+        }
+        Some("RequirePinned" | "REQUIRE_PINNED" | "require_pinned") => {
+            SidecarHandshakeMode::RequirePinned
+        }
+        Some(other) => panic!(
+            "invalid SAACP_HANDSHAKE_MODE '{other}': expected \
+             LEGACY_ONLY | PREFER_PINNED | REQUIRE_PINNED"
+        ),
+    }
+}
+
+/// M1 (R1): read the server's stable Ed25519 seed (64 hex chars) from
+/// `SAACP_SERVER_SEED_FILE`. Required for `REQUIRE_PINNED`; optional (a fresh
+/// ephemeral seed is generated and its VK fingerprint printed once) otherwise.
+fn parse_server_seed_file(path: &str) -> [u8; 32] {
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read SAACP_SERVER_SEED_FILE '{path}': {e}"));
+    let trimmed = raw.trim();
+    let bytes = hex::decode(trimmed)
+        .unwrap_or_else(|e| panic!("SAACP_SERVER_SEED_FILE '{path}': invalid hex: {e}"));
+    let seed: [u8; 32] = bytes.try_into().unwrap_or_else(|v: Vec<u8>| {
+        panic!(
+            "SAACP_SERVER_SEED_FILE '{path}': expected 64 hex chars (32 bytes), got {}",
+            v.len()
+        )
+    });
+    eprintln!(
+        "[saacp-sidecar] server identity seed loaded from {path} (vk fingerprint: {})",
+        hex::encode(sha2::Sha256::digest(seed))
+    );
+    seed
+}
+
+/// M1 (R1): read per-peer pinned Ed25519 verifying keys from
+/// `SAACP_PEER_PINS_FILE`. Accepted JSON shapes (both per entry):
+/// `{"agent-b": {"vk_hex": "<64 hex>"}}` (documented form) or the shorthand
+/// `{"agent-b": "<64 hex>"}`. Pinned keys are what `REQUIRE_PINNED` enforces
+/// and what `PREFER_PINNED` verifies (with fallback) against.
+fn parse_peer_pins_file(path: &str) -> std::collections::HashMap<String, [u8; 32]> {
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read SAACP_PEER_PINS_FILE '{path}': {e}"));
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("SAACP_PEER_PINS_FILE '{path}': invalid JSON: {e}"));
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => panic!("SAACP_PEER_PINS_FILE '{path}': top level must be a JSON object"),
+    };
+    let mut pins = std::collections::HashMap::new();
+    for (agent, entry) in obj {
+        let hex_str = match entry {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Object(m) => m
+                .get("vk_hex")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    panic!("SAACP_PEER_PINS_FILE '{path}': peer '{agent}' missing \"vk_hex\"")
+                }),
+            other => panic!(
+                "SAACP_PEER_PINS_FILE '{path}': peer '{agent}' must be a string or \
+                 {{\"vk_hex\": ...}} object, got {other}"
+            ),
+        };
+        let bytes = hex::decode(hex_str.trim()).unwrap_or_else(|e| {
+            panic!("SAACP_PEER_PINS_FILE '{path}': peer '{agent}': invalid hex: {e}")
+        });
+        let vk: [u8; 32] = bytes.try_into().unwrap_or_else(|v: Vec<u8>| {
+            panic!(
+                "SAACP_PEER_PINS_FILE '{path}': peer '{agent}': expected 64 hex chars \
+                 (32 bytes), got {}",
+                v.len()
+            )
+        });
+        pins.insert(agent.clone(), vk);
+    }
+    eprintln!(
+        "[saacp-sidecar] loaded {} peer pin(s) from {path}",
+        pins.len()
+    );
+    pins
 }
 
 #[cfg(test)]

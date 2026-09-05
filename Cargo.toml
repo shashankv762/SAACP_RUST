@@ -2,18 +2,15 @@
 name = "saacp"
 version = "0.2.0"
 edition = "2021"
-# `rust-version` (MSRV) is intentionally not declared here. The codebase
-# uses language features stable in Rust 1.80+ (e.g. `std::sync::LazyLock`
-# in `src/acsvaf_authority.rs`) but other features are stable only in
-# 1.82+ or 1.87+ (see `clippy::incompatible_msrv` failures under
-# `cargo clippy --all-targets -- -D warnings`). Declaring a single MSRV
-# here would turn on that lint and fail CI on the pre-existing usages.
-# TODO: lower the MSRV floor by either (a) downgrading the affected
-# `acsvaf_authority.rs` / `daemon.rs` / `handler.rs` / `security.rs`
-# sites to features stable in 1.80, or (b) accepting the current floor
-# and adding a `clippy.toml` with `msrv = "1.87"` to acknowledge the
-# real minimum. Until then, downstream consumers should pin
-# `rust-toolchain.toml` (which uses 1.96.0) as the de-facto floor.
+# MSRV (audit G7: "declare the real MSRV" — resolves the previous TODO).
+# The de-facto floor is pinned by rust-toolchain.toml (1.96.0) and is what
+# every CI job and the Dockerfile (rust:1.96-slim-bookworm) now use, so the
+# floor is declared here to match instead of being left implicit. Downgrading
+# to the older 1.80 floor sketched in the original TODO would require
+# rewriting the 1.82+/1.87+-stable sites in acsvaf_authority.rs / daemon.rs /
+# handler.rs / security.rs (see git history for that analysis) — tracked as
+# roadmap work, not done silently here.
+rust-version = "1.96.0"
 description = "Secure Autonomous Agent Communication Protocol - Rust Implementation"
 license = "MIT"
 

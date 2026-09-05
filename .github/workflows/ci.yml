@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    # Nightly deep fuzz (see the fuzz-nightly job below).
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,8 +21,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Audit G7 (toolchain unification): every non-nightly job is pinned to
+      # the same toolchain as rust-toolchain.toml / Cargo.toml `rust-version`
+      # so CI lint/test verdicts can never drift from local development (a
+      # fresh `stable` release shipping a new lint would otherwise break CI
+      # under `-D warnings` with no local repro). The nightly fuzz jobs
+      # below intentionally stay on @nightly — cargo-fuzz requires it.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
@@ -29,8 +40,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
@@ -41,7 +53,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -55,10 +69,12 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: [stable]
+        rust: ["1.96.0"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --all-features
@@ -73,7 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Test transport-ws
         run: cargo test --features transport-ws --test test_transport_ws_rs
@@ -95,7 +113,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
         run: cargo bench -- --test --warmup-iters 3 --measurement-time 10 2>&1 | tail -20
@@ -111,7 +131,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
@@ -132,8 +154,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
@@ -160,9 +183,14 @@ jobs:
           PCT=$(echo "${SUMMARY}" | awk '/^TOTAL/ {print $NF}' | tr -d '%')
           awk -v p="${PCT}" 'BEGIN { if (p+0 < 60) { print "FAIL: coverage " p "% < 60%"; exit 1 } else { print "PASS: coverage " p "% >= 60%" } }'
 
-  # ── Fuzz targets (short run) ─────────────────────────────────────────────
+  # ── Fuzz targets (smoke pass, blocking) ──────────────────────────────────
+  # Runs a short 10s/target pass on every push and PR. Unlike the previous
+  # `|| true`-swallowed invocation, a libFuzzer crash here FAILS the build —
+  # a finding that only blocks when someone remembers to check a nightly log
+  # is not a finding at all. The deeper nightly pass is the `fuzz-nightly`
+  # job below (30s/target + crash artifacts).
   fuzz:
-    name: Fuzz (short run)
+    name: Fuzz (smoke, blocking)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -170,7 +198,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      - name: Fuzz MEASC frame parser (30s)
-        run: timeout 60 cargo +nightly fuzz run fuzz_measc_parse_frame -- -max_total_time=30 2>&1 || true
-      - name: Fuzz capability token (30s)
-        run: timeout 60 cargo +nightly fuzz run fuzz_capability_token_from_wire -- -max_total_time=30 2>&1 || true
+      - name: Smoke-fuzz all 5 targets (10s each)
+        run: |
+          for target in fuzz_measc_parse_frame fuzz_saacpframe_parse_header \
+                        fuzz_capability_token_from_wire fuzz_bypass_injection_scanner \
+                        fuzz_gate_pipeline_raw; do
+            timeout 120 cargo +nightly fuzz run "$target" -- -max_total_time=10
+          done
+
+  # ── Fuzz targets (nightly deep pass) ─────────────────────────────────────
+  # Only triggered by the schedule/workflow_dispatch events above. Longer
+  # budget per target, and crash artifacts are uploaded so a finding can be
+  # reproduced locally with `cargo fuzz run <target> fuzz/artifacts/<file>`.
+  fuzz-nightly:
+    name: Fuzz (nightly, deep)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Deep-fuzz all 5 targets (30s each)
+        run: |
+          for target in fuzz_measc_parse_frame fuzz_saacpframe_parse_header \
+                        fuzz_capability_token_from_wire fuzz_bypass_injection_scanner \
+                        fuzz_gate_pipeline_raw; do
+            timeout 180 cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore

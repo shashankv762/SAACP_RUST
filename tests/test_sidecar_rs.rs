@@ -13,7 +13,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use saacp::security::{AuditRecord, ImmutableAuditLog};
-use saacp::sidecar::{run, run_with_shutdown, SidecarConfig, SIDECAR_INBOX_CAPACITY};
+use saacp::sidecar::{
+    run, run_with_shutdown, SidecarConfig, SidecarHandshakeMode, SIDECAR_INBOX_CAPACITY,
+};
 
 async fn free_addr() -> SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -597,12 +599,17 @@ async fn run_with_shutdown_returns_promptly_and_stops_serving() {
 
     shutdown.cancel();
 
-    // `run_with_shutdown` (an `async fn` with no explicit return type) must
-    // complete — bounded well within the daemon's own drain timeout.
-    tokio::time::timeout(Duration::from_secs(15), handle)
+    // `run_with_shutdown` returns `Result<(), SidecarError>` since the M1 (R1)
+    // startup-posture validation; a graceful shutdown with a valid config must
+    // complete Ok — bounded well within the daemon's own drain timeout.
+    let result = tokio::time::timeout(Duration::from_secs(15), handle)
         .await
         .expect("run_with_shutdown did not return within 15s")
         .expect("sidecar task panicked");
+    assert!(
+        result.is_ok(),
+        "run_with_shutdown must exit Ok on graceful shutdown, got: {result:?}"
+    );
 
     // The HTTP listener must no longer be accepting connections post-shutdown.
     let post_shutdown = client
@@ -669,6 +676,10 @@ async fn c2_pool_reuses_connection_across_sends() {
             false,
             None,
             false,
+            // The spawned receiver uses the library-default LegacyOnly posture,
+            // so the client must dial with the matching plain-ECDH handshake.
+            SidecarHandshakeMode::LegacyOnly,
+            None,
         )
         .await
         .expect("first pooled send");
@@ -688,6 +699,8 @@ async fn c2_pool_reuses_connection_across_sends() {
             false,
             None,
             false,
+            SidecarHandshakeMode::LegacyOnly,
+            None,
         )
         .await
         .expect("second pooled send");
@@ -721,6 +734,8 @@ async fn c2_pool_sweep_reclaims_idle_connections() {
             false,
             None,
             false,
+            SidecarHandshakeMode::LegacyOnly,
+            None,
         )
         .await
         .expect("pooled send");
@@ -777,6 +792,8 @@ async fn c4_padded_send_succeeds_end_to_end() {
             false,
             None,
             true,
+            SidecarHandshakeMode::LegacyOnly,
+            None,
         )
         .await
         .expect("pooled padded send");

@@ -2,9 +2,10 @@
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | ✅        |
+| Version | Supported          |
+|---------|--------------------|
+| 0.2.x   | ✅                 |
+| 0.1.x   | ❌ (superseded)    |
 
 ## Reporting a Vulnerability
 

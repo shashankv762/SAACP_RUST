@@ -56,6 +56,9 @@ SAACP_AGENT_ID=agent-a SAACP_TOKEN_SECRET=<shared secret> \
 | `SAACP_ALLOW_UNAUTHENTICATED_HTTP` | `1` = run the loopback HTTP API with no auth at all and silence the warning. Any process on the host can then issue messages as this agent and drain its inbox |
 | `SAACP_MAX_CONCURRENT_SENDS` | Bound on concurrent outbound `/send` dispatches (default 64) |
 | `SAACP_SEND_RETRY_ATTEMPTS` | Retries for a transient TCP-connect failure only (default 2) |
+| `SAACP_HANDSHAKE_MODE` | Outbound + inbound handshake posture. `PREFER_PINNED` (default): verify the peer's Ed25519 signature when it answers the authenticated 128-byte handshake, fall back to plain v1 ECDH with a loud WARN otherwise. `REQUIRE_PINNED`: production posture — refuse any peer that will not authenticate. `LEGACY_ONLY`: v1 behavior (unauthenticated ECDH) |
+| `SAACP_SERVER_SEED_FILE` | File containing this sidecar's Ed25519 server seed (64 hex chars). Required for `REQUIRE_PINNED` — the authenticated inbound handshake needs a stable server identity clients can pin; optional otherwise |
+| `SAACP_PEER_PINS_FILE` | JSON file pinning each peer's Ed25519 verifying key: `{"agent-b": {"vk_hex": "<64 hex>"}}` (or shorthand `{"agent-b": "<64 hex>"}`). What `REQUIRE_PINNED` enforces and what `PREFER_PINNED` verifies (with fallback) against |
 
 ### Local HTTP API authentication
 
