@@ -164,8 +164,8 @@ async fn daemon_encrypted_valid_signed_token_accepted_and_decodes() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "validly-signed encrypted frame must be accepted"
     );
 
@@ -203,8 +203,8 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_ne!(
-        &response, b"SUCCESS",
+    assert!(
+        !response.starts_with(b"SUCCESS"),
         "AES-GCM auth failure must not be silently accepted"
     );
 }
@@ -236,8 +236,8 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_ne!(
-        &response, b"SUCCESS",
+    assert!(
+        !response.starts_with(b"SUCCESS"),
         "a token signed with the wrong secret must be rejected"
     );
 }
@@ -292,8 +292,8 @@ async fn daemon_plain_new_default_behavior_unchanged() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "default daemon behavior (no builders) must be unchanged"
     );
 }
@@ -334,7 +334,7 @@ async fn daemon_encrypted_two_independent_sessions() {
         );
         stream.write_all(&frame).await.expect("send frame");
         let response = read_response(&mut stream, 128).await;
-        assert_eq!(&response, b"SUCCESS");
+        assert!(response.starts_with(b"SUCCESS"));
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;

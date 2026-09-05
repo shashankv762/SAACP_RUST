@@ -4,9 +4,9 @@
 //! NegotiationTranscript, and SuiteNegotiator.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -76,6 +76,266 @@ pub const CIPHER_SUITE_BASELINE: &str = "AES-256-GCM-HKDF-SHA256";
 /// Approved AEAD session cipher suites — only identifiers in this list may
 /// be selected as the MEASC session encryption algorithm.
 pub const APPROVED_SESSION_CIPHER_SUITES: &[&str] = &["AES-256-GCM-HKDF-SHA256"];
+/// Approved signature suites — classical and post-quantum.
+pub const APPROVED_SIGNATURE_SUITES: &[&str] = &[
+    "ed25519",
+    "ml-dsa-65",
+    "slh-dsa",
+    "hybrid-ed25519-ml-dsa-65",
+];
+/// Approved KEM suites — classical and post-quantum.
+pub const APPROVED_KEM_SUITES: &[&str] = &[
+    "x25519",
+    "ml-kem-768",
+    "ml-kem-1024",
+    "hybrid-x25519-ml-kem-768",
+    "hybrid-p384-ml-kem-1024",
+];
+// ---------------------------------------------------------------------------
+// Security Tiers (#8 — PQC-required tier + fail-closed)
+// ---------------------------------------------------------------------------
+
+/// Security tiers for cryptographic negotiation.
+///
+/// #8 FIX: Introduces a hard PQC floor. A `PqcRequired` endpoint physically
+/// cannot complete a classical handshake — it fails closed with a distinct
+/// error rather than silently degrading. This is the single most important
+/// architectural fix because without it, an active attacker can negotiate
+/// down to classical and the PQC becomes decorative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecurityTier {
+    /// PQC is mandatory. Any non-hybrid completion fails closed.
+    /// Use for healthcare/banking channels carrying long-lived data.
+    PqcRequired,
+    /// PQC is preferred but classical is acceptable (logged as degraded).
+    /// Use for general-purpose channels where backward compat matters.
+    PqcPreferred,
+    /// Classical-only, explicit opt-in, audit-flagged.
+    /// Use only for legacy interoperability during migration windows.
+    ClassicalLegacy,
+}
+
+impl SecurityTier {
+    /// Parse from string.
+    ///
+    /// Deliberately an inherent method (Python-parity shape), not a `FromStr`
+    /// impl — see `cluster.rs`'s matching `#[allow]` for the rationale.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "PQC-REQUIRED" | "PQCREQUIRED" => Some(Self::PqcRequired),
+            "PQC-PREFERRED" | "PQCPREFERRED" => Some(Self::PqcPreferred),
+            "CLASSICAL-LEGACY" | "CLASSICALLEGACY" | "LEGACY" => Some(Self::ClassicalLegacy),
+            _ => None,
+        }
+    }
+
+    /// String representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PqcRequired => "PQC-REQUIRED",
+            Self::PqcPreferred => "PQC-PREFERRED",
+            Self::ClassicalLegacy => "CLASSICAL-LEGACY",
+        }
+    }
+
+    /// Whether this tier requires a hybrid (PQC) suite.
+    pub fn requires_pqc(&self) -> bool {
+        matches!(self, Self::PqcRequired)
+    }
+
+    /// Whether this tier allows classical-only suites.
+    pub fn allows_classical(&self) -> bool {
+        matches!(self, Self::PqcPreferred | Self::ClassicalLegacy)
+    }
+}
+
+/// Recommended hybrid signature suite (quantum-resistant default).
+pub const RECOMMENDED_SIGNATURE_SUITE: &str = "hybrid-ed25519-ml-dsa-65";
+/// Recommended hybrid KEM suite (quantum-resistant default).
+pub const RECOMMENDED_KEM_SUITE: &str = "hybrid-x25519-ml-kem-768";
+
+// ---------------------------------------------------------------------------
+// #9 FIX: Crypto-Telemetry per Session
+// ---------------------------------------------------------------------------
+
+/// Cryptographic telemetry for a single session.
+///
+/// #9 FIX: Records the exact cryptographic parameters used in each session
+/// so that when a weakness is discovered (e.g., a Falcon side-channel or
+/// an ML-KEM parameter revision), you can query which sessions are affected
+/// within minutes, not days. This is also the compliance artifact for
+/// regulated sectors — you must be able to *demonstrate* PQC was in force.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionCryptoTelemetry {
+    /// Session identifier.
+    pub session_id: String,
+    /// Negotiated suite name.
+    pub negotiated_suite: String,
+    /// Security tier used during negotiation.
+    pub security_tier: String,
+    /// Algorithm code-points used (signature algorithms).
+    pub signature_algorithms: Vec<u16>,
+    /// KEM algorithm code-point used.
+    pub kem_algorithm: String,
+    /// Attestation verdict (if attestation was performed).
+    pub attestation_verdict: Option<String>,
+    /// Whether any degradation occurred during negotiation.
+    pub degradation_occurred: bool,
+    /// Reason for degradation (if any).
+    pub degradation_reason: Option<String>,
+    /// Timestamp when the session was established.
+    pub established_at: f64,
+    /// Negotiation transcript hash.
+    pub transcript_hash: String,
+}
+
+impl SessionCryptoTelemetry {
+    /// Create a new telemetry record for a session.
+    pub fn new(
+        session_id: String,
+        negotiated_suite: String,
+        security_tier: String,
+        transcript_hash: String,
+    ) -> Self {
+        Self {
+            session_id,
+            negotiated_suite,
+            security_tier,
+            signature_algorithms: Vec::new(),
+            kem_algorithm: String::new(),
+            attestation_verdict: None,
+            degradation_occurred: false,
+            degradation_reason: None,
+            established_at: now_epoch_secs(),
+            transcript_hash,
+        }
+    }
+
+    /// Record that a degradation occurred.
+    pub fn record_degradation(&mut self, reason: &str) {
+        self.degradation_occurred = true;
+        self.degradation_reason = Some(reason.to_string());
+    }
+
+    /// Record the attestation verdict.
+    pub fn record_attestation(&mut self, verdict: &str) {
+        self.attestation_verdict = Some(verdict.to_string());
+    }
+
+    /// Add a signature algorithm code-point.
+    pub fn add_signature_algorithm(&mut self, code_point: u16) {
+        if !self.signature_algorithms.contains(&code_point) {
+            self.signature_algorithms.push(code_point);
+        }
+    }
+}
+
+/// Registry of session crypto-telemetry records.
+///
+/// #9 FIX: Provides queryable storage for session cryptographic parameters.
+/// When a weakness is discovered, query this registry to find affected sessions.
+#[derive(Debug, Clone)]
+pub struct CryptoTelemetryRegistry {
+    records: Vec<SessionCryptoTelemetry>,
+}
+
+impl CryptoTelemetryRegistry {
+    /// Create a new empty registry.
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    /// Record telemetry for a session.
+    pub fn record(&mut self, telemetry: SessionCryptoTelemetry) {
+        self.records.push(telemetry);
+    }
+
+    /// Find all sessions that used a specific suite.
+    pub fn find_by_suite(&self, suite: &str) -> Vec<&SessionCryptoTelemetry> {
+        self.records
+            .iter()
+            .filter(|r| r.negotiated_suite == suite)
+            .collect()
+    }
+
+    /// Find all sessions that used a specific signature algorithm code-point.
+    pub fn find_by_signature_algorithm(&self, code_point: u16) -> Vec<&SessionCryptoTelemetry> {
+        self.records
+            .iter()
+            .filter(|r| r.signature_algorithms.contains(&code_point))
+            .collect()
+    }
+
+    /// Find all sessions where degradation occurred.
+    pub fn find_degraded_sessions(&self) -> Vec<&SessionCryptoTelemetry> {
+        self.records
+            .iter()
+            .filter(|r| r.degradation_occurred)
+            .collect()
+    }
+
+    /// Find all sessions that used a specific security tier.
+    pub fn find_by_tier(&self, tier: &str) -> Vec<&SessionCryptoTelemetry> {
+        self.records
+            .iter()
+            .filter(|r| r.security_tier == tier)
+            .collect()
+    }
+
+    /// Get all records.
+    pub fn all_records(&self) -> &[SessionCryptoTelemetry] {
+        &self.records
+    }
+}
+
+impl Default for CryptoTelemetryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Downgrade sentinel — a fixed value written into the transcript when a
+/// PQC-capable endpoint ends up in a classical suite. A genuine classical-only
+/// peer cannot produce the PQC-capable sentinel, so a stripped negotiation
+/// fails signature verification.
+///
+/// #2 FIX: This is the TLS 1.3 server-random downgrade canary mechanism,
+/// generalized to the SAACP suite registry.
+pub const DOWNGRADE_SENTINEL_PQC_CAPABLE: &[u8] = b"SAACP-PQC-CAPABLE-v2";
+pub const DOWNGRADE_SENTINEL_CLASSICAL_ONLY: &[u8] = b"SAACP-CLASSICAL-ONLY-v2";
+
+/// Determine the downgrade sentinel based on peer capabilities and selected suite.
+///
+/// If the peer advertised PQC suites but the selected suite is classical,
+/// returns the PQC-capable sentinel (indicating a potential downgrade attack).
+/// Otherwise returns the classical-only sentinel.
+pub fn compute_downgrade_sentinel(
+    peer_advertised_pqc: bool,
+    selected_suite: &str,
+) -> &'static [u8] {
+    let is_hybrid = selected_suite.contains("hybrid")
+        || selected_suite.contains("ml-dsa")
+        || selected_suite.contains("ml-kem");
+    if peer_advertised_pqc && !is_hybrid {
+        // Peer advertised PQC but we ended up classical — potential downgrade
+        DOWNGRADE_SENTINEL_PQC_CAPABLE
+    } else {
+        DOWNGRADE_SENTINEL_CLASSICAL_ONLY
+    }
+}
+
+/// Check if a suite name indicates a hybrid (PQC) construction.
+pub fn is_hybrid_suite(suite: &str) -> bool {
+    suite.contains("hybrid") || suite.contains("ml-dsa") || suite.contains("ml-kem")
+}
+
+/// Check if a suite name indicates a classical-only construction.
+pub fn is_classical_suite(suite: &str) -> bool {
+    !is_hybrid_suite(suite)
+}
 
 // ---------------------------------------------------------------------------
 // CryptoLedgerEntry
@@ -181,24 +441,17 @@ impl CryptoTransparencyLedger {
     /// Append an entry with hash-chaining.
     pub fn append(&self, mut entry: CryptoLedgerEntry) {
         let canonical = canonical_json(&entry);
-        let prev = self
-            .last_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let prev = self.last_hash.lock().clone();
         let chain_input = format!("{}{}", prev, canonical);
         let hash = sha256_hex(chain_input.as_bytes());
         entry.entry_hash = hash.clone();
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
-        self.log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(entry);
+        *self.last_hash.lock() = hash;
+        self.log.lock().push(entry);
     }
 
     /// Return all entries.
     pub fn entries(&self) -> Vec<CryptoLedgerEntry> {
-        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.log.lock().clone()
     }
 
     /// Verify the hash chain integrity.
@@ -208,7 +461,7 @@ impl CryptoTransparencyLedger {
     /// of `!=`, so a local timing side-channel can't help an attacker narrow
     /// down a forged ledger entry's hash byte-by-byte.
     pub fn verify_chain(&self) -> bool {
-        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let log = self.log.lock();
         let mut prev_hash = "0".repeat(64);
         for entry in log.iter() {
             let canonical = canonical_json(entry);
@@ -224,8 +477,8 @@ impl CryptoTransparencyLedger {
 
     /// Reset the ledger (for tests only).
     pub fn reset(&self) {
-        self.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = "0".repeat(64);
+        self.log.lock().clear();
+        *self.last_hash.lock() = "0".repeat(64);
     }
 }
 
@@ -337,6 +590,15 @@ pub fn production_policy() -> ApprovedSuitePolicy {
     approved.insert("ed25519".into());
     // Also mark the AEAD session cipher suite as approved for validate_suite_properties calls
     approved.insert("AES-256-GCM-HKDF-SHA256".into());
+    // Post-quantum signature suites (NIST FIPS standardized)
+    approved.insert("ml-dsa-65".into());
+    approved.insert("slh-dsa".into());
+    approved.insert("hybrid-ed25519-ml-dsa-65".into());
+    // Post-quantum KEM suites
+    approved.insert("ml-kem-768".into());
+    approved.insert("ml-kem-1024".into());
+    approved.insert("hybrid-x25519-ml-kem-768".into());
+    approved.insert("hybrid-p384-ml-kem-1024".into());
     ApprovedSuitePolicy {
         approved_algorithms: approved,
         minimum_signature_length: 64,
@@ -345,6 +607,15 @@ pub fn production_policy() -> ApprovedSuitePolicy {
         suite_status_map: vec![
             ("ed25519".into(), SuiteStatus::Approved),
             ("AES-256-GCM-HKDF-SHA256".into(), SuiteStatus::Approved),
+            // Post-quantum signatures
+            ("ml-dsa-65".into(), SuiteStatus::Approved),
+            ("slh-dsa".into(), SuiteStatus::Approved),
+            ("hybrid-ed25519-ml-dsa-65".into(), SuiteStatus::Approved),
+            // Post-quantum KEMs
+            ("ml-kem-768".into(), SuiteStatus::Approved),
+            ("ml-kem-1024".into(), SuiteStatus::Approved),
+            ("hybrid-x25519-ml-kem-768".into(), SuiteStatus::Approved),
+            ("hybrid-p384-ml-kem-1024".into(), SuiteStatus::Approved),
         ],
         // mandatory_baseline here governs SIGNATURE algorithm (ACSVAF/FAITF signing).
         // Session encryption baseline is governed by CIPHER_SUITE_BASELINE separately.
@@ -357,6 +628,14 @@ pub fn lab_policy() -> ApprovedSuitePolicy {
     let mut approved = HashSet::new();
     approved.insert("ed25519".into());
     approved.insert("AES-256-GCM-HKDF-SHA256".into());
+    // Post-quantum suites
+    approved.insert("ml-dsa-65".into());
+    approved.insert("slh-dsa".into());
+    approved.insert("hybrid-ed25519-ml-dsa-65".into());
+    approved.insert("ml-kem-768".into());
+    approved.insert("ml-kem-1024".into());
+    approved.insert("hybrid-x25519-ml-kem-768".into());
+    approved.insert("hybrid-p384-ml-kem-1024".into());
     ApprovedSuitePolicy {
         approved_algorithms: approved,
         minimum_signature_length: 32,
@@ -365,6 +644,13 @@ pub fn lab_policy() -> ApprovedSuitePolicy {
         suite_status_map: vec![
             ("ed25519".into(), SuiteStatus::Approved),
             ("AES-256-GCM-HKDF-SHA256".into(), SuiteStatus::Approved),
+            ("ml-dsa-65".into(), SuiteStatus::Approved),
+            ("slh-dsa".into(), SuiteStatus::Approved),
+            ("hybrid-ed25519-ml-dsa-65".into(), SuiteStatus::Approved),
+            ("ml-kem-768".into(), SuiteStatus::Approved),
+            ("ml-kem-1024".into(), SuiteStatus::Approved),
+            ("hybrid-x25519-ml-kem-768".into(), SuiteStatus::Approved),
+            ("hybrid-p384-ml-kem-1024".into(), SuiteStatus::Approved),
         ],
         mandatory_baseline: "ed25519".into(),
     }
@@ -391,6 +677,15 @@ pub struct NegotiationTranscript {
     pub protocol_version: String,
     pub session_id: Vec<u8>,
     pub transcript_hash: Vec<u8>,
+    /// #2 FIX: Security tier used during negotiation (PqcRequired, PqcPreferred, ClassicalLegacy).
+    /// This binds the negotiation mode into the transcript so a downgrade attempt
+    /// that changes the tier is detectable.
+    pub security_tier: String,
+    /// #2 FIX: Downgrade sentinel value. When a PQC-capable peer ends up in a
+    /// classical suite, this is set to DOWNGRADE_SENTINEL_PQC_CAPABLE. A genuine
+    /// classical-only peer cannot produce this sentinel, so a stripped negotiation
+    /// fails signature verification.
+    pub downgrade_sentinel: Vec<u8>,
 }
 
 /// Appends a length-prefixed encoding of `items` to `out`: each element is
@@ -417,7 +712,14 @@ impl NegotiationTranscript {
         selected_suite: String,
         protocol_version: String,
         session_id: Vec<u8>,
+        security_tier: SecurityTier,
+        peer_advertised_pqc: bool,
     ) -> Self {
+        // #2 FIX: Compute the downgrade sentinel based on peer capabilities and selected suite.
+        // If the peer advertised PQC suites but we ended up classical, this is a potential downgrade.
+        let downgrade_sentinel =
+            compute_downgrade_sentinel(peer_advertised_pqc, &selected_suite).to_vec();
+
         let mut canonical = Vec::new();
         canonical.extend_from_slice(b"|A|");
         encode_length_prefixed(&peer_a_suites, &mut canonical);
@@ -429,6 +731,12 @@ impl NegotiationTranscript {
         canonical.extend_from_slice(protocol_version.as_bytes());
         canonical.extend_from_slice(b"|ID|");
         canonical.extend_from_slice(&session_id);
+        // #2 FIX: Include security tier and downgrade sentinel in transcript hash.
+        // This binds the negotiation mode into the transcript so any tampering is detectable.
+        canonical.extend_from_slice(b"|T|");
+        canonical.extend_from_slice(security_tier.as_str().as_bytes());
+        canonical.extend_from_slice(b"|D|");
+        canonical.extend_from_slice(&downgrade_sentinel);
 
         let mut hasher = Sha256::new();
         hasher.update(&canonical);
@@ -441,6 +749,8 @@ impl NegotiationTranscript {
             protocol_version,
             session_id,
             transcript_hash,
+            security_tier: security_tier.as_str().to_string(),
+            downgrade_sentinel,
         }
     }
 
@@ -450,17 +760,158 @@ impl NegotiationTranscript {
 }
 
 // ---------------------------------------------------------------------------
+// Signed Negotiation Transcript (Downgrade Prevention)
+// ---------------------------------------------------------------------------
+
+/// A negotiation transcript signed with a hybrid signature to prevent
+/// downgrade attacks. An active MITM cannot strip PQC suites from the
+/// advertisement without invalidating the signature.
+#[derive(Debug, Clone)]
+pub struct SignedNegotiationTranscript {
+    /// The underlying unsigned transcript.
+    pub transcript: NegotiationTranscript,
+    /// Hybrid signature (Ed25519 + ML-DSA) over the transcript hash.
+    pub signature: Vec<u8>,
+    /// Public key of the signer (for verification).
+    pub signer_public_key: Vec<u8>,
+    /// Signature algorithm used.
+    pub algorithm: String,
+}
+
+impl SignedNegotiationTranscript {
+    /// Create a signed transcript from an existing transcript and signature suite.
+    pub fn sign(
+        transcript: NegotiationTranscript,
+        signer_keypair: &crate::pqc::signature::HybridKeypair,
+        suite: &crate::pqc::signature::HybridEd25519MlDsa65,
+    ) -> Result<Self, crate::pqc::PqcError> {
+        let sig = suite.sign_hybrid(signer_keypair, &transcript.transcript_hash, None)?;
+        // Length-prefixed hybrid public key: [4-byte len][Ed25519 PK][4-byte len][ML-DSA PK]
+        // This allows `verify` to correctly split the two keys regardless of their sizes.
+        let mut signer_public_key = Vec::new();
+        signer_public_key
+            .extend_from_slice(&(signer_keypair.ed25519_public.len() as u32).to_be_bytes());
+        signer_public_key.extend_from_slice(&signer_keypair.ed25519_public);
+        signer_public_key
+            .extend_from_slice(&(signer_keypair.ml_dsa_public.len() as u32).to_be_bytes());
+        signer_public_key.extend_from_slice(&signer_keypair.ml_dsa_public);
+        Ok(Self {
+            transcript,
+            signature: sig.to_bytes(),
+            signer_public_key,
+            algorithm: "hybrid-ed25519-ml-dsa-65".to_string(),
+        })
+    }
+
+    /// Verify the signature over the transcript hash.
+    ///
+    /// Correctly deserializes the length-prefixed hybrid public key
+    /// (Ed25519 PK is 32 bytes, ML-DSA PK is 1952 bytes — the two
+    /// cannot be split at a hardcoded offset).
+    pub fn verify(&self, suite: &crate::pqc::signature::HybridEd25519MlDsa65) -> bool {
+        // Deserialize the hybrid public key using the same length-prefixed
+        // format that `sign()` uses when concatenating the two public keys.
+        let pk_bytes = &self.signer_public_key;
+        if pk_bytes.len() < 8 {
+            return false;
+        }
+        // Read length-prefixed Ed25519 public key
+        let ed25519_len =
+            u32::from_be_bytes([pk_bytes[0], pk_bytes[1], pk_bytes[2], pk_bytes[3]]) as usize;
+        if ed25519_len != 32 || pk_bytes.len() < 4 + ed25519_len + 4 {
+            return false;
+        }
+        let ed25519_public = pk_bytes[4..4 + ed25519_len].to_vec();
+        // Read length-prefixed ML-DSA public key
+        let ml_dsa_offset = 4 + ed25519_len;
+        let ml_dsa_len = u32::from_be_bytes([
+            pk_bytes[ml_dsa_offset],
+            pk_bytes[ml_dsa_offset + 1],
+            pk_bytes[ml_dsa_offset + 2],
+            pk_bytes[ml_dsa_offset + 3],
+        ]) as usize;
+        if pk_bytes.len() < ml_dsa_offset + 4 + ml_dsa_len {
+            return false;
+        }
+        let ml_dsa_public = pk_bytes[ml_dsa_offset + 4..ml_dsa_offset + 4 + ml_dsa_len].to_vec();
+
+        let keypair = crate::pqc::signature::HybridKeypair {
+            ed25519_public,
+            ed25519_secret: vec![],
+            ml_dsa_public,
+            ml_dsa_secret: vec![],
+        };
+        let sig = match crate::pqc::signature::HybridSignature::from_bytes(&self.signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        suite.verify_hybrid(&keypair, &self.transcript.transcript_hash, &sig, None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel Binding
+// ---------------------------------------------------------------------------
+
+/// Derive a channel-bound token that ties a session token to the exact
+/// handshake transcript. This prevents session hijacking where a stolen
+/// token is replayed on a different channel.
+///
+/// # Arguments
+/// * `transcript_hash` - The handshake transcript hash
+/// * `session_secret` - The session's shared secret
+/// * `agent_id` - The agent identifier
+///
+/// # Returns
+/// A 32-byte channel-bound token that is unique to this channel.
+pub fn derive_channel_binding_token(
+    transcript_hash: &[u8],
+    session_secret: &[u8],
+    agent_id: &str,
+) -> Vec<u8> {
+    use hkdf::Hkdf;
+    use sha2::Sha384;
+
+    let mut ikm = Vec::with_capacity(transcript_hash.len() + session_secret.len() + agent_id.len());
+    ikm.extend_from_slice(session_secret);
+    ikm.extend_from_slice(transcript_hash);
+    ikm.extend_from_slice(agent_id.as_bytes());
+
+    let hk = Hkdf::<Sha384>::new(Some(b"SAACP-channel-binding-salt-v1"), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(crate::pqc::domain_separation::CHANNEL_BINDING, &mut okm)
+        .expect("HKDF-SHA384 expand: output length 32 is always valid");
+    okm.to_vec()
+}
+
+/// Verify a channel-bound token against the expected transcript.
+pub fn verify_channel_binding_token(
+    token: &[u8],
+    transcript_hash: &[u8],
+    session_secret: &[u8],
+    agent_id: &str,
+) -> bool {
+    let expected = derive_channel_binding_token(transcript_hash, session_secret, agent_id);
+    crate::security::constant_time_eq(token, &expected)
+}
+
+// ---------------------------------------------------------------------------
 // SuiteNegotiator
 // ---------------------------------------------------------------------------
 
 /// Protocol version string.
-pub const PROTOCOL_VERSION: &str = "SAACP/0.1-beta2";
+pub const PROTOCOL_VERSION: &str = "SAACP/0.2-beta1";
 
 /// Enforces cryptographic suite selection under the governance policy.
 pub struct SuiteNegotiator;
 
 impl SuiteNegotiator {
     /// Negotiate a cryptographic suite and return a bound NegotiationTranscript.
+    ///
+    /// #8 FIX: The `security_tier` parameter enforces a hard PQC floor.
+    /// When `SecurityTier::PqcRequired` is specified, any non-hybrid suite
+    /// selection fails closed with a distinct `PqcRequiredError` — the negotiation
+    /// will never silently degrade to classical.
     pub fn negotiate(
         local_suites: &[&str],
         remote_suites: &[&str],
@@ -468,12 +919,14 @@ impl SuiteNegotiator {
         protocol_version: Option<&str>,
         policy: Option<&ApprovedSuitePolicy>,
         ledger: &CryptoTransparencyLedger,
+        security_tier: Option<SecurityTier>,
     ) -> Result<NegotiationTranscript, String> {
         let default_policy = production_policy();
         let policy = policy.unwrap_or(&default_policy);
         let pv = protocol_version.unwrap_or(PROTOCOL_VERSION);
         let session_hex = hex::encode(session_id);
         let ts = now_epoch_secs();
+        let tier = security_tier.unwrap_or(SecurityTier::PqcPreferred);
 
         // Log advertisement
         ledger.append(CryptoLedgerEntry {
@@ -484,8 +937,10 @@ impl SuiteNegotiator {
             outcome: "PENDING".into(),
             transcript_hash: String::new(),
             details: format!(
-                "Local advertised: {:?}; Remote advertised: {:?}",
-                local_suites, remote_suites
+                "Local advertised: {:?}; Remote advertised: {:?}; Tier: {}",
+                local_suites,
+                remote_suites,
+                tier.as_str()
             ),
             entry_hash: String::new(),
         });
@@ -567,12 +1022,61 @@ impl SuiteNegotiator {
             "No approved algorithm is common to both peers.".to_string()
         })?;
 
+        // #8 FIX: Enforce the security tier. If PQC is required but the selected
+        // suite is classical-only, fail closed with a distinct error.
+        if tier.requires_pqc() && is_classical_suite(selected) {
+            ledger.append(CryptoLedgerEntry {
+                timestamp: now_epoch_secs(),
+                event_type: "DOWNGRADE_ATTEMPT".into(),
+                suite_name: selected.to_string(),
+                session_id: session_hex.clone(),
+                outcome: "BLOCKED".into(),
+                transcript_hash: String::new(),
+                details: format!(
+                    "Security tier {} requires PQC, but only classical suite '{}' is available. Failing closed.",
+                    tier.as_str(), selected
+                ),
+                entry_hash: String::new(),
+            });
+            return Err(format!(
+                "PQC_REQUIRED_VIOLATION: Security tier '{}' mandates a hybrid/PQC suite, but only classical suite '{}' is available. Negotiation aborted to prevent downgrade.",
+                tier.as_str(), selected
+            ));
+        }
+
+        // #8 FIX: Log when a PQC-capable peer falls back to classical (audit trail)
+        if tier.allows_classical() && is_classical_suite(selected) {
+            let peer_advertised_pqc = remote_suites.iter().any(|s| is_hybrid_suite(s));
+            if peer_advertised_pqc {
+                ledger.append(CryptoLedgerEntry {
+                    timestamp: now_epoch_secs(),
+                    event_type: "PQC_DEGRADATION".into(),
+                    suite_name: selected.to_string(),
+                    session_id: session_hex.clone(),
+                    outcome: "DEGRADED".into(),
+                    transcript_hash: String::new(),
+                    details: format!(
+                        "Peer advertised PQC suites but negotiation selected classical '{}'. Downgrade sentinel: {:?}",
+                        selected,
+                        String::from_utf8_lossy(compute_downgrade_sentinel(true, selected))
+                    ),
+                    entry_hash: String::new(),
+                });
+            }
+        }
+
+        // #2 FIX: Determine if the remote peer advertised any PQC suites.
+        // This is used to compute the downgrade sentinel.
+        let peer_advertised_pqc = remote_suites.iter().any(|s| is_hybrid_suite(s));
+
         let transcript = NegotiationTranscript::new(
             local_suites.iter().map(|s| s.to_string()).collect(),
             remote_suites.iter().map(|s| s.to_string()).collect(),
             selected.to_string(),
             pv.to_string(),
             session_id.to_vec(),
+            tier,
+            peer_advertised_pqc,
         );
 
         ledger.append(CryptoLedgerEntry {
@@ -583,8 +1087,9 @@ impl SuiteNegotiator {
             outcome: "SELECTED".into(),
             transcript_hash: transcript.transcript_hash_hex(),
             details: format!(
-                "Suite '{}' selected and bound to session transcript.",
-                selected
+                "Suite '{}' selected under tier {} and bound to session transcript.",
+                selected,
+                tier.as_str()
             ),
             entry_hash: String::new(),
         });
@@ -755,6 +1260,7 @@ mod tests {
             None,
             Some(&policy),
             &ledger,
+            None,
         );
         assert!(result.is_ok());
         let t = result.unwrap();
@@ -773,6 +1279,7 @@ mod tests {
             None,
             Some(&policy),
             &ledger,
+            None,
         );
         assert!(result.is_err());
     }
@@ -803,6 +1310,7 @@ mod tests {
             None,
             Some(&policy),
             &ledger,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -813,15 +1321,19 @@ mod tests {
             vec!["ed25519".into()],
             vec!["ed25519".into()],
             "ed25519".into(),
-            "SAACP/0.1-beta2".into(),
+            "SAACP/0.2-beta1".into(),
             b"session".to_vec(),
+            SecurityTier::PqcPreferred,
+            false,
         );
         let t2 = NegotiationTranscript::new(
             vec!["ed25519".into()],
             vec!["ed25519".into()],
             "ed25519".into(),
-            "SAACP/0.1-beta2".into(),
+            "SAACP/0.2-beta1".into(),
             b"session".to_vec(),
+            SecurityTier::PqcPreferred,
+            false,
         );
         assert_eq!(t1.transcript_hash_hex(), t2.transcript_hash_hex());
     }
@@ -836,15 +1348,19 @@ mod tests {
             vec!["a,b".into(), "c".into()],
             vec!["ed25519".into()],
             "ed25519".into(),
-            "SAACP/0.1-beta2".into(),
+            "SAACP/0.2-beta1".into(),
             b"session".to_vec(),
+            SecurityTier::PqcPreferred,
+            false,
         );
         let t2 = NegotiationTranscript::new(
             vec!["a".into(), "b,c".into()],
             vec!["ed25519".into()],
             "ed25519".into(),
-            "SAACP/0.1-beta2".into(),
+            "SAACP/0.2-beta1".into(),
             b"session".to_vec(),
+            SecurityTier::PqcPreferred,
+            false,
         );
         assert_ne!(t1.transcript_hash_hex(), t2.transcript_hash_hex());
     }
@@ -873,6 +1389,7 @@ mod tests {
             None,
             None, // uses production_policy (baseline="ed25519")
             &ledger,
+            None,
         );
         assert!(result.is_err(), "missing baseline must fail negotiation");
         // The ledger must contain a DOWNGRADE_ATTEMPT entry

@@ -209,7 +209,7 @@ fn test_revoked_jti_rejected() {
     claims.insert("jti".into(), Value::String(jti.clone()));
     let tok = cia.issue(claims).unwrap();
     assert!(cva.verify(&tok).is_ok(), "token valid before revocation");
-    cva.revoke_token(&jti);
+    cva.revoke_token(&jti, 9_999_999_999.0);
     let res = cva.verify(&tok);
     assert!(res.is_err(), "Revoked token must be rejected");
 }
@@ -228,9 +228,9 @@ fn test_revoke_trusted_key_blocks_verify() {
 #[test]
 fn test_clear_replay_registry_returns_count() {
     let (_cia, cva) = make_pair("iss-14");
-    cva.revoke_token("jti-a");
-    cva.revoke_token("jti-b");
-    cva.revoke_token("jti-c");
+    cva.revoke_token("jti-a", 9_999_999_999.0);
+    cva.revoke_token("jti-b", 9_999_999_999.0);
+    cva.revoke_token("jti-c", 9_999_999_999.0);
     let n = cva.clear_replay_registry();
     assert_eq!(n, 3);
     assert_eq!(cva.clear_replay_registry(), 0);
@@ -250,7 +250,7 @@ fn test_different_token_same_key_works_after_one_revoked() {
     c2.insert("jti".into(), Value::String(jti2.clone()));
     let tok2 = cia.issue(c2).unwrap();
 
-    cva.revoke_token(&jti1);
+    cva.revoke_token(&jti1, 9_999_999_999.0);
     assert!(cva.verify(&tok1).is_err(), "tok1 revoked");
     assert!(cva.verify(&tok2).is_ok(), "tok2 still valid");
 }

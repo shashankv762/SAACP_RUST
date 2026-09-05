@@ -773,8 +773,19 @@ impl SessionEpochManager {
             session_cap: MEASC_MAX_TRACKED_SESSIONS,
             unauth_idle_secs: MEASC_UNAUTH_SESSION_IDLE_SECS,
             auth_idle_secs: MEASC_AUTH_SESSION_IDLE_SECS,
-            root_ratchet: false,
+            // R-4 fix: forward-secrecy root ratchet is now on by default. A PSK
+            // compromise no longer exposes past/future traffic. Use
+            // `without_root_ratchet()` to opt out (changes derived key values
+            // vs the v1 Python-parity schedule).
+            root_ratchet: true,
         }
+    }
+
+    /// R-4 fix: explicitly disable the forward-secrecy root ratchet.
+    /// Opt-out only — most deployments should keep the ratchet enabled.
+    pub fn without_root_ratchet(mut self) -> Self {
+        self.root_ratchet = false;
+        self
     }
 
     /// S4: enable the forward-secrecy root ratchet for every session this
@@ -834,8 +845,12 @@ impl SessionEpochManager {
         );
 
         {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let mut sessions = self.sessions.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking —
+            // `SessionEpochManager` is exercised from the daemon's packet pipeline,
+            // so one poisoning panic must not cascade into every other in-flight
+            // packet losing epoch management entirely. A poisoned lock does not
+            // imply data corruption — the data is still valid and recoverable.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if sessions.contains_key(&session_id) {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::SchemaMismatch,
@@ -859,8 +874,8 @@ impl SessionEpochManager {
             sessions.insert(session_id, ep_map);
         }
 
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.meta.lock().unwrap().insert(
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(
             session_id,
             SessionMeta {
                 secret: bound_secret,
@@ -872,10 +887,10 @@ impl SessionEpochManager {
                 authenticated: false,
             },
         );
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
         self.grace
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(session_id, HashMap::new());
         Ok(0)
     }
@@ -935,8 +950,8 @@ impl SessionEpochManager {
 
     pub fn rotate_epoch(&self, session_id: &[u8; 16]) -> Result<u32, SAACPHardDrop> {
         let (current_id, secret, packet_threshold, time_threshold_secs) = {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let meta = self.meta.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
             let m = meta.get(session_id).ok_or_else(|| {
                 SAACPHardDrop::new(
                     SAACPBytecodes::EpochExpired,
@@ -955,8 +970,8 @@ impl SessionEpochManager {
         };
 
         let prev_key = {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let sessions = self.sessions.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let ep_map = sessions.get(session_id).ok_or_else(|| {
                 SAACPHardDrop::new(SAACPBytecodes::EpochExpired, "Session not found")
             })?;
@@ -999,8 +1014,8 @@ impl SessionEpochManager {
         );
 
         {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let mut sessions = self.sessions.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let ep_map = sessions.get_mut(session_id).ok_or_else(|| {
                 SAACPHardDrop::new(
                     SAACPBytecodes::EpochExpired,
@@ -1010,8 +1025,13 @@ impl SessionEpochManager {
             ep_map.insert(new_epoch_id, new_epoch);
         }
 
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        if let Some(m) = self.meta.lock().unwrap().get_mut(session_id) {
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        if let Some(m) = self
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(session_id)
+        {
             m.current_epoch = new_epoch_id;
             // S4: commit the ratcheted root over the old one. Assigning a
             // fixed-size array overwrites every byte of the previous value —
@@ -1020,17 +1040,17 @@ impl SessionEpochManager {
                 m.secret = new_root;
             }
         }
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
         self.grace
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(*session_id)
             .or_default()
             .insert(current_id, Instant::now());
 
         {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let mut sessions = self.sessions.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ep_map) = sessions.get_mut(session_id) {
                 if let Some(old) = ep_map.get_mut(&current_id) {
                     old.enter_grace_period();
@@ -1053,12 +1073,22 @@ impl SessionEpochManager {
     }
 
     pub fn destroy_session(&self, session_id: &[u8; 16]) {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        let epochs = self.sessions.lock().unwrap().remove(session_id);
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.meta.lock().unwrap().remove(session_id);
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.grace.lock().unwrap().remove(session_id);
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        let epochs = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
         if let Some(mut ep_map) = epochs {
             for e in ep_map.values_mut() {
                 e.destroy();
@@ -1071,8 +1101,13 @@ impl SessionEpochManager {
     /// only a genuine traffic-key holder can reach it, so the reaper can trust
     /// `authenticated == false` as "possibly attacker junk".
     pub(crate) fn note_authenticated(&self, session_id: &[u8; 16]) {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        if let Some(m) = self.meta.lock().unwrap().get_mut(session_id) {
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        if let Some(m) = self
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(session_id)
+        {
             m.last_active = Instant::now();
             m.authenticated = true;
         }
@@ -1091,8 +1126,8 @@ impl SessionEpochManager {
         let auth_idle = Duration::from_secs_f64(self.auth_idle_secs);
         let now = Instant::now();
         let doomed: Vec<[u8; 16]> = {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let meta = self.meta.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
             meta.iter()
                 .filter(|(_, m)| {
                     let idle_for = now.duration_since(m.last_active);
@@ -1117,8 +1152,8 @@ impl SessionEpochManager {
             grace_seconds.unwrap_or(MEASC_EPOCH_GRACE_PERIOD_SECONDS as f64),
         );
         let to_remove: Vec<([u8; 16], u32)> = {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let g = self.grace.lock().unwrap();
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let g = self.grace.lock().unwrap_or_else(|e| e.into_inner());
             g.iter()
                 .flat_map(|(sid, eid_map)| {
                     eid_map
@@ -1131,17 +1166,17 @@ impl SessionEpochManager {
         };
         let mut collected = 0;
         for (sid, eid) in to_remove {
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
             let ep = self
                 .sessions
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&sid)
                 .and_then(|m| m.remove(&eid));
-            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
             self.grace
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&sid)
                 .map(|m| m.remove(&eid));
             if let Some(mut e) = ep {
@@ -1166,8 +1201,8 @@ impl SessionEpochManager {
     /// Return a clone of the SessionEpoch state for the given (session_id, epoch_id).
     /// Python parity: `SessionEpochManager.get_epoch(session_id, epoch_id)`.
     pub fn get_epoch(&self, session_id: &[u8; 16], epoch_id: u32) -> Option<EpochSnapshot> {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        let sessions = self.sessions.lock().unwrap();
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let ep = sessions.get(session_id)?.get(&epoch_id)?;
         Some(EpochSnapshot {
             session_id: *session_id,
@@ -1218,6 +1253,7 @@ impl SessionEpochManager {
             protocol_version,
             None, // use production policy default
             &tmp_ledger,
+            None, // use default security tier (PqcPreferred)
         )
         .map_err(|e| {
             SAACPHardDrop::new(
@@ -2517,11 +2553,11 @@ mod tests {
         assert_ne!(k2a, ka, "epoch keys must advance");
     }
 
-    /// S4: default OFF — rotation must produce the exact v1 (Python-parity)
+    /// S4: opt-out (`without_root_ratchet`) must produce the exact v1 (Python-parity)
     /// schedule value; the cross-language vectors depend on this.
     #[test]
     fn s4_default_off_matches_v1_schedule() {
-        let mgr = SessionEpochManager::new();
+        let mgr = SessionEpochManager::new().without_root_ratchet();
         let sid = [0xC3u8; 16];
         let root0 = [0x59u8; 32];
         mgr.create_session(sid, root0, 2, 60.0, None).unwrap();

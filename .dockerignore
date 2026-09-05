@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# CI/CD
+.github
+
+# Documentation
+*.md
+LICENSE
+
+# Build artifacts
+target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test fixtures (large files)
+tests/fixtures/*.bin
+benchmark_results.txt
+
+# Rust
+Cargo.lock

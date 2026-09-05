@@ -244,6 +244,16 @@ pub struct SAACPWebSocketDaemon {
     /// `SaacpContext::shared_default()` — byte-identical to the pre-Phase-4
     /// global behavior. See `SAACPNetworkDaemon::with_context`.
     context: Option<Arc<crate::context::SaacpContext>>,
+    /// M4 (R2 / opusreview.md): global in-flight payload byte budget. `None`
+    /// preserves the pre-M4 unbounded behavior; `Some` enables the
+    /// memory-amplification protection.
+    inflight_payload_semaphore: Option<Arc<Semaphore>>,
+    /// M12 (R3 / opusreview.md): bounds concurrent gate-pipeline executions.
+    pipeline_semaphore: Option<Arc<Semaphore>>,
+    /// M11 (R7 / opusreview.md): unique node identifier for session affinity.
+    node_id: Option<String>,
+    /// M11 (R7 / opusreview.md): session affinity tracker.
+    session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
     /// C3: when set (feature `transport-wss`), every accepted TCP connection
     /// is upgraded to TLS (wss://) before the WebSocket handshake.
     #[cfg(feature = "transport-tls")]
@@ -271,6 +281,10 @@ impl SAACPWebSocketDaemon {
             cluster: None,
             handshake_timeout_secs: None,
             context: None,
+            inflight_payload_semaphore: None,
+            pipeline_semaphore: None,
+            node_id: None,
+            session_affinity_tracker: None,
             #[cfg(feature = "transport-tls")]
             tls_config: None,
         }
@@ -281,6 +295,29 @@ impl SAACPWebSocketDaemon {
     /// default. See `SAACPNetworkDaemon::with_context` — identical semantics.
     pub fn with_context(mut self, context: Arc<crate::context::SaacpContext>) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// M4 (R2 / opusreview.md): set the global in-flight payload byte budget.
+    pub fn with_inflight_payload_budget(mut self, max_bytes: Option<usize>) -> Self {
+        self.inflight_payload_semaphore = max_bytes.map(|n| Arc::new(Semaphore::new(n)));
+        self
+    }
+
+    /// M12 (R3 / opusreview.md): set the maximum number of concurrent
+    /// gate-pipeline executions dispatched to `spawn_blocking`.
+    pub fn with_pipeline_concurrency(mut self, max_concurrent: Option<usize>) -> Self {
+        self.pipeline_semaphore = max_concurrent.map(|n| Arc::new(Semaphore::new(n)));
+        self
+    }
+
+    /// M11 (R7 / opusreview.md): set a unique node identifier for this daemon
+    /// instance and enable session affinity tracking.
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        let node_id = node_id.into();
+        let tracker = crate::session_affinity::SessionAffinityTracker::new();
+        self.node_id = Some(node_id);
+        self.session_affinity_tracker = Some(Arc::new(tracker));
         self
     }
 
@@ -455,6 +492,10 @@ impl SAACPWebSocketDaemon {
                             let cluster         = self.cluster.clone();
                             let handshake_timeout_override = self.handshake_timeout_secs;
                             let daemon_context  = self.context.clone();
+                            let inflight_payload_semaphore = self.inflight_payload_semaphore.clone();
+                            let pipeline_semaphore = self.pipeline_semaphore.clone();
+                            let node_id = self.node_id.clone();
+                            let session_affinity_tracker = self.session_affinity_tracker.clone();
                             #[cfg(feature = "transport-tls")]
                             let tls_acceptor = self.tls_config.clone()
                                 .map(tokio_rustls::TlsAcceptor::from);
@@ -486,6 +527,7 @@ impl SAACPWebSocketDaemon {
                                                     tls_stream, peer_addr, cbs, secret, seed,
                                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                                     handshake_timeout_override, daemon_context,
+                                                    inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
                                                 ).await;
                                             }
                                             Ok(Err(e)) => {
@@ -507,6 +549,7 @@ impl SAACPWebSocketDaemon {
                                             stream, peer_addr, cbs, secret, seed,
                                             gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                             handshake_timeout_override, daemon_context,
+                                            inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
                                         ).await;
                                     }
                                 }
@@ -516,6 +559,7 @@ impl SAACPWebSocketDaemon {
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                     handshake_timeout_override,
                                     daemon_context,
+                                    inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
                                 ).await;
                             });
                         }
@@ -584,6 +628,10 @@ async fn serve_ws_connection<S>(
     cluster: Option<Arc<crate::cluster::ClusterEngine>>,
     handshake_timeout_override: Option<f64>,
     context: Option<Arc<crate::context::SaacpContext>>,
+    inflight_payload_semaphore: Option<Arc<Semaphore>>,
+    pipeline_semaphore: Option<Arc<Semaphore>>,
+    node_id: Option<String>,
+    session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -640,6 +688,10 @@ async fn serve_ws_connection<S>(
         cluster,
         handshake_timeout_override,
         context,
+        inflight_payload_semaphore,
+        pipeline_semaphore,
+        node_id,
+        session_affinity_tracker,
     )
     .await;
 }

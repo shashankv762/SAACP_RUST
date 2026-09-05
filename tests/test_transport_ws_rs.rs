@@ -139,9 +139,9 @@ async fn ws_tunnel_cover_traffic_roundtrip() {
         .await
         .expect("send frame");
 
-    let response = recv_exact(&mut ws_stream, 7).await; // b"SUCCESS" = 7 bytes
-    assert_eq!(
-        &response, b"SUCCESS",
+    let response = recv_exact(&mut ws_stream, 39).await; // b"SUCCESS"(7) + mac_tag(32) = 39 bytes
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "cover traffic must ack with WIRE_SUCCESS over the WS tunnel"
     );
 
@@ -199,8 +199,8 @@ async fn ws_tunnel_two_connections_independent_sessions() {
             .encode_encrypted(b"", &key)
             .expect("encode_encrypted");
         ws.send(Message::Binary(frame)).await.expect("send frame");
-        let response = recv_exact(ws, 7).await;
-        assert_eq!(&response, b"SUCCESS");
+        let response = recv_exact(ws, 39).await;
+        assert!(response.starts_with(b"SUCCESS"));
     }
 
     let _ = ws_a.close(None).await;
@@ -312,9 +312,9 @@ async fn c3_wss_tunnel_cover_traffic_roundtrip() {
         .await
         .expect("send frame over wss");
 
-    let response = recv_exact(&mut ws_stream, 7).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    let response = recv_exact(&mut ws_stream, 39).await; // b"SUCCESS"(7) + mac_tag(32) = 39 bytes
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "cover traffic must ack with WIRE_SUCCESS over the wss:// tunnel"
     );
     let _ = ws_stream.close(None).await;

@@ -48,6 +48,11 @@ pub const FLAG_ENCRYPTED: u8 = 0x10;
 pub const FLAG_COMPRESSED: u8 = 0x20;
 /// Packet belongs to a StreamSession
 pub const FLAG_STREAMING: u8 = 0x40;
+/// V6 fix: combination of flags indicating a high-risk mutative operation.
+/// Previously this was a hardcoded 0x0B value in handler.rs; now a named constant.
+/// The combination 0x0B = FLAG_HAS_TOKEN | FLAG_BINARY_STREAM | 0x08 requires a
+/// secondary validation token (Gate 3.0). Individual flags (including 0x08) do not.
+pub const FLAGS_HIGH_RISK_MUTATIVE_COMBINATION: u8 = 0x0B;
 
 // ── Action class constants ────────────────────────────────────────────────────
 pub const ACTION_CLASS_READ_ONLY: u8 = 0x00;

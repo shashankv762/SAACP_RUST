@@ -138,10 +138,10 @@ async fn tls_tunnel_cover_traffic_roundtrip() {
         .expect("encode_encrypted");
     tls.write_all(&frame).await.expect("send frame");
 
-    let mut response = [0u8; 7]; // b"SUCCESS" = 7 bytes
+    let mut response = [0u8; 39]; // b"SUCCESS"(7) + mac_tag(32) = 39 bytes
     tls.read_exact(&mut response).await.expect("read response");
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "cover traffic must ack with WIRE_SUCCESS over the TLS transport"
     );
 }

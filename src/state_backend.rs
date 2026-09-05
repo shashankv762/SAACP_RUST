@@ -94,9 +94,9 @@
 //!   record lives on one node. Building Raft/consensus from scratch for this
 //!   is out of proportion to the actual requirement.
 
-use std::collections::HashMap;
 #[cfg(feature = "redis-backend")]
-use std::sync::Mutex;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -506,7 +506,7 @@ impl RedisBackend {
 
     /// Take a pooled connection if one is idle, otherwise open a fresh one.
     fn checkout(&self) -> BackendResult<redis::Connection> {
-        if let Some(conn) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        if let Some(conn) = self.pool.lock().pop() {
             return Ok(conn);
         }
         self.client
@@ -517,7 +517,7 @@ impl RedisBackend {
     /// Return a still-healthy connection to the pool for reuse; drop it
     /// (closing the TCP connection) if the pool is already at capacity.
     fn checkin(&self, conn: redis::Connection) {
-        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = self.pool.lock();
         if pool.len() < self.max_pool_size {
             pool.push(conn);
         }

@@ -171,51 +171,88 @@ pub const MANDATORY_GATES: &[&str] = &[
 
 /// Injection patterns checked against normalized text.
 /// All injection patterns as a static slice — no heap allocation per scan call.
+/// Patterns use space-separated words to match the space-preserving normalizer
+/// (M7 / R4 / opusreview.md): normalize_window collapses whitespace runs to a
+/// single space, so patterns must be written in their space-separated form.
 static INJECTION_PATTERNS: &[&str] = &[
     // ── Prompt hijacking ─────────────────────────────────────────────────
+    // Space-separated forms match the normalizer output (M7/R4/opusreview.md).
+    // Concatenated forms are defense-in-depth against non-normalizing clients.
+    "ignore previous instructions",
     "ignorepreviousinstructions",
+    "ignore above instructions",
     "ignoreaboveinstructions",
+    "ignore all instructions",
     "ignoreallinstructions",
+    "ignore all previous",
     "ignoreallprevious",
+    "disregard previous",
     "disregardprevious",
+    "disregard all previous",
     "disregardallprevious",
+    "system override",
     "systemoverride",
+    "you are now a",
     "youarenowa",
+    "act as",
     "actas",
+    "new instructions:",
     "newinstructions:",
+    "forget your persona",
     "forgetyourpersona",
+    "forget your rules",
     "forgetyourrules",
+    "new role:",
     "newrole:",
+    "new persona:",
     "newpersona:",
+    "developer mode",
     "developermode",
     "jailbreak",
+    "dant mode",
     "dantmode",
+    "unlock mode",
     "unlockmode",
+    "no limits",
     "nolimits",
+    "bypas filters",
     "bypasfilters",
+    "bypass filters",
     "bypassfilters",
+    "disable filters",
     "disablefilters",
+    "remove filters",
     "removefilters",
+    "disable safety",
     "disablesafety",
+    "remove safety",
     "removesafety",
     // ── LLM special tokens (model-specific) ─────────────────────────────
     "<|im_start|>system",
     "<|im_end|>",
     "<|system|>",
-    "<|endoftext|>",
+    "end of text",
+    "endoftext",
     "[/inst]",
     "<<sys>>",
     "<</sys>>",
     "\x3c/think\x3e",
+    "### instruction",
     "###instruction",
+    "### system",
     "###system",
     "[system]",
     "[[system]]",
     // ── SQL / Code injection ─────────────────────────────────────────────
+    "drop table",
     "droptable",
+    "or 1=1",
     "or1=1",
+    "or '1'='1'",
     "or'1'='1'",
+    "union select",
     "unionselect",
+    "'; exec",
     "';exec",
     "xp_cmdshell",
     "exec(",
@@ -721,18 +758,46 @@ impl PromptInjectionScanner {
 
     /// Per-window normalization pipeline. S-3 fix factored this out of
     /// [`Self::normalize`] so the head and tail scan windows share identical
-    /// normalization. NFKC-folds, drops zero-width chars, maps confusables to
-    /// their ASCII homoglyph, keeps only non-whitespace ASCII, strips the `/**/`
-    /// comment-splitting trick, then lowercases.
+    /// normalization. NFKC-folds, replaces zero-width chars with a space
+    /// (preserving word boundaries), maps confusables to their ASCII homoglyph,
+    /// keeps only ASCII (including space), collapses whitespace runs to a single
+    /// space, strips the `/**/` comment-splitting trick, then lowercases.
     fn normalize_window(text: &str) -> String {
         // One allocation: chain all char-level filters after NFKC.
+        // Zero-width chars between words (e.g., "ignore\u{200b}previous") are
+        // replaced with a space so the word boundary survives normalization.
         let s: String = text
             .nfkc()
-            .filter(|c| !ZERO_WIDTH_CHARS.contains(c))
+            .map(|c| {
+                if ZERO_WIDTH_CHARS.contains(&c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .map(replace_confusable)
-            .filter(|c| (*c as u32) < 128 && !c.is_whitespace())
+            .filter(|c| (*c as u32) < 128)
             .collect();
-        s.replace("/**/", "").to_lowercase()
+        // Collapse whitespace runs to a single space, strip /**/, lowercase, trim
+        let mut result = String::with_capacity(s.len());
+        let mut prev_was_space = true; // start true to trim leading whitespace
+        for c in s.chars() {
+            if c.is_whitespace() {
+                if !prev_was_space {
+                    result.push(' ');
+                    prev_was_space = true;
+                }
+                // skip consecutive whitespace
+            } else {
+                result.push(c);
+                prev_was_space = false;
+            }
+        }
+        // Trim trailing space if any
+        if result.ends_with(' ') {
+            result.pop();
+        }
+        result.replace("/**/", "").to_lowercase()
     }
 
     /// Scan a single normalized string against all injection patterns.
@@ -966,6 +1031,14 @@ pub enum JsonValue {
     String(String),
     Array(Vec<JsonValue>),
     Object(Vec<(String, JsonValue)>),
+    /// Marker returned by [`serde_value_to_json_value_bounded`] when the input
+    /// JSON tree exceeds [`PromptInjectionScanner::MAX_DEPTH`] (8). The caller
+    /// (`intercept_packet_full`) checks for this sentinel and translates it into
+    /// a `PayloadTooLarge` hard drop before any downstream gate inspects the
+    /// dict. Using a dedicated variant (rather than `Null` or a panic) lets the
+    /// entire conversion stay total and stack-bounded, and lets the rejection
+    /// carry the depth-exceeded reason to the caller.
+    MalformedDepthExceeded,
 }
 
 // ---------------------------------------------------------------------------
@@ -2293,6 +2366,15 @@ impl SAACPProtocolHandler {
         // (success, invalid UTF-8, or invalid JSON) so Gate 9.0 can reuse it
         // instead of re-parsing — see that gate's block below for the reuse
         // and its exact error-parity argument.
+        //
+        // Fix 3 (longcat.md Gap F): also enforce `MAX_PAYLOAD_KEYS` so an
+        // authenticated peer cannot construct a JSON object with millions of
+        // keys, each backed by a cloned `String` + `JsonValue` heap allocation.
+        // `MAX_PAYLOAD_SIZE` (10 MB) was previously the only ceiling on this
+        // dict's memory consumption; 1M keys × ~64 bytes per entry ≈ 100 MB
+        // amplification. The bound matches Python parity (RFC §"Payload
+        // dictionary limits") and is far above any legitimate schema's
+        // expected key count (the largest current schema has <50 keys).
         enum PayloadJsonParseOutcome {
             InvalidUtf8,
             InvalidJson,
@@ -2304,10 +2386,72 @@ impl SAACPProtocolHandler {
                 Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
                     Ok(v) => {
                         if let serde_json::Value::Object(ref map) = v {
+                            // Fix 3: key-count bound (pre-check before any allocation).
+                            if map.len() > MAX_PAYLOAD_KEYS {
+                                return Err(SAACPHardDrop::new(
+                                    SAACPBytecodes::PayloadTooLarge,
+                                    format!(
+                                        "Payload object has {} keys, max {}",
+                                        map.len(),
+                                        MAX_PAYLOAD_KEYS
+                                    ),
+                                ));
+                            }
+                            // Fix 4 (M2 / Risk 2): retained-byte budget.
+                            // Counts key bytes plus the recursive
+                            // `serde_json::to_string` size of each value, so a
+                            // payload with few keys but a deeply-nested or
+                            // string-heavy tree still cannot allocate
+                            // unboundedly. The per-value `to_string` is bounded
+                            // by `MAX_PAYLOAD_DICT_BYTES` so a malicious value
+                            // cannot trigger a multi-MB serialization here. This
+                            // is a *count* of bytes that would be retained in
+                            // memory after the depth-bounded conversion, not the
+                            // on-the-wire payload size (which is already capped
+                            // by `MAX_PAYLOAD_SIZE` upstream).
+                            let mut retained: usize = 0;
                             for (k, val) in map.iter() {
-                                parsed
-                                    .payload_dict
-                                    .insert(k.clone(), serde_value_to_json_value(val.clone()));
+                                retained = retained.saturating_add(k.len());
+                                let val_bytes = serde_json::to_string(val)
+                                    .map(|s| s.len())
+                                    .unwrap_or(MAX_PAYLOAD_DICT_BYTES);
+                                retained = retained.saturating_add(val_bytes);
+                                if retained > MAX_PAYLOAD_DICT_BYTES {
+                                    return Err(SAACPHardDrop::new(
+                                        SAACPBytecodes::PayloadTooLarge,
+                                        format!(
+                                            "Payload dict exceeds retained-byte budget \
+                                             ({} > {})",
+                                            retained, MAX_PAYLOAD_DICT_BYTES
+                                        ),
+                                    ));
+                                }
+                            }
+                            for (k, val) in map.iter() {
+                                // Fix 2: depth-limited conversion. The
+                                // bounded converter walks the tree with a
+                                // recursion counter capped at
+                                // `PromptInjectionScanner::MAX_DEPTH` (8) and
+                                // embeds a `MalformedDepthExceeded` sentinel
+                                // at any node deeper than the limit. We
+                                // must walk the *result* (not just inspect
+                                // the top-level variant) because the sentinel
+                                // may be buried several layers deep — the
+                                // outer Array/Object wrappers themselves are
+                                // shallow and will NOT be replaced by the
+                                // sentinel.
+                                let jv = serde_value_to_json_value_bounded(val.clone(), 1);
+                                if json_value_depth_exceeded(&jv) {
+                                    return Err(SAACPHardDrop::new(
+                                        SAACPBytecodes::PayloadTooLarge,
+                                        format!(
+                                            "Payload JSON exceeds max nesting depth ({}). \
+                                             Rejecting before any downstream gate inspects the dict.",
+                                            PromptInjectionScanner::MAX_DEPTH
+                                        ),
+                                    ));
+                                }
+                                parsed.payload_dict.insert(k.clone(), jv);
                             }
                         }
                         parsed_payload_json = Some(Ok(v));
@@ -2393,12 +2537,17 @@ impl SAACPProtocolHandler {
             .inspect_err(|e| {
                 report_gate_rejection("gate_1_0_token", current_agent_name, e);
             })?
-        } else {
-            // No gateway injected — structural token check only (test/daemon-less mode).
-            // SECURITY FIX: max_action_class was incorrectly set to 2 (IRREVERSIBLE),
-            // granting every unvalidated token the highest privilege tier. Safe default
-            // is 0 (READ_ONLY) — callers that need higher tiers must inject a real gateway.
-            // In production the daemon always injects a ZeroTrustGateway instance.
+        } else if cfg!(feature = "dangerously-skip-gateway") {
+            // No gateway injected AND the operator has explicitly opted in to the
+            // unsafe escape hatch via the `dangerously-skip-gateway` Cargo feature
+            // (off by default — see Cargo.toml:184–192). This branch is compiled out
+            // entirely from every default build, making a misconfigured daemon
+            // (one that forgets `SAACPNetworkDaemon::with_gateway(...)`) fail
+            // closed at Gate 1.0 instead of silently issuing READ_ONLY tokens.
+            //
+            // SECURITY: the max_action_class ceiling is fixed at 0 (READ_ONLY).
+            // Any caller needing higher tiers must inject a real `ZeroTrustGateway`
+            // — there is no other path to a non-zero ceiling.
             crate::gateway::TokenValidationResult {
                 is_valid: true,
                 source_agent: "unknown".to_string(),
@@ -2409,6 +2558,24 @@ impl SAACPProtocolHandler {
                 // this is the one remaining call to the hand-rolled parser.
                 token_sig_hash: extract_token_sig_hex(capability_token_b64.as_bytes()),
             }
+        } else {
+            // Production default: fail closed. A request that arrives at Gate 1.0
+            // without an injected `ZeroTrustGateway` cannot be cryptographically
+            // verified — there is no trust anchor to validate the capability token
+            // against. Granting any `is_valid: true` here, even with
+            // `max_action_class = 0`, would let unauthenticated peers transact
+            // (Gate 2.5's READ_ONLY ceiling still authorizes reads against the
+            // downstream handlers) and would silently bypass identity binding.
+            //
+            // The previous behavior (synthetic READ_ONLY token, see longcat.md
+            // Gap A / opusplan §Risk 6) is preserved ONLY when the
+            // `dangerously-skip-gateway` Cargo feature is enabled, so existing
+            // tests / daemon-less tooling keep working with that explicit opt-in.
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::LateralMovementBlocked,
+                "No ZeroTrustGateway injected — capability token cannot be verified. \
+                 Configure SAACPNetworkDaemon::with_gateway(...) before serving traffic.",
+            ));
         };
 
         // One clone for local use, then move the original into `parsed` — avoids
@@ -3435,26 +3602,218 @@ impl SAACPProtocolHandler {
     }
 }
 
+// ─── PQC Structural Hardening Constants ─────────────────────────────────────
+/// Maximum size for a hybrid handshake message (bytes).
+/// Prevents DoS via oversized PQC handshake payloads.
+pub const MAX_HYBRID_HANDSHAKE_SIZE: usize = 8192;
+/// Maximum size for an attestation quote (bytes).
+pub const MAX_ATTESTATION_QUOTE_SIZE: usize = 4096;
+/// Maximum size for a single PQC public key (bytes).
+pub const MAX_PQC_PUBLIC_KEY_SIZE: usize = 2048;
+/// Maximum size for a single PQC ciphertext/signature (bytes).
+pub const MAX_PQC_SIGNATURE_SIZE: usize = 50_000;
+/// Maximum number of PQC key shares in a single handshake.
+pub const MAX_PQC_KEY_SHARES: usize = 16;
+
+/// Maximum number of top-level keys in a decoded payload JSON object.
+///
+/// Fix 3 (longcat.md Gap F, 2026-08-31): authenticated peers can otherwise
+/// construct a 10 MB JSON object with millions of short keys, each backed by
+/// a cloned `String` + `JsonValue` heap allocation — 5–10× memory amplification
+/// versus the wire size. The wire size cap (`MAX_PAYLOAD_SIZE` = 10 MB at
+/// `framing.rs`) was previously the only bound on `payload_dict`'s in-memory
+/// footprint.
+///
+/// 4096 is far above every legitimate schema's expected key count (the largest
+/// current schema has <50 keys) while keeping worst-case memory bounded at
+/// ≈ 4096 × (key string + `JsonValue` ≈ 64 bytes) ≈ 256 KB per packet.
+pub const MAX_PAYLOAD_KEYS: usize = 4096;
+/// Maximum total *retained* bytes across all keys + serialized values of the
+/// JSON payload object. Enforced alongside [`MAX_PAYLOAD_KEYS`] as a second
+/// axis of the M2/Risk-2 amplification mitigation: a payload with few keys
+/// but a deeply-nested or string-heavy value tree can still allocate more
+/// than `MAX_PAYLOAD_SIZE` after the depth-bounded conversion (each `String`
+/// in the `JsonValue` enum is heap-allocated). Sized at 8 MiB to leave
+/// headroom under the protocol's 10 MiB `MAX_PAYLOAD_SIZE` while bounding
+/// the worst-case allocator commit from a single authenticated packet.
+pub const MAX_PAYLOAD_DICT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum total size of all PQC extensions in a handshake (bytes).
+pub const MAX_PQC_EXTENSIONS_TOTAL_SIZE: usize = 16_384;
+
+// ─── PQC Structural Hardening ───────────────────────────────────────────────
+
+/// Validate a hybrid handshake message size to prevent DoS.
+///
+/// PQC messages are significantly larger than classical ones
+/// (ML-KEM-768 public key = 1184 bytes, ML-DSA-65 signature = 3293 bytes).
+/// This function enforces bounds to prevent memory exhaustion.
+pub fn validate_hybrid_handshake_size(total_size: usize) -> Result<(), SAACPHardDrop> {
+    if total_size > MAX_HYBRID_HANDSHAKE_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::PayloadTooLarge,
+            format!(
+                "Hybrid handshake message exceeds maximum size: {} > {}",
+                total_size, MAX_HYBRID_HANDSHAKE_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a PQC public key size.
+pub fn validate_pqc_public_key_size(key_size: usize) -> Result<(), SAACPHardDrop> {
+    if key_size > MAX_PQC_PUBLIC_KEY_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            format!(
+                "PQC public key exceeds maximum size: {} > {}",
+                key_size, MAX_PQC_PUBLIC_KEY_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a PQC signature size.
+pub fn validate_pqc_signature_size(sig_size: usize) -> Result<(), SAACPHardDrop> {
+    if sig_size > MAX_PQC_SIGNATURE_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::InvalidSignature,
+            format!(
+                "PQC signature exceeds maximum size: {} > {}",
+                sig_size, MAX_PQC_SIGNATURE_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the total size of PQC extensions in a handshake.
+pub fn validate_pqc_extensions_size(total_ext_size: usize) -> Result<(), SAACPHardDrop> {
+    if total_ext_size > MAX_PQC_EXTENSIONS_TOTAL_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::PayloadTooLarge,
+            format!(
+                "PQC extensions total size exceeds maximum: {} > {}",
+                total_ext_size, MAX_PQC_EXTENSIONS_TOTAL_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the number of PQC key shares in a handshake.
+pub fn validate_pqc_key_shares_count(count: usize) -> Result<(), SAACPHardDrop> {
+    if count > MAX_PQC_KEY_SHARES {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::PayloadTooLarge,
+            format!(
+                "PQC key shares count exceeds maximum: {} > {}",
+                count, MAX_PQC_KEY_SHARES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an attestation quote size.
+pub fn validate_attestation_quote_size(quote_size: usize) -> Result<(), SAACPHardDrop> {
+    if quote_size > MAX_ATTESTATION_QUOTE_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::PayloadTooLarge,
+            format!(
+                "Attestation quote exceeds maximum size: {} > {}",
+                quote_size, MAX_ATTESTATION_QUOTE_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Convert serde_json::Value to our lightweight JsonValue.
+///
+/// # Production Safety (Fix 2)
+/// This function recurses through the JSON tree without depth bounds. An
+/// authenticated peer can craft a JSON payload nested to depth 1k+ that passes
+/// the `serde_json::Value` parse (which validates bytes, not structure) but
+/// then blows the stack during this conversion. The conversion runs **after**
+/// AES-GCM authentication, so this is reachable from any authenticated peer.
+///
+/// `serde_value_to_json_value_bounded` enforces `PromptInjectionScanner::MAX_DEPTH`
+/// (8, matching the scanner's own recursion limit at lines 918/979/993) and
+/// is the only caller-facing entry point. The unbounded variant is retained
+/// as `pub` for backwards-compatible API surface and used by tests that
+/// intentionally construct non-malicious deep trees.
 pub fn serde_value_to_json_value(v: serde_json::Value) -> JsonValue {
+    serde_value_to_json_value_bounded(v, 0)
+}
+
+/// Convert a `serde_json::Value` to the lightweight `JsonValue`, enforcing a
+/// maximum recursion depth of [`PromptInjectionScanner::MAX_DEPTH`] (8).
+///
+/// Returns [`JsonValue::MalformedDepthExceeded`] when the input contains a node
+/// nested deeper than `MAX_DEPTH`. The caller (`intercept_packet_full`) checks
+/// the returned value and translates this into a `PayloadTooLarge` hard drop
+/// before any downstream gate inspects the dict.
+///
+/// The depth counter tracks the **maximum depth of any path** from the root to
+/// a leaf. A flat object of 4k keys passes (depth=1); a single key whose value
+/// is an array of arrays of arrays of arrays fails at depth=5.
+pub fn serde_value_to_json_value_bounded(v: serde_json::Value, depth: usize) -> JsonValue {
+    if depth > PromptInjectionScanner::MAX_DEPTH {
+        return JsonValue::MalformedDepthExceeded;
+    }
     match v {
         serde_json::Value::Null => JsonValue::Null,
         serde_json::Value::Bool(b) => JsonValue::Bool(b),
         serde_json::Value::Number(n) => JsonValue::Number(n.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(s) => JsonValue::String(s),
-        serde_json::Value::Array(arr) => {
-            JsonValue::Array(arr.into_iter().map(serde_value_to_json_value).collect())
-        }
+        serde_json::Value::Array(arr) => JsonValue::Array(
+            arr.into_iter()
+                .map(|item| serde_value_to_json_value_bounded(item, depth + 1))
+                .collect(),
+        ),
         serde_json::Value::Object(obj) => JsonValue::Object(
             obj.into_iter()
-                .map(|(k, v)| (k, serde_value_to_json_value(v)))
+                .map(|(k, v)| (k, serde_value_to_json_value_bounded(v, depth + 1)))
                 .collect(),
         ),
     }
+}
+
+/// Return `true` iff `v` contains a [`JsonValue::MalformedDepthExceeded`]
+/// sentinel anywhere in its tree.
+///
+/// Used by [`SAACPProtocolHandler::intercept_packet_full`] after each
+/// `serde_value_to_json_value_bounded` call: the bounded converter embeds
+/// the sentinel at the *first* node that exceeds
+/// [`PromptInjectionScanner::MAX_DEPTH`], but the OUTER wrappers at shallow
+/// depths still construct normally and wrap the sentinel inside an
+/// `Array`/`Object` node. The sentinel is therefore never at the top level
+/// for a deeply-nested payload — checking only the top variant misses it.
+///
+/// The helper itself stops recursing past [`PromptInjectionScanner::MAX_DEPTH`]
+/// so it remains stack-safe even when fed a `JsonValue` tree produced by an
+/// unbounded external source (e.g. a test fixture).
+pub fn json_value_depth_exceeded(v: &JsonValue) -> bool {
+    fn walk(v: &JsonValue, depth: usize) -> bool {
+        if depth > PromptInjectionScanner::MAX_DEPTH {
+            // Treat further nesting as already-exceeded — matches the
+            // bounded converter's behavior.
+            return true;
+        }
+        match v {
+            JsonValue::MalformedDepthExceeded => true,
+            JsonValue::Array(items) => items.iter().any(|x| walk(x, depth + 1)),
+            JsonValue::Object(entries) => entries.iter().any(|(_, x)| walk(x, depth + 1)),
+            _ => false,
+        }
+    }
+    walk(v, 0)
 }
 
 /// Extract SHA-256 hex of the signature bytes from a base64-encoded capability token.
@@ -3598,7 +3957,9 @@ mod tests {
     fn test_prompt_injection_normalize() {
         let text = "Ignore Previous Instructions";
         let norm = PromptInjectionScanner::normalize(text);
-        assert_eq!(norm, "ignorepreviousinstructions");
+        // M7 (R4 / opusreview.md): normalization preserves word boundaries,
+        // so the output is space-separated.
+        assert_eq!(norm, "ignore previous instructions");
     }
 
     /// M-9 regression: U+0413 CYRILLIC CAPITAL LETTER GHE (Г) is a visual
@@ -3624,7 +3985,7 @@ mod tests {
         // Cyrillic confusable: "іgnοrе" using lookalikes
         let text = "\u{0456}gn\u{03bf}r\u{0435} previous instructions";
         let norm = PromptInjectionScanner::normalize(text);
-        assert!(norm.contains("ignorepreviousinstructions"));
+        assert!(norm.contains("ignore previous instructions"));
     }
 
     /// S-3 fix: an injection pattern appended AFTER the first `MAX_SCAN_LENGTH`
@@ -3636,7 +3997,7 @@ mod tests {
         text.push_str(" ignore previous instructions");
         let norm = PromptInjectionScanner::normalize(&text);
         assert!(
-            norm.contains("ignorepreviousinstructions"),
+            norm.contains("ignore previous instructions"),
             "tail-window normalization must surface an injection appended past MAX_SCAN_LENGTH"
         );
         // And the full scan path rejects it.

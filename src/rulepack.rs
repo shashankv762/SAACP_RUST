@@ -215,7 +215,7 @@ impl From<RulePackRejection> for SAACPHardDrop {
 /// One injection signature. `pattern` is matched against Gate 4.0's *normalized*
 /// text, so it is put through the identical normalization pipeline at install
 /// time — an operator writes `"Ignore previous instructions"` and the loader
-/// stores `"ignorepreviousinstructions"`.
+/// stores `"ignore previous instructions"` (M7 / R4: word boundaries preserved).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectionRule {
     /// Operator-facing identifier (e.g. `"CVE-2026-1234"`, `"zeroday-2026-08-03"`),
@@ -999,15 +999,23 @@ mod tests {
             );
         }
         // The built-in signature still fires under the recompiled automaton.
+        // M7 (R4 / opusreview.md): normalization preserves word boundaries,
+        // so the assertion checks for the space-separated form.
+        // Patterns are stored with spaces to match the normalizer output.
         assert!(
             compiled
                 .automaton()
-                .find("ignorepreviousinstructions")
+                .find("ignore previous instructions")
                 .is_some(),
             "a pack must never be able to remove a shipped signature"
         );
         // And so does the new rule, matched against normalized text.
-        assert!(compiled.automaton().find("brandnewzerodayphrase").is_some());
+        // The pack rule "brand new zero day phrase" is normalized with
+        // preserved word boundaries: "brand new zero day phrase".
+        assert!(compiled
+            .automaton()
+            .find("brand new zero day phrase")
+            .is_some());
     }
 
     #[test]

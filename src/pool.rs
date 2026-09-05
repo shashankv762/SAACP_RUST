@@ -24,8 +24,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
+
+use parking_lot::Mutex;
 
 use crate::errors::SAACPHardDrop;
 
@@ -220,7 +221,7 @@ impl ConnectionPool {
         target_agent: &str,
         revocation_epoch: f64,
     ) -> Option<PinnedConnection> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         let key = (source_agent.to_string(), target_agent.to_string());
 
         if let Some(entries) = pool.get_mut(&key) {
@@ -257,7 +258,7 @@ impl ConnectionPool {
     /// If the pool is at capacity the connection with the longest idle
     /// time is evicted.
     pub fn release(&self, connection: PinnedConnection) -> Result<(), SAACPHardDrop> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         let key = (
             connection.source_agent.clone(),
             connection.target_agent.clone(),
@@ -305,7 +306,7 @@ impl ConnectionPool {
 
     /// Evict all idle connections that have exceeded `MAX_IDLE_SECONDS`.
     pub fn evict_idle(&self) -> usize {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         let mut evicted = 0;
 
         let keys: Vec<(String, String)> = pool.keys().cloned().collect();
@@ -324,12 +325,12 @@ impl ConnectionPool {
 
     /// Total number of connections currently in the pool.
     pub fn size(&self) -> usize {
-        self.pool.lock().unwrap().values().map(|v| v.len()).sum()
+        self.pool.lock().values().map(|v| v.len()).sum()
     }
 
     /// Remove and close all connections for a specific agent pair.
     pub fn purge(&self, source_agent: &str, target_agent: &str) -> usize {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         let key = (source_agent.to_string(), target_agent.to_string());
         if let Some(entries) = pool.remove(&key) {
             entries.len()
@@ -475,7 +476,7 @@ mod tests {
 
         // Force idle_since to be old.
         {
-            let mut p = pool.pool.lock().unwrap();
+            let mut p = pool.pool.lock();
             let key = ("a".to_string(), "b".to_string());
             if let Some(entries) = p.get_mut(&key) {
                 for e in entries.iter_mut() {
@@ -523,7 +524,7 @@ mod tests {
 
         // Force idle_since to the ancient past.
         {
-            let mut p = pool.pool.lock().unwrap();
+            let mut p = pool.pool.lock();
             let key = ("a".to_string(), "b".to_string());
             if let Some(entries) = p.get_mut(&key) {
                 for e in entries.iter_mut() {

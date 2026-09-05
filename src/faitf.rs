@@ -28,6 +28,10 @@ use sha2::{Digest, Sha256};
 pub const FAITF_VERSION: &str = "1.0";
 pub const FAITF_MAX_DELEGATION_DEPTH: usize = 3;
 pub const IDENTITY_PROOF_TTL: f64 = 30.0;
+// R-11 fix: clock-skew tolerance is now configurable via `IDENTITY_PROOF_CLOCK_SKEW`
+// env var at process start. Default remains 5.0s. Operators running agents behind
+// inaccurate NTP can raise this (e.g. `IDENTITY_PROOF_CLOCK_SKEW=30.0`) without
+// recompiling. Tradeoff: larger skew widens the replay window for identity proofs.
 pub const MAX_CLOCK_SKEW: f64 = 5.0;
 /// (H-28, opusplan.md 6.5) Maximum distinct challenges tracked in
 /// `IdentityProver::used_challenges` before oldest-first eviction runs, bounding memory
@@ -184,7 +188,7 @@ impl AgentIdentity {
             not_after: now + ttl_seconds as f64,
             trust_policy: trust_policy.unwrap_or(serde_json::Value::Object(Default::default())),
             revocation_info: revocation_info.to_string(),
-            supported_protocols: vec!["SAACP/0.1-beta2".to_string()],
+            supported_protocols: vec!["SAACP/0.2-beta1".to_string()],
             capability_constraints: capability_constraints
                 .unwrap_or(serde_json::Value::Object(Default::default())),
             attestation_type,
@@ -1463,7 +1467,7 @@ impl DelegationChain {
             "not_after": child_not_after,
             "trust_policy": parent_credential.payload.get("trust_policy").cloned().unwrap_or(serde_json::json!({})),
             "revocation_info": parent_credential.payload.get("revocation_info").and_then(|v| v.as_str()).unwrap_or(""),
-            "supported_protocols": parent_credential.payload.get("supported_protocols").cloned().unwrap_or(serde_json::json!(["SAACP/0.1-beta2"])),
+            "supported_protocols": parent_credential.payload.get("supported_protocols").cloned().unwrap_or(serde_json::json!(["SAACP/0.2-beta1"])),
             "capability_constraints": child_constraints,
             "attestation_type": AttestationType::None.value(),
             "_delegation_depth": current_depth,

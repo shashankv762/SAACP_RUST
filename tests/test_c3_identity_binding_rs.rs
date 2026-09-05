@@ -28,7 +28,7 @@ fn make_test_session() -> TranscriptBoundSession {
         &"bb".repeat(32),
         &"cc".repeat(16),
         &"dd".repeat(16),
-        "SAACP/0.1-beta2",
+        "SAACP/0.2-beta1",
         "Ed25519-AES256GCM",
         None,
     )

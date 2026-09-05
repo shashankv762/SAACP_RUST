@@ -1,12 +1,5 @@
-import { AgentList } from "@/components/AgentList";
+import CommandUI from "@/components/saacp/CommandUI";
 
 export default function AgentsPage() {
-  return (
-    <main className="stage">
-      <p className="stage-title">Agents · Behavioral Trust</p>
-      <div className="panel">
-        <AgentList />
-      </div>
-    </main>
-  );
+  return <CommandUI initialPage="agents" />;
 }

@@ -11,9 +11,9 @@
 //! 7. ExternalResponse   — the wire-visible structure returned to the remote peer.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
@@ -93,7 +93,7 @@ fn profile_from_env() -> DeploymentProfile {
 /// other in-flight connection losing the ability to read the deployment
 /// profile at all.
 pub fn get_active_profile() -> DeploymentProfile {
-    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = ACTIVE_PROFILE.lock();
     // M-34: only ever consult the env var before the profile has been set
     // programmatically — once `manually_set` is true, the explicit choice
     // always wins, no matter which profile value it was set to.
@@ -105,7 +105,7 @@ pub fn get_active_profile() -> DeploymentProfile {
 
 /// Override the active profile (used in tests and admin tooling).
 pub fn set_active_profile(profile: DeploymentProfile) {
-    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = ACTIVE_PROFILE.lock();
     state.profile = profile;
     state.manually_set = true;
 }
@@ -114,7 +114,7 @@ pub fn set_active_profile(profile: DeploymentProfile) {
 /// Call this once at process startup before handling any requests.
 /// Calling this after `set_active_profile()` overwrites the programmatic value.
 pub fn init_profile_from_env() {
-    let mut state = ACTIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = ACTIVE_PROFILE.lock();
     state.profile = profile_from_env();
     state.manually_set = false;
 }
@@ -467,7 +467,7 @@ impl SecureDiagnosticLedger {
 
     /// Append one diagnostic entry to the ledger (thread-safe).
     pub fn record(&self, entry: SdlEntry) {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.entries.lock();
         if entries.len() >= SDL_MAX_ENTRIES {
             entries.pop_front(); // evict oldest; preserve most-recent window
         }
@@ -479,7 +479,7 @@ impl SecureDiagnosticLedger {
     /// IMPORTANT: This method must only be called by authorised admin tooling.
     /// It must NEVER be wired to any network-accessible endpoint.
     pub fn query(&self, correlation_id: Option<&str>, limit: usize) -> Vec<SdlEntry> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = self.entries.lock();
         let filtered: Vec<SdlEntry> = if let Some(cid) = correlation_id {
             entries
                 .iter()
@@ -495,15 +495,12 @@ impl SecureDiagnosticLedger {
 
     /// Wipe the ledger (used in tests).
     pub fn clear(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.entries.lock().clear();
     }
 
     /// Return the current number of entries.
     pub fn entry_count(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.entries.lock().len()
     }
 }
 

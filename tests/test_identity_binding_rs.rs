@@ -164,8 +164,8 @@ async fn identity_bound_matching_token_accepted() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "a token whose claimed identity matches the proven handshake identity must be accepted"
     );
 }
@@ -214,8 +214,8 @@ async fn identity_bound_token_claiming_different_agent_rejected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_ne!(
-        &response, b"SUCCESS",
+    assert!(
+        !response.starts_with(b"SUCCESS"),
         "a token claiming an identity other than the one proven at handshake must be rejected"
     );
 }
@@ -350,8 +350,8 @@ async fn non_identity_bound_connection_unaffected() {
     stream.write_all(&frame).await.expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "non-identity-bound connections must be entirely unaffected"
     );
 }

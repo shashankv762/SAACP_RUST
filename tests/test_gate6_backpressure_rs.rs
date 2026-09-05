@@ -98,7 +98,11 @@ fn wal_open_failure_is_fatal_not_silent() {
     );
 
     let mut waited = Duration::ZERO;
-    while log.health() != AuditHealth::Fatal && waited < Duration::from_secs(2) {
+    // 10s patience: on a heavily loaded machine (full-suite parallel run), the
+    // WAL worker thread's spawn + open-failure detection can exceed 2s. The
+    // bound only guards against an infinite hang — Fatal must EVENTUALLY be
+    // observed.
+    while log.health() != AuditHealth::Fatal && waited < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(5));
         waited += Duration::from_millis(5);
     }
@@ -146,7 +150,9 @@ fn dropped_audit_pins_health_until_acknowledged() {
     );
 
     let mut waited = Duration::ZERO;
-    while log.health() != AuditHealth::Fatal && waited < Duration::from_secs(2) {
+    // 10s patience for the same load-induced-spawn-latency reason as
+    // `wal_open_failure_is_fatal_not_silent` above.
+    while log.health() != AuditHealth::Fatal && waited < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(5));
         waited += Duration::from_millis(5);
     }

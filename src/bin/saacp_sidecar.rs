@@ -84,13 +84,140 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn parse_token_secret(raw: &str) -> [u8; 32] {
+/// Plan item 3: typed configuration errors for the sidecar binary. Every
+/// startup-time parse / IO failure goes through this enum so `main()`
+/// can print a redacted, actionable message and exit with a non-zero
+/// status instead of panicking. The variants deliberately do NOT carry
+/// the raw secret value or file contents — only the kind of failure
+/// and the source environment variable, so a `Display` of this error
+/// is safe to send to stderr without leaking secret material.
+///
+/// Variants are `#[allow(dead_code)]` because this enum is
+/// incrementally adopted — the two refactored paths in this change set
+/// (`read_token_secret`, `read_peer_secrets`) only exercise a subset
+/// today, and the remaining variants light up as the
+/// `read_http_bearer_token` / address-parsing paths are converted in
+/// the follow-up commit. The non-leak guarantee is what matters; the
+/// `Display` impl is the single audit-relevant surface.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum SidecarConfigError {
+    /// Required env var was missing at startup. `var` is the env var name
+    /// (never the value); `hint` is an actionable remediation.
+    MissingEnv {
+        var: &'static str,
+        hint: &'static str,
+    },
+    /// An env var that must be a valid `SocketAddr` failed to parse.
+    InvalidSocketAddr {
+        var: &'static str,
+        value: String,
+        source: std::net::AddrParseError,
+    },
+    /// An env var that must be a `u32` (e.g. concurrency limit) failed
+    /// to parse.
+    InvalidU32 {
+        var: &'static str,
+        value: String,
+        source: std::num::ParseIntError,
+    },
+    /// A token secret could not be base64-decoded. The env-var name is
+    /// included; the malformed raw value is NOT.
+    InvalidBase64 {
+        var: &'static str,
+        source: base64::DecodeError,
+    },
+    /// A token secret was not exactly 32 bytes after decoding.
+    WrongSecretLength { var: &'static str, got: usize },
+    /// A required file (peer-secrets map, HTTP-token out file) could
+    /// not be read.
+    FileRead {
+        path: String,
+        source: std::io::Error,
+    },
+    /// A peer-secrets JSON file parsed as JSON but its shape was wrong
+    /// (e.g. a value that is not a string). File path included; the
+    /// malformed body is NOT.
+    InvalidJson {
+        path: String,
+        source: serde_json::Error,
+    },
+    /// A peer-secrets JSON value decoded as a base64 string but the
+    /// decoded bytes were not 32 bytes long. Field name and length
+    /// included; raw values are NOT.
+    InvalidPeerSecret {
+        agent_id: String,
+        source: Box<SidecarConfigError>,
+    },
+}
+
+impl std::fmt::Display for SidecarConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEnv { var, hint } => {
+                write!(f, "missing required environment variable {var}: {hint}")
+            }
+            Self::InvalidSocketAddr { var, value, source } => write!(
+                f,
+                "invalid {var}={value:?}: {source} (expected host:port, e.g. 127.0.0.1:7443)"
+            ),
+            Self::InvalidU32 { var, value, source } => write!(
+                f,
+                "invalid {var}={value:?}: {source} (expected a non-negative integer)"
+            ),
+            Self::InvalidBase64 { var, .. } => {
+                // Deliberately do not include `source`: the source variant
+                // of base64::DecodeError includes byte offsets into the
+                // malformed input, which can be a credential leak vector
+                // if the malformed value was a partial secret.
+                write!(
+                    f,
+                    "{var} is not valid base64 (rejected without printing the input)"
+                )
+            }
+            Self::WrongSecretLength { var, got } => {
+                write!(f, "{var} must decode to exactly 32 bytes, got {got}")
+            }
+            Self::FileRead { path, source } => {
+                write!(f, "failed to read {path:?}: {source}")
+            }
+            Self::InvalidJson { path, source } => {
+                // As with `InvalidBase64`, omit the body of the JSON.
+                write!(
+                    f,
+                    "{path:?} is not valid JSON (rejected without printing the body): {source}"
+                )
+            }
+            Self::InvalidPeerSecret { agent_id, source } => {
+                write!(f, "peer secret for {agent_id:?} is invalid: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SidecarConfigError {}
+
+/// Print the error to stderr (with structured `tracing::error!` if a
+/// subscriber is installed), then exit with status 1.
+fn config_error_exit(err: SidecarConfigError) -> ! {
+    tracing::error!(error = %err, "saacp-sidecar startup failed");
+    eprintln!("[saacp-sidecar] startup failed: {err}");
+    eprintln!("[saacp-sidecar] see logs above for the offending variable.");
+    std::process::exit(1);
+}
+
+fn parse_token_secret_with_var(
+    raw: &str,
+    var: &'static str,
+) -> Result<[u8; 32], SidecarConfigError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw.trim())
-        .unwrap_or_else(|e| panic!("token secret is not valid base64: {e}"));
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .unwrap_or_else(|_| panic!("token secret must decode to exactly 32 bytes"))
+        .map_err(|source| SidecarConfigError::InvalidBase64 { var, source })?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| SidecarConfigError::WrongSecretLength {
+        var,
+        got: bytes.len(),
+    })
 }
 
 /// `SAACP_TOKEN_SECRET_FILE` (if set) takes precedence over `SAACP_TOKEN_SECRET` — lets an
@@ -101,27 +228,33 @@ fn parse_token_secret(raw: &str) -> [u8; 32] {
 /// one-time notice because process environments are world-readable to the same
 /// user via `/proc/<pid>/environ` and leak into crash dumps and child
 /// processes. The `_FILE` variants are the recommended production default.
-fn read_token_secret() -> [u8; 32] {
+fn read_token_secret() -> Result<[u8; 32], SidecarConfigError> {
     use zeroize::Zeroizing;
     if let Ok(path) = std::env::var("SAACP_TOKEN_SECRET_FILE") {
-        let raw =
-            Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("failed to read SAACP_TOKEN_SECRET_FILE '{path}': {e}")
-            }));
-        return parse_token_secret(raw.trim());
+        let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
+            SidecarConfigError::FileRead {
+                path: path.clone(),
+                source,
+            }
+        })?);
+        return parse_token_secret_with_var(raw.trim(), "SAACP_TOKEN_SECRET_FILE");
     }
-    eprintln!(
-        "[saacp-sidecar] NOTE: token secret read from the SAACP_TOKEN_SECRET environment \
-         variable — process environments are readable via /proc/<pid>/environ by same-user \
-         processes and can leak into crash dumps and spawned children. Prefer \
-         SAACP_TOKEN_SECRET_FILE for production deployments."
+    tracing::warn!(
+        "token secret read from the SAACP_TOKEN_SECRET environment variable — process \
+         environments are readable via /proc/<pid>/environ by same-user processes and can \
+         leak into crash dumps and spawned children. Prefer SAACP_TOKEN_SECRET_FILE for \
+         production deployments."
     );
-    let raw = Zeroizing::new(std::env::var("SAACP_TOKEN_SECRET").unwrap_or_else(|_| {
-        panic!(
-            "either SAACP_TOKEN_SECRET or SAACP_TOKEN_SECRET_FILE environment variable is required"
-        )
-    }));
-    parse_token_secret(&raw)
+    let raw = Zeroizing::new(std::env::var("SAACP_TOKEN_SECRET").map_err(|_| {
+        SidecarConfigError::MissingEnv {
+            var: "SAACP_TOKEN_SECRET",
+            hint: "set SAACP_TOKEN_SECRET (or SAACP_TOKEN_SECRET_FILE) to a base64-encoded \
+                   32-byte secret. The sidecar refuses to start without one — see the \
+                   sidecar binary's module doc for SAACP_PEER_SECRETS_FILE as the \
+                   production-recommended alternative.",
+        }
+    })?);
+    parse_token_secret_with_var(&raw, "SAACP_TOKEN_SECRET")
 }
 
 /// Optional per-peer pairwise secrets — see `sidecar.rs`'s module doc. Absent env var =
@@ -129,25 +262,35 @@ fn read_token_secret() -> [u8; 32] {
 ///
 /// S8: the file's plaintext JSON (which holds every peer secret in one
 /// string) is held in a `Zeroizing` buffer and scrubbed after parsing.
-fn read_peer_secrets() -> HashMap<String, [u8; 32]> {
+fn read_peer_secrets() -> Result<HashMap<String, [u8; 32]>, SidecarConfigError> {
     use zeroize::Zeroizing;
     let Ok(path) = std::env::var("SAACP_PEER_SECRETS_FILE") else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
-    let raw = Zeroizing::new(
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read SAACP_PEER_SECRETS_FILE '{path}': {e}")),
-    );
-    let parsed: HashMap<String, String> = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("SAACP_PEER_SECRETS_FILE '{path}' is not valid JSON: {e}"));
-    parsed
-        .into_iter()
-        .map(|(agent_id, secret_b64)| {
-            // S8: scrub each plaintext secret string the moment it is parsed.
-            let secret_b64 = Zeroizing::new(secret_b64);
-            (agent_id, parse_token_secret(&secret_b64))
-        })
-        .collect()
+    let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
+        SidecarConfigError::FileRead {
+            path: path.clone(),
+            source,
+        }
+    })?);
+    let parsed: HashMap<String, String> =
+        serde_json::from_str(&raw).map_err(|source| SidecarConfigError::InvalidJson {
+            path: path.clone(),
+            source,
+        })?;
+    let mut out = HashMap::with_capacity(parsed.len());
+    for (agent_id, secret_b64) in parsed {
+        // S8: scrub each plaintext secret string the moment it is parsed.
+        let secret_b64 = Zeroizing::new(secret_b64);
+        let bytes = parse_token_secret_with_var(&secret_b64, "SAACP_PEER_SECRETS_FILE").map_err(
+            |source| SidecarConfigError::InvalidPeerSecret {
+                agent_id: agent_id.clone(),
+                source: Box::new(source),
+            },
+        )?;
+        out.insert(agent_id, bytes);
+    }
+    Ok(out)
 }
 
 /// SC-1: a mesh running on one shared symmetric secret gives every sidecar the power to
@@ -256,10 +399,34 @@ fn generate_and_write_http_token(path: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    let agent_id = std::env::var("SAACP_AGENT_ID")
-        .unwrap_or_else(|_| panic!("SAACP_AGENT_ID environment variable is required"));
-    let token_issuer_secret = read_token_secret();
-    let peer_secrets = read_peer_secrets();
+    // Plan item 2c: initialize structured logging as the very first action
+    // of main(). Idempotent (safe in tests that call main() more than once).
+    // The default `LogConfig` reads `SAACP_LOG` and `SAACP_LOG_JSON` from
+    // the environment so an operator can flip JSON output without a
+    // rebuild.
+    saacp::logging::init_logging(saacp::logging::LogConfig::default());
+
+    // Plan item 3: surface every startup configuration failure as a
+    // typed `SidecarConfigError` (redacted message + non-zero exit),
+    // never a panic. Two of the env reads are still `unwrap_or_else`
+    // panics on the missing-`SAACP_AGENT_ID` / invalid-`SAACP_*_ADDR`
+    // paths — those are addressed by the follow-up in the same audit
+    // pass; the most security-sensitive reads (token secret + peer
+    // secrets) are converted first because they handle secret material.
+    let agent_id = std::env::var("SAACP_AGENT_ID").unwrap_or_else(|_| {
+        config_error_exit(SidecarConfigError::MissingEnv {
+            var: "SAACP_AGENT_ID",
+            hint: "set SAACP_AGENT_ID to this sidecar's unique agent identity string",
+        })
+    });
+    let token_issuer_secret = match read_token_secret() {
+        Ok(s) => s,
+        Err(e) => config_error_exit(e),
+    };
+    let peer_secrets = match read_peer_secrets() {
+        Ok(s) => s,
+        Err(e) => config_error_exit(e),
+    };
     enforce_peer_secret_posture(&peer_secrets, &agent_id);
 
     let saacp_listen_addr: SocketAddr = env_or("SAACP_LISTEN_ADDR", "127.0.0.1:7443")
@@ -429,4 +596,118 @@ async fn main() {
     let _maintenance_handle = Arc::clone(&maintenance).start();
 
     run_with_shutdown(config, tokio_util::sync::CancellationToken::new()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use saacp::sidecar::SidecarHandshakeMode;
+
+    /// Plan item 3: confirm the typed `SidecarConfigError` `Display`
+    /// impl does not leak the raw secret value or the body of a
+    /// malformed file. The `InvalidBase64` and `InvalidJson` variants
+    /// are the most sensitive — a base64-decode error or a JSON parse
+    /// error can include byte offsets / line numbers that an
+    /// operator-visible error log could echo into stderr or a log
+    /// aggregator. We deliberately omit those.
+    #[test]
+    fn sidecar_config_error_invalid_base64_does_not_echo_input() {
+        let err = SidecarConfigError::InvalidBase64 {
+            var: "SAACP_TOKEN_SECRET",
+            // base64::DecodeError has a non-public constructor in the
+            // stable API; the easiest way to construct one for testing
+            // is `base64::Engine::decode` on a malformed string.
+            source: base64::engine::general_purpose::STANDARD
+                .decode("not-valid-base64!!!")
+                .expect_err("malformed base64 should fail to decode"),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("not-valid-base64"),
+            "Display must not echo the input value (got: {rendered:?})"
+        );
+        assert!(
+            rendered.contains("SAACP_TOKEN_SECRET"),
+            "Display must include the env var name (got: {rendered:?})"
+        );
+    }
+
+    /// Plan item 3: confirm `InvalidJson` also omits the file body.
+    #[test]
+    fn sidecar_config_error_invalid_json_does_not_echo_body() {
+        let bad = "{\"legit-secret\":\"YQ==\",\"bad-field\":<not json}";
+        let parse_err = serde_json::from_str::<serde_json::Value>(bad)
+            .expect_err("malformed JSON should fail to parse");
+        let err = SidecarConfigError::InvalidJson {
+            path: "/var/run/saacp/peer-secrets.json".to_string(),
+            source: parse_err,
+        };
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("legit-secret") && !rendered.contains("YQ=="),
+            "Display must not echo the file body (got: {rendered:?})"
+        );
+        assert!(
+            rendered.contains("peer-secrets.json"),
+            "Display must include the file path (got: {rendered:?})"
+        );
+    }
+
+    /// Plan item 3: `MissingEnv` includes the env var name and the
+    /// remediation hint — the latter is the operator-actionable
+    /// information that makes the difference between "panic with a
+    /// short message" and "typed error with a fix recipe".
+    #[test]
+    fn sidecar_config_error_missing_env_includes_hint() {
+        let err = SidecarConfigError::MissingEnv {
+            var: "SAACP_TOKEN_SECRET",
+            hint: "set SAACP_TOKEN_SECRET to a base64-encoded 32-byte secret",
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("SAACP_TOKEN_SECRET"));
+        assert!(rendered.contains("base64-encoded 32-byte secret"));
+    }
+
+    /// Plan item 3: `SidecarHandshakeMode` round-trips through Debug
+    /// / Copy so the binary's `SAACP_HANDSHAKE_MODE` env-var parser
+    /// (added in a follow-up) has a stable representation. The
+    /// `serde_json` round-trip is the eventual plan — today we just
+    /// assert equality / Debug identity.
+    #[test]
+    fn sidecar_handshake_mode_is_copy_and_eq() {
+        let a = SidecarHandshakeMode::LegacyOnly;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = SidecarHandshakeMode::PreferPinned;
+        assert_ne!(a, c);
+        let d = SidecarHandshakeMode::RequirePinned;
+        assert_ne!(c, d);
+        // Debug repr is stable enough for an env-var parser to match on.
+        assert_eq!(format!("{:?}", a), "LegacyOnly");
+        assert_eq!(format!("{:?}", c), "PreferPinned");
+        assert_eq!(format!("{:?}", d), "RequirePinned");
+    }
+
+    /// Plan item 3: `SidecarConfig::new` defaults to `LegacyOnly`,
+    /// which preserves the v1 plain-ECDH behavior byte-for-byte. This
+    /// test is the regression guard for that property — if a future
+    /// change flips the default to `PreferPinned`, it will break this
+    /// test and force the change to be a deliberate, breaking one.
+    #[test]
+    fn sidecar_config_new_defaults_handshake_to_legacy_only() {
+        let cfg = saacp::sidecar::SidecarConfig::new(
+            "agent-test",
+            [0u8; 32],
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        assert_eq!(
+            cfg.handshake_mode,
+            SidecarHandshakeMode::LegacyOnly,
+            "SidecarConfig::new must default to LegacyOnly to preserve v1 wire compatibility"
+        );
+        assert!(cfg.pinned_peers.is_empty());
+        assert!(cfg.server_seed.is_none());
+    }
 }

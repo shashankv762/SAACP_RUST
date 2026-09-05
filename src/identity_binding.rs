@@ -284,7 +284,7 @@ pub struct TranscriptBoundSession {
     pub client_nonce_hex: String,
     /// Hex-encoded random server nonce.
     pub server_nonce_hex: String,
-    /// Protocol version string (e.g. "SAACP/0.1-beta2").
+    /// Protocol version string (e.g. "SAACP/0.2-beta1").
     pub protocol_version: String,
     /// Cipher suite string (e.g. "Ed25519-AES256GCM").
     pub cipher_suite: String,
@@ -1092,7 +1092,7 @@ mod tests {
             &"bb".repeat(32),
             &"cc".repeat(16),
             &"dd".repeat(16),
-            "SAACP/0.1-beta2",
+            "SAACP/0.2-beta1",
             "Ed25519-AES256GCM",
             None,
         );

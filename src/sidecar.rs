@@ -200,6 +200,43 @@ pub struct SidecarConfig {
     /// mesh peers. Implemented as an ignored `_mpf_pad` JSON field, so
     /// receivers need no change. Opt-in (default `false`).
     pub payload_padding: bool,
+    /// Plan item 3: handshake posture for both inbound (server-side
+    /// `SAACPNetworkDaemon`) and outbound (client-side `send_message`)
+    /// connections. The default ([`SidecarHandshakeMode::LegacyOnly`])
+    /// preserves the v1 plain ECDH behavior byte-for-byte.
+    ///
+    /// Production deployments SHOULD set this to
+    /// [`SidecarHandshakeMode::PreferPinned`] or
+    /// [`SidecarHandshakeMode::RequirePinned`].
+    pub handshake_mode: SidecarHandshakeMode,
+    /// Server-side Ed25519 signing-key seed (32 bytes) for the
+    /// authenticated handshake. Required when `handshake_mode` is
+    /// [`SidecarHandshakeMode::RequirePinned`]. Ignored for
+    /// [`SidecarHandshakeMode::LegacyOnly`].
+    pub server_seed: Option<[u8; 32]>,
+    /// Pin the per-peer Ed25519 public-key fingerprints the client
+    /// side will accept. Keyed by peer `agent_id`. When non-empty,
+    /// the outbound `send_message` will refuse to dial a peer whose
+    /// handshake response does not match the pinned fingerprint.
+    pub pinned_peers: HashMap<String, [u8; 32]>,
+}
+
+/// Plan item 3: how the sidecar negotiates its server-side handshake
+/// with inbound peers and verifies the peer identity of outbound
+/// connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarHandshakeMode {
+    /// Use the authenticated handshake on both sides, refuse to fall
+    /// back to the plain handshake. Documented production posture.
+    RequirePinned,
+    /// Try the authenticated handshake; on the client side, if the
+    /// peer does not respond with a valid `HandshakeResponse`, fall
+    /// back to the plain handshake with a WARN log. Recommended
+    /// during the migration window.
+    PreferPinned,
+    /// Use the v1 plain ECDH handshake on both sides, exactly as
+    /// before. **Insecure for production**. Audit default.
+    LegacyOnly,
 }
 
 impl SidecarConfig {
@@ -227,6 +264,14 @@ impl SidecarConfig {
             http_bearer_token: None,
             connection_pooling: true,
             payload_padding: false,
+            // Plan item 3: default to LegacyOnly so the sidecar is a
+            // drop-in replacement for any pre-plan mesh. Operators
+            // opt into a more secure posture via the
+            // `SAACP_HANDSHAKE_MODE` env var (added in a follow-up) or
+            // by setting the field directly in code.
+            handshake_mode: SidecarHandshakeMode::LegacyOnly,
+            server_seed: None,
+            pinned_peers: HashMap::new(),
         }
     }
 }
@@ -665,24 +710,76 @@ pub async fn send_message(
     .map_err(SidecarError::Io)?;
 
     let mut response = [0u8; 128];
-    let n = tokio::time::timeout(timeout, {
-        use tokio::io::AsyncReadExt;
-        stream.read(&mut response)
-    })
-    .await
-    .map_err(|_| SidecarError::Timeout)?
-    .map_err(SidecarError::Io)?;
-
-    if &response[..n] == b"SUCCESS"
-        || &response[..n] == b"STREAM_ACK"
-        || &response[..n] == b"STREAM_END_ACK"
-    {
-        Ok(SendOutcome::Success)
-    } else {
-        Ok(SendOutcome::Rejected)
-    }
+    read_and_classify_response(&mut stream, &session_key, &mut response, timeout).await
 }
 
+/// M3 (R1): read and classify the peer's response on the wire.
+///
+/// The daemon appends an HMAC-SHA256 tag — keyed by the ECDH session root key
+/// (see `response_auth::compute_response_mac`) — to every ack it writes, so a
+/// bare `b"SUCCESS"`-style ack can no longer be forged by an active MITM and
+/// no longer counts as `Success` when produced by a pre-M3 peer. A PECF
+/// opaque error (44 bytes, deliberately unauthenticated — its confidentiality
+/// is PECF's job and its only power is to make the sender retry) still
+/// classifies as `Rejected`.
+///
+/// Reads accumulate into `buf` until a known ack prefix plus its MAC is
+/// complete, the stream ends, the timeout fires, or the buffer fills — robust
+/// to the TCP short-reads a single `read()` can produce. A recognized ack
+/// prefix whose MAC is missing/invalid is a hard `Err` (forged or truncated
+/// acceptance — never report it as `Success`).
+async fn read_and_classify_response<S>(
+    stream: &mut S,
+    session_key: &[u8; 32],
+    buf: &mut [u8; 128],
+    timeout: Duration,
+) -> Result<SendOutcome, SidecarError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    const ACKS: [&[u8]; 3] = [b"SUCCESS", b"STREAM_ACK", b"STREAM_END_ACK"];
+    let mut n = 0usize;
+    loop {
+        let r = tokio::time::timeout(timeout, stream.read(&mut buf[n..]))
+            .await
+            .map_err(|_| SidecarError::Timeout)?
+            .map_err(SidecarError::Io)?;
+        if r == 0 {
+            break; // EOF — peer closed
+        }
+        n += r;
+        // Complete once a known ack prefix is fully present plus its MAC tag.
+        if let Some(ack) = ACKS.iter().find(|a| n >= a.len() && &buf[..a.len()] == **a) {
+            let need = ack.len() + crate::response_auth::RESPONSE_MAC_LEN;
+            if n >= need {
+                let tag: [u8; crate::response_auth::RESPONSE_MAC_LEN] =
+                    buf[ack.len()..need].try_into().expect("32-byte MAC slice");
+                if crate::response_auth::verify_response_mac(session_key, ack, &tag) {
+                    return Ok(SendOutcome::Success);
+                }
+                return Err(SidecarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "response MAC verification failed — ack forged or truncated",
+                )));
+            }
+        }
+        if n == buf.len() {
+            break;
+        }
+    }
+    if std::env::var("SAACP_POOL_DEBUG").is_ok() {
+        eprintln!(
+            "[pool-debug] unverified response ({} bytes): {:?}",
+            n,
+            &buf[..n.min(16)]
+        );
+    }
+    // No authenticated ack on the wire — a PECF opaque error, a truncated
+    // response, or an unknown payload. None of these is a verified
+    // acceptance, so the outcome is `Rejected` (never `Success`).
+    Ok(SendOutcome::Rejected)
+}
 // ─── C2: outbound connection pooling ─────────────────────────────────────────
 
 /// One reusable outbound connection: the TCP stream plus the client-side
@@ -957,30 +1054,18 @@ impl SidecarConnectionPool {
                 .0;
 
             let send_result: Result<SendOutcome, SidecarError> = async {
-                use tokio::io::AsyncReadExt;
                 use tokio::io::AsyncWriteExt;
                 tokio::time::timeout(timeout, conn.stream.write_all(&frame))
                     .await
                     .map_err(|_| SidecarError::Timeout)?
                     .map_err(SidecarError::Io)?;
+                // M3 (R1): verify the daemon's ack MAC against the connection's
+                // ECDH root key. `root_key` is fixed for the connection's
+                // lifetime (epoch/session rotation above it never re-derives
+                // it), which is exactly the key the server MACs acks with.
                 let mut response = [0u8; 128];
-                let n = tokio::time::timeout(timeout, conn.stream.read(&mut response))
+                read_and_classify_response(&mut conn.stream, &conn.root_key, &mut response, timeout)
                     .await
-                    .map_err(|_| SidecarError::Timeout)?
-                    .map_err(SidecarError::Io)?;
-                if std::env::var("SAACP_POOL_DEBUG").is_ok() {
-                    eprintln!("[pool-debug] n={} bytes={:?}", n, &response[..n.min(16)]);
-                }
-                Ok(
-                    if &response[..n] == b"SUCCESS"
-                        || &response[..n] == b"STREAM_ACK"
-                        || &response[..n] == b"STREAM_END_ACK"
-                    {
-                        SendOutcome::Success
-                    } else {
-                        SendOutcome::Rejected
-                    },
-                )
             }
             .await;
 

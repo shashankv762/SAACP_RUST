@@ -47,7 +47,7 @@ fn bind_session(session_id_byte: u8, client_agent_id: &str) -> (SigningKey, Stri
         &"bb".repeat(32),
         &"cc".repeat(16),
         &"dd".repeat(16),
-        "SAACP/0.1-beta2",
+        "SAACP/0.2-beta1",
         "Ed25519-AES256GCM",
         None,
     );

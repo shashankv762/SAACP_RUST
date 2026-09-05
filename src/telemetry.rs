@@ -1821,7 +1821,17 @@ pub const ALERT_FEED_MAX_ENTRIES: usize = 2000;
 pub struct SecurityAlertFeed {
     ring: Mutex<VecDeque<SecurityAlert>>,
     #[allow(clippy::type_complexity)]
-    subscribers: Mutex<Vec<Arc<dyn Fn(&SecurityAlert) + Send + Sync>>>,
+    subscribers: Mutex<Vec<SubscriberEntry>>,
+}
+
+/// One entry in `SecurityAlertFeed::subscribers`. Holds the
+/// caller-provided callback plus a sentinel `Arc<()>` that the
+/// `AlertSubscription` handle uses to identify *which* entry to remove
+/// when the handle is dropped. The sentinel is heap-allocated, so its
+/// `Arc::as_ptr` is unique and stable for the entry's lifetime.
+pub struct SubscriberEntry {
+    sentinel: Arc<()>,
+    callback: Arc<dyn Fn(&SecurityAlert) + Send + Sync>,
 }
 
 impl SecurityAlertFeed {
@@ -1862,8 +1872,8 @@ impl SecurityAlertFeed {
             ring.push_back(alert.clone());
         }
         let subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
-        for cb in subs.iter() {
-            cb(&alert);
+        for entry in subs.iter() {
+            (entry.callback)(&alert);
         }
     }
 
@@ -1873,11 +1883,80 @@ impl SecurityAlertFeed {
         ring.iter().rev().take(limit).cloned().collect()
     }
 
-    pub fn subscribe(&self, cb: Arc<dyn Fn(&SecurityAlert) + Send + Sync>) {
+    /// Plan item 2d: subscribe a callback to live alerts. Returns an
+    /// [`AlertSubscription`] handle that, when dropped, removes the
+    /// callback from the subscriber list. The handle is the only way to
+    /// unsubscribe — there is no `unsubscribe_by_id` API by design, so
+    /// the only entity that can drop a subscription is the one that
+    /// created it (lifecycle ownership matches the dashboard's
+    /// consumer-handle pattern).
+    pub fn subscribe(
+        &self,
+        cb: Arc<dyn Fn(&SecurityAlert) + Send + Sync>,
+    ) -> AlertSubscription<'_> {
+        // Allocate a fresh, unique sentinel for this subscription. The
+        // sentinel is heap-allocated so its `Arc::as_ptr` is stable for
+        // the lifetime of the subscription and identical between
+        // insertion and removal (the key trick that lets the Drop impl
+        // find *exactly* the entry to remove without ambiguity).
+        let sentinel: Arc<()> = Arc::new(());
+        let sentinel_for_list = Arc::clone(&sentinel);
+        let cb_wrapped: Arc<dyn Fn(&SecurityAlert) + Send + Sync> =
+            Arc::new(move |alert| cb(alert));
+        let entry = SubscriberEntry {
+            sentinel: sentinel_for_list,
+            callback: Arc::clone(&cb_wrapped),
+        };
         self.subscribers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(cb);
+            .push(entry);
+        AlertSubscription {
+            feed: self,
+            sentinel,
+            callback: Arc::clone(&cb_wrapped),
+        }
+    }
+
+    /// Subscribe a callback that lives for the entire program lifetime
+    /// (no unsubscribe handle). Use this for **bootstrap** subscribers
+    /// that the process creates at startup and never tears down — the
+    /// Command Center wires one of these into its `event_tx` broadcast
+    /// channel so every `/events` SSE client can observe every
+    /// `InjectionAlert` regardless of when the client connected.
+    ///
+    /// Plan item 2d: deliberately separate from [`subscribe`] so the
+    /// common pattern of "I want an unsubscribe handle" requires
+    /// holding the handle explicitly. This avoids the silent-unbind
+    /// bug that the `subscribe` API was *designed* to fix: a caller
+    /// who writes `let _ = feed.subscribe(...)` today gets a callback
+    /// that's removed at end of statement; the same line of code with
+    /// `subscribe_forever` keeps the callback alive until the process
+    /// exits.
+    pub fn subscribe_forever(&self, cb: Arc<dyn Fn(&SecurityAlert) + Send + Sync>) {
+        let sentinel: Arc<()> = Arc::new(());
+        let entry = SubscriberEntry {
+            sentinel,
+            callback: cb,
+        };
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(entry);
+        // Intentionally do NOT return the sentinel/handle — the caller
+        // has no way to drop it. The Arc inside the entry keeps the
+        // sentinel alive for the program's lifetime.
+    }
+
+    /// Internal: remove a subscription by its sentinel pointer. Called
+    /// from `AlertSubscription::Drop` only.
+    fn remove_subscription(&self, sentinel_ptr: *const ()) {
+        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        // Compare by `Arc::as_ptr` to identify the right entry. The
+        // `callback` Arc is also kept here for the lifetime of the
+        // list entry — once removed, the Arc count drops and the
+        // closure can be freed.
+        subs.retain(|entry| !std::ptr::eq(Arc::as_ptr(&entry.sentinel), sentinel_ptr));
     }
 
     pub fn len(&self) -> usize {
@@ -1886,6 +1965,34 @@ impl SecurityAlertFeed {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Handle returned by [`SecurityAlertFeed::subscribe`]. Dropping the
+/// handle unsubscribes the associated callback. The handle owns the
+/// sentinel `Arc<()>` whose `Arc::as_ptr` identifies the entry to
+/// remove; the callback `Arc` is held so the closure lives as long as
+/// the entry is in the list (and is freed once the entry is removed).
+///
+/// Plan item 2d: this is the only way to remove a subscription — by
+/// design, the dashboard/consumer that creates a subscription is the
+/// only entity that can drop it, so the consumer's lifecycle cleanly
+/// governs its alert callbacks. Leaks are not possible: every
+/// `subscribe` is paired with exactly one `drop` of the handle.
+pub struct AlertSubscription<'a> {
+    feed: &'a SecurityAlertFeed,
+    sentinel: Arc<()>,
+    // Kept for symmetry / debug introspection; the actual list removal
+    // uses the sentinel pointer. The callback `Arc` is otherwise held
+    // by the subscriber entry itself, so dropping this field does not
+    // free the closure until the entry is removed.
+    #[allow(dead_code)]
+    callback: Arc<dyn Fn(&SecurityAlert) + Send + Sync>,
+}
+
+impl<'a> Drop for AlertSubscription<'a> {
+    fn drop(&mut self) {
+        self.feed.remove_subscription(Arc::as_ptr(&self.sentinel));
     }
 }
 
@@ -1900,15 +2007,45 @@ pub fn global_alert_feed() -> &'static SecurityAlertFeed {
 /// in one call — the standard instrumentation point for every gate's reject
 /// site in `handler.rs`. `gate` should be one of the strings recognized by
 /// `TelemetryCollector::record_gate_rejection` (e.g. `"gate_4_0_inject"`).
+///
+/// **Backward-compatible convenience API.** New code should prefer
+/// [`report_gate_rejection_for`] with an explicit `&SaacpContext` so the
+/// rejection is recorded into the per-tenant counter bank + alert feed
+/// instead of the process-wide default. The global helper is preserved for
+/// callers that genuinely do not have a context available (e.g. the
+/// command-center demo activity generator) — it is exactly equivalent to
+/// `report_gate_rejection_for(&SaacpContext::shared_default(), ...)`.
 pub fn report_gate_rejection(
     gate: &'static str,
     agent_id: &str,
     err: &crate::errors::SAACPHardDrop,
 ) {
-    global_telemetry().record_gate_rejection(gate);
+    report_gate_rejection_for(
+        crate::context::SaacpContext::shared_default(),
+        gate,
+        agent_id,
+        err,
+    );
+}
+
+/// Context-aware gate-rejection recorder (Phase 4 de-globalization, item 2a).
+///
+/// Routes the rejection into the per-context telemetry counter bank and live
+/// alert feed so multi-tenant deployments see per-tenant counter values and
+/// per-tenant alert streams, instead of every rejection landing in the
+/// process-wide singletons. The byte-code string is materialized once and
+/// shared by both the counter bank and the alert feed.
+pub fn report_gate_rejection_for(
+    ctx: &crate::context::SaacpContext,
+    gate: &'static str,
+    agent_id: &str,
+    err: &crate::errors::SAACPHardDrop,
+) {
     let bytecode = format!("{:?}", err.bytecode);
-    global_telemetry().record_gate_rejection_bytecode(gate, &bytecode);
-    global_alert_feed().record(SecurityAlert {
+    ctx.telemetry.record_gate_rejection(gate);
+    ctx.telemetry
+        .record_gate_rejection_bytecode(gate, &bytecode);
+    ctx.alerts.record(SecurityAlert {
         timestamp: now_epoch_secs(),
         agent_id: agent_id.to_string(),
         gate,
@@ -1925,12 +2062,34 @@ pub fn report_gate_rejection(
 /// Transactions" ledger sees a real per-event entry instead of only the aggregate
 /// counter moving. `estimated_cost` is expected already validated finite/non-negative
 /// by the caller (same contract as `record_financial_rejection`).
+///
+/// **Backward-compatible convenience API.** New code should prefer
+/// [`report_financial_rejection_for`] with an explicit `&SaacpContext` so the
+/// rejection lands in the per-tenant counter bank + alert feed.
 pub fn report_financial_rejection(agent_id: &str, estimated_cost: f64) {
+    report_financial_rejection_for(
+        crate::context::SaacpContext::shared_default(),
+        agent_id,
+        estimated_cost,
+    );
+}
+
+/// Context-aware financial-rejection recorder (Phase 4 de-globalization, item 2a).
+///
+/// Routes the rejection into the per-context telemetry counter bank and live
+/// alert feed. The gate name is fixed at `"gate_0_5_financial"`; the byte-code
+/// is the canonical `"BudgetExceeded"` string.
+pub fn report_financial_rejection_for(
+    ctx: &crate::context::SaacpContext,
+    agent_id: &str,
+    estimated_cost: f64,
+) {
     const GATE: &str = "gate_0_5_financial";
-    global_telemetry().record_financial_rejection(estimated_cost);
-    global_telemetry().record_gate_rejection(GATE);
-    global_telemetry().record_gate_rejection_bytecode(GATE, "BudgetExceeded");
-    global_alert_feed().record(SecurityAlert {
+    ctx.telemetry.record_financial_rejection(estimated_cost);
+    ctx.telemetry.record_gate_rejection(GATE);
+    ctx.telemetry
+        .record_gate_rejection_bytecode(GATE, "BudgetExceeded");
+    ctx.alerts.record(SecurityAlert {
         timestamp: now_epoch_secs(),
         agent_id: agent_id.to_string(),
         gate: GATE,
@@ -2138,7 +2297,10 @@ mod tests {
         let feed = SecurityAlertFeed::new();
         let seen = Arc::new(AtomicUsize::new(0));
         let seen_clone = Arc::clone(&seen);
-        feed.subscribe(Arc::new(move |_alert: &SecurityAlert| {
+        // Plan item 2d: bind the subscription handle to keep the
+        // callback registered for the rest of the test. Dropping the
+        // handle at end-of-scope is exactly the unsubscribe semantics.
+        let _sub = feed.subscribe(Arc::new(move |_alert: &SecurityAlert| {
             seen_clone.fetch_add(1, Ordering::Relaxed);
         }));
 
@@ -2177,6 +2339,62 @@ mod tests {
         assert_eq!(
             recent[0].agent_id,
             format!("agent-{}", ALERT_FEED_MAX_ENTRIES + 9)
+        );
+    }
+
+    /// Plan item 2d: dropping the [`AlertSubscription`] handle must
+    /// remove the associated callback from the subscriber list. We
+    /// verify by counting invocations before/after drop and confirming
+    /// the subscriber list shrinks accordingly. (The list isn't
+    /// directly observable from outside the module, so we infer
+    /// membership by recording two alerts and checking that the second
+    /// one does not invoke the dropped callback.)
+    #[test]
+    fn test_alert_subscription_handle_unsubscribes_on_drop() {
+        use crate::errors::{SAACPBytecodes, SAACPHardDrop};
+        use std::sync::atomic::AtomicUsize;
+
+        let feed = SecurityAlertFeed::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        {
+            let _sub = feed.subscribe(Arc::new(move |_alert: &SecurityAlert| {
+                count_clone.fetch_add(1, Ordering::Relaxed);
+            }));
+
+            // While `_sub` is alive, the callback fires.
+            let err = SAACPHardDrop::new(SAACPBytecodes::PromptInjectionDetected, "t1");
+            feed.record(SecurityAlert {
+                timestamp: 1.0,
+                agent_id: "a1".to_string(),
+                gate: "gate_4_0_inject",
+                bytecode: "PromptInjectionDetected".to_string(),
+                estimated_cost: None,
+            });
+            // `report_gate_rejection` would have added context we don't
+            // need here — record the alert directly.
+            let _ = err;
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                1,
+                "callback fired while subscribed"
+            );
+        }
+        // `_sub` dropped here — the callback is now removed.
+
+        // Record another alert; the dropped callback must not fire.
+        feed.record(SecurityAlert {
+            timestamp: 2.0,
+            agent_id: "a2".to_string(),
+            gate: "gate_4_0_inject",
+            bytecode: "PromptInjectionDetected".to_string(),
+            estimated_cost: None,
+        });
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "callback did not fire after subscription was dropped"
         );
     }
 

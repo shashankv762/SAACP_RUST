@@ -8,11 +8,11 @@
 //! - `PostCompromiseRecovery` — structured key-compromise handling
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -317,10 +317,7 @@ impl ThresholdAuthorityIssuer {
         &self,
         ca: std::sync::Arc<CapabilityVerificationAuthority>,
     ) {
-        *self
-            .verification_authority
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(ca);
+        *self.verification_authority.lock() = Some(ca);
     }
 
     /// Register a new threshold request. Returns request_id.
@@ -334,7 +331,7 @@ impl ThresholdAuthorityIssuer {
             expires_at: now + self.proposal_ttl,
         };
 
-        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        let mut requests = self.requests.lock();
         // IoT / low-resource fix: sweep once the cap is exceeded — expired
         // proposals first, then oldest-created as a fallback if the map is
         // still full (mirrors the two-pass idiom in trust_decay.rs).
@@ -383,7 +380,7 @@ impl ThresholdAuthorityIssuer {
         // N-6 fix: auto-clean expired proposals on every submission (matches Python behavior)
         self.gc_expired_proposals();
 
-        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        let mut requests = self.requests.lock();
         let state = requests.get_mut(request_id).ok_or_else(|| {
             SAACPHardDrop::new(
                 SAACPBytecodes::AcsvafThresholdNotReached,
@@ -394,10 +391,7 @@ impl ThresholdAuthorityIssuer {
         // Reject expired proposals
         if now_f64() > state.expires_at {
             drop(requests);
-            self.requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(request_id);
+            self.requests.lock().remove(request_id);
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::AcsvafThresholdNotReached,
                 format!(
@@ -425,11 +419,7 @@ impl ThresholdAuthorityIssuer {
         // `verify_threshold_token` would trust. Fail-closed: a registered CVA
         // that lacks this kid's key rejects the approval.
         {
-            let ca_opt = self
-                .verification_authority
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let ca_opt = self.verification_authority.lock().clone();
             if let Some(ca) = ca_opt {
                 let claims_bytes = serde_json::to_vec(&state.base_claims).unwrap_or_default();
                 let kid = token.kid();
@@ -477,17 +467,14 @@ impl ThresholdAuthorityIssuer {
         &self,
         request_id: &str,
     ) -> Result<ThresholdCapabilityToken, String> {
-        let requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        let requests = self.requests.lock();
         let state = requests
             .get(request_id)
             .ok_or_else(|| format!("FACTF: Unknown request_id '{}'.", request_id))?;
 
         if now_f64() > state.expires_at {
             drop(requests);
-            self.requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(request_id);
+            self.requests.lock().remove(request_id);
             return Err(format!(
                 "FACTF: Proposal '{}' has expired before reaching threshold.",
                 request_id
@@ -514,7 +501,7 @@ impl ThresholdAuthorityIssuer {
     /// Remove expired proposals. Returns purge count. (Python API: purge_expired_requests)
     pub fn purge_expired_requests(&self) -> usize {
         let now = now_f64();
-        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        let mut requests = self.requests.lock();
         let expired: Vec<String> = requests
             .iter()
             .filter(|(_, s)| now > s.expires_at)
@@ -539,7 +526,6 @@ impl ThresholdAuthorityIssuer {
         let now = now_f64();
         self.requests
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|s| now <= s.expires_at)
             .count()
@@ -697,7 +683,7 @@ impl InMemoryBackend {
     /// capacity. Returns the evicted entry, if one was removed.
     pub fn append(&self, entry: TransparencyLogEntry) -> Option<TransparencyLogEntry> {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let evicted = if entries.len() >= self.max_entries {
             entries.pop_front()
         } else {
@@ -709,14 +695,12 @@ impl InMemoryBackend {
 
     pub fn get_all(&self) -> Vec<TransparencyLogEntry> {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.entries.lock().unwrap().iter().cloned().collect()
+        self.entries.lock().iter().cloned().collect()
     }
 
     pub fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries
             .lock()
-            .unwrap()
             .iter()
             .filter(|e| e.jti.as_deref() == Some(jti))
             .cloned()
@@ -724,10 +708,8 @@ impl InMemoryBackend {
     }
 
     pub fn get_since(&self, timestamp: f64) -> Vec<TransparencyLogEntry> {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries
             .lock()
-            .unwrap()
             .iter()
             .filter(|e| e.timestamp >= timestamp)
             .cloned()
@@ -736,12 +718,12 @@ impl InMemoryBackend {
 
     pub fn count(&self) -> usize {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.entries.lock().unwrap().len()
+        self.entries.lock().len()
     }
 
     pub fn clear(&self) {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.entries.lock().unwrap().clear();
+        self.entries.lock().clear();
     }
 }
 
@@ -877,7 +859,7 @@ impl CapabilityTransparencyLog {
         entry.entry_hash = compute_entry_hash(&entry);
 
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        let mut last_hash = self.last_hash.lock().unwrap();
+        let mut last_hash = self.last_hash.lock();
         let prev_hash = last_hash.clone();
         entry.chain_hash = sha256_hex(format!("{}{}", prev_hash, entry.entry_hash).as_bytes());
 
@@ -897,7 +879,7 @@ impl CapabilityTransparencyLog {
         // entry.
         if let Some(evicted) = self.backend.append(&entry) {
             // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            *self.chain_floor_hash.lock().unwrap() = evicted.chain_hash;
+            *self.chain_floor_hash.lock() = evicted.chain_hash;
             self.pruned_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -945,7 +927,7 @@ impl CapabilityTransparencyLog {
         let generation_at_start = self.generation.load(std::sync::atomic::Ordering::Relaxed);
         {
             // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-            let cached = self.cached_verification.lock().unwrap();
+            let cached = self.cached_verification.lock();
             if let Some((gen, result)) = *cached {
                 if gen == generation_at_start {
                     return result;
@@ -955,7 +937,7 @@ impl CapabilityTransparencyLog {
 
         let entries = self.backend.get_all();
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        let mut prev_hash = self.chain_floor_hash.lock().unwrap().clone();
+        let mut prev_hash = self.chain_floor_hash.lock().clone();
         let mut result = true;
 
         for entry in &entries {
@@ -974,7 +956,7 @@ impl CapabilityTransparencyLog {
         }
 
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        *self.cached_verification.lock().unwrap() = Some((generation_at_start, result));
+        *self.cached_verification.lock() = Some((generation_at_start, result));
         result
     }
 
@@ -1607,7 +1589,7 @@ impl TransparencyLogBackend for FilesystemBackend {
 
         let line = serde_json::to_string(entry).unwrap_or_default();
         {
-            let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = self.writer.lock();
             if Self::maybe_rotate(&mut w, &self.path, self.max_file_size).is_ok() {
                 if writeln!(w.file, "{line}").is_ok() {
                     w.size += line.len() as u64 + 1;
@@ -1659,10 +1641,8 @@ impl TransparencyLogBackend for InMemoryBackend {
     }
 
     fn get_by_jti(&self, jti: &str) -> Vec<TransparencyLogEntry> {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries
             .lock()
-            .unwrap()
             .iter()
             .filter(|e| e.jti.as_deref() == Some(jti))
             .cloned()
@@ -1670,10 +1650,8 @@ impl TransparencyLogBackend for InMemoryBackend {
     }
 
     fn get_since(&self, timestamp: f64) -> Vec<TransparencyLogEntry> {
-        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
         self.entries
             .lock()
-            .unwrap()
             .iter()
             .filter(|e| e.timestamp >= timestamp)
             .cloned()
@@ -1682,12 +1660,12 @@ impl TransparencyLogBackend for InMemoryBackend {
 
     fn count(&self) -> usize {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.entries.lock().unwrap().len()
+        self.entries.lock().len()
     }
 
     fn clear(&self) {
         // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
-        self.entries.lock().unwrap().clear();
+        self.entries.lock().clear();
     }
 }
 

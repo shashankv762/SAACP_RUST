@@ -6,7 +6,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -15,6 +15,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Chains longer than 3 raise `ACSVAF_DELEGATION_DEPTH_EXCEEDED`.
 pub const ACSVAF_MAX_DELEGATION_DEPTH: u32 = 3;
 pub const WIRE_JSON_LEN_SIZE: usize = 4;
+/// M22 (§2.9 / opusreview.md): cap on distinct revoked JTIs held by a
+/// `CapabilityVerificationAuthority`. Past this, `enforce_revoked_tokens_cap`
+/// evicts lowest-`exp` entries. Mirrors `gateway.rs::REVOKED_TOKENS_MAX`.
+pub const ACSVAF_REVOKED_TOKENS_MAX: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // KeyStatus
@@ -420,7 +424,11 @@ pub struct CapabilityVerificationResult {
 
 pub struct CapabilityVerificationAuthority {
     keys: RwLock<HashMap<String, VerifyingKey>>,
-    revoked_tokens: RwLock<HashSet<String>>,
+    /// M22 (§2.9 / opusreview.md): `HashMap<JTI, exp_timestamp>` instead of
+    /// a bare `HashSet<String>` so entries carry an expiry and can be
+    /// evicted by oldest-first when the cap is exceeded. Poison-recovering
+    /// locks (matching `gateway.rs` convention) replace bare `.unwrap()`.
+    revoked_tokens: RwLock<HashMap<String, f64>>,
 }
 
 impl Default for CapabilityVerificationAuthority {
@@ -433,43 +441,99 @@ impl CapabilityVerificationAuthority {
     pub fn new() -> Self {
         Self {
             keys: RwLock::new(HashMap::new()),
-            revoked_tokens: RwLock::new(HashSet::new()),
+            revoked_tokens: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a verification key.
     pub fn register_key(&self, kid: &str, key: VerifyingKey) {
-        self.keys.write().unwrap().insert(kid.to_string(), key);
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(kid.to_string(), key);
     }
 
     /// Get a verification key by kid.
     pub fn get_verification_key(&self, kid: &str) -> Option<VerifyingKey> {
-        self.keys.read().unwrap().get(kid).copied()
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(kid)
+            .copied()
     }
 
-    /// Revoke a token by JTI.
-    pub fn revoke_token(&self, jti: &str) {
-        self.revoked_tokens.write().unwrap().insert(jti.to_string());
+    /// Revoke a token by JTI. Stores the token's expiry timestamp so the
+    /// bounded revocation map can evict oldest-first when the cap is exceeded.
+    /// M22 (§2.9 / opusreview.md).
+    pub fn revoke_token(&self, jti: &str, exp: f64) {
+        let mut revoked = self
+            .revoked_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        revoked.insert(jti.to_string(), exp);
+        drop(revoked);
+        self.enforce_revoked_tokens_cap();
     }
 
     /// Remove a trusted key (e.g. on compromise).
     pub fn revoke_trusted_key(&self, kid: &str) {
-        self.keys.write().unwrap().remove(kid);
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(kid);
     }
 
     /// Return a list of all registered key IDs.
     /// Python parity: `CapabilityVerificationAuthority.list_kids()`.
     pub fn list_kids(&self) -> Vec<String> {
-        self.keys.read().unwrap().keys().cloned().collect()
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Clear the JTI revocation registry. Returns the number of entries cleared.
     /// Python parity: `CapabilityVerificationAuthority.clear_replay_registry() -> int`.
     pub fn clear_replay_registry(&self) -> usize {
-        let mut revoked = self.revoked_tokens.write().unwrap();
+        let mut revoked = self
+            .revoked_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let count = revoked.len();
         revoked.clear();
         count
+    }
+
+    /// M22 (§2.9 / opusreview.md): evict expired entries, then if still over
+    /// `ACSVAF_REVOKED_TOKENS_MAX`, evict lowest-`exp` entries until back
+    /// under the cap. Evicted tokens are no longer in the revocation set —
+    /// this is the same trade-off `gateway.rs::enforce_revoked_tokens_cap`
+    /// makes, but here the cap is large (100k) and entries are short-lived
+    /// (token TTLs are seconds to minutes), so the window is bounded.
+    fn enforce_revoked_tokens_cap(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut revoked = self
+            .revoked_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        revoked.retain(|_, &mut exp| now < exp);
+        if revoked.len() <= ACSVAF_REVOKED_TOKENS_MAX {
+            return;
+        }
+        let mut entries: Vec<(f64, String)> = revoked
+            .iter()
+            .map(|(jti, &exp)| (exp, jti.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let evict_count = revoked.len() - ACSVAF_REVOKED_TOKENS_MAX;
+        for (_, jti) in entries.into_iter().take(evict_count) {
+            revoked.remove(&jti);
+        }
     }
 
     /// Verify a token: signature + temporal bounds + revocation check.
@@ -513,11 +577,17 @@ impl CapabilityVerificationAuthority {
             .unwrap_or("")
             .to_string();
 
-        if self.revoked_tokens.read().unwrap().contains(&jti) {
-            return Err(SAACPHardDrop::new(
-                SAACPBytecodes::TokenExpired,
-                "Token has been revoked",
-            ));
+        {
+            let revoked = self
+                .revoked_tokens
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if revoked.contains_key(&jti) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::TokenExpired,
+                    "Token has been revoked",
+                ));
+            }
         }
 
         // 6. Check temporal bounds
@@ -830,14 +900,19 @@ mod tests {
     #[test]
     fn test_clear_replay_registry_returns_count() {
         let cva = CapabilityVerificationAuthority::new();
-        cva.revoke_token("jti-aaa");
-        cva.revoke_token("jti-bbb");
-        cva.revoke_token("jti-ccc");
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            + 3600.0;
+        cva.revoke_token("jti-aaa", future);
+        cva.revoke_token("jti-bbb", future);
+        cva.revoke_token("jti-ccc", future);
         // clear_replay_registry must return 3 and drain the set
         let cleared = cva.clear_replay_registry();
         assert_eq!(cleared, 3, "must return count of cleared JTIs");
         // After clearing, revoking again returns 1
-        cva.revoke_token("jti-new");
+        cva.revoke_token("jti-new", future);
         assert_eq!(cva.clear_replay_registry(), 1);
     }
 
@@ -971,7 +1046,17 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        cva.revoke_token(&jti);
+        let exp = token
+            .get_claim("exp")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    + 3600.0
+            });
+        cva.revoke_token(&jti, exp);
         let result2 = cva.verify(&token);
         assert!(result2.is_err(), "revoked token must be rejected");
     }

@@ -1,7 +1,7 @@
 //! easi.rs — Encrypted Agent State Information (EASI)
 //!
 //! Implements the EASI encryption wrapper for the 32-byte Context Ref ID
-//! field in MEASC transport frames (GAP-9 / M-2 fix, SAACP/0.1-beta2).
+//! field in MEASC transport frames (GAP-9 / M-2 fix, SAACP/0.2-beta1).
 //!
 //! # Security design
 //!

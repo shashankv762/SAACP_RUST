@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Code quality ─────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy (lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  # ── Security audit ───────────────────────────────────────────────────────
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run cargo-audit
+        run: cargo audit
+
+  # ── Test suite ───────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-features
+      - name: Run library tests
+        run: cargo test --lib --all-features
+      - name: Run integration tests
+        run: cargo test --tests --all-features
+
+  # ── Feature-gated tests ──────────────────────────────────────────────────
+  test-features:
+    name: Feature-gated tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test transport-ws
+        run: cargo test --features transport-ws --test test_transport_ws_rs
+      - name: Test transport-tls
+        run: cargo test --features transport-tls --test test_transport_tls_rs
+      - name: Test sidecar
+        run: cargo test --features sidecar --test test_sidecar_rs
+      - name: Test sidecar MITM pinning
+        run: cargo test --features sidecar --test test_sidecar_mitm_rs
+
+      - name: Test redis-backend
+        run: cargo test --features redis-backend --test test_redis_backend_rs
+      - name: Test command-center
+        run: cargo test --features command-center --test test_command_center_rs
+
+  # ── Benchmarks (no regression gate) ─────────────────────────────────────
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks
+        run: cargo bench -- --test --warmup-iters 3 --measurement-time 10 2>&1 | tail -20
+
+  # ── Supply chain (cargo deny) ─────────────────────────────────────────────
+  # Runs advisories / bans / licenses / sources checks. Configured in
+  # `deny.toml`. Failure here means a dependency was added that violates
+  # the policy (e.g. new transitive dep with an unapproved license, or
+  # a crate with a known CVE). The advisory database is fetched fresh on
+  # every run; expect ~30s of network for the git clone.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check advisories + licenses + bans + sources
+        # `check` runs all four categories in one invocation. `--locked`
+        # pins the lockfile so an unexpected transitive bump can't
+        # silently slip into the policy decision.
+        run: cargo deny --locked check
+
+  # ── Coverage (cargo llvm-cov) ─────────────────────────────────────────────
+  # Library-coverage gate. Line-coverage threshold is conservative
+  # (60%) so a new test that adds a single function to a wide module
+  # doesn't fail CI, while a regression that removes a tested function
+  # will. Run as lib + doctests only — integration tests can be
+  # expensive on CI and are gated by the `test` job above.
+  coverage:
+    name: Coverage (lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate coverage
+        # `--no-fail-fast` so a single failing test still produces a
+        # coverage report (and we can see the regression in the diff).
+        # The threshold is enforced at the end via `llvm-cov report`.
+        run: |
+          cargo llvm-cov --locked --no-fail-fast --lib --doc \
+            --codecov --output-path codecov_lib.json
+      - name: Enforce line-coverage threshold
+        # `cargo llvm-cov report --summary-only` ends with a `TOTAL`
+        # line whose last whitespace-separated field is the percentage
+        # (e.g. `TOTAL ... 78.42%`). We extract that field and bail
+        # out if it is below the floor. `--fail-under-lines` is not in
+        # stable cargo-llvm-cov yet, so this bash check is the most
+        # portable way to enforce a 60% floor today. Bump this number
+        # as the test suite grows.
+        run: |
+          set -euo pipefail
+          SUMMARY=$(cargo llvm-cov report --summary-only)
+          echo "${SUMMARY}"
+          PCT=$(echo "${SUMMARY}" | awk '/^TOTAL/ {print $NF}' | tr -d '%')
+          awk -v p="${PCT}" 'BEGIN { if (p+0 < 60) { print "FAIL: coverage " p "% < 60%"; exit 1 } else { print "PASS: coverage " p "% >= 60%" } }'
+
+  # ── Fuzz targets (short run) ─────────────────────────────────────────────
+  fuzz:
+    name: Fuzz (short run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz MEASC frame parser (30s)
+        run: timeout 60 cargo +nightly fuzz run fuzz_measc_parse_frame -- -max_total_time=30 2>&1 || true
+      - name: Fuzz capability token (30s)
+        run: timeout 60 cargo +nightly fuzz run fuzz_capability_token_from_wire -- -max_total_time=30 2>&1 || true

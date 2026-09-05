@@ -602,9 +602,16 @@ fn system_revoker_identity() -> &'static AgentIdentity {
 /// already calls `SecurityAlertFeed::record`). Explicit opt-in, matching
 /// `telemetry::wire_trust_decay_metrics`'s own convention — call once at
 /// deployment startup.
+///
+/// Uses [`SecurityAlertFeed::subscribe_forever`], NOT `subscribe`: the
+/// returned `AlertSubscription` handle unsubscribes the callback when dropped,
+/// so a plain `.subscribe(...)` whose handle is never bound would silently
+/// unbind the MACE engine the moment this function returns — leaving every
+/// detector permanently blind to real traffic (a regression this wiring
+/// actually shipped with; see the test-mace alert-feed-wiring suite).
 pub fn wire_mace_alert_feed() {
     let engine = MultiAgentCollusionEngine::global();
-    global_alert_feed().subscribe(Arc::new(move |alert: &SecurityAlert| {
+    global_alert_feed().subscribe_forever(Arc::new(move |alert: &SecurityAlert| {
         engine.feed_gate_outcome(&alert.agent_id, alert.gate);
         if alert.bytecode == "CircuitBreakerOpen" {
             engine.record_rate_limit_event(&alert.agent_id, alert.timestamp);

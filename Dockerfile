@@ -1,0 +1,31 @@
+# SAACP-rs multi-stage Dockerfile
+# Build stage: compiles the daemon binaries
+# Runtime stage: distroless image with just the binaries
+
+# ── Build stage ────────────────────────────────────────────────────────────
+FROM rust:1.79-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/saacp
+
+# Cache dependencies: copy only Cargo files first
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+
+# Build release binaries with all features
+RUN cargo build --release --bins --features "transport-ws transport-tls sidecar command-center"
+
+# ── Runtime stage ──────────────────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+# Copy binaries from builder
+COPY --from=builder /usr/src/saacp/target/release/saacp-sidecar /usr/local/bin/
+COPY --from=builder /usr/src/saacp/target/release/saacp-command-center /usr/local/bin/
+
+# Default to the sidecar binary (most common deployment)
+ENTRYPOINT ["/usr/local/bin/saacp-sidecar"]

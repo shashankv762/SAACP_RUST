@@ -1,6 +1,6 @@
 # SAACP — Secure Autonomous Agent Communication Protocol
 
-**Rust implementation** · Protocol `SAACP/0.1-beta2` · Crate `saacp` v0.1.0 · License MIT
+**Rust implementation** · Protocol `SAACP/0.2-beta1` · Crate `saacp` v0.2.0 · License MIT
 
 SAACP is a zero-trust, cryptographically-authenticated wire protocol and security
 gate pipeline for **autonomous AI agents talking to other autonomous AI agents**.
@@ -14,37 +14,37 @@ agent's business logic.
 > **Design thesis:** classic RPC/service-mesh security answers *"is this connection
 > from a trusted host?"*. That is necessary but not sufficient for LLM-driven agents,
 > where the threat is often a *legitimately authenticated* agent that has been
-> prompt-injected, confused-deputied, or driven into a runaway loop. SAACP adds the
+> prompt-injected, confused-deputized, or driven into a runaway loop. SAACP adds the
 > agent-specific layer on top of transport security: **authorization invariance**,
 > **intent envelopes**, **injection scanning**, **epistemic circuit breakers**, and
 > **causal-graph governance**.
 
 ---
 
-## Table of contents
+## Table of Contents
 
 1. [Highlights](#highlights)
-2. [Architecture at a glance](#architecture-at-a-glance)
-3. [The security gate pipeline](#the-security-gate-pipeline)
-4. [Cryptography & the MEASC wire format](#cryptography--the-measc-wire-format)
-5. [Identity, trust & delegation](#identity-trust--delegation)
-6. [Module map](#module-map)
-7. [Getting started (Rust)](#getting-started-rust)
-8. [Python integration (`saacp.wrap`)](#python-integration-saacpwrap)
-9. [The Command Center dashboard](#the-command-center-dashboard)
-10. [Cargo feature flags](#cargo-feature-flags)
-11. [Testing & fuzzing](#testing--fuzzing)
+2. [Architecture at a Glance](#architecture-at-a-glance)
+3. [The Security Gate Pipeline](#the-security-gate-pipeline)
+4. [Cryptography & the MEASC Wire Format](#cryptography--the-measc-wire-format)
+5. [Identity, Trust & Delegation](#identity-trust--delegation)
+6. [Module Map](#module-map)
+7. [Getting Started (Rust)](#getting-started-rust)
+8. [Python Integration (`saacp.wrap`)](#python-integration-saacpwrap)
+9. [The Command Center Dashboard](#the-command-center-dashboard)
+10. [Cargo Feature Flags](#cargo-feature-flags)
+11. [Testing & Fuzzing](#testing--fuzzing)
 12. [Benchmarks](#benchmarks)
-13. [Security model & threat coverage](#security-model--threat-coverage)
-14. [Project layout](#project-layout)
+13. [Security Model & Threat Coverage](#security-model--threat-coverage)
+14. [Project Layout](#project-layout)
 15. [License](#license)
 
 ---
 
 ## Highlights
 
-- **Per-frame AEAD.** Every frame is AES-256-GCM encrypted with a key derived per
-  `(session, epoch, packet-sequence-number)` via HKDF-SHA256. The 128-byte transport
+- **Per-frame AEAD.** Every frame is encrypted with AES-256-GCM with a key derived for each
+  `(session, epoch, packet-sequence-number)` triple via HKDF-SHA256. The 128-byte transport
   header is authenticated as AAD — tamper any header bit and decryption fails closed.
 - **Forward-secret key evolution.** Session keys ratchet forward by epoch (time- or
   packet-threshold-triggered), so compromise of one epoch's key does not expose past
@@ -62,21 +62,26 @@ agent's business logic.
   write-ahead-log (WAL) writer that batches `fsync` for throughput.
 - **Replay protection** via a 4096-entry sliding PSN window with anomaly detection
   and quarantine.
+- **Response authentication (M3).** HMAC-SHA256 MAC tags on plaintext ack responses
+  prevent active MITM forgery of SUCCESS/STREAM_ACK confirmations.
 - **Runs from cloud to edge.** The core library trims its Tokio feature set for
   embedded-Linux-class targets (Raspberry Pi / OpenWrt-class routers); optional
   transports, Redis state sharing, and dashboards are all behind feature flags.
 - **Language-agnostic edge.** A `saacp-sidecar` binary lets any HTTP-capable agent
   (Python, LangChain, AutoGen, plain scripts) get full SAACP guarantees over plain
   localhost HTTP/JSON, with zero SAACP protocol knowledge on the agent side.
+- **Tenant-isolated contexts.** Phase 4 `SaacpContext` de-globalizes trust, telemetry,
+  alerts, rulepacks, streams, and audit state into injectable per-context instances,
+  enabling multi-tenant deployments and eliminating test serialization.
 
 ---
 
-## Architecture at a glance
+## Architecture at a Glance
 
 ```
    ┌──────────────┐      plain HTTP/JSON        ┌──────────────────────┐
    │  Your agent  │ ─────────────────────────▶  │   saacp-sidecar      │
-   │ (any lang)   │ ◀─────────────────────────  │  (optional edge)     │
+    │ (any language) │ ◀─────────────────────────  │  (optional edge)     │
    └──────────────┘                             └──────────┬───────────┘
                                                             │  real SAACP wire
                                                             ▼
@@ -108,12 +113,13 @@ agent's business logic.
 
 Cross-cutting engines run alongside the numbered gates: a per-agent **rate
 limiter / circuit breaker**, a **Trust Decay Engine** (continuous behavioral trust
-scoring), a **Dead Man's Switch** (stalled-session watchdog), and process-wide
-**telemetry** feeding the optional Command Center dashboard.
+scoring), a **Dead Man's Switch** (stalled-session watchdog), a **Session Affinity
+Tracker** (non-affine load balancer detection), **streaming continuation** support,
+and process-wide **telemetry** feeding the optional Command Center dashboard.
 
 ---
 
-## The security gate pipeline
+## The Security Gate Pipeline
 
 The canonical, mandatory gate set (`handler::MANDATORY_GATES`) is:
 
@@ -167,19 +173,22 @@ history, **not** execution order — the true execution order is documented in
 ### Cross-cutting enforcement (not numbered gates)
 
 - **AgentRateLimiter / circuit breaker** — locks out an agent after
-  `RATE_LIMITER_THRESHOLD = 5` errors within `RATE_LIMITER_WINDOW_SECONDS = 10.0`s for
-  `RATE_LIMITER_LOCKOUT_SECONDS = 30.0`s. Cover traffic is throttled at
-  `COVER_TRAFFIC_THRESHOLD = 50` per `1.0`s window.
+  `RATE_LIMITER_THRESHOLD = 5` errors within `RATE_LIMITER_WINDOW_SECONDS = 10.0` s for
+  `RATE_LIMITER_LOCKOUT_SECONDS = 30.0` s. Cover traffic is throttled at
+  `COVER_TRAFFIC_THRESHOLD = 50` per `1.0` s window.
 - **Trust Decay Engine** (`trust_decay.rs`) — continuous behavioral trust score keyed
   by Ed25519 fingerprint (when identity-bound) or agent id; sustained low trust forces
   a soft-reset / re-handshake. Gate-specific violations carry heavier penalties than a
   generic hard drop.
 - **Dead Man's Switch / Temporal Heartbeat** (`temporal.rs`) — watchdog for stalled
   agent sessions.
+- **Session Affinity Tracker** (`session_affinity.rs`, M11/R7) — records which daemon
+  node accepted each session and detects non-affine load balancers that silently break
+  replay-protection guarantees.
 
 ---
 
-## Cryptography & the MEASC wire format
+## Cryptography & the MEASC Wire Format
 
 **MEASC** = *Mandatory Encryption & Authenticated Sequence Control*. It is the
 transport-layer frame that carries all live traffic.
@@ -192,6 +201,7 @@ transport-layer frame that carries all live traffic.
 | Key derivation / ratchet | **HKDF-SHA256** |
 | Capability & identity signatures | **Ed25519** (`ed25519-dalek`) |
 | Session key agreement (sidecar mesh) | **X25519 ECDH** |
+| Response authentication (M3) | **HMAC-SHA256** |
 | Corruption filter (non-cryptographic) | **Adler-32** |
 | Baseline suite string | `AES-256-GCM-HKDF-SHA256` / signature `ed25519` |
 
@@ -266,7 +276,7 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 
 ---
 
-## Identity, trust & delegation
+## Identity, Trust & Delegation
 
 - **FAITF** — *Federated Agent Identity and Trust Framework* (`faitf.rs`): agent
   identities, trust anchors/stores, a **Distributed Revocation Infrastructure**,
@@ -286,12 +296,14 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 - **Identity binding + HTH** (`identity_binding.rs`, `hth.rs`): a Handshake Transcript
   Hash binds a capability to the exact handshake it was negotiated in, defeating
   transcript-substitution and capability-replay-across-sessions attacks.
-- **Crypto governance** (`crypto_governance.rs`): an approved-suite policy, a crypto
+- **Crypto Governance** (`crypto_governance.rs`): an approved-suite policy, a crypto
   transparency ledger, and a negotiation transcript to resist downgrade attacks.
+- **Key Lifecycle Management** (`klms.rs`): key rotation, revocation, audit, and
+  hardware-backed key storage via the `HardwareKeyStore` trait.
 
 ---
 
-## Module map
+## Module Map
 
 <details>
 <summary><strong>Core protocol</strong></summary>
@@ -307,7 +319,6 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 | `easi.rs` | Encrypted Agent State Information |
 | `cryptosuite.rs` | Cryptographic agility layer (Ed25519 default) |
 | `crypto_governance.rs` | Approved-suite policy, downgrade resistance, transparency ledger |
-
 </details>
 
 <details>
@@ -357,29 +368,37 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 | `security.rs` | Nonce tracker + immutable hash-chained WAL audit log |
 | `pecf.rs` | Protocol Error Confidentiality Framework (opaque wire errors) |
 | `error_confidentiality.rs` | Fixed-size opaque error responses |
+| `response_auth.rs` | Response authentication — HMAC-SHA256 MAC tags for MITM protection (M3/R1) |
 | `telemetry.rs` | Metrics, gate-rejection counters, security alert feed |
 | `gossip.rs` | Revocation gossip protocol |
-| `hrt.rs` | Hardware Root of Trust — `HardwareKeyStore` seam plus real PKCS#11 / AWS KMS / GCP KMS backends |
+| `hrt/` | Hardware Root of Trust — `HardwareKeyStore` seam plus PKCS#11, AWS KMS, GCP KMS backends; `hrt/remote.rs` bridges sync-to-async for cloud KMS SDKs |
 | `rulepack.rs` | Dynamic hot-reloadable injection rules — Ed25519-signed, versioned, additive-only rule packs adopted without a restart |
 | `cluster.rs` | Active-active clustering, leader leases, and failover over signed membership messages |
 | `type_state.rs` | Compile-time gate-ordering enforcement (`PipelineToken`) |
 | `maintenance.rs` | Background maintenance sweeps |
+| `session_affinity.rs` | Session affinity tracking — non-affine load balancer detection (M11/R7) |
+| `streaming.rs` | Stream session continuation — ordered frame sequences with cumulative byte caps, duration limits, and frame-gap enforcement |
+| `shard.rs` | Shared FNV-1a shard-index hashing for the crate's sharded lock tables |
 | `sidecar.rs` | Local HTTP proxy: plain JSON ⇄ SAACP-secured traffic |
 | `command_center.rs` / `command_center_demo.rs` | REST + SSE dashboard backend |
+| `context.rs` | `SaacpContext` — Phase 4 de-globalization container for trust, telemetry, alerts, rulepacks, streams, and audit state |
 
 </details>
 
 Daemon safety limits: `HANDSHAKE_TIMEOUT_SECS = 0.1`,
-`IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS = 0.5`, `MAX_ASSEMBLY_TIME = 30.0`s,
+`IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS = 0.5`, `MAX_ASSEMBLY_TIME = 30.0` s,
 `MAX_CIRCUIT_BREAKER_IPS = 10_000`. Audit log: HMAC hash chain, WAL flush every
 200 entries or 50 ms, `AUDIT_MAX_LOG_SIZE = 50 MB` rotation. Nonce tracker:
-`NONCE_MAX_AGE_SECONDS = 30.0`, `NONCE_MAX_ENTRIES = 100_000`.
+`NONCE_MAX_AGE_SECONDS = 30.0`, `NONCE_MAX_ENTRIES = 100_000`. Streaming limits:
+`STREAM_MAX_TOTAL_BYTES = 5 MB`, `STREAM_MAX_DURATION_SECONDS = 120.0`,
+`STREAM_MAX_FRAME_GAP_SECONDS = 10.0`, `MAX_ACTIVE_STREAMS = 1000`,
+`MAX_STREAMS_PER_AGENT = 10`.
 
 ---
 
-## Getting started (Rust)
+## Getting Started (Rust)
 
-**Prerequisites:** Rust 1.96+ (2021 edition).
+**Prerequisites:** Rust 1.96+ (2021 edition), pinned by `rust-toolchain.toml`.
 
 ```sh
 git clone https://github.com/shashankv762/SAACP_RUST.git
@@ -407,7 +426,6 @@ let epoch_id = manager.get_current_epoch_id(&session_id).unwrap();
 let payload = br#"{"task":"analyze the quarterly report","priority":1}"#;
 let frame = manager.with_epoch_mut(&session_id, epoch_id, |epoch| {
     MEASCFrame::build_frame(
-        epoch,
         /* schema_id     */ 1,
         /* status_code   */ 0x10,
         /* flags         */ 0x01,
@@ -435,7 +453,7 @@ and `tests/test_daemon_encrypted_rs.rs` for a full encrypted round-trip.
 
 ---
 
-## Python integration (`saacp.wrap`)
+## Python Integration (`saacp.wrap`)
 
 Any HTTP-capable agent can get SAACP's guarantees without speaking the wire protocol,
 by talking plain localhost HTTP/JSON to a local `saacp-sidecar` process.
@@ -487,7 +505,7 @@ concurrency, secret-file hygiene) are in [`python/README.md`](python/README.md).
 
 ---
 
-## The Command Center dashboard
+## The Command Center Dashboard
 
 An optional operator dashboard shows, in real time, what a fleet of SAACP gateways is
 doing: live agent trust scores, the trust-mesh delegation graph, prompt-injection
@@ -508,7 +526,7 @@ cd dashboard-ui && npm install && npm run dev
 
 ---
 
-## Cargo feature flags
+## Cargo Feature Flags
 
 All features are **off by default** (`default = []`), keeping the core library lean
 for embedded targets.
@@ -518,8 +536,8 @@ for embedded targets.
 | `transport-ws` | WebSocket tunneling transport (survives HTTP-only proxies/CDNs) | tokio-tungstenite, bytes, futures-util |
 | `transport-tls` | Raw TCP + in-protocol TLS termination | tokio-rustls, rustls-pemfile |
 | `redis-backend` | Redis-shared `StateBackend` for horizontally-scaled fleets | redis |
-| `sidecar` | `saacp-sidecar` HTTP proxy binary | axum |
-| `command-center` | `saacp-command-center` REST+SSE dashboard backend | (reuses axum, futures-util) |
+| `sidecar` | `saacp-sidecar` HTTP proxy binary | axum, mpf |
+| `command-center` | `saacp-command-center` REST+SSE dashboard backend | axum, futures-util |
 | `mpf` | Metadata Privacy Filter (cover traffic, adaptive padding, timing jitter) | — |
 | `hrt-pkcs11` | **Hardware Root of Trust: PKCS#11.** Signing keys held in an on-premise HSM or token (Thales, Entrust, Utimaco, YubiHSM, SoftHSM2) — the private key never enters process memory. | cryptoki |
 | `hrt-aws-kms` | **Hardware Root of Trust: AWS KMS.** `ECC_NIST_EDWARDS25519` keys; every signature lands in CloudTrail. | aws-sdk-kms, aws-config |
@@ -546,18 +564,18 @@ lifetime (identity-rotation defense). From the second frame onward the peer —
 and every audit entry — sees the sender's real agent identity. First-party
 tokens (issuer deliberately listing itself in the allow-list) are valid
 authentication for the pinned identity; presenting a token under a DIFFERENT
-identity than it allows remains a hard `ScopeViolation`. Delegation-layer
+identity than its allow-list permits remains a hard `ScopeViolation`. Delegation-layer
 self-issue prohibitions live in ACSVAF's authority policy (only
 federation-root authorities may self-issue).
 
-Release profile is tuned for performance: `lto = "thin"`, `codegen-units = 1`,
-`opt-level = 3`. `panic = "abort"` is deliberately **not** set — a long-lived network
-daemon must not turn one attacker-triggered panic on one connection into a
-whole-process crash.
+The release profile is tuned for performance: `lto = "thin"`, `codegen-units = 1`,
+`opt-level = 3`, `overflow-checks = true` (M6/R13 fix). `panic = "abort"` is
+deliberately **not** set — a long-lived network daemon must not turn one
+attacker-triggered panic on one connection into a whole-process crash.
 
 ---
 
-## Testing & fuzzing
+## Testing & Fuzzing
 
 The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
 **56 integration/adversarial test files** under `tests/`, and **5 fuzz targets**.
@@ -571,8 +589,7 @@ The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
   negotiation, key-material forensics, supply-chain dependency audit, concurrency
   race hunting, and a two-agent compromise scenario
 - `tests/test_exploit_vulnerabilities_rs.rs`, `test_crit2_stream_gate_bypass_rs.rs`
-- `tests/test_cross_lang_vectors_rs.rs` + `tests/cross_lang_verify.py` — byte-exact
-  wire compatibility with the Python reference
+- `tests/test_cross_lang_vectors_rs.rs` + byte-exact wire compatibility with the Python reference
 
 **Fuzz targets** (`fuzz/fuzz_targets/`, run with `cargo +nightly fuzz run <target>`):
 `fuzz_measc_parse_frame`, `fuzz_saacpframe_parse_header`,
@@ -590,7 +607,7 @@ cargo test --features command-center
 ## Benchmarks
 
 Performance is measured with [Criterion](https://github.com/bheisler/criterion.rs),
-not asserted. The harness (`benches/benchmarks.rs`) covers three families:
+not asserted. The harness (`benches/benchmarks.rs`) covers four families:
 
 - **Per-gate latency** (`Gate_*`) — every gate in isolation, across payload sizes.
 - **End-to-end throughput** (`T1`–`T14`) — frame build, replay window, token
@@ -598,6 +615,8 @@ not asserted. The harness (`benches/benchmarks.rs`) covers three families:
 - **Worst-case / adversarial** (`WC1`–`WC13`) — DDoS floods, replay saturation,
   rate-limiter lockout storms, maximal injection inputs, multi-agent concurrency,
   token-exhaustion, epoch-rotation pressure, session explosion.
+- **Contention / multi-core** (`T20`–`T27`) — lock contention across thread counts;
+  documents negative scaling of audit WAL under heavy parallelism.
 
 ```sh
 cargo bench                    # everything
@@ -613,7 +632,7 @@ and Criterion point estimates — no fabricated numbers.
 
 ---
 
-## Security model & threat coverage
+## Security Model & Threat Coverage
 
 SAACP assumes a hostile network **and** potentially-compromised or manipulated peers.
 The protocol is **fail-closed**: any gate failure produces a `SAACPHardDrop` and the
@@ -638,6 +657,8 @@ packet is dropped, never partially processed.
 | Timing side-channels | Constant-time comparisons on signature/checksum paths |
 | Collusion / Sybil | MACE collusion engine |
 | Error-message information leakage | PECF opaque fixed-size wire errors |
+| Response forgery by active MITM | Response authentication (HMAC-SHA256 MAC tags, M3/R1) |
+| Non-affine load balancer replay degradation | Session affinity tracking (M11/R7) |
 | **Pre-auth replay-state poisoning** (unauthenticated frames consuming PSNs / advancing the replay window / filling the nonce tracker) | **`measc::parse_frame` accepts a PSN only after the AES-GCM tag verifies (read-only `peek` pre-auth); `SAACPFrame::parse_header` inserts nonces only post-auth (`contains_scoped` read-only pre-check)** |
 | Degenerate X25519 handshake keys (identity / low-order points) | Contributory check — all-zero DH shared secrets rejected in both handshake directions |
 | Mis-configured "secure" deployments | `SAACPNetworkDaemon::secure(...)` one-call hardened profile + construction-time suite-policy downgrade guard; **`SAACPNetworkDaemon::new()` is secure-by-default (authenticated handshake + AEAD transport)** — the permissive shape is `insecure_for_testing()` and says so on every use |
@@ -703,14 +724,15 @@ packet is dropped, never partially processed.
 
 ---
 
-## Project layout
+## Project Layout
 
 ```
 saacp-rs/
-├── src/                     # ~50 Rust modules — protocol core, gates, crypto, trust
+├── src/                     # 52 Rust modules — protocol core, gates, crypto, trust
 │   ├── bin/                 # saacp-sidecar, saacp-command-center binaries
+│   ├── hrt/                 # Hardware Root of Trust (mod.rs + aws_kms, gcp_kms, pkcs11, remote)
 │   └── transport/           # ws.rs, tls.rs
-├── benches/benchmarks.rs    # Criterion benchmark harness
+├── benches/benchmarks.rs    # Criterion benchmark harness (175 benchmarks)
 ├── tests/                   # 56 integration/adversarial test files
 │   ├── breakit/             # red-team: timing, injection, downgrade, forensics, …
 │   └── adversarial/         # agent framework + attack library
@@ -730,4 +752,4 @@ MIT. See [`LICENSE`](LICENSE).
 
 ---
 
-*Protocol version `SAACP/0.1-beta2` · crate version `0.1.0` · Ed25519 + AES-256-GCM + HKDF-SHA256.*
+*Protocol version `SAACP/0.2-beta1` · crate version `0.2.0` · Ed25519 + AES-256-GCM + HKDF-SHA256.*

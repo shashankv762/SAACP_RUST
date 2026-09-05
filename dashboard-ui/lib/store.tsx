@@ -270,29 +270,52 @@ export function DashboardStoreProvider({ children }: { children: React.ReactNode
     // ── one SSE connection ───────────────────────────────────────────────
     // S-7 fix: opening the stream is now async (POST for a one-time ticket, then
     // connect EventSource with it) so the bearer token never lands in the URL.
-    // `source` is assigned once the ticket resolves; the cleanup below closes it
-    // whether or not the connect has completed yet.
+    // Robustness: each ticket is single-use, so a dropped stream can't just let
+    // EventSource retry the same (now-consumed) ticket URL — that would 401
+    // forever. Instead every failure closes the source and schedules a fresh
+    // ticketed connect 5s later, until the backend is reachable again.
     let source: EventSource | null = null;
-    openEventSource()
-      .then((es) => {
-        if (cancelled) {
-          es.close();
-          return;
-        }
-        source = es;
-        es.onopen = () => store.setConnection("live");
-        es.onerror = () => store.setConnection("offline");
-        es.onmessage = (msg) => {
-          try {
-            store.ingest(JSON.parse(msg.data) as DashboardEvent);
-          } catch {
-            /* malformed/partial event — ignore rather than crash the feed */
+    let retryTo: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRetry = () => {
+      if (cancelled || retryTo !== null) return;
+      retryTo = setTimeout(() => {
+        retryTo = null;
+        connect();
+      }, 5000);
+    };
+    const connect = () => {
+      openEventSource()
+        .then((es) => {
+          if (cancelled) {
+            es.close();
+            return;
           }
-        };
-      })
-      .catch(() => {
-        if (!cancelled) store.setConnection("offline");
-      });
+          source = es;
+          es.onopen = () => store.setConnection("live");
+          es.onerror = () => {
+            store.setConnection("offline");
+            try {
+              es.close();
+            } catch {
+              /* already closed */
+            }
+            if (source === es) source = null;
+            scheduleRetry();
+          };
+          es.onmessage = (msg) => {
+            try {
+              store.ingest(JSON.parse(msg.data) as DashboardEvent);
+            } catch {
+              /* malformed/partial event — ignore rather than crash the feed */
+            }
+          };
+        })
+        .catch(() => {
+          if (!cancelled) store.setConnection("offline");
+          scheduleRetry();
+        });
+    };
+    connect();
 
     // ── pollers ──────────────────────────────────────────────────────────
     const pollFinancial = () =>
@@ -341,6 +364,7 @@ export function DashboardStoreProvider({ children }: { children: React.ReactNode
 
     return () => {
       cancelled = true;
+      if (retryTo !== null) clearTimeout(retryTo);
       if (source) source.close();
       clearInterval(finId);
       clearInterval(healthId);

@@ -159,14 +159,18 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// L-7 fix: HMAC's spec (RFC 2104) accepts any key length — short keys are
-/// zero-padded, long keys are pre-hashed — so `Hmac::new_from_slice(key).unwrap()`
-/// was not actually reachable as a panic. But a short (or empty) key is a genuine
+/// zero-padded, long keys are pre-hashed — so `Hmac::new_from_slice(key)` is
+/// expected to succeed for any key length. But a short (or empty) key is a genuine
 /// *cryptographic weakness* regardless: a trivially guessable/brute-forceable MAC key.
 /// Rather than thread a new `Result` through this function's ~7 call sites across this
 /// file (a large blast radius for what the underlying weakness needs), any key shorter
 /// than 32 bytes is strengthened here by hashing it with SHA-256 first — every caller
 /// keeps compiling unchanged, but the *effective* key HMAC actually signs/verifies with
 /// is always full-entropy-width-derived, never a short raw value.
+///
+/// M-38 fix: if HMAC initialization fails (theoretically unreachable per RFC 2104,
+/// but defensively handled), return an empty Vec so the caller's signature
+/// comparison fails closed rather than panicking the entire daemon.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let strengthened;
     let key = if key.len() < 32 {
@@ -175,7 +179,16 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     } else {
         key
     };
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = match Hmac::<Sha256>::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => {
+            // HMAC-SHA256 accepts any key length per RFC 2104 — this branch is
+            // theoretically unreachable. Return an empty Vec so the caller's
+            // signature comparison fails closed (an empty signature never
+            // matches a real one) rather than panicking the daemon.
+            return Vec::new();
+        }
+    };
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

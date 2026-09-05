@@ -643,8 +643,8 @@ async fn inbound_schema_12_packet_reaches_the_wired_cluster_engine() {
         .expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "a well-formed cluster envelope must clear the gate pipeline"
     );
 
@@ -722,7 +722,7 @@ async fn forged_cluster_message_over_a_real_connection_changes_nothing() {
 
     // The packet itself is well-formed SAACP, so the gate pipeline accepts it...
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS");
+    assert!(response.starts_with(b"SUCCESS"));
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     // ...but the cluster layer independently refuses it: the signing key is not the one
@@ -780,7 +780,7 @@ async fn tampered_envelope_routing_fields_are_rejected_over_a_real_connection() 
         .expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(&response, b"SUCCESS");
+    assert!(response.starts_with(b"SUCCESS"));
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -835,8 +835,8 @@ async fn daemon_without_a_cluster_engine_ignores_schema_12_packets() {
         .expect("send frame");
 
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "schema 12 is a registered schema, so the packet must still clear the pipeline \
          even with no engine wired"
     );

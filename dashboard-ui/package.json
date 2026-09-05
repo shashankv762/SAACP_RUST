@@ -1,8 +1,8 @@
 {
   "name": "saacp-command-center-ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "SAACP Command Center — web dashboard for saacp-rs's REST+SSE Command Center backend (see ../src/command_center.rs).",
+  "description": "SAACP Command Center — web dashboard for saacp-rs's REST+SSE Command Center backend (see ../src/command_center.rs). v3 UI ports the v3 design from `commandUI.md` to a Next.js App Router codebase.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,13 +10,12 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "d3": "^7.9.0",
+    "framer-motion": "^11.18.2",
     "next": "^16.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/d3": "^7.4.3",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

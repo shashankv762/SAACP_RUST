@@ -59,7 +59,8 @@ fn finding_5_lowercase_suite_causes_rejection() {
     let uppercased_sig = SIG_BASELINE.to_uppercase();
     let remote = vec![uppercased_sig.as_str(), BASELINE];
 
-    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger, None);
 
     let transcript = result.unwrap_or_else(|e| {
         panic!(
@@ -91,7 +92,8 @@ fn finding_5_mixed_case_suite_rejected() {
     let local = vec![BASELINE, SIG_BASELINE];
     let remote = vec![mixed, SIG_BASELINE];
 
-    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger, None);
 
     let transcript = result.unwrap_or_else(|e| {
         panic!(
@@ -120,7 +122,8 @@ fn empty_remote_suite_list_hard_failure() {
     let local = VALID_SUITES;
     let remote: Vec<&str> = vec![];
 
-    let result = SuiteNegotiator::negotiate(local, &remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(local, &remote, &session_id(), None, None, &ledger, None);
 
     assert!(
         result.is_err(),
@@ -133,7 +136,7 @@ fn empty_remote_suite_list_hard_failure() {
 #[test]
 fn both_empty_suite_lists_hard_failure() {
     let ledger = make_ledger();
-    let result = SuiteNegotiator::negotiate(&[], &[], &session_id(), None, None, &ledger);
+    let result = SuiteNegotiator::negotiate(&[], &[], &session_id(), None, None, &ledger, None);
     assert!(result.is_err(), "Both-empty suite lists must fail");
     eprintln!("[DOWNGRADE] Both-empty suite lists: hard failure (correct).");
 }
@@ -150,7 +153,8 @@ fn prefix_suite_not_selected() {
     let local = vec![SIG_BASELINE, BASELINE, prefix_suite];
     let remote = vec![SIG_BASELINE, prefix_suite]; // remote lacks the full AEAD suite name
 
-    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger, None);
 
     match &result {
         Ok(transcript) => {
@@ -185,7 +189,8 @@ fn unknown_suite_blocked_and_logged() {
     let local = vec![SIG_BASELINE, BASELINE, unknown];
     let remote = vec![SIG_BASELINE, BASELINE, unknown];
 
-    let result = SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(&local, &remote, &session_id(), None, None, &ledger, None);
 
     // Should succeed — ed25519 sig baseline is present in both lists.
     // "ed25519" is selected first (first in local order) before the negotiation
@@ -226,8 +231,15 @@ fn leading_space_suite_rejected() {
     let local = vec![SIG_BASELINE, BASELINE];
     let remote_suites = vec![SIG_BASELINE, spaced_aead.as_str()];
 
-    let result =
-        SuiteNegotiator::negotiate(&local, &remote_suites, &session_id(), None, None, &ledger);
+    let result = SuiteNegotiator::negotiate(
+        &local,
+        &remote_suites,
+        &session_id(),
+        None,
+        None,
+        &ledger,
+        None,
+    );
 
     // Sig baseline ed25519 is common, but spaced AEAD is not approved → no AEAD common suite
     // Result: either selects sig-only (if policy allows) or fails on AEAD mismatch
@@ -256,8 +268,15 @@ fn trailing_space_suite_rejected() {
     let local = vec![SIG_BASELINE, BASELINE];
     let remote_suites = vec![SIG_BASELINE, spaced_aead.as_str()];
 
-    let result =
-        SuiteNegotiator::negotiate(&local, &remote_suites, &session_id(), None, None, &ledger);
+    let result = SuiteNegotiator::negotiate(
+        &local,
+        &remote_suites,
+        &session_id(),
+        None,
+        None,
+        &ledger,
+        None,
+    );
 
     match &result {
         Ok(transcript) => {
@@ -293,7 +312,8 @@ fn duplicate_suite_entries_no_panic_no_hang() {
     let remote = remote_vec.as_slice();
 
     let start = std::time::Instant::now();
-    let result = SuiteNegotiator::negotiate(&local, remote, &session_id(), None, None, &ledger);
+    let result =
+        SuiteNegotiator::negotiate(&local, remote, &session_id(), None, None, &ledger, None);
     let elapsed = start.elapsed();
 
     assert!(
@@ -393,6 +413,7 @@ fn non_standard_protocol_version_recorded() {
         Some("SAACP/0.0-alpha"), // non-standard version
         None,
         &ledger,
+        None,
     );
 
     match result {

@@ -286,21 +286,26 @@ impl TrustMeshStore {
     }
 }
 
-/// `[FAITF:DELEGATION]`-prefixed `AuditRecord`s carry `token_signature =
-/// "depth:{N}"` (see `faitf_audit.rs::FAITFAuditLog::log_delegation`) — parse
-/// it back out. Returns `None` for any non-delegation record (the common
-/// case — every other accepted packet's audit entry).
+/// Delegation `AuditRecord`s carry `token_signature = "depth:{N}"` (see
+/// `faitf_audit.rs::FAITFAuditLog::log_delegation`) — parse it back out.
+/// Returns `None` for any non-delegation record (the common case — every
+/// other accepted packet's audit entry).
+///
+/// R-3 compatibility fix: detection reads the PLAINTEXT `token_signature`
+/// field, not `intent`. Since the R-3 fix, `append_event` encrypts `intent`
+/// at rest (AES-256-GCM), so the record handed to the live subscriber carries
+/// ciphertext there and the former
+/// `intent.starts_with("[FAITF:DELEGATION]")` check could never match —
+/// leaving `/api/trust-mesh` (and the `DelegationEdge` SSE stream)
+/// permanently empty in production. `"depth:{N}"` is written to
+/// `token_signature` exclusively by `FAITFAuditLog::log_delegation` (every
+/// other writer stores an HMAC digest or a bytecode string), so it is an
+/// unambiguous delegation marker.
 fn parse_delegation_depth(record: &AuditRecord) -> Option<u32> {
-    if !record.intent.starts_with("[FAITF:DELEGATION]") {
-        return None;
-    }
-    Some(
-        record
-            .token_signature
-            .strip_prefix("depth:")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0),
-    )
+    record
+        .token_signature
+        .strip_prefix("depth:")
+        .and_then(|s| s.parse::<u32>().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -981,7 +986,13 @@ pub async fn run(config: CommandCenterConfig) -> std::io::Result<()> {
     // bounded, and cleaned up automatically when the receiver drops).
     {
         let tx = event_tx.clone();
-        telemetry::global_alert_feed().subscribe(Arc::new(move |alert: &SecurityAlert| {
+        // Plan item 2d: use `subscribe_forever` for the bootstrap
+        // alert-feed-to-SSE bridge so the callback stays alive for the
+        // whole process. `subscribe` returns a handle that, when
+        // dropped, unsubscribes — a previous version of this code
+        // dropped the implicit handle at end-of-scope and silently
+        // stopped forwarding InjectionAlert to SSE clients.
+        telemetry::global_alert_feed().subscribe_forever(Arc::new(move |alert: &SecurityAlert| {
             let _ = tx.send(DashboardEvent::InjectionAlert(alert.clone()));
         }));
     }

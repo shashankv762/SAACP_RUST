@@ -210,7 +210,21 @@ struct NonceInner {
     seen_nonces: HashMap<u64, f64>,
     max_age_seconds: f64,
     max_entries: usize,
+    /// Risk 1 / Fix 4: monotonic insert counter used to gate the amortized
+    /// prune. Instead of running a full `retain()` pass (iterating the entire
+    /// HashMap) on every insert while holding the lock, we only check capacity
+    /// every `PRUNE_INTERVAL` inserts. This bounds lock-hold time to amortized
+    /// O(1) and prevents a sustained flood of unique nonces from turning the
+    /// prune into a self-inflicted DoS (the old `retain()` could spike from
+    /// microseconds to milliseconds of lock hold time at 100K entries).
+    insert_count: u64,
 }
+
+/// Risk 1 / Fix 4: how often (in inserts) the capacity-backed prune runs.
+/// 1000 means the amortized prune cost is 1/1000th of a full `retain()` per
+/// insert — negligible per-packet, while still bounding memory to
+/// `NONCE_MAX_ENTRIES` within a few thousand inserts of a flood ending.
+const NONCE_PRUNE_INTERVAL: u64 = 1000;
 
 impl NonceTracker {
     /// Create a new NonceTracker with default settings.
@@ -220,6 +234,7 @@ impl NonceTracker {
                 seen_nonces: HashMap::new(),
                 max_age_seconds: NONCE_MAX_AGE_SECONDS,
                 max_entries: NONCE_MAX_ENTRIES,
+                insert_count: 0,
             }),
         }
     }
@@ -231,6 +246,7 @@ impl NonceTracker {
                 seen_nonces: HashMap::new(),
                 max_age_seconds,
                 max_entries,
+                insert_count: 0,
             }),
         }
     }
@@ -272,7 +288,7 @@ impl NonceTracker {
     pub fn contains(&self, nonce: u64) -> bool {
         self.inner
             .lock()
-            .expect("lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .seen_nonces
             .contains_key(&nonce)
     }
@@ -283,6 +299,11 @@ impl NonceTracker {
         self.contains(Self::composite_key(session_id, nonce))
     }
 
+    /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
+    /// poison rather than panicking (`.expect()` / `.unwrap()`) — `NonceTracker`
+    /// is exercised from the daemon's packet pipeline, so one poisoning panic
+    /// must not cascade into every other in-flight packet losing replay
+    /// protection entirely.
     /// Derive a session-scoped `u64` key from `(session_id, nonce)` via
     /// SHA-256 truncated to its first 8 bytes (big-endian). Collision
     /// probability is cryptographically negligible for any realistic number
@@ -303,9 +324,14 @@ impl NonceTracker {
     /// `track()` (raw nonce as key) and `track_scoped()` (session-composited
     /// key) — the only difference between the two public entry points is
     /// which `u64` they pass in here.
+    ///
+    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
+    /// `NonceTracker` is exercised from the daemon's packet pipeline, so one
+    /// poisoning panic must not cascade into every other in-flight packet
+    /// losing replay protection entirely.
     fn track_key(&self, key: u64) -> Result<(), SAACPHardDrop> {
         let current_time = now_secs();
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Atomic check-and-insert (fixes TOCTOU race condition)
         if inner.seen_nonces.contains_key(&key) {
@@ -317,8 +343,14 @@ impl NonceTracker {
 
         inner.seen_nonces.insert(key, current_time);
 
-        // Prune expired nonces to prevent OOM memory leaks
-        if inner.seen_nonces.len() > inner.max_entries {
+        // Risk 1 / Fix 4: incremental prune — only check capacity every
+        // NONCE_PRUNE_INTERVAL inserts. This bounds the prune cost to
+        // amortized O(1): a full retain() runs once per 1000 inserts (only
+        // when the map is also over max_entries), not on every single insert.
+        inner.insert_count += 1;
+        if inner.insert_count.is_multiple_of(NONCE_PRUNE_INTERVAL)
+            && inner.seen_nonces.len() > inner.max_entries
+        {
             let max_age = inner.max_age_seconds;
             inner
                 .seen_nonces
@@ -340,13 +372,13 @@ impl NonceTracker {
 
     /// Return the number of tracked nonces.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seen_nonces.len()
     }
 
     /// Clear all tracked nonces.
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seen_nonces.clear();
     }
 }
@@ -725,9 +757,16 @@ impl<'a> CanonicalAuditRecord<'a> {
     /// hash of this record", shared by `append_event`, `verify_chain`, and
     /// `verify_chain_disk` so the three can never drift apart (the M-40 fix,
     /// preserved and extended to the v2 fields).
+    ///
+    /// M-38 fix: if HMAC initialization fails (theoretically unreachable per
+    /// RFC 2104, but defensively handled), return an empty string so the
+    /// caller's chain-hash comparison fails closed rather than panicking.
     fn chain_hash(&self, issuer_secret: &[u8]) -> String {
         let json = serde_json::to_string(self).unwrap_or_default();
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+        let mut mac = match <HmacSha256 as Mac>::new_from_slice(issuer_secret) {
+            Ok(m) => m,
+            Err(_) => return String::new(),
+        };
         mac.update(json.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -735,9 +774,15 @@ impl<'a> CanonicalAuditRecord<'a> {
     /// As [`Self::chain_hash`], but also returns the canonical JSON so
     /// `append_event` can reuse it for the on-disk line instead of serializing
     /// the identical bytes a second time.
+    ///
+    /// M-38 fix: if HMAC initialization fails, return empty strings so the
+    /// caller's chain-hash comparison fails closed rather than panicking.
     fn serialize_and_hash(&self, issuer_secret: &[u8]) -> (String, String) {
         let json = serde_json::to_string(self).unwrap_or_default();
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+        let mut mac = match <HmacSha256 as Mac>::new_from_slice(issuer_secret) {
+            Ok(m) => m,
+            Err(_) => return (String::new(), String::new()),
+        };
         mac.update(json.as_bytes());
         (json, hex::encode(mac.finalize().into_bytes()))
     }
@@ -1261,6 +1306,12 @@ impl ImmutableAuditLog {
     /// read-modify-write of `last_hash`/`shard_seq` plus the HMAC over them is
     /// inside the lock; serialization of the WAL line, the enqueue, health
     /// bookkeeping, and subscriber callbacks all happen after it is released.
+    ///
+    /// R-3 fix: intent is now encrypted at rest by default (AES-256-GCM via
+    /// `encrypt_intent`). The HMAC covers the ciphertext identically to how it
+    /// covered plaintext, so `verify_chain`/`verify_chain_disk` are unchanged.
+    /// Decrypt with `decrypt_intent`. To opt out (e.g. for debugging), use
+    /// `append_event_plaintext` (feature-gated behind `audit-plaintext`).
     pub fn append_event(
         &self,
         issuer_secret: &[u8],
@@ -1268,6 +1319,54 @@ impl ImmutableAuditLog {
         target_agent: &str,
         token_signature: &str,
         evaluated_intent: &str,
+        traceparent: &str,
+    ) {
+        let encrypted = encrypt_intent(issuer_secret, evaluated_intent);
+        self.append_event_inner(
+            issuer_secret,
+            source_agent,
+            target_agent,
+            token_signature,
+            &encrypted,
+            traceparent,
+        );
+    }
+
+    /// Append an audit event with plaintext intent (debugging only).
+    ///
+    /// Feature-gated behind `audit-plaintext` so production builds cannot
+    /// accidentally write unencrypted audit logs. Use `append_event` for
+    /// normal operation — it encrypts the intent at rest.
+    #[cfg(feature = "audit-plaintext")]
+    pub fn append_event_plaintext(
+        &self,
+        issuer_secret: &[u8],
+        source_agent: &str,
+        target_agent: &str,
+        token_signature: &str,
+        evaluated_intent: &str,
+        traceparent: &str,
+    ) {
+        self.append_event_inner(
+            issuer_secret,
+            source_agent,
+            target_agent,
+            token_signature,
+            evaluated_intent,
+            traceparent,
+        );
+    }
+
+    /// Internal implementation shared by `append_event` and
+    /// `append_event_plaintext`. Takes the already-processed (encrypted or
+    /// plaintext) intent string.
+    fn append_event_inner(
+        &self,
+        issuer_secret: &[u8],
+        source_agent: &str,
+        target_agent: &str,
+        token_signature: &str,
+        intent: &str,
         traceparent: &str,
     ) {
         let shard_idx = AUDIT_SHARD_SLOT.with(|s| *s);
@@ -1296,7 +1395,7 @@ impl ImmutableAuditLog {
             timestamp,
             source: source_agent.to_string(),
             target: target_agent.to_string(),
-            intent: evaluated_intent.to_string(),
+            intent: intent.to_string(),
             token_signature: token_signature.to_string(),
             traceparent: traceparent.to_string(),
             prev_hash: shard.last_hash.clone(),
@@ -1358,6 +1457,7 @@ impl ImmutableAuditLog {
         self.shard_heads[shard_idx].store(Arc::new(ShardHead { hash: chain_hash }));
 
         self.enqueue_wal_line(entry_json);
+        self.recompute_health();
 
         for cb in self
             .subscribers
@@ -1369,12 +1469,132 @@ impl ImmutableAuditLog {
         }
     }
 
+    /// Gap D / Fix 6 — fallible variant of [`Self::append_event`] that returns
+    /// a `Result` instead of silently dropping the event when the WAL queue is
+    /// full. Use this from the packet pipeline when you want backpressure
+    /// (reject the packet) rather than a silent audit gap. The event's
+    /// chain-hash HMAC is still computed and the shard is still advanced on
+    /// success; on failure, the sticky drop floor is raised and health is
+    /// recomputed exactly as in `append_event`.
+    ///
+    /// Returns `Ok(())` if the event was enqueued, `Err(SAACPHardDrop)` with
+    /// [`SAACPBytecodes::AuditSubsystemDegraded`] if the WAL queue was full
+    /// or the worker had exited. Callers that receive `Err` should propagate
+    /// it as a hard drop — the audit trail has a permanent hole until an
+    /// operator calls [`Self::acknowledge_dropped_audits`].
+    pub fn try_append_event(
+        &self,
+        issuer_secret: &[u8],
+        source_agent: &str,
+        target_agent: &str,
+        token_signature: &str,
+        evaluated_intent: &str,
+        traceparent: &str,
+    ) -> Result<(), SAACPHardDrop> {
+        let shard_idx = AUDIT_SHARD_SLOT.with(|s| *s);
+        let anchor_epoch = self.anchor_epoch.load(Ordering::Relaxed);
+        let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
+        let timestamp = now_secs();
+
+        // O-6: non-blocking probe first — on contention, record the observation
+        // then fall through to the normal blocking lock() below.
+        let mut shard = match self.shards[shard_idx].try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
+                self.shards[shard_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+
+        let record = AuditRecord {
+            timestamp,
+            source: source_agent.to_string(),
+            target: target_agent.to_string(),
+            intent: evaluated_intent.to_string(),
+            token_signature: token_signature.to_string(),
+            traceparent: traceparent.to_string(),
+            prev_hash: shard.last_hash.clone(),
+            seq,
+            shard_id: Some(shard_idx as u16),
+            shard_seq: Some(shard.shard_seq),
+            anchor_epoch: Some(anchor_epoch),
+        };
+
+        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place —
+        // `verify_chain`/`verify_chain_disk` call the same helper, so the three
+        // can never drift apart (M-40).
+        let (record_json, chain_hash) =
+            CanonicalAuditRecord::from_record(&record).serialize_and_hash(issuer_secret);
+
+        let log_entry = AuditLogEntry {
+            record: record.clone(),
+            chain_hash: chain_hash.clone(),
+        };
+
+        // Build the JSONL line for disk persistence, reusing `record_json`
+        // (already serialized once, for the HMAC input) as the nested "record"
+        // value instead of re-serializing an identical tree.
+        let entry_json = format!(r#"{{"record":{record_json},"chain_hash":"{chain_hash}"}}"#);
+
+        shard.last_hash = chain_hash.clone();
+        shard.shard_seq += 1;
+
+        // Keep in-memory for fast verify_chain().
+        let record_for_subscribers = log_entry.record.clone();
+        shard.entries.push(log_entry);
+
+        // S-6 fix, per-shard: bound the in-memory retention window.
+        if shard.entries.len() > AUDIT_PER_SHARD_MAX_IN_MEMORY {
+            let drop_n = AUDIT_PER_SHARD_MAX_IN_MEMORY / 5;
+            shard.entries.drain(0..drop_n);
+        }
+
+        // Release the shard lock before enqueueing, touching health, or invoking
+        // subscriber callbacks.
+        drop(shard);
+
+        // Publish this shard's head for the Merkle anchor.
+        self.shard_heads[shard_idx].store(Arc::new(ShardHead { hash: chain_hash }));
+
+        // Gap D / Fix 6: surface the enqueue result to the caller instead of
+        // silently dropping. If the WAL queue is full, return a hard drop so
+        // the packet path can apply backpressure.
+        if self.enqueue_wal_line(entry_json) {
+            self.recompute_health();
+            for cb in self
+                .subscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                cb(&record_for_subscribers);
+            }
+            Ok(())
+        } else {
+            self.recompute_health();
+            Err(SAACPHardDrop::new(
+                SAACPBytecodes::AuditSubsystemDegraded,
+                "Audit WAL saturated — event dropped, backpressure applied.",
+            ))
+        }
+    }
+
     /// Enqueue one already-serialized JSONL line for the WAL worker, applying
     /// the full backpressure contract (drop-on-full, sticky floor, health
     /// recompute). Unchanged from the pre-Phase-6 inline version — factored out
     /// only so `append_event` can call it after releasing its shard lock.
-    fn enqueue_wal_line(&self, entry_json: String) {
-        let Some(ref tx) = self.wal_tx else { return };
+    ///
+    /// Returns `true` if the event was enqueued successfully, `false` if it was
+    /// dropped because the WAL queue was full (or the worker had exited).
+    /// The caller can use this to apply backpressure (e.g., reject the packet)
+    /// instead of silently losing the audit record.
+    fn enqueue_wal_line(&self, entry_json: String) -> bool {
+        let Some(ref tx) = self.wal_tx else {
+            return false;
+        };
         let event_count = self.global_seq.load(Ordering::Relaxed);
         let msg = WalMessage::Entry {
             entry_json,
@@ -1382,10 +1602,20 @@ impl ImmutableAuditLog {
         };
         if tx.try_send(msg).is_ok() {
             self.queue_len.fetch_add(1, Ordering::Relaxed);
+            true
         } else {
             // FIX 3: rate-limited signal via an atomic counter — never an
             // inline eprintln! on this hot path.
-            self.dropped_audits.fetch_add(1, Ordering::Relaxed);
+            let dropped = self.dropped_audits.fetch_add(1, Ordering::Relaxed) + 1;
+            // R-9 fix: structured warn on every drop so operators can alert.
+            // Rate: one trace line per dropped event. In practice the WAL worker
+            // drains fast enough that sustained drops indicate a real problem
+            // worth paging on.
+            tracing::warn!(
+                dropped_audits = dropped,
+                "Audit event dropped — WAL queue full. IRREVERSIBLE_ACTION now \
+                 fail-closed until acknowledge_dropped_audits() is called."
+            );
             // This event is now permanently absent from the audit trail — not
             // merely late. Raise the sticky floor so health cannot fall back to
             // Healthy when the queue drains, keeping Gate 2.5 fail-closed on
@@ -1395,17 +1625,21 @@ impl ImmutableAuditLog {
             self.health_floor
                 .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
             crate::telemetry::global_telemetry().record_gate_rejection("gate_6_0_audit");
+            false
         }
 
-        // FIX 4: recompute health from live queue pressure. `fetch_update`
-        // refuses to overwrite a sticky `Fatal` — only the WAL worker sets that
-        // (on an actual I/O failure), and only a fresh `ImmutableAuditLog`
-        // clears it.
-        //
-        // The sticky drop floor is deliberately NOT folded into this stored
-        // value: `health()` applies it on read instead. Baking it in here would
-        // leave the floor's level latched in `health` even after
-        // `acknowledge_dropped_audits` cleared the floor itself.
+        // Health recomputation is intentionally NOT inlined here — it runs
+        // after the caller decides what to do with the enqueue result. This
+        // keeps `enqueue_wal_line` focused on the enqueue + drop accounting.
+    }
+
+    /// Recompute and store the live WAL health from current queue pressure.
+    /// Separated from [`Self::enqueue_wal_line`] so callers that apply
+    /// backpressure (e.g., `try_append_event`) can recompute health after
+    /// deciding whether to drop. `fetch_update` refuses to overwrite a sticky
+    /// `Fatal` — only the WAL worker sets that (on an actual I/O failure), and
+    /// only a fresh `ImmutableAuditLog` clears it.
+    fn recompute_health(&self) {
         let pct = self.queue_len.load(Ordering::Relaxed) as f64 / AUDIT_WAL_QUEUE_CAPACITY as f64;
         let level = if pct > AUDIT_HEALTH_SATURATED_PCT {
             AuditHealth::Saturated
@@ -1729,7 +1963,13 @@ impl ImmutableAuditLog {
                 })
                 .unwrap_or_default();
 
-                let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+                // M-38 fix: if HMAC initialization fails (theoretically unreachable
+                // per RFC 2104, but defensively handled), fail closed by returning
+                // false rather than panicking.
+                let mut mac = match <HmacSha256 as Mac>::new_from_slice(issuer_secret) {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                };
                 mac.update(record_json.as_bytes());
                 let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -1770,7 +2010,12 @@ impl ImmutableAuditLog {
             })
             .unwrap_or_default();
 
-            let mut mac = <HmacSha256 as Mac>::new_from_slice(issuer_secret).expect("HMAC key");
+            // M-38 fix: if HMAC initialization fails, fail closed by returning
+            // false rather than panicking.
+            let mut mac = match <HmacSha256 as Mac>::new_from_slice(issuer_secret) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
             mac.update(record_json.as_bytes());
             let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -1837,6 +2082,72 @@ impl ImmutableAuditLog {
         self.health_floor
             .store(AuditHealth::Healthy as u8, Ordering::Relaxed);
         self.dropped_audits.load(Ordering::Relaxed)
+    }
+
+    /// Auto-acknowledge dropped audits after a quiet window (Fix 6).
+    ///
+    /// Spawns a Tokio task that periodically checks `dropped_audits`. If no
+    /// NEW drops have been recorded within `quiet_window`, calls
+    /// [`acknowledge_dropped_audits`] to release the `Saturated` health floor.
+    /// The lifetime `dropped_audits` counter is NEVER reset — only the
+    /// fail-closed gate-rejection behavior is relaxed.
+    ///
+    /// # Safety properties
+    /// - **No auto-ack under active pressure**: the task compares the counter
+    ///   against the value at the previous tick; a new drop re-arms the timer
+    ///   instead of being silently acknowledged.
+    /// - **Lifetime counter preserved**: the audit gap remains visible via
+    ///   [`dropped_audit_count`] for post-incident analysis.
+    /// - **Stops cleanly on cancellation**: the task exits as soon as the
+    ///   cancellation token fires (typically on daemon shutdown). Cancelling
+    ///   while a drop has been observed but not yet auto-acknowledged is safe:
+    ///   the operator-visible counter still records the loss.
+    /// - **Does not undo `Fatal` health**: only the sticky drop floor is
+    ///   relaxed. A `Fatal` (disk-write failure) state still requires
+    ///   constructing a fresh `ImmutableAuditLog`.
+    ///
+    /// Recommended values: `quiet_window = 60s` for high-traffic deployments
+    /// (recover within a minute of a transient burst), `300s` for conservative
+    /// deployments (require 5 minutes of stability before re-authorizing
+    /// IRREVERSIBLE actions).
+    pub fn spawn_dropped_audit_autoack(
+        self: &Arc<Self>,
+        quiet_window: std::time::Duration,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut last_seen = me.dropped_audits.load(Ordering::Relaxed);
+            let quiet = std::cmp::max(quiet_window, std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(quiet) => {}
+                }
+                let current = me.dropped_audits.load(Ordering::Relaxed);
+                if current == 0 {
+                    // No drops at all — nothing to acknowledge. Reset baseline.
+                    last_seen = 0;
+                    continue;
+                }
+                if current == last_seen {
+                    // No NEW drops during this quiet window — safe to release
+                    // the floor. (Longcat.md Risk 6: previous behavior was a
+                    // sticky-forever floor; this auto-relieves transient
+                    // bursts without operator action.)
+                    let released = me.acknowledge_dropped_audits();
+                    tracing::info!(
+                        released_count = released,
+                        quiet_window_secs = quiet.as_secs(),
+                        "auto-acknowledged audit-drop floor after quiet window",
+                    );
+                    last_seen = current;
+                } else {
+                    // New drops observed — re-arm the timer without acking.
+                    last_seen = current;
+                }
+            }
+        })
     }
 
     /// Count of audit events dropped because the WAL queue was full (or the
@@ -1934,9 +2245,10 @@ impl ImmutableAuditLog {
     /// `encrypt_intent`). Opt-in — choose this instead of `append_event` when
     /// the deployment's threat model includes an attacker with filesystem
     /// read access to the log but not `issuer_secret`. Chain integrity is
-    /// identical either way: `verify_chain`/`verify_chain_disk` need no
-    /// changes, since the HMAC covers whatever string is in `intent`.
-    /// Decrypt with `decrypt_intent`.
+    /// Convenience: append an audit event with encrypted intent.
+    ///
+    /// R-3 fix: this method is now equivalent to `append_event` (which
+    /// encrypts by default). Kept for backward compatibility.
     pub fn append_event_confidential(
         &self,
         issuer_secret: &[u8],
@@ -1946,13 +2258,12 @@ impl ImmutableAuditLog {
         evaluated_intent: &str,
         traceparent: &str,
     ) {
-        let encrypted = encrypt_intent(issuer_secret, evaluated_intent);
         self.append_event(
             issuer_secret,
             source_agent,
             target_agent,
             token_signature,
-            &encrypted,
+            evaluated_intent,
             traceparent,
         );
     }
@@ -2770,12 +3081,15 @@ mod tests {
             received2.lock().unwrap().push(record.clone());
         }));
 
+        // R-3: intent is encrypted at rest by default. Use decrypt_intent()
+        // to recover the plaintext for assertions.
+        let plaintext_intent = "read:data";
         log.append_event(
             secret,
             "agent-a",
             "agent-b",
             "sig-001",
-            "read:data",
+            plaintext_intent,
             "trace-001",
         );
 
@@ -2783,7 +3097,11 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].source, "agent-a");
         assert_eq!(recs[0].target, "agent-b");
-        assert_eq!(recs[0].intent, "read:data");
+        // R-3: intent is now encrypted — decrypt to verify plaintext.
+        assert_eq!(
+            decrypt_intent(secret, &recs[0].intent).unwrap(),
+            plaintext_intent
+        );
         log.reset();
     }
 

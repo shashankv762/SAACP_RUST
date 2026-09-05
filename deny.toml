@@ -1,0 +1,104 @@
+# cargo deny configuration for SAACP (opusreview.md M5 / §2.3).
+#
+# This file configures `cargo deny check` — a supply-chain audit tool that
+# runs in CI on every push and PR. It checks four categories:
+#
+# 1. Advisories:  crates with known CVEs or unmaintained status
+# 2. Bans:        crates that are explicitly forbidden
+# 3. Licenses:    license compatibility enforcement
+# 4. Sources:     where dependencies are allowed to come from
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+# Check the RustSec advisory database for known vulnerabilities.
+[advisories]
+# Path to the advisory database (defaults to the official RustSec repo).
+path = "~/.cargo/advisory-dbs"
+# Ignore advisories that are withdrawn or unaffected in this crate.
+# Each entry must be justified with a comment.
+ignore = [
+    # Example: "RUSTSEC-2020-0001",  # Not affected: only used in tests
+]
+# The crates.io API token is read from the CARGO_REGISTRY_TOKEN env var
+# if needed for private registries. Not used here.
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+# Deny specific crates by name or version range.
+[bans]
+# Deny multiple versions of the same crate. Each duplicate is a deliberate,
+# reviewed decision (see `skip` below).
+multiple-versions = "deny"
+
+# Dependencies that are allowed to appear multiple times. Each entry is a
+# reviewed exception — see the inline justification.
+skip = [
+    # `rand 0.10.2` is the new version; `rand 0.8.6` is required by
+    # `ed25519-dalek 2.x` for its `rand_core` feature. The old version
+    # is only used in dev-dependencies and test utilities, never in
+    # production code paths. Tracked in opusreview.md §2.8.
+    { name = "rand" },
+
+    # `axum 0.7.9` and `axum 0.8.9` coexist because the `sidecar` and
+    # `command-center` features use different major versions. Unification
+    # is tracked in opusreview.md §2.8 / M21.
+    { name = "axum" },
+
+    # `rustls 0.21.12` is pulled in transitively by `aws-smithy-runtime`
+    # when `hrt-aws-kms` is enabled. Upgrading the AWS SDK is tracked
+    # in opusreview.md §2.8 / M21.
+    { name = "rustls" },
+
+    # `tokio-rustls 0.24.1` accompanies `rustls 0.21` via the same
+    # transitive path. Same remediation as above.
+    { name = "tokio-rustls" },
+
+    # `hyper 0.14` and `h2 0.3` enter through `aws-smithy-runtime` →
+    # `hyper-rustls 0.24.2` when `hrt-aws-kms` is enabled.
+    { name = "hyper" },
+    { name = "h2" },
+]
+
+# Deny crates from unknown git repositories (no git = "..." sources).
+unknown-git = "deny"
+
+# Deny crates that are not from crates.io or an approved registry.
+unknown-registry = "deny"
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+# Enforce license compatibility. SAACP is MIT-licensed; dependencies must
+# be compatible with MIT distribution.
+[licenses]
+# The confidence threshold for license detection (0.0 - 1.0).
+confidence-threshold = 0.9
+
+# Allowed licenses. MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0,
+# and OpenSSL (for the OpenSSL crate itself) are all MIT-compatible.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+]
+
+# Exceptions for crates with non-standard licensing that are verified
+# compatible. Each entry must be reviewed and justified.
+exceptions = [
+    # Example: { allow = ["GPL-3.0"], name = "some-crate" },
+]
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+# Control where dependencies can be sourced from.
+[sources]
+# Deny crates from unknown registries (only crates.io is allowed).
+unknown-registry = "deny"
+
+# Deny crates from unknown git repositories.
+unknown-git = "deny"
+
+# Allow crates from the official crates.io registry.
+[sources.allow-org]
+github = []  # No GitHub organizations allowed by default

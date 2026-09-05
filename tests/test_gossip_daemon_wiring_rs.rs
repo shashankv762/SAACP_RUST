@@ -174,8 +174,8 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
 
     stream.write_all(&frame).await.expect("send frame");
     let response = read_response(&mut stream, 128).await;
-    assert_eq!(
-        &response, b"SUCCESS",
+    assert!(
+        response.starts_with(b"SUCCESS"),
         "a well-formed gossip envelope must clear the gate pipeline"
     );
 

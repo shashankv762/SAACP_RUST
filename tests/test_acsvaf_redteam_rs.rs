@@ -177,7 +177,7 @@ fn test_revoked_token_cannot_bypass_via_new_jti_claim() {
     claims.insert("jti".into(), Value::String(jti.clone()));
     let mut tok = cia.issue(claims.clone()).unwrap();
 
-    cva.revoke_token(&jti);
+    cva.revoke_token(&jti, 9_999_999_999.0);
     // Attacker replaces jti claim in the token (breaks signature)
     tok.claims
         .insert("jti".into(), Value::String("jti-new-forged".to_string()));

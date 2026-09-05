@@ -1,7 +1,19 @@
 [package]
 name = "saacp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+# `rust-version` (MSRV) is intentionally not declared here. The codebase
+# uses language features stable in Rust 1.80+ (e.g. `std::sync::LazyLock`
+# in `src/acsvaf_authority.rs`) but other features are stable only in
+# 1.82+ or 1.87+ (see `clippy::incompatible_msrv` failures under
+# `cargo clippy --all-targets -- -D warnings`). Declaring a single MSRV
+# here would turn on that lint and fail CI on the pre-existing usages.
+# TODO: lower the MSRV floor by either (a) downgrading the affected
+# `acsvaf_authority.rs` / `daemon.rs` / `handler.rs` / `security.rs`
+# sites to features stable in 1.80, or (b) accepting the current floor
+# and adding a `clippy.toml` with `msrv = "1.87"` to acknowledge the
+# real minimum. Until then, downstream consumers should pin
+# `rust-toolchain.toml` (which uses 1.96.0) as the de-facto floor.
 description = "Secure Autonomous Agent Communication Protocol - Rust Implementation"
 license = "MIT"
 
@@ -77,6 +89,17 @@ axum = { version = "0.7", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# ── Post-Quantum Cryptography (NIST FIPS standards) ──────────────────────────
+# ML-DSA (FIPS 204, Dilithium) — lattice-based digital signatures for quantum-safe non-repudiation.
+ml-dsa = "0.1.1"
+# ML-KEM (FIPS 203, Kyber) — lattice-based key encapsulation for quantum-safe key exchange.
+# `getrandom` feature enables system RNG for key generation and encapsulation.
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
+# SHA-3 — used by PQC primitives and for domain-separated hashing in hybrid constructions.
+sha3 = "0.10"
+# rand_core — needed for PQC key generation (ml-dsa uses rand_core 0.10)
+rand_core = "0.10"
+
 # ── Hardware Root of Trust backends (src/hrt/) ──────────────────────────────────
 # All three are optional and off by default; see the `hrt-*` feature comments below.
 #
@@ -97,6 +120,14 @@ gcloud-sdk = { version = "0.30", optional = true, default-features = false, feat
     "google-cloud-kms-v1",
     "tls-roots",
 ] }
+
+# ── Structured logging & observability (G-3 / R-1 fix) ──────────────────────
+# `tracing` is the logging facade; `tracing-subscriber` provides the
+# JSON/formatted output layer. Both are non-optional — every binary in this
+# crate writes structured logs to stderr by default, with severity levels
+# and span context, replacing the ad-hoc `eprintln!` calls on the hot path.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [features]
 default = []
@@ -129,6 +160,15 @@ redis-backend = ["dep:redis"]
 # even compile it; enable explicitly if your deployment's threat model
 # includes passive traffic analysis.
 mpf = []
+# G-4: health/readiness HTTP endpoints (`/healthz`, `/readyz`) for Kubernetes
+# probes and load-balancer health checks. Off by default so deployments that
+# don't need them never pull in axum. Reuses the already-optional axum (also
+# pulled in by `sidecar` and `command-center`).
+health-endpoint = ["dep:axum"]
+# R-3: opt-out for audit-log encryption at rest. When enabled, `append_event`
+# writes plaintext intent instead of AES-256-GCM ciphertext. Intended only for
+# local debugging — MUST remain off in every real deployment.
+audit-plaintext = []
 # Python/HTTP sidecar proxy (src/sidecar.rs + the `saacp-sidecar` binary) — lets a
 # Python (or any HTTP-capable) agent get SAACP's crypto/gate-pipeline guarantees over
 # plain localhost HTTP/JSON, with zero SAACP protocol knowledge on the Python side. Off
@@ -154,6 +194,14 @@ command-center = ["dep:axum", "dep:futures-util"]
 # structural path was migrated to build genuinely-encrypted frames via
 # `encode_encrypted` instead. See CRIT-1 in opusplan.md.
 unsafe-structural-only = []
+# UNSAFE: allows the no-gateway fallback path in `handler.rs` Gate 1.0 to grant
+# READ_ONLY access instead of rejecting unverified tokens. Off by default —
+# every production deployment MUST inject a real `ZeroTrustGateway` via
+# `SAACPNetworkDaemon::with_gateway` or `intercept_packet_full`. This exists
+# solely as an explicit, auditable escape hatch for unit tests and daemon-less
+# tooling that exercise the gate pipeline without configuring real token
+# verification. See Risk 6 in the production readiness audit (longcat.md).
+dangerously-skip-gateway = []
 # Hardware Root of Trust (src/hrt/, Phase 6 / item 8 / Part 8.8) — hardware-backed
 # `HardwareKeyStore` implementations, so a long-lived signing key can live inside a
 # device that never releases it rather than in this process's address space.
@@ -266,6 +314,22 @@ required-features = ["command-center"]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+# M6 (opusreview.md §R13): without this, release builds WRAP on integer
+# overflow while debug/test builds PANIC — so this crate's parsers had
+# different arithmetic semantics in the test suite than in production. Every
+# `payload_length: u32` (framing.rs), `psn: u64` (measc.rs), hop counter, and
+# trust/telemetry accumulator is attacker-influenced, and the `faitf` overflow
+# bugs fixed in a0b2ca0 were found *by* debug-mode panics — the identical
+# silent wrap in release was undetectable by that same suite. Turning this on
+# makes the release profile fail closed (panic → connection-scoped unwind,
+# since `panic = "abort"` is deliberately NOT set above) instead of silently
+# computing a wrong bound. The cost is negligible here: AES-GCM and Ed25519
+# dominate every path in benchmark_results.md, and the arithmetic that is
+# genuinely meant to wrap already says so explicitly via `wrapping_*`
+# (`shard.rs` FNV-1a, `gateway.rs` cache_generation, `framing.rs`
+# constant-time helpers, `hrt/gcp_kms.rs` CRC32C) — those are unaffected by
+# this flag by construction.
+overflow-checks = true
 
 # `debug = 1` (line tables only) instead of the default full DWARF/PDB. This
 # crate has 60+ modules and heavy dev-dependencies (criterion, reqwest, rcgen),

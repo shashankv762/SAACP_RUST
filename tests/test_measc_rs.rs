@@ -411,3 +411,186 @@ fn test_measc_replay_window_policy_defaults_are_sane() {
     );
     assert!(p.anomaly_jump_threshold < p.max_advance);
 }
+
+// ─── Advanced: Root Ratchet Forward Secrecy (S4) ────────────────────────────
+
+#[test]
+fn test_root_ratchet_distinct_keys_per_epoch() {
+    // Enabling the root ratchet must produce different epoch keys than the
+    // non-ratchet (Python-parity) schedule, and each epoch's key must be unique.
+    let mgr_ratchet = SessionEpochManager::new();
+    let mgr_plain = SessionEpochManager::new().without_root_ratchet();
+    let sid = [0x77u8; 16];
+    let secret = [0x42u8; 32];
+
+    mgr_ratchet
+        .create_session(
+            sid,
+            secret,
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            600.0,
+            None,
+        )
+        .unwrap();
+    mgr_plain
+        .create_session(
+            sid,
+            secret,
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            600.0,
+            None,
+        )
+        .unwrap();
+
+    // Epoch 0 keys: ratchet manager's epoch 0 key is derived from the same
+    // initial schedule, so they should match.
+    let k0_ratchet = mgr_ratchet
+        .with_epoch(&sid, 0, |ep| *ep.traffic_key().unwrap())
+        .unwrap();
+    let k0_plain = mgr_plain
+        .with_epoch(&sid, 0, |ep| *ep.traffic_key().unwrap())
+        .unwrap();
+    assert_eq!(
+        k0_ratchet, k0_plain,
+        "Epoch 0 keys must match (same initial schedule)"
+    );
+
+    // After rotation: ratchet manager's key MUST differ (root was ratcheted).
+    mgr_ratchet.rotate_epoch(&sid).unwrap();
+    mgr_plain.rotate_epoch(&sid).unwrap();
+
+    let k1_ratchet = mgr_ratchet
+        .with_epoch(&sid, 1, |ep| *ep.traffic_key().unwrap())
+        .unwrap();
+    let k1_plain = mgr_plain
+        .with_epoch(&sid, 1, |ep| *ep.traffic_key().unwrap())
+        .unwrap();
+    assert_ne!(
+        k1_ratchet, k1_plain,
+        "Epoch 1 keys must differ (ratchet changes root)"
+    );
+}
+
+// ─── Advanced: Session Idle Reaper (S1) ─────────────────────────────────────
+
+#[test]
+fn test_idle_reaper_removes_unauth_sessions_quickly() {
+    // A session that NEVER authenticated must be reaped after the short
+    // unauth idle TTL (default 60s — too long to wait in a test, so we
+    // inject a short TTL via with_idle_ttls).
+    let mgr = SessionEpochManager::new().with_idle_ttls(0.05, 0.1); // 50ms unauth, 100ms auth
+    let sid = [0x88u8; 16];
+
+    // Create session but never authenticate (no parse_frame call)
+    mgr.create_session(
+        sid,
+        [0x42u8; 32],
+        MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        None,
+    )
+    .unwrap();
+    assert_eq!(mgr.session_count(), 1);
+
+    // Wait for unauth TTL to elapse
+    std::thread::sleep(std::time::Duration::from_millis(80));
+
+    // Reap should remove the never-authenticated session
+    let reaped = mgr.reap_idle_sessions();
+    assert!(
+        reaped >= 1,
+        "Unauth idle session must be reaped, got {reaped}"
+    );
+    assert_eq!(mgr.session_count(), 0);
+}
+
+// ─── Advanced: Epoch Expiration After Grace Period ──────────────────────────
+
+#[test]
+fn test_expire_old_epochs_after_grace_period() {
+    let mgr = SessionEpochManager::new();
+    let sid = [0x99u8; 16];
+    mgr.create_session(
+        sid,
+        [0x42u8; 32],
+        MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+        MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        None,
+    )
+    .unwrap();
+
+    // Rotate 3 times to create epochs 1, 2, 3 (epochs 0, 1, 2 in grace)
+    mgr.rotate_epoch(&sid).unwrap();
+    mgr.rotate_epoch(&sid).unwrap();
+    mgr.rotate_epoch(&sid).unwrap();
+
+    // All old epochs should still be present (in grace period)
+    let epochs = mgr.list_epoch_ids(&sid);
+    assert_eq!(
+        epochs.len(),
+        4,
+        "All 4 epochs should exist before grace expiry"
+    );
+
+    // Expire with a very short grace period (0.001s)
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let expired = mgr.expire_old_epochs(Some(0.001));
+    assert!(
+        expired >= 3,
+        "At least 3 old epochs should be expired, got {expired}"
+    );
+
+    // Only the current epoch (3) should remain
+    let remaining = mgr.list_epoch_ids(&sid);
+    assert_eq!(
+        remaining,
+        vec![3],
+        "Only current epoch should remain after expiry"
+    );
+}
+
+// ─── Advanced: check_and_accept Atomicity (C-1 Fix) ─────────────────────────
+
+#[test]
+fn test_check_and_accept_atomic_no_toctou() {
+    // Verify that check_and_accept both checks and marks in one operation,
+    // so a duplicate check after accept returns false.
+    let mut w = ReplayWindow::with_default_policy();
+
+    // First check_and_accept: should succeed
+    let (ok, reason) = w.check_and_accept(1);
+    assert!(ok, "First check_and_accept must succeed");
+    assert_eq!(reason, "ok");
+
+    // Second check_and_accept with same PSN: must fail as duplicate
+    let (ok, reason) = w.check_and_accept(1);
+    assert!(!ok, "Duplicate check_and_accept must fail");
+    assert_eq!(reason, "duplicate");
+
+    // Verify highest was advanced exactly once
+    assert_eq!(w.highest(), 1);
+}
+
+// ─── Advanced: Grace Period Does Not Block Packet Acceptance ────────────────
+
+#[test]
+fn test_grace_period_allows_in_flight_packets() {
+    // During grace period, check() must still accept packets (to avoid
+    // dropping in-flight legitimate traffic), but reset() must be blocked.
+    let mut w = ReplayWindow::with_default_policy();
+    w.accept(100).unwrap();
+    w.lock_for_grace_period();
+
+    // Packets within the replay window should still be accepted
+    let (ok, reason) = w.check(101);
+    assert!(
+        ok,
+        "In-flight packet must be accepted during grace period, got: {reason}"
+    );
+
+    // But reset must be blocked
+    assert!(
+        w.reset().is_err(),
+        "reset() must be blocked during grace period"
+    );
+}

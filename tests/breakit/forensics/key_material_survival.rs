@@ -111,9 +111,7 @@ fn key_survives_after_drop(heap_pressure_vecs: usize) -> bool {
     // this file guards (pre-ZeroizeOnDrop, the entire key survives drop,
     // a full match) while being false-positive-proof: the allocator would
     // have to rewrite all 32 marker bytes verbatim (~2^-256).
-    let survived = post_drop_bytes == MARKER_KEY;
-
-    survived
+    post_drop_bytes == MARKER_KEY
 }
 
 /// Run 50 trials with zero heap pressure (allocator likely reuses the block immediately).

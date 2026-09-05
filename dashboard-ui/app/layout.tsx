@@ -1,9 +1,6 @@
 import type { Metadata } from "next";
 import { Outfit, JetBrains_Mono } from "next/font/google";
-import { Nav } from "@/components/Nav";
-import { GlobalOverlays } from "@/components/GlobalOverlays";
 import { DashboardStoreProvider } from "@/lib/store";
-import "./globals.css";
 
 const outfit = Outfit({
   subsets: ["latin"],
@@ -24,15 +21,18 @@ export const metadata: Metadata = {
   description: "Live security dashboard for the SAACP gateway fleet.",
 };
 
+/*
+ * DashboardStoreProvider owns the ONE real /events SSE connection + REST
+ * pollers against src/command_center.rs (see lib/store.tsx). The CommandUI
+ * app consumes those slices via useSyncExternalStore and renders ONLY real
+ * backend data in LIVE mode; the client-side simulator is opt-in via the
+ * SIM switch and clearly labelled.
+ */
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${outfit.variable} ${jetbrainsMono.variable}`}>
       <body>
-        <DashboardStoreProvider>
-          <Nav />
-          {children}
-          <GlobalOverlays />
-        </DashboardStoreProvider>
+        <DashboardStoreProvider>{children}</DashboardStoreProvider>
       </body>
     </html>
   );

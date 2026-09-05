@@ -52,38 +52,106 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn parse_secret(raw: &str) -> [u8; 32] {
+/// Plan item 3: typed configuration errors for the command-center
+/// binary. Mirror of `saacp_sidecar::SidecarConfigError` with the
+/// variants this binary actually exercises. Same non-leak guarantee
+/// for `Display` — no raw secret / file body in the rendered message.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum CommandCenterConfigError {
+    /// A required env var was missing at startup.
+    MissingEnv {
+        var: &'static str,
+        hint: &'static str,
+    },
+    /// A token could not be base64-decoded.
+    InvalidBase64 {
+        var: &'static str,
+        source: base64::DecodeError,
+    },
+    /// A token was not exactly 32 bytes after decoding.
+    WrongSecretLength { var: &'static str, got: usize },
+    /// A file (e.g. rulepack key file, dashboard-token file) could not
+    /// be read.
+    FileRead {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CommandCenterConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEnv { var, hint } => {
+                write!(f, "missing required environment variable {var}: {hint}")
+            }
+            Self::InvalidBase64 { var, .. } => {
+                // Omit the decode-error source: base64 includes byte
+                // offsets into the input, which is a credential leak
+                // vector if the malformed value was a partial secret.
+                write!(
+                    f,
+                    "{var} is not valid base64 (rejected without printing the input)"
+                )
+            }
+            Self::WrongSecretLength { var, got } => {
+                write!(f, "{var} must decode to exactly 32 bytes, got {got}")
+            }
+            Self::FileRead { path, source } => write!(f, "failed to read {path:?}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for CommandCenterConfigError {}
+
+/// Print the error to stderr and exit with status 1.
+fn config_error_exit(err: CommandCenterConfigError) -> ! {
+    tracing::error!(error = %err, "saacp-command-center startup failed");
+    eprintln!("[saacp-command-center] startup failed: {err}");
+    std::process::exit(1);
+}
+
+fn parse_secret_with_var(
+    raw: &str,
+    var: &'static str,
+) -> Result<[u8; 32], CommandCenterConfigError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw.trim())
-        .unwrap_or_else(|e| panic!("dashboard token is not valid base64: {e}"));
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .unwrap_or_else(|_| panic!("dashboard token must decode to exactly 32 bytes"))
+        .map_err(|source| CommandCenterConfigError::InvalidBase64 { var, source })?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        CommandCenterConfigError::WrongSecretLength {
+            var,
+            got: bytes.len(),
+        }
+    })
 }
 
-/// `SAACP_DASHBOARD_TOKEN_FILE` (if set) takes precedence over
-/// `SAACP_DASHBOARD_TOKEN` — same secret-hygiene pattern as `saacp-sidecar`.
-///
-/// S8: raw token strings are held in `Zeroizing` buffers while parsed, and
-/// the env-var fallback prints a one-time /proc-environ leak notice.
-fn read_dashboard_token() -> [u8; 32] {
+fn read_dashboard_token() -> Result<[u8; 32], CommandCenterConfigError> {
     use zeroize::Zeroizing;
     if let Ok(path) = std::env::var("SAACP_DASHBOARD_TOKEN_FILE") {
-        let raw =
-            Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("failed to read SAACP_DASHBOARD_TOKEN_FILE '{path}': {e}")
-            }));
-        return parse_secret(raw.trim());
+        let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
+            CommandCenterConfigError::FileRead {
+                path: path.clone(),
+                source,
+            }
+        })?);
+        return parse_secret_with_var(raw.trim(), "SAACP_DASHBOARD_TOKEN_FILE");
     }
-    eprintln!(
-        "[SAACP Command Center] NOTE: dashboard token read from the SAACP_DASHBOARD_TOKEN \
-         environment variable — prefer SAACP_DASHBOARD_TOKEN_FILE in production (process \
-         environments are readable via /proc/<pid>/environ by same-user processes)."
+    tracing::warn!(
+        "dashboard token read from the SAACP_DASHBOARD_TOKEN environment variable — prefer \
+         SAACP_DASHBOARD_TOKEN_FILE in production (process environments are readable via \
+         /proc/<pid>/environ by same-user processes)."
     );
-    let raw = Zeroizing::new(std::env::var("SAACP_DASHBOARD_TOKEN").unwrap_or_else(|_| {
-        panic!("either SAACP_DASHBOARD_TOKEN or SAACP_DASHBOARD_TOKEN_FILE environment variable is required")
-    }));
-    parse_secret(&raw)
+    let raw = Zeroizing::new(std::env::var("SAACP_DASHBOARD_TOKEN").map_err(|_| {
+        CommandCenterConfigError::MissingEnv {
+            var: "SAACP_DASHBOARD_TOKEN",
+            hint: "set SAACP_DASHBOARD_TOKEN (or SAACP_DASHBOARD_TOKEN_FILE) to a \
+                   base64-encoded 32-byte secret. The command center refuses to start \
+                   without one — see the binary's module doc for details.",
+        }
+    })?);
+    parse_secret_with_var(&raw, "SAACP_DASHBOARD_TOKEN")
 }
 
 /// Provision the one Ed25519 key allowed to sign injection rule packs
@@ -123,7 +191,13 @@ fn provision_rulepack_anchor() {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let dashboard_token = read_dashboard_token();
+    // Plan item 2c: structured logging (idempotent). See `src/logging.rs`.
+    saacp::logging::init_logging(saacp::logging::LogConfig::default());
+
+    let dashboard_token = match read_dashboard_token() {
+        Ok(t) => t,
+        Err(e) => config_error_exit(e),
+    };
     provision_rulepack_anchor();
 
     let listen_addr: SocketAddr = env_or("SAACP_COMMAND_CENTER_ADDR", "127.0.0.1:9090")

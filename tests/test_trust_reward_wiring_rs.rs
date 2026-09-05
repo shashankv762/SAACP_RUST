@@ -6,7 +6,7 @@
 
 use saacp::framing::MEASCFrame as StructuralFrame;
 use saacp::trust_decay::{trust_key_for, PenaltyKind, TrustDecayEngine};
-use saacp::{AgentRateLimiter, SAACPProtocolHandler};
+use saacp::{AgentRateLimiter, SAACPProtocolHandler, ZeroTrustGateway};
 
 /// See `test_telemetry_wiring_rs.rs::build_frame` for why `framing::MEASCFrame` (not
 /// `measc::MEASCFrame`) is used here.
@@ -36,6 +36,21 @@ fn build_frame(
         .expect("encode_encrypted must succeed")
 }
 
+fn issue_test_token(gw: &ZeroTrustGateway, agent: &str) -> Vec<u8> {
+    let secret = [0x42u8; 32];
+    gw.register_issuer_key("test-issuer", &secret).unwrap();
+    gw.issue_capability_token(
+        &secret,
+        "test-issuer",
+        &[agent],
+        &[],
+        3600,
+        None,
+        0x00,
+        None,
+    )
+}
+
 #[test]
 fn clean_pipeline_pass_rewards_trust_score() {
     let secret = [0xB1u8; 32];
@@ -57,13 +72,18 @@ fn clean_pipeline_pass_rewards_trust_score() {
         "penalize must have lowered the score below the initial ceiling"
     );
 
+    // Configure a gateway with a valid token so the packet passes Gate 1.0
+    // and reaches the trust reward path at the clean-pass tail of the pipeline.
+    let gw = ZeroTrustGateway::new();
+    let token = issue_test_token(&gw, agent_id);
+
     // A clean, structurally-valid, non-injection packet. Schema 1 ("Task") requires
     // both `task` and `priority`. `action_class: 0` (READ_ONLY) — not the IRREVERSIBLE
     // 2x-multiplier path, which is covered by the pure unit test in `trust_decay.rs`.
     let clean_payload = serde_json::json!({
         "task": "summarize the quarterly report",
         "priority": 1,
-        "_capability_token": "structural-test-token",
+        "_capability_token": String::from_utf8_lossy(&token).to_string(),
     })
     .to_string();
     let frame = build_frame(session, &secret, clean_payload.as_bytes(), 1, 0x10, 0);
@@ -74,7 +94,7 @@ fn clean_pipeline_pass_rewards_trust_score() {
         &secret,
         agent_id,
         false,
-        None,
+        Some(&gw),
         Some(&rl),
         None,
         None,

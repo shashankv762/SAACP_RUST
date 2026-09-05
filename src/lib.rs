@@ -9,6 +9,7 @@ pub mod acsvaf;
 pub mod acsvaf_audit;
 pub mod acsvaf_authority;
 pub mod aegf;
+pub mod attestation;
 pub mod cluster;
 pub mod context;
 pub mod crypto_governance;
@@ -33,10 +34,13 @@ pub mod measc;
 pub mod memory;
 pub mod pecf;
 pub mod pool;
+pub mod pqc;
+pub mod response_auth;
 pub mod rgc;
 pub mod rulepack;
 pub mod schemas;
 pub mod security;
+pub mod session_affinity;
 pub mod shard;
 pub mod streaming;
 pub mod temporal;
@@ -52,8 +56,11 @@ pub mod aca;
 pub mod command_center;
 #[cfg(feature = "command-center")]
 pub mod command_center_demo;
+#[cfg(feature = "health-endpoint")]
+pub mod health;
 pub mod hrt;
 pub mod ievl;
+pub mod logging; // G-3: structured logging
 pub mod mace;
 pub mod maintenance;
 #[cfg(feature = "mpf")]
@@ -65,7 +72,7 @@ pub mod state_backend;
 pub mod telemetry;
 pub mod transport;
 pub mod trust_decay;
-pub mod type_state;
+pub mod type_state; // G-4: health/readiness endpoints
 
 pub use acsvaf::{
     CapabilityIssuanceAuthority, CapabilitySigningKey, CapabilityVerificationAuthority,
@@ -85,6 +92,12 @@ pub use aegf::{
     ExecutionStateMachine, GovernanceDecision, StateRecord, AEGF_META_FIELD_OFFSETS,
     AEGF_META_FORMAT_VERSION, AEGF_META_SIZE, AEGF_TEST_VECTOR_BYTES, CID_NONE,
     GLOBAL_AEGF_GOVERNOR, GLOBAL_DAEG, RID_ROOT,
+};
+pub use attestation::{
+    create_attestation_binding, generate_attestation_challenge, validate_attestation_size,
+    verify_challenge_response, AttestationEvidence, AttestationType as HardwareAttestationType,
+    AttestationVerification, AttestationVerifier, HsmAttestation, TeeAttestation, TpmQuote,
+    MAX_ATTESTATION_QUOTE_SIZE,
 };
 pub use cluster::{
     ClusterConfig, ClusterEngine, ClusterMessage, ClusterMessageKind, ClusterRejection,
@@ -142,12 +155,18 @@ pub use gateway::{
     AgentRateLimiter, DelegationGuard, RRBCGateway, RRBCRedemptionResult, TokenValidationResult,
     ZeroTrustGateway, COVER_TRAFFIC_THRESHOLD, COVER_TRAFFIC_WINDOW_SECONDS,
     RATE_LIMITER_LOCKOUT_SECONDS, RATE_LIMITER_THRESHOLD, RATE_LIMITER_WINDOW_SECONDS,
+    TOKEN_CACHE_TTL,
 };
 pub use handler::{
-    builtin_injection_patterns, normalize_scan_window, serde_value_to_json_value,
-    CachedTokenResult, GateTier, JsonValue, ParsedPacket, PromptInjectionScanner,
-    SAACPProtocolHandler, EPISTEMIC_CLAIMED_CONFIDENCE_MAX, EPISTEMIC_THRESHOLD,
-    GATE_EXECUTION_BUDGET_SECONDS, INTENT_MIN_OVERLAP, MANDATORY_GATES,
+    builtin_injection_patterns, json_value_depth_exceeded, normalize_scan_window,
+    serde_value_to_json_value, serde_value_to_json_value_bounded, validate_attestation_quote_size,
+    validate_hybrid_handshake_size, validate_pqc_extensions_size, validate_pqc_key_shares_count,
+    validate_pqc_public_key_size, validate_pqc_signature_size, CachedTokenResult, GateTier,
+    JsonValue, ParsedPacket, PromptInjectionScanner, SAACPProtocolHandler,
+    EPISTEMIC_CLAIMED_CONFIDENCE_MAX, EPISTEMIC_THRESHOLD, GATE_EXECUTION_BUDGET_SECONDS,
+    INTENT_MIN_OVERLAP, MANDATORY_GATES, MAX_HYBRID_HANDSHAKE_SIZE, MAX_PAYLOAD_KEYS,
+    MAX_PQC_EXTENSIONS_TOTAL_SIZE, MAX_PQC_KEY_SHARES, MAX_PQC_PUBLIC_KEY_SIZE,
+    MAX_PQC_SIGNATURE_SIZE,
 };
 /// AWS KMS key store (`ECC_NIST_EDWARDS25519` keys).
 #[cfg(feature = "hrt-aws-kms")]
@@ -254,10 +273,28 @@ pub use temporal::{
     DeadMansSwitch, TemporalHeartbeat, DEAD_MAN_MAX_SESSIONS, DEAD_MAN_MAX_TIMEOUT,
     GLOBAL_DEAD_MANS_SWITCH, HEARTBEAT_INTERVAL_SECONDS,
 };
-pub use type_state::PipelineToken;
+
+// ─── Post-Quantum Cryptography Exports ───────────────────────────────────────
+pub use pqc::{
+    domain_separation,
+    kem::{
+        derive_hybrid_session_key, HybridHandshakeMessage, HybridKem, HybridKeypair,
+        HybridSharedSecret, Kem, KemAlgorithm, MlKem768, X25519Kem,
+    },
+    max_sizes,
+    signature::{
+        HybridEd25519MlDsa65, HybridSignature, SignatureAlgorithm, SignatureSuite, SigningContext,
+    },
+    PqcError,
+};
 
 // ─── Protocol Version Constants ───────────────────────────────────────────────
 /// Python parity: `__version__ = "0.1-beta2"`
 pub const SAACP_VERSION: &str = "0.1-beta2";
-/// Python parity: `__protocol__ = "SAACP/0.1-beta2"`
-pub const SAACP_PROTOCOL: &str = "SAACP/0.1-beta2";
+/// Python parity: `__protocol__ = "SAACP/0.2-beta1"`
+pub const SAACP_PROTOCOL: &str = "SAACP/0.2-beta1";
+/// Extended protocol version that advertises PQC capability.
+/// This allows peers to detect PQC support without an extra negotiation round.
+pub const SAACP_PROTOCOL_WITH_PQC: &str = "SAACP/0.2-beta1+PQC";
+/// PQC capability flags indicating which post-quantum algorithms are available.
+pub const SAACP_PQC_CAPABILITIES: &str = "ML-KEM-768:ML-DSA-65:HYBRID";

@@ -22,6 +22,7 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::handler::{JsonValue, ParsedPacket, SAACPProtocolHandler};
 use crate::measc::SessionEpochManager;
 use crate::pecf::{generate_correlation_id, internal_to_external_raw, SREL};
+use crate::response_auth::{compute_response_mac, RESPONSE_MAC_LEN};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -103,9 +104,18 @@ pub(crate) const MAX_PAYLOAD_SIZE: usize = 10_000_000;
 /// remaining lifetime, even if every subsequent packet is tiny — across `MAX_CONNECTIONS`
 /// that is a real memory-amplification vector, not just a missed micro-optimization.
 /// Chosen with headroom above the spec's literal 16KB (most legitimate payloads comfortably
+/// M4 (R2 / opusreview.md): global in-flight payload byte budget. When a daemon
+/// enables the budget (`with_inflight_payload_budget`), every packet's
+/// `payload_length` reserves this many permits-worth of bytes from a shared
+/// `Semaphore` before its buffer is assembled, bounding AGGREGATE in-flight
+/// payload memory across all connections; an exhausted budget rejects the packet
+/// with `PayloadTooLarge` (fail closed). 2 GiB is the documented default ceiling.
+pub const MAX_INFLIGHT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// P-6 fix: steady-state per-connection payload buffer ceiling (sized so typical
 /// fit under 64KB) so ordinary size variation within normal traffic never triggers a
 /// reallocation — only a genuine outlier does.
-const CONNECTION_BUFFER_STEADY_STATE_CAP: usize = 65_536;
+pub const CONNECTION_BUFFER_STEADY_STATE_CAP: usize = 65_536;
 
 /// MEASC header size in bytes.
 const HEADER_SIZE: usize = 128;
@@ -378,6 +388,40 @@ pub struct SAACPNetworkDaemon {
     /// LAN. The C-3 identity-bound mode always uses at least
     /// [`IDENTITY_BINDING_HANDSHAKE_TIMEOUT_SECS`] regardless of this value.
     handshake_timeout_secs: Option<f64>,
+    /// Plan item 2b: health-endpoint bind address. `None` (the default)
+    /// means no health/metrics HTTP server is spawned. `Some(addr)`
+    /// spawns a dedicated `axum` listener on `addr` exposing
+    /// `/healthz`, `/readyz`, and (Prometheus) `/metrics`. Loopback
+    /// is the default recommendation; non-loopback binds require a
+    /// bearer token (fail-closed — see `with_health_endpoint`).
+    ///
+    /// Requires the `health-endpoint` Cargo feature.
+    health_bind: Option<std::net::SocketAddr>,
+    /// Bearer token required on `/metrics` when [`health_bind`] is
+    /// non-loopback. Constant-time compared on every request. `None`
+    /// when no health server is configured, OR when the bind is
+    /// loopback.
+    health_bearer_token: Option<Arc<str>>,
+    /// M4 (R2 / opusreview.md): optional global in-flight payload byte budget
+    /// (`Semaphore` permits = bytes). `None` (the default) preserves the
+    /// unbounded behavior; `Some` (via [`Self::with_inflight_payload_budget`])
+    /// makes every packet reserve its `payload_length` in bytes before assembly.
+    inflight_payload_semaphore: Option<Arc<Semaphore>>,
+    /// M12 (R3 / opusreview.md): optional bound on concurrent gate-pipeline
+    /// executions dispatched to `spawn_blocking`. `None` (the default) preserves
+    /// the unbounded tokio blocking-pool behavior; `Some` (via
+    /// [`Self::with_pipeline_concurrency`]) applies backpressure instead of
+    /// unbounded queue latency.
+    pipeline_semaphore: Option<Arc<Semaphore>>,
+    /// M11 (R7 / opusreview.md): this node's fleet-unique identifier. Required
+    /// together with [`Self::session_affinity_tracker`] (set together via
+    /// [`Self::with_node_id`]); `None` disables affinity tracking entirely.
+    node_id: Option<String>,
+    /// M11 (R7 / opusreview.md): session-affinity tracker. When `Some` (with
+    /// `node_id`), every packet's header session_id is checked against the node
+    /// that first recorded it — a violation proves a non-affine load balancer is
+    /// degrading the node-local replay-window guarantee (AlertOnly enforcement).
+    session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
 }
 
 impl SAACPNetworkDaemon {
@@ -439,6 +483,12 @@ impl SAACPNetworkDaemon {
             cluster: None,
             handshake_timeout_secs: None,
             context: None,
+            health_bind: None,
+            health_bearer_token: None,
+            inflight_payload_semaphore: None,
+            pipeline_semaphore: None,
+            node_id: None,
+            session_affinity_tracker: None,
         }
     }
 
@@ -447,6 +497,53 @@ impl SAACPNetworkDaemon {
     /// `context` field doc.
     pub fn with_context(mut self, context: std::sync::Arc<crate::context::SaacpContext>) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// Plan item 2b: enable a lightweight standalone health/metrics HTTP
+    /// server alongside the main MEASC listener.
+    ///
+    /// - `bind` — the address the health server listens on. The default
+    ///   recommendation is a loopback address (e.g. `127.0.0.1:9091`).
+    ///   When `bind` resolves to a non-loopback IP, the operator MUST
+    ///   also pass a `bearer_token` — otherwise the health server
+    ///   refuses to start (fail-closed: we never expose audit-derived
+    ///   metrics on a public address without a token).
+    /// - `bearer_token` — token required on `/metrics` for non-loopback
+    ///   binds. `/healthz` and `/readyz` are always unauthenticated
+    ///   because that is the Kubernetes probe contract. Constant-time
+    ///   compared. Pass `None` to allow a loopback bind (Kubernetes
+    ///   `livenessProbe` can reach the pod's `127.0.0.1`).
+    ///
+    /// Requires the `health-endpoint` Cargo feature. Calling this method
+    /// without the feature enabled is a *no-op* (the field stays `None`)
+    /// so a deployment that toggles the feature never breaks the daemon.
+    pub fn with_health_endpoint(
+        mut self,
+        bind: std::net::SocketAddr,
+        bearer_token: Option<String>,
+    ) -> Self {
+        // Refuse a non-loopback bind without a token at configuration
+        // time, BEFORE start(). The health server itself also re-checks
+        // this in start_with_shutdown — defense in depth.
+        let needs_token = !bind.ip().is_loopback();
+        let token_is_empty = bearer_token.as_ref().is_some_and(|t| t.is_empty());
+        if needs_token && bearer_token.is_none() {
+            eprintln!(
+                "[SAACP Daemon] with_health_endpoint: non-loopback bind {bind} requires a \
+                 bearer token; ignoring the request. Call with Some(token) or bind 127.0.0.1."
+            );
+            return self;
+        }
+        if needs_token && token_is_empty {
+            eprintln!(
+                "[SAACP Daemon] with_health_endpoint: non-loopback bind {bind} requires a \
+                 non-empty bearer token; ignoring the request."
+            );
+            return self;
+        }
+        self.health_bind = Some(bind);
+        self.health_bearer_token = bearer_token.map(Arc::from);
         self
     }
 
@@ -556,6 +653,7 @@ impl SAACPNetworkDaemon {
             None,
             None,
             &ledger,
+            None, // security_tier — accept any PQC floor in `secure()` mode
         )
         .map_err(|e| {
             format!(
@@ -602,6 +700,44 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// M4 (R2 / opusreview.md): set the global in-flight payload byte budget.
+    /// `Some(bytes)` makes every packet's `payload_length` reserve that many
+    /// bytes from a shared `Semaphore` before its buffer is assembled — bounding
+    /// AGGREGATE in-flight payload memory across ALL connections; an exhausted
+    /// budget rejects the packet with `PayloadTooLarge` (fail closed). `None`
+    /// (the default) preserves the unbounded behavior. See
+    /// [`MAX_INFLIGHT_PAYLOAD_BYTES`] for the documented default ceiling.
+    pub fn with_inflight_payload_budget(mut self, max_bytes: Option<usize>) -> Self {
+        self.inflight_payload_semaphore = max_bytes.map(|n| Arc::new(Semaphore::new(n)));
+        self
+    }
+
+    /// M12 (R3 / opusreview.md): set the maximum number of concurrent
+    /// gate-pipeline executions dispatched to `spawn_blocking`. `Some(n)` makes
+    /// each packet acquire one permit before its gate run, so a saturated
+    /// pipeline applies backpressure at the connection instead of growing the
+    /// unbounded tokio blocking-pool queue. `None` (the default) preserves the
+    /// unbounded behavior.
+    pub fn with_pipeline_concurrency(mut self, max_concurrent: Option<usize>) -> Self {
+        self.pipeline_semaphore = max_concurrent.map(|n| Arc::new(Semaphore::new(n)));
+        self
+    }
+
+    /// M11 (R7 / opusreview.md): set a fleet-unique node identifier for this
+    /// daemon and enable session-affinity tracking. Once enabled, every packet's
+    /// header session_id is recorded/checked against the node that first
+    /// accepted it: a mismatch proves a non-affine load balancer is silently
+    /// degrading the node-local replay-window guarantee. Enforcement is
+    /// AlertOnly (log once per connection + feed the per-IP error counter so a
+    /// persistently mis-routed peer trips the existing IP circuit breaker).
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        let node_id = node_id.into();
+        let tracker = crate::session_affinity::SessionAffinityTracker::new();
+        self.node_id = Some(node_id);
+        self.session_affinity_tracker = Some(Arc::new(tracker));
+        self
+    }
+
     /// Opt in to the revocation gossip mesh (Phase 6 / item 4, see the `gossip` field doc
     /// comment). The caller constructs the `GossipEngine` itself (wiring its own
     /// `GossipTransport`, `DistributedRevocationInfrastructure`, and `TrustStore` — see
@@ -639,6 +775,95 @@ impl SAACPNetworkDaemon {
             .await
     }
 
+    /// Plan item 2b: spawn the standalone health/metrics HTTP server.
+    ///
+    /// Returns `Some(JoinHandle)` when the server is started (so the
+    /// caller can `await` it for graceful shutdown) or `None` when no
+    /// health endpoint is configured. The server re-checks the
+    /// loopback policy here (defense in depth — see
+    /// `with_health_endpoint`); if the bind is non-loopback and no
+    /// bearer token was provided, the function returns `Ok(None)` and
+    /// logs the refusal, leaving the daemon running normally on the
+    /// main listener.
+    #[cfg(feature = "health-endpoint")]
+    async fn spawn_health_server(
+        &self,
+        bind: std::net::SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::io::Result<Option<tokio::task::JoinHandle<std::io::Result<()>>>> {
+        use std::sync::atomic::AtomicU64;
+
+        if !bind.ip().is_loopback() && self.health_bearer_token.is_none() {
+            eprintln!(
+                "[SAACP Daemon] spawn_health_server: refusing non-loopback bind {bind} \
+                 without a bearer token."
+            );
+            return Ok(None);
+        }
+
+        let audit = self.audit_log_for_health();
+        let telemetry_arc = self.telemetry_for_health();
+        // TODO(2b-followup): wire a real per-daemon connection counter.
+        // The current `AtomicU64(0)` is honest about its scope — the
+        // value is process-wide-zero until a future change passes the
+        // actual `ConnectionCountGuard`-backed gauge from `telemetry`
+        // here.
+        let _connection_count = Arc::new(AtomicU64::new(0));
+
+        let mut state = crate::health::HealthState::new(audit, telemetry_arc);
+        if let Some(tok) = &self.health_bearer_token {
+            state = state.with_bearer_token(tok.as_ref());
+        }
+
+        let router = crate::health::health_router(state);
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        eprintln!(
+            "[SAACP Daemon] Health/metrics endpoint listening on http://{bind} \
+             (/healthz, /readyz, /metrics{})",
+            if self.health_bearer_token.is_some() {
+                " — bearer-token-gated"
+            } else {
+                ""
+            }
+        );
+
+        let handle = tokio::spawn(async move {
+            let server = axum::serve(listener, router);
+            let shutdown_fut = async move {
+                shutdown.cancelled().await;
+            };
+            tokio::select! {
+                result = server => result,
+                _ = shutdown_fut => Ok(()),
+            }
+        });
+        Ok(Some(handle))
+    }
+
+    /// Return the audit log to expose on `/healthz` and `/readyz`.
+    /// Per-tenant work can return the context's `audit` field instead.
+    #[cfg(feature = "health-endpoint")]
+    fn audit_log_for_health(&self) -> std::sync::Arc<crate::security::ImmutableAuditLog> {
+        match &self.context {
+            Some(c) => c.audit.clone(),
+            None => crate::context::SaacpContext::shared_default_arc()
+                .audit
+                .clone(),
+        }
+    }
+
+    /// Return the telemetry collector to expose on `/metrics`. Mirrors
+    /// [`audit_log_for_health`].
+    #[cfg(feature = "health-endpoint")]
+    fn telemetry_for_health(&self) -> std::sync::Arc<crate::telemetry::TelemetryCollector> {
+        match &self.context {
+            Some(c) => c.telemetry.clone(),
+            None => crate::context::SaacpContext::shared_default_arc()
+                .telemetry
+                .clone(),
+        }
+    }
+
     /// M-15/R-2 fix: same as `start`, but stops accepting new connections as soon as
     /// `shutdown` is cancelled, then drains in-flight connections (bounded by
     /// `SHUTDOWN_DRAIN_TIMEOUT_SECS`, after which any still-open connections are
@@ -661,6 +886,21 @@ impl SAACPNetworkDaemon {
         }
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;
+
+        // Plan item 2b: optionally spawn the standalone health/metrics
+        // HTTP server. The server is bound to a *separate* TcpListener
+        // (so its lifecycle is independent and its address can be on
+        // a different network namespace / port). The server is opt-in
+        // via `with_health_endpoint`; if no bind is set (the default)
+        // the feature is dormant and adds no overhead.
+        #[cfg(feature = "health-endpoint")]
+        let health_handle = if let Some(hb) = self.health_bind {
+            self.spawn_health_server(hb, shutdown.clone()).await?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "health-endpoint"))]
+        let _health_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
 
         let auth_mode = if self.server_ed25519_seed.is_some() {
             "authenticated"
@@ -747,6 +987,10 @@ impl SAACPNetworkDaemon {
                             let cluster       = self.cluster.clone();
                             let handshake_timeout_override = self.handshake_timeout_secs;
                             let daemon_context = self.context.clone();
+                            let inflight_payload_semaphore = self.inflight_payload_semaphore.clone();
+                            let pipeline_semaphore = self.pipeline_semaphore.clone();
+                            let node_id = self.node_id.clone();
+                            let session_affinity_tracker = self.session_affinity_tracker.clone();
                             tasks.spawn(async move {
                                 let _permit = permit; // released on drop when this task ends
                                 let _per_ip_guard = per_ip_guard;
@@ -760,6 +1004,7 @@ impl SAACPNetworkDaemon {
                                     stream, peer_addr, cbs, secret, seed,
                                     gateway, epoch_manager, on_delivered, server_agent_id, gossip, cluster,
                                     handshake_timeout_override, daemon_context,
+                                    inflight_payload_semaphore, pipeline_semaphore, node_id, session_affinity_tracker,
                                 ).await;
                             });
                         }
@@ -786,6 +1031,16 @@ impl SAACPNetworkDaemon {
             );
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
+        }
+
+        // Plan item 2b: wait for the health/metrics server to shut
+        // down. The health server is bound to the same `shutdown`
+        // token, so it will return on its own within microseconds of
+        // the cancel; this await just joins the task so we don't leave
+        // a zombie task on the runtime.
+        #[cfg(feature = "health-endpoint")]
+        if let Some(h) = health_handle {
+            let _ = h.await;
         }
 
         // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
@@ -851,6 +1106,17 @@ pub(crate) async fn handle_client<S>(
     handshake_timeout_override: Option<f64>,
     // Phase 4: explicit pipeline context; `None` = shared default.
     context: Option<Arc<crate::context::SaacpContext>>,
+    // M4 (R2 / opusreview.md): optional global in-flight payload byte budget
+    // (permits = bytes). `None` = unbounded (pre-M4 behavior).
+    inflight_payload_semaphore: Option<Arc<Semaphore>>,
+    // M12 (R3 / opusreview.md): optional bound on concurrent gate-pipeline
+    // executions. `None` = unbounded tokio blocking pool (pre-M12 behavior).
+    pipeline_semaphore: Option<Arc<Semaphore>>,
+    // M11 (R7 / opusreview.md): this node's fleet-unique id; read together with
+    // the affinity tracker below (both `Some` = tracking enabled).
+    node_id: Option<String>,
+    // M11 (R7 / opusreview.md): session-affinity tracker (AlertOnly enforcement).
+    session_affinity_tracker: Option<Arc<crate::session_affinity::SessionAffinityTracker>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -941,6 +1207,10 @@ pub(crate) async fn handle_client<S>(
     // for this connection's session_id — so bootstrap pinning here is untouched.
     let mut pinned_agent: Option<String> = None;
     let mut last_validated_at: Option<Instant> = None;
+    // M11 (R7): first-affinity-violation-only log guard — while a mis-routed
+    // session keeps arriving, every packet still feeds `record_error`, but the
+    // human-readable alert fires at most once per connection.
+    let mut affinity_violation_reported = false;
     // Track the revocation epoch at the time of last successful validation.
     // If the global epoch advances (i.e. all tokens are revoked), this connection
     // must be disconnected — continuing would accept a revoked token.
@@ -1018,6 +1288,33 @@ pub(crate) async fn handle_client<S>(
             break;
         }
 
+        // M4 (R2): reserve this packet's `payload_length` bytes from the global
+        // in-flight payload budget BEFORE allocating the assembly buffer. `None`
+        // (no budget configured) preserves the unbounded behavior exactly. The
+        // permit is held to the end of this loop iteration (packet fully
+        // assembled and dispatched), so the semaphore bounds AGGREGATE in-flight
+        // payload memory across ALL connections. Budget exhausted ⇒ reject with
+        // `PayloadTooLarge` (fail closed) and feed the per-IP error counter.
+        // `try_acquire_many_owned` (non-blocking) matches M4's "reject, don't
+        // queue" design: waiting would let one connection stall all others.
+        let _inflight_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+            match inflight_payload_semaphore.as_ref() {
+                Some(sem) => match sem.clone().try_acquire_many_owned(payload_length as u32) {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        send_hard_drop(
+                            &mut stream,
+                            SAACPBytecodes::PayloadTooLarge,
+                            "Global in-flight payload budget exhausted",
+                        )
+                        .await;
+                        record_error(&circuit_breakers, &ip_key);
+                        break;
+                    }
+                },
+                None => None,
+            };
+
         // 2c. MTU chunking assembly with MAX_ASSEMBLY_TIME aggregate timeout
         // payload_length <= MAX_PAYLOAD_SIZE (10 MB); +16 for auth tag is safe.
         let assembly_start = Instant::now();
@@ -1082,6 +1379,31 @@ pub(crate) async fn handle_client<S>(
                 .await;
                 record_error(&circuit_breakers, &ip_key);
                 break;
+            }
+        }
+
+        // M11 (R7): session-affinity record/check — AlertOnly policy. When this
+        // node has a node_id + tracker configured (fleet deployment), every
+        // packet's header session_id (bytes 16..32) is checked against the node
+        // that first recorded it. A mismatch proves a non-affine load balancer
+        // is silently degrading replay protection (the 4096-entry PSN window is
+        // node-local BY DESIGN — see state_backend.rs's "out of scope" section).
+        // AlertOnly: log once per connection + feed the per-IP error counter so
+        // a persistently mis-routed peer trips the existing IP circuit breaker;
+        // the packet itself is still processed (detection must not become a
+        // self-inflicted outage before the operator has seen the signal).
+        if let (Some(tracker), Some(node)) = (session_affinity_tracker.as_ref(), node_id.as_deref())
+        {
+            if let Some(sid_bytes) = full_packet.get(16..32) {
+                if let Ok(sid) = <[u8; 16]>::try_from(sid_bytes) {
+                    if let Err(violation) = tracker.record_session(&sid, node) {
+                        if !affinity_violation_reported {
+                            affinity_violation_reported = true;
+                            eprintln!("[SAACP Daemon] {peer_addr}: {violation}");
+                        }
+                        record_error(&circuit_breakers, &ip_key);
+                    }
+                }
             }
         }
 
@@ -1158,6 +1480,30 @@ pub(crate) async fn handle_client<S>(
         // relied on exactly this non-blocking guarantee; this fix makes the
         // guarantee real for any future implementation too.
         let on_delivered_for_task = on_delivered.clone();
+
+        // M12 (R3): bound concurrent gate-pipeline executions. `None` (unset)
+        // preserves the unbounded tokio blocking-pool behavior exactly. The
+        // permit is held across the `spawn_blocking(...).await` below (to the
+        // end of this loop iteration), so the semaphore caps how many packets
+        // execute gates concurrently instead of growing an unbounded blocking
+        // queue. A closed semaphore (runtime shutdown) hard-drops — fail closed.
+        let _pipeline_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+            match pipeline_semaphore.as_ref() {
+                Some(sem) => match sem.clone().acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        send_hard_drop(
+                            &mut stream,
+                            SAACPBytecodes::CircuitBreakerOpen,
+                            "Gate pipeline closed",
+                        )
+                        .await;
+                        break;
+                    }
+                },
+                None => None,
+            };
+
         let intercept_result = if let Some(epoch_mgr) = epoch_manager.clone() {
             let session_id: [u8; 16] = full_packet
                 .get(16..32)
@@ -1368,15 +1714,31 @@ pub(crate) async fn handle_client<S>(
                         0x18 => WIRE_STREAM_ACK,
                         0x19 => WIRE_STREAM_END_ACK, // STREAM_END
                         0x08 => {
-                            // INPUT_REQUIRED → yield + close
-                            let _ = stream.write_all(WIRE_YIELD_ASYNC).await;
+                            // INPUT_REQUIRED → yield + close. M3-authenticated like
+                            // every other ack (see the authed write below).
+                            let mut authed =
+                                Vec::with_capacity(WIRE_YIELD_ASYNC.len() + RESPONSE_MAC_LEN);
+                            authed.extend_from_slice(WIRE_YIELD_ASYNC);
+                            authed.extend_from_slice(&compute_response_mac(
+                                &session_key_bytes,
+                                WIRE_YIELD_ASYNC,
+                            ));
+                            let _ = stream.write_all(&authed).await;
                             break;
                         }
                         _ => WIRE_SUCCESS,
                     }
                 };
 
-                if stream.write_all(response).await.is_err() {
+                // M3 (R1): response authentication — the plaintext ack is
+                // forgeable by an active MITM. Append an HMAC-SHA256 tag over
+                // the ack, keyed by the ECDH session root key, so only a peer
+                // that completed the handshake can produce/verify a valid ack
+                // (the sidecar verifies this — see sidecar.rs's ack read).
+                let mut authed = Vec::with_capacity(response.len() + RESPONSE_MAC_LEN);
+                authed.extend_from_slice(response);
+                authed.extend_from_slice(&compute_response_mac(&session_key_bytes, response));
+                if stream.write_all(&authed).await.is_err() {
                     break;
                 }
             }

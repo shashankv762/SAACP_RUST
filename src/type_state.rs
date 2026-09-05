@@ -109,10 +109,32 @@ impl PipelineToken<Gate0Verified> {
                 if let Ok(serde_json::Value::Object(map)) =
                     serde_json::from_str::<serde_json::Value>(s)
                 {
+                    // Fix 2 (longcat.md Gap D): depth-limited conversion. The
+                    // scaffold previously recursed without bound; an
+                    // authenticated peer with a deeply-nested payload would
+                    // blow the stack during this dict construction.
                     for (k, val) in map.into_iter() {
-                        parsed
-                            .payload_dict
-                            .insert(k, crate::handler::serde_value_to_json_value(val));
+                        let jv = crate::handler::serde_value_to_json_value_bounded(val, 1);
+                        // Fix 2 (longcat.md Gap D): depth-limited conversion. The
+                        // scaffold previously recursed without bound; an
+                        // authenticated peer with a deeply-nested payload would
+                        // blow the stack during this dict construction.
+                        //
+                        // The bounded converter embeds the sentinel at the
+                        // deepest node, not at the top, so we must walk the
+                        // resulting tree via `json_value_depth_exceeded` rather
+                        // than pattern-matching only the top-level variant.
+                        if crate::handler::json_value_depth_exceeded(&jv) {
+                            return Err(SAACPHardDrop::new(
+                                crate::errors::SAACPBytecodes::PayloadTooLarge,
+                                format!(
+                                    "Payload JSON exceeds max nesting depth ({}). \
+                                     Rejecting at Gate 0 scaffold.",
+                                    crate::handler::PromptInjectionScanner::MAX_DEPTH
+                                ),
+                            ));
+                        }
+                        parsed.payload_dict.insert(k, jv);
                     }
                 }
             }

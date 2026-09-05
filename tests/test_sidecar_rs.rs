@@ -473,20 +473,27 @@ async fn sidecar_send_logs_delegation_edge_with_real_target_agent() {
     assert_eq!(send_resp.status(), 200);
 
     let recs = received.lock().unwrap();
-    // Filter on OUR specific agent pair, not just the `[FAITF:DELEGATION]` prefix —
-    // `ImmutableAuditLog::global()` is a process-wide singleton shared with every other
-    // test in this binary, several of which run concurrently and log their own
-    // delegation entries for their own agent pairs.
+    // R-3 compatibility: `append_event` encrypts `intent` at rest, so the
+    // record handed to a live subscriber carries ciphertext there — an
+    // `intent.starts_with("[FAITF:DELEGATION]")` check can never match (same
+    // root cause `command_center.rs::parse_delegation_depth` documents for the
+    // trust-mesh stream). Delegation records are instead identified by their
+    // plaintext `token_signature == "depth:{N}"` marker, written exclusively by
+    // `FAITFAuditLog::log_delegation`, plus the semantic (parent, child) pair
+    // in the (source, target) fields.
     let delegation = recs
         .iter()
-        .find(|r| r.intent.starts_with("[FAITF:DELEGATION]") && r.source == "agent-delegator")
+        .find(|r| {
+            r.token_signature == "depth:0"
+                && r.source == "agent-delegator"
+                && r.target == "agent-delegate-target"
+        })
         .expect(
             "expected a [FAITF:DELEGATION] audit entry for agent-delegator to have been logged",
         );
     assert_eq!(delegation.source, "agent-delegator");
     assert_eq!(delegation.target, "agent-delegate-target");
-    assert!(delegation.intent.contains("parent=agent-delegator"));
-    assert!(delegation.intent.contains("child=agent-delegate-target"));
+    assert_eq!(delegation.token_signature, "depth:0");
 }
 
 /// M-22 fix: with `http_bearer_token` unset (default), `/healthz` and `/receive` remain
