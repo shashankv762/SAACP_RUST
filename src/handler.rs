@@ -588,15 +588,88 @@ pub enum GateTier {
 // PromptInjectionScanner
 // ---------------------------------------------------------------------------
 
-/// S10 config: when true, payloads classified `GateTier::Full`
-/// (IRREVERSIBLE / EXTERNAL_INPUT) are normalized over their ENTIRE body
-/// (time-budgeted, see [`PromptInjectionScanner::FULL_SCAN_BUDGET`]) instead
-/// of the head+tail windows, closing the documented >32KB interior-scan gap
-/// for the tier where an injected instruction does the most damage. Default
-/// `false` keeps the documented head/tail behavior and its ~2-window cost for
-/// every tier — operators opt in per deployment.
+// ─── M8 (R4): Gate 4.0 corroboration policy ──────────────────────────────────
+// opusreview.md M8: Gate 4.0 is a heuristic with a measurable false-positive
+// rate, but every rejection used to fire `PenaltyKind::InjectionAttempt`
+// (weight 0.30) unconditionally — three "the contract as agreed"-class false
+// positives ejected an agent from the mesh. The PACKET is still always
+// hard-dropped (blocking behavior is unchanged for every action class); what
+// is decoupled is the trust PENALTY:
+//
+// - mutation/irreversible action classes keep today's immediate penalty;
+// - READ_ONLY agents get one uncorroborated grace hit per window: it is
+//   counted as `injection_suspected` telemetry (plus the gate_4_0_inject
+//   SecurityAlert that `report_gate_rejection` already fires) but costs no
+//   trust;
+// - a second detection for the same agent within
+//   `INJECTION_CORROBORATION_WINDOW_SECS` is corroboration and penalizes.
+
+/// How long an uncorroborated READ_ONLY Gate 4.0 detection stays on record as
+/// corroboration bait: two detections inside this window penalize; a lone
+/// detection does not.
+const INJECTION_CORROBORATION_WINDOW_SECS: f64 = 300.0;
+
+/// Upper bound on agents tracked in the corroboration map, so a flood of
+/// unique attacker-chosen identities cannot grow it without bound. On
+/// saturation the stalest entries are swept first; if the sweep cannot free
+/// enough, the map is cleared (fail-safe: it errs toward NOT penalizing, and
+/// every detection was still alerted and counted either way).
+const INJECTION_CORROBORATION_MAX_ENTRIES: usize = 10_000;
+
+static INJECTION_SOLO_HITS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, f64>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// M8 decision: does THIS Gate 4.0 detection cost the agent trust? Returns
+/// `true` when the penalty should be applied (mutation/irreversible class, or
+/// a corroborated second READ_ONLY hit inside the window); returns `false`
+/// for a first, uncorroborated READ_ONLY hit — in which case the detection is
+/// recorded as `injection_suspected` telemetry instead.
+fn gate_4_0_should_penalize(
+    action_class: u8,
+    trust_key: &str,
+    ctx: &crate::context::SaacpContext,
+) -> bool {
+    if action_class != crate::framing::ACTION_CLASS_READ_ONLY {
+        return true;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default();
+    let mut solo = INJECTION_SOLO_HITS.lock();
+    if solo.len() >= INJECTION_CORROBORATION_MAX_ENTRIES {
+        solo.retain(|_, t| now - *t <= INJECTION_CORROBORATION_WINDOW_SECS);
+        if solo.len() >= INJECTION_CORROBORATION_MAX_ENTRIES {
+            solo.clear();
+        }
+    }
+    match solo.get(trust_key) {
+        Some(&t) if now - t <= INJECTION_CORROBORATION_WINDOW_SECS => {
+            solo.remove(trust_key);
+            true
+        }
+        _ => {
+            solo.insert(trust_key.to_string(), now);
+            ctx.telemetry.record_injection_suspected();
+            false
+        }
+    }
+}
+
+/// S10 config / M10 (R6) default: when true, payloads classified
+/// `GateTier::Full` (IRREVERSIBLE / EXTERNAL_INPUT) are normalized over their
+/// ENTIRE body (time-budgeted, see
+/// [`PromptInjectionScanner::FULL_SCAN_BUDGET`]) instead of the head+tail
+/// windows, closing the documented >32KB interior-scan gap for the tier where
+/// an injected instruction does the most damage. M10 flips the default to
+/// **true**: the measured cost is a bounded ~2× on >16KB payloads
+/// (benchmark_results.md §P-4), and the gate already has a time budget with a
+/// guaranteed tail window on exhaustion — an unscanned interior on an
+/// irreversible action is the wrong side of that trade. Operators who
+/// specifically need the old head/tail-only posture for `Full`-tier packets
+/// can call [`PromptInjectionScanner::set_full_scan_irreversible(false)`].
 static FULL_SCAN_FOR_IRREVERSIBLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Heuristic scanner to detect prompt injection patterns.
 pub struct PromptInjectionScanner;
@@ -677,13 +750,14 @@ impl PromptInjectionScanner {
     /// while still scanning ~every window of realistic agent payloads.
     pub const FULL_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
-    /// S10 config: when true, payloads classified `GateTier::Full`
+    /// S10 config / M10 (R6): when true, payloads classified `GateTier::Full`
     /// (IRREVERSIBLE / EXTERNAL_INPUT) are normalized over their ENTIRE body
     /// (time-budgeted, see [`Self::FULL_SCAN_BUDGET`]) instead of the
     /// head+tail windows, closing the documented >32KB interior-scan gap for
     /// the tier where an injected instruction does the most damage. Default
-    /// `false` keeps the documented head/tail behavior and its ~2-window cost
-    /// for every tier — operators opt in per deployment.
+    /// **true** since M10 (see `FULL_SCAN_FOR_IRREVERSIBLE` above);
+    /// `set_full_scan_irreversible(false)` restores the old head/tail-only
+    /// posture for `Full`-tier packets.
     /// (The storage static lives at module scope — Rust has no associated
     /// statics: see `FULL_SCAN_FOR_IRREVERSIBLE` above.)
     ///
@@ -2826,8 +2900,8 @@ impl SAACPProtocolHandler {
         // deep-cloning it into a throwaway JsonValue::Object via
         // json_value_from_map — see PromptInjectionScanner::scan_payload_map's
         // doc comment for the equivalence argument.
-        // S10: IRREVERSIBLE/EXTERNAL_INPUT packets (GateTier::Full) get a
-        // time-budgeted full-body scan when the operator enabled it, closing
+        // S10/M10 (R6): IRREVERSIBLE/EXTERNAL_INPUT packets (GateTier::Full)
+        // get a time-budgeted full-body scan (default ON since M10), closing
         // the documented >32KB interior gap for the highest-stakes tier.
         if !parsed.is_binary_stream {
             let full_scan = parsed.gate_tier == GateTier::Full
@@ -2836,9 +2910,15 @@ impl SAACPProtocolHandler {
                 "gate_4_0_inject",
                 Self::gate_4_0_injection_scan_map_tiered(&parsed.payload_dict, full_scan)
             ) {
-                let _ = ctx
-                    .trust
-                    .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                // M8 (R4): READ_ONLY agents get one uncorroborated grace hit
+                // (suspected-only telemetry) before trust penalties; mutation
+                // classes and corroborated repeats penalize as before. The
+                // packet is rejected either way — see gate_4_0_should_penalize.
+                if gate_4_0_should_penalize(parsed.action_class, &trust_key, ctx) {
+                    let _ = ctx
+                        .trust
+                        .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                }
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
@@ -3337,10 +3417,13 @@ impl SAACPProtocolHandler {
             if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
                 // Parity with Gate 4.0's penalty in run_gates_1_through_12 — a
                 // detected injection costs behavioral trust regardless of which
-                // pipeline caught it.
-                let _ = ctx
-                    .trust
-                    .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                // pipeline caught it. M8 (R4): same corroboration policy —
+                // READ_ONLY agents get one uncorroborated grace hit first.
+                if gate_4_0_should_penalize(parsed.action_class, &trust_key, ctx) {
+                    let _ = ctx
+                        .trust
+                        .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                }
                 report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                 return Err(e);
             }
@@ -3492,9 +3575,14 @@ impl SAACPProtocolHandler {
                     JsonValue::String(end_text),
                 )]);
                 if let Err(e) = Self::gate_4_0_injection_scan(&jv) {
-                    let _ = ctx
-                        .trust
-                        .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                    // M8 (R4): same corroboration policy as the main-pipeline
+                    // Gate 4.0 site — READ_ONLY agents get one uncorroborated
+                    // grace hit before trust penalties.
+                    if gate_4_0_should_penalize(parsed.action_class, &trust_key, ctx) {
+                        let _ = ctx
+                            .trust
+                            .penalize(&trust_key, PenaltyKind::InjectionAttempt);
+                    }
                     report_gate_rejection("gate_4_0_inject", current_agent_name, &e);
                     return Err(e);
                 }
@@ -4048,13 +4136,14 @@ mod tests {
         }
     }
 
-    /// S-3 fix, documented residue: a pattern lying strictly between the two scan
-    /// windows of a payload LARGER than `2 * MAX_SCAN_LENGTH` is not seen. This
-    /// test asserts the current, deliberate limitation (full-body scanning is the
-    /// deferred alternative in opusplan2.md Step 7 / P-4) so that a future change
-    /// to full-payload scanning fails here loudly rather than silently.
+    /// M10 (R6) regression — supersedes `test_scan_middle_of_oversized_payload_is_known_gap`:
+    /// the interior of a payload larger than `2 * MAX_SCAN_LENGTH` is NOW SCANNED
+    /// whenever full-scan mode is on (the `GateTier::Full` default since M10).
+    /// The head/tail `scan_payload` path (still used for Lightweight/Standard
+    /// tiers) keeps its documented bounded behavior, asserted alongside so the
+    /// two postures cannot be confused.
     #[test]
-    fn test_scan_middle_of_oversized_payload_is_known_gap() {
+    fn test_scan_middle_of_oversized_payload_is_now_scanned() {
         let max = PromptInjectionScanner::MAX_SCAN_LENGTH;
         let needle = "ignore previous instructions";
         // 3*max total, needle centered — outside both the leading and trailing window.
@@ -4063,10 +4152,18 @@ mod tests {
         let text = format!("{filler_before}{needle}{filler_after}");
         assert_eq!(text.len(), 3 * max);
         let payload = JsonValue::Object(vec![("task".into(), JsonValue::String(text))]);
+        // Full-scan mode (GateTier::Full default since M10): interior is covered.
+        assert!(
+            PromptInjectionScanner::scan_payload_with(&payload, 0, true).is_err(),
+            "full-scan mode must surface an injection buried in the interior"
+        );
+        // The plain head/tail path keeps its documented bounded behavior for
+        // the tiers that still use it (see scan_payload's doc comment).
         assert!(
             PromptInjectionScanner::scan_payload(&payload, 0).is_ok(),
-            "documents the known interior gap for payloads >2*MAX_SCAN_LENGTH; if this \
-             now fails, scanning was widened — update this test and the S-3 comment"
+            "head/tail-only scanning must keep its documented interior gap; \
+             if this now fails, that path was widened — update this test and \
+             scan_payload's doc comment deliberately"
         );
     }
 

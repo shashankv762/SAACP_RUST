@@ -72,6 +72,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and all three outcomes are visible on `/healthz` (`handshake_pinned_ok` /
   `handshake_fallback_total` / `handshake_reject_total`). Regression-tested in
   `tests/test_sidecar_mitm_rs.rs`.
+- **M10 / R6 — default full-body scan for irreversible actions**: 
+  `FULL_SCAN_FOR_IRREVERSIBLE` now defaults to **on**. `GateTier::Full`
+  (IRREVERSIBLE / EXTERNAL_INPUT) payloads are normalized over their entire
+  body (time-budgeted, tail-guaranteed), closing the documented >32KB
+  interior-scan gap for the tier where an injected instruction does the most
+  damage. Measured cost stays the already-bounded ~2x on >16KB payloads
+  (benchmark_results.md §P-4); `set_full_scan_irreversible(false)` restores
+  the old posture.
+- **M8 / R4 — Gate 4.0 corroboration policy**: the packet rejection behavior
+  is unchanged for every action class, but the trust penalty is decoupled
+  from the heuristic's false-positive rate. READ_ONLY agents get one
+  uncorroborated grace hit per 300s window (counted as the new
+  `injection_suspected` metric, alerted as before, but costing no trust); a
+  second detection inside the window — or any detection on a
+  mutation/irreversible class — applies `PenaltyKind::InjectionAttempt` as
+  before. Three benign-sounding false positives can no longer eject an agent
+  on their own. Regression-tested in `tests/test_m8_injection_corroboration_rs.rs`.
 - **M6 / R13**: Added `overflow-checks = true` to `[profile.release]` in
   `Cargo.toml`. Without this, release builds silently wrapped on integer
   overflow while debug/test builds panicked — giving parser arithmetic

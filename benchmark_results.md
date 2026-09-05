@@ -202,10 +202,22 @@ scans only 32 KB, not 10 MB.
 Tradeoff accepted deliberately (opusplan2.md §7 Q2): a bounded ~2x on oversized
 payloads buys closure of the append-past-the-limit bypass, versus the alternative of
 scanning the full body (~500 ms for a 10 MB payload — a DoS lever in itself). The
-residual gap is that content strictly *interior* to a payload >32 KB is still unscanned;
-that limit is regression-locked by
-`handler.rs::test_scan_middle_of_oversized_payload_is_known_gap` so any future widening
+residual gap is that content strictly *interior* to a payload >32 KB is still unscanned
+**on the head/tail path**; that limit is regression-locked by
+`handler.rs::test_scan_middle_of_oversized_payload_is_now_scanned` so any future widening
 fails loudly rather than silently.
+
+**2026-09-05 — M10 (R6) update:** `FULL_SCAN_FOR_IRREVERSIBLE` now defaults to **on**
+(`handler.rs`), so `GateTier::Full` (IRREVERSIBLE / EXTERNAL_INPUT) payloads are
+scanned over their ENTIRE body via the S10 time-budgeted full-scan mode, closing
+the interior gap for the highest-stakes tier. The cost is bounded by construction:
+per-string normalization is capped by `FULL_SCAN_BUDGET` (50 ms) and the trailing
+window is always scanned even on budget exhaustion
+(`s10_full_scan_budget_exhaustion_still_covers_tail`). The head/tail path remains
+the default for Lightweight/Standard tiers, so the numbers above still describe
+non-`Full`-tier scanning; a full WC4 re-run quantifying the `Full`-tier delta on
+real traffic shapes is queued as follow-up work (the S10/P-4 measurement above
+already bounds it at ~2x on >16 KB bodies).
 
 ### Gate 5.0 — Epistemic circuit breaker
 | Benchmark | low | median | high |

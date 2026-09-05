@@ -194,6 +194,13 @@ pub struct Counters {
     pub trust_penalties_injection: AtomicU64,
     pub trust_penalties_epistemic: AtomicU64,
     pub trust_penalties_generic: AtomicU64,
+    /// M8 (R4): Gate 4.0 detections on READ_ONLY action classes that were
+    /// counted as suspected-only (alerted + rejected) but did NOT cost trust —
+    /// the uncorroborated-heuristic decoupling. A rising value with a flat
+    /// `trust_penalties_injection` means the scanner is firing on likely
+    /// false positives; a rising value followed by a rising penalty count
+    /// means corroboration caught a real attacker.
+    pub injection_suspected: AtomicU64,
     /// Phase 6 / Part 8.1 (IEVL): `PenaltyKind::TargetViolation`.
     pub trust_penalties_target_violation: AtomicU64,
     /// Phase 6 / Part 8.1 (IEVL): `PenaltyKind::ReceiptTimeout`.
@@ -284,6 +291,7 @@ impl Counters {
             trust_penalties_intent_drift: z!(),
             trust_penalties_scope_violation: z!(),
             trust_penalties_injection: z!(),
+            injection_suspected: z!(),
             trust_penalties_epistemic: z!(),
             trust_penalties_generic: z!(),
             trust_penalties_target_violation: z!(),
@@ -1162,6 +1170,16 @@ impl TelemetryCollector {
     /// Record a Trust Decay Engine penalty by kind (bounded cardinality —
     /// see the `Counters` struct doc comment on why this is per-kind, not
     /// per-agent).
+    /// M8 (R4): record a Gate 4.0 detection on a READ_ONLY action class that
+    /// was alerted and rejected but did NOT cost the agent trust (the
+    /// uncorroborated-heuristic decoupling — see `handler.rs`'s
+    /// `gate_4_0_should_penalize`).
+    pub fn record_injection_suspected(&self) {
+        self.counters
+            .injection_suspected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_trust_penalty(&self, kind: crate::trust_decay::PenaltyKind) {
         use crate::trust_decay::PenaltyKind;
         match kind {
@@ -1331,6 +1349,7 @@ impl TelemetryCollector {
             c.trust_penalties_scope_violation
         );
         snap!("trust_penalties_injection", c.trust_penalties_injection);
+        snap!("injection_suspected", c.injection_suspected);
         snap!("trust_penalties_epistemic", c.trust_penalties_epistemic);
         snap!("trust_penalties_generic", c.trust_penalties_generic);
         snap!(
@@ -1750,6 +1769,7 @@ impl TelemetryCollector {
         rst!(c.trust_penalties_intent_drift);
         rst!(c.trust_penalties_scope_violation);
         rst!(c.trust_penalties_injection);
+        rst!(c.injection_suspected);
         rst!(c.trust_penalties_epistemic);
         rst!(c.trust_penalties_generic);
         rst!(c.trust_penalties_target_violation);
