@@ -1,4 +1,4 @@
-//! temporal.rs — Dead Man's Switch + Temporal Heartbeat
+//! temporal.rs â€” Dead Man's Switch + Temporal Heartbeat
 //!
 //! Tracks active agent sessions. If an agent fails to send a heartbeat ping
 //! within the MAX_TIMEOUT limit, the session is terminated.
@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,17 +19,14 @@ pub const DEAD_MAN_MAX_SESSIONS: usize = 10_000;
 /// Default heartbeat interval (5 seconds).
 pub const HEARTBEAT_INTERVAL_SECONDS: f64 = 5.0;
 /// Maximum pings per context per window before ping-flood is declared.
-/// A legitimate heartbeat fires at HEARTBEAT_INTERVAL_SECONDS = 5s → max 12/min.
+/// A legitimate heartbeat fires at HEARTBEAT_INTERVAL_SECONDS = 5s â†’ max 12/min.
 /// Anything above 60/min is flood territory.
 pub const DEAD_MAN_PING_FLOOD_THRESHOLD: usize = 60;
 /// Window size in seconds for ping-flood counting.
 pub const DEAD_MAN_PING_FLOOD_WINDOW_SECS: f64 = 60.0;
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::now_secs_f64()
 }
 
 // ===========================================================================
@@ -42,7 +39,7 @@ fn now_secs() -> f64 {
 /// Backed by a process-local `HashMap` by default. [`DeadMansSwitch::with_backend`]
 /// instead routes session/ping-flood state through a shared [`StateBackend`]
 /// (e.g. Redis) so a heartbeat observed by one SAACP gateway node is visible
-/// to every other node in the fleet — see `state_backend.rs` for the design.
+/// to every other node in the fleet â€” see `state_backend.rs` for the design.
 pub struct DeadMansSwitch {
     inner: Mutex<DeadManInner>,
     max_timeout: f64,
@@ -66,7 +63,7 @@ struct PingRecordWire {
 
 struct DeadManInner {
     active_sessions: HashMap<Vec<u8>, f64>,
-    /// Per-context ping-flood tracking: cid → PingRecord.
+    /// Per-context ping-flood tracking: cid â†’ PingRecord.
     ping_flood_records: HashMap<Vec<u8>, PingRecord>,
 }
 
@@ -103,13 +100,13 @@ impl DeadMansSwitch {
     ///
     /// NOTE: `ping`'s flood-window read-then-write is not made atomic across
     /// the network round trip the way the in-process `Mutex` makes it atomic
-    /// locally — two pings for the same session landing on different nodes
+    /// locally â€” two pings for the same session landing on different nodes
     /// at the same instant could both read the same window/count and both
     /// increment from it, undercounting the flood by at most the number of
     /// concurrent nodes. Heartbeats are low-frequency and per-session
     /// (a well-behaved agent has exactly one heartbeat source), so this is an
     /// acceptable, explicitly-documented trade-off rather than a correctness
-    /// bug — unlike MEASC's per-packet replay window, which cannot tolerate
+    /// bug â€” unlike MEASC's per-packet replay window, which cannot tolerate
     /// this (see `state_backend.rs`'s module doc).
     pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
         Self::with_backend_and_limits(DEAD_MAN_MAX_TIMEOUT, DEAD_MAN_MAX_SESSIONS, backend)
@@ -145,7 +142,7 @@ impl DeadMansSwitch {
     pub fn register_session(&self, context_state_id: &[u8]) {
         match &self.backend {
             Some(backend) => {
-                // O(n) scan for the cap check — registration is a low-frequency,
+                // O(n) scan for the cap check â€” registration is a low-frequency,
                 // non-hot-path operation (once per session lifetime, not per packet).
                 let keys = backend.scan_prefix("dms:session:").unwrap_or_default();
                 if keys.len() >= self.max_sessions {
@@ -173,7 +170,7 @@ impl DeadMansSwitch {
             }
             None => {
                 // M-38 fix: every `self.inner.lock()` in this impl block recovers via
-                // `into_inner()` on poison rather than panicking — `GLOBAL_DEAD_MANS_SWITCH`
+                // `into_inner()` on poison rather than panicking â€” `GLOBAL_DEAD_MANS_SWITCH`
                 // is a process-wide singleton, so one poisoning panic must not cascade
                 // into every other session's ping-tracking/timeout checks.
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -211,7 +208,7 @@ impl DeadMansSwitch {
     fn ping_local(&self, context_state_id: &[u8], now: f64) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        // ── Ping-flood detection (DMS-PINGFLOOD fix) ─────────────────────────
+        // â”€â”€ Ping-flood detection (DMS-PINGFLOOD fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // A compromised context can call ping at maximum rate to stay alive forever.
         // Track pings per context per window and reject excess pings.
         let flood_rec = inner
@@ -229,7 +226,7 @@ impl DeadMansSwitch {
         }
         flood_rec.count += 1;
         if flood_rec.count > DEAD_MAN_PING_FLOOD_THRESHOLD {
-            // Flood detected — do NOT update the session timestamp so the DMS can
+            // Flood detected â€” do NOT update the session timestamp so the DMS can
             // time out the context naturally. Return false to signal the caller.
             return false;
         }
@@ -278,7 +275,7 @@ impl DeadMansSwitch {
             return false;
         }
 
-        // Only refresh the session timestamp if the session is (still) tracked —
+        // Only refresh the session timestamp if the session is (still) tracked â€”
         // matches the local path's `get_mut` no-op-on-missing-key semantics.
         let session_key = Self::session_key(context_state_id);
         if backend.get(&session_key).ok().flatten().is_some() {
@@ -295,7 +292,7 @@ impl DeadMansSwitch {
     ///
     /// M-19 fix: the local-mode branch also removes `context_state_id`'s
     /// entry from `ping_flood_records`. That map has no TTL/expiry mechanism
-    /// of its own — it is only ever pruned opportunistically inside `ping()`
+    /// of its own â€” it is only ever pruned opportunistically inside `ping()`
     /// (see `ping_local`'s window-reset logic), which never runs again once a
     /// session stops pinging (e.g. because it was just unregistered). Without
     /// this, every session that is ever unregistered leaks one
@@ -367,7 +364,7 @@ impl DeadMansSwitch {
     /// Return the number of active sessions.
     ///
     /// In backend mode this is a `scan_prefix` over the `dms:session:`
-    /// namespace — an O(n) diagnostic operation, not a hot-path call.
+    /// namespace â€” an O(n) diagnostic operation, not a hot-path call.
     pub fn session_count(&self) -> usize {
         match &self.backend {
             Some(backend) => backend
@@ -422,17 +419,17 @@ impl Default for DeadMansSwitch {
 /// spawns a dedicated `std::thread` per instance rather than a `tokio::spawn`
 /// task. `TemporalHeartbeat` is public library API (exported from `lib.rs`
 /// with a `TemporalHeartbeatThread` Python-parity alias) with no documented
-/// requirement that a Tokio runtime be active — its own test coverage
+/// requirement that a Tokio runtime be active â€” its own test coverage
 /// (`test_heartbeat_starts_and_stops`) constructs and drives it from a plain
 /// synchronous `#[test]`, not `#[tokio::test]`, and no call site anywhere in
 /// this crate (`daemon.rs`, `sidecar.rs`, `command_center.rs`) references it
 /// at all today. Switching to `tokio::spawn` would panic ("there is no
-/// reactor running") for any synchronous caller or embedder — exactly the
+/// reactor running") for any synchronous caller or embedder â€” exactly the
 /// same reasoning `maintenance.rs`'s module doc comment gives for why its own
 /// coordinator thread is deliberately not built on `tokio::spawn` either. The
 /// per-instance thread stack cost (2-8MB, OS-dependent) this finding flags is
 /// real but bounded by however many concurrent `TemporalHeartbeat` instances
-/// a caller chooses to run — if a future caller needs many concurrent
+/// a caller chooses to run â€” if a future caller needs many concurrent
 /// heartbeats from an async context specifically, that call site should
 /// route through `tokio::spawn` + `tokio::time::interval` itself (or drive
 /// `DeadMansSwitch::ping` from `MaintenanceCoordinator`, which already
@@ -442,7 +439,7 @@ impl Default for DeadMansSwitch {
 pub struct TemporalHeartbeat {
     // L-19 fix: `Condvar` paired with the stop flag lets `stop()` wake the
     // background thread immediately (`notify_one`) instead of it only
-    // noticing the flag after `thread::sleep(interval)` returns on its own —
+    // noticing the flag after `thread::sleep(interval)` returns on its own â€”
     // previously `.stop()` -> `.join()` could block the caller for up to one
     // full `interval_secs` even though the thread was idle the whole time.
     stop: Arc<(Mutex<bool>, Condvar)>,
@@ -514,7 +511,7 @@ impl Drop for TemporalHeartbeat {
     }
 }
 
-// ── Process-wide singleton ──────────────────────────────────────────────────
+// â”€â”€ Process-wide singleton â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Global `DeadMansSwitch` used by the gate pipeline and daemon layer.
 /// Matches Python's class-level singleton semantics of `DeadMansSwitch`.
@@ -560,7 +557,7 @@ mod tests {
 
     /// M-19 regression: `unregister_session` (local mode) must also clean up
     /// `ping_flood_records`, not just `active_sessions`. Before the fix, this
-    /// entry would remain forever — `ping_flood_records` has no independent
+    /// entry would remain forever â€” `ping_flood_records` has no independent
     /// TTL/expiry, only opportunistic pruning inside `ping()` itself, which
     /// never runs again for an unregistered session.
     #[test]
@@ -589,7 +586,7 @@ mod tests {
     }
 
     /// M-19: repeated register -> ping -> unregister cycles for DIFFERENT
-    /// session IDs must not leave `ping_flood_records` growing unbounded —
+    /// session IDs must not leave `ping_flood_records` growing unbounded â€”
     /// proves the fix holds under session churn, not just a single instance.
     #[test]
     fn test_ping_flood_records_bounded_under_session_churn() {

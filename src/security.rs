@@ -1,4 +1,4 @@
-//! security.rs — Nonce Tracking + Immutable Audit Log
+//! security.rs â€” Nonce Tracking + Immutable Audit Log
 //!
 //! Implements:
 //! - `NonceTracker`: Tracks nonces to defeat Replay Attacks
@@ -6,9 +6,9 @@
 //!
 //! C-4: rotated audit logs (`<path>.<timestamp>.bak`, written by `WalWriter::maybe_rotate`
 //! once the active log exceeds `AUDIT_MAX_LOG_SIZE`) are gzip-compressed to `.bak.gz` on a
-//! dedicated `saacp-audit-archival` background thread — never the `saacp-wal-worker` thread
+//! dedicated `saacp-audit-archival` background thread â€” never the `saacp-wal-worker` thread
 //! that services live writes, so compression never adds latency to audit-log appends. What
-//! happens to the compressed file afterward is pluggable via the [`ArchivalSink`] trait —
+//! happens to the compressed file afterward is pluggable via the [`ArchivalSink`] trait â€”
 //! see its doc comment, [`NoopArchivalSink`] (default), and [`FilesystemArchivalSink`]
 //! (opt in via [`ENV_AUDIT_ARCHIVE_DIR`] or [`ImmutableAuditLog::with_paths_and_archival_sink`]).
 
@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -39,17 +39,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// M-1 fix: this is the SINGLE canonical implementation for the whole crate.
 /// `gateway.rs`, `command_center.rs`, and `identity_binding.rs` previously each
 /// carried a byte-identical private copy of this function (and of
-/// `constant_time_eq_hex` below) — harmless on its own, but a maintenance trap:
+/// `constant_time_eq_hex` below) â€” harmless on its own, but a maintenance trap:
 /// a future correctness fix applied to one copy silently would not propagate to
 /// the other three. `pub(crate)` so every module in this crate can call this one
 /// instead of redefining it.
 /// L-5 fix: delegates to `subtle::ConstantTimeEq` (already a declared dependency,
-/// already used elsewhere in this crate — nothing new pulled in) instead of a
+/// already used elsewhere in this crate â€” nothing new pulled in) instead of a
 /// hand-rolled `diff |= x ^ y` loop. LLVM is legally permitted to prove `diff == 0`
 /// early and short-circuit a hand-written loop like the old one under aggressive
 /// inlining/optimization, defeating the constant-time intent; `subtle::ConstantTimeEq`
 /// is specifically engineered to resist that. The `a.len() != b.len()` short-circuit is
-/// kept as-is — length isn't secret, so comparing it in variable time is fine; only the
+/// kept as-is â€” length isn't secret, so comparing it in variable time is fine; only the
 /// byte-content comparison needs the constant-time guarantee.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
@@ -63,7 +63,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Decodes both to raw bytes before comparing so no timing information
 /// about the first differing hex character leaks.
 ///
-/// M-1 fix: canonical implementation — see `constant_time_eq`'s doc comment.
+/// M-1 fix: canonical implementation â€” see `constant_time_eq`'s doc comment.
 pub(crate) fn constant_time_eq_hex(a: &str, b: &str) -> bool {
     match (hex::decode(a), hex::decode(b)) {
         (Ok(ab), Ok(bb)) => constant_time_eq(&ab, &bb),
@@ -72,26 +72,23 @@ pub(crate) fn constant_time_eq_hex(a: &str, b: &str) -> bool {
 }
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::now_secs_f64()
 }
 
 // ===========================================================================
-// Audit-intent confidentiality (opt-in — STRIDE Information Disclosure fix)
+// Audit-intent confidentiality (opt-in â€” STRIDE Information Disclosure fix)
 // ===========================================================================
 //
 // `ImmutableAuditLog::append_event`'s `intent` field (task/action text,
 // naming source/target agents) is written to disk in cleartext JSONL,
 // integrity-protected by the chain-hash HMAC but never confidentiality-
-// protected. An attacker with filesystem read access to the log — a
+// protected. An attacker with filesystem read access to the log â€” a
 // different compromised process on the same host, a stolen backup, a
-// misconfigured permission — gets a full plaintext history of every agent's
+// misconfigured permission â€” gets a full plaintext history of every agent's
 // tasks. `append_event_confidential` closes this gap by encrypting just the
 // `intent` string before it ever reaches `append_event`, so the audit record
 // schema, the canonical HMAC input, and `verify_chain`/`verify_chain_disk`
-// are all completely unchanged — the chain-hash covers whatever string ends
+// are all completely unchanged â€” the chain-hash covers whatever string ends
 // up in `intent`, plaintext or ciphertext, identically.
 //
 // Opt-in, mirroring this crate's established pattern for optional
@@ -100,7 +97,7 @@ fn now_secs() -> f64 {
 // test that expects a human-readable `intent` field keeps working exactly
 // as before.
 
-/// HKDF info string for audit-intent encryption key derivation — domain-
+/// HKDF info string for audit-intent encryption key derivation â€” domain-
 /// separated from the chain-hash HMAC (which uses `issuer_secret` directly
 /// as MAC key input) so adding encryption never weakens or entangles with
 /// the existing chain-integrity guarantee.
@@ -108,7 +105,7 @@ const AUDIT_INTENT_HKDF_INFO: &[u8] = b"SAACP-audit-intent-confidentiality-v1";
 
 /// L-1 fix: HKDF-Extract salt for audit-intent key derivation. `AUDIT_INTENT_HKDF_INFO`
 /// (above) already domain-separates the *expand* step, but a `None` salt at the
-/// *extract* step falls back to a zero-filled salt per RFC 5869 — fine per-spec, but it
+/// *extract* step falls back to a zero-filled salt per RFC 5869 â€” fine per-spec, but it
 /// gives up free domain separation between this extraction and any other unsalted HKDF
 /// extraction elsewhere that might reuse the same `issuer_secret` as IKM. A fixed,
 /// purpose-specific salt closes that gap even though no such collision is known today.
@@ -125,7 +122,7 @@ fn derive_intent_key(issuer_secret: &[u8]) -> [u8; 32] {
 }
 
 /// Encrypt an audit intent string for confidentiality-at-rest. Returns
-/// `hex(nonce(12) || ciphertext || tag)` — pure lowercase ASCII hex, safe to
+/// `hex(nonce(12) || ciphertext || tag)` â€” pure lowercase ASCII hex, safe to
 /// embed directly as a JSON string value with no escaping, exactly like the
 /// existing `chain_hash` field. See module docs above for the security
 /// rationale and `ImmutableAuditLog::append_event_confidential` for the
@@ -177,7 +174,7 @@ pub const ENV_AUDIT_LOG: &str = "SAACP_AUDIT_LOG";
 pub const ENV_COUNT_FILE: &str = "SAACP_COUNT_FILE";
 /// C-4: optional directory that rotated-and-gzip-compressed audit logs are moved into
 /// after compression. Unset (the default) leaves compressed `.bak.gz` files beside the
-/// live WAL — see [`FilesystemArchivalSink`] / [`ArchivalSink`].
+/// live WAL â€” see [`FilesystemArchivalSink`] / [`ArchivalSink`].
 pub const ENV_AUDIT_ARCHIVE_DIR: &str = "SAACP_AUDIT_ARCHIVE_DIR";
 
 // ===========================================================================
@@ -187,7 +184,7 @@ pub const ENV_AUDIT_ARCHIVE_DIR: &str = "SAACP_AUDIT_ARCHIVE_DIR";
 /// Maximum age of a nonce before it is pruned.
 ///
 /// F8 hardening: this TTL IS the replay-protection horizon for the legacy
-/// `SAACPFrame` (101-byte Python-parity) path — a captured frame replayed
+/// `SAACPFrame` (101-byte Python-parity) path â€” a captured frame replayed
 /// after every nonce has aged out passes this tracker (the nonce is 64-bit
 /// random, so no monotonic floor exists for it). 30s was too short to call
 /// replay protection with a straight face; 300s (5 minutes) is the new
@@ -195,7 +192,7 @@ pub const ENV_AUDIT_ARCHIVE_DIR: &str = "SAACP_AUDIT_ARCHIVE_DIR";
 /// pressure fails CLOSED with `CircuitBreakerOpen`, never silently evicts).
 /// Deployments that need a longer horizon (or tighter memory) should use
 /// [`NonceTracker::with_limits`]. The canonical MEASC path does NOT rely on
-/// this tracker at all — its `ReplayWindow` uses a monotonic-PSN sliding
+/// this tracker at all â€” its `ReplayWindow` uses a monotonic-PSN sliding
 /// window with no time-based eviction.
 pub const NONCE_MAX_AGE_SECONDS: f64 = 300.0;
 /// Hard cap to prevent OOM under sustained load.
@@ -222,7 +219,7 @@ struct NonceInner {
 
 /// Risk 1 / Fix 4: how often (in inserts) the capacity-backed prune runs.
 /// 1000 means the amortized prune cost is 1/1000th of a full `retain()` per
-/// insert — negligible per-packet, while still bounding memory to
+/// insert â€” negligible per-packet, while still bounding memory to
 /// `NONCE_MAX_ENTRIES` within a few thousand inserts of a flood ending.
 const NONCE_PRUNE_INTERVAL: u64 = 1000;
 
@@ -259,7 +256,7 @@ impl NonceTracker {
     /// M-4 fix: track a nonce scoped to `session_id`, so the same raw nonce
     /// value reused by two different sessions is not treated as a replay of
     /// itself. `NonceTracker` as originally written has no per-session
-    /// scoping baked into `track()` — every caller shares one flat `u64`
+    /// scoping baked into `track()` â€” every caller shares one flat `u64`
     /// keyspace. That is a real hazard for any *future* caller that tracks
     /// nonces across multiple concurrent sessions from one shared
     /// `NonceTracker` (today, `NonceTracker` is only exercised by this
@@ -268,7 +265,7 @@ impl NonceTracker {
     /// already correctly scoped per `SessionEpochManager` entry). Composes
     /// `(session_id, nonce)` into a single derived key via SHA-256 (truncated
     /// to the first 8 bytes) before delegating to the same atomic
-    /// check-and-insert logic `track()` uses — a different `session_id` with
+    /// check-and-insert logic `track()` uses â€” a different `session_id` with
     /// the same `nonce` value hashes to a different key, so no cross-session
     /// collision is possible.
     pub fn track_scoped(&self, session_id: &str, nonce: u64) -> Result<(), SAACPHardDrop> {
@@ -279,8 +276,8 @@ impl NonceTracker {
     ///
     /// Reports whether `nonce` is currently recorded WITHOUT inserting it.
     /// Wire-parsing code calls this BEFORE authentication so an obvious replay
-    /// is cheaply rejected while unauthenticated junk — which must never be
-    /// able to pollute the tracker — is not. The authoritative, state-mutating
+    /// is cheaply rejected while unauthenticated junk â€” which must never be
+    /// able to pollute the tracker â€” is not. The authoritative, state-mutating
     /// `track`/`track_scoped` call happens only AFTER the frame's AEAD tag
     /// verifies, so only authenticated traffic can consume tracker capacity
     /// (pre-fix, a flood of unauthenticated frames with random nonces filled
@@ -293,14 +290,14 @@ impl NonceTracker {
             .contains_key(&nonce)
     }
 
-    /// Session-scoped variant of [`contains`] — same key composition as
+    /// Session-scoped variant of [`contains`] â€” same key composition as
     /// `track_scoped`, read-only.
     pub fn contains_scoped(&self, session_id: &str, nonce: u64) -> bool {
         self.contains(Self::composite_key(session_id, nonce))
     }
 
     /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
-    /// poison rather than panicking (`.expect()` / `.unwrap()`) — `NonceTracker`
+    /// poison rather than panicking (`.expect()` / `.unwrap()`) â€” `NonceTracker`
     /// is exercised from the daemon's packet pipeline, so one poisoning panic
     /// must not cascade into every other in-flight packet losing replay
     /// protection entirely.
@@ -322,10 +319,10 @@ impl NonceTracker {
 
     /// Shared atomic check-and-insert-with-pruning logic backing both
     /// `track()` (raw nonce as key) and `track_scoped()` (session-composited
-    /// key) — the only difference between the two public entry points is
+    /// key) â€” the only difference between the two public entry points is
     /// which `u64` they pass in here.
     ///
-    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
+    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking â€”
     /// `NonceTracker` is exercised from the daemon's packet pipeline, so one
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing replay protection entirely.
@@ -343,7 +340,7 @@ impl NonceTracker {
 
         inner.seen_nonces.insert(key, current_time);
 
-        // Risk 1 / Fix 4: incremental prune — only check capacity every
+        // Risk 1 / Fix 4: incremental prune â€” only check capacity every
         // NONCE_PRUNE_INTERVAL inserts. This bounds the prune cost to
         // amortized O(1): a full retain() runs once per 1000 inserts (only
         // when the map is also over max_entries), not on every single insert.
@@ -361,7 +358,7 @@ impl NonceTracker {
             if inner.seen_nonces.len() > inner.max_entries {
                 return Err(SAACPHardDrop::new(
                     SAACPBytecodes::CircuitBreakerOpen,
-                    "Nonce tracker capacity exceeded under sustained flood — \
+                    "Nonce tracker capacity exceeded under sustained flood â€” \
                      rejecting to protect replay integrity.",
                 ));
             }
@@ -399,22 +396,22 @@ pub const AUDIT_LOG_FILE: &str = "saacp_audit.log";
 pub const AUDIT_COUNT_FILE: &str = "saacp_event_count.sentinel";
 /// Maximum log file size before rotation (50 MB).
 pub const AUDIT_MAX_LOG_SIZE: u64 = 50_000_000;
-/// WAL queue capacity — events are dropped (not rejected) when full.
+/// WAL queue capacity â€” events are dropped (not rejected) when full.
 pub const AUDIT_WAL_QUEUE_CAPACITY: usize = 100_000;
 
 /// WAL flush cadence (Gate 6.0 backpressure repair, fix #1/#3): the WAL
 /// worker batches disk writes behind a `BufWriter` and only calls `flush()` +
 /// `sync_data()` after this many buffered entries, or after
-/// `AUDIT_WAL_FLUSH_INTERVAL_MS` milliseconds — whichever comes first.
+/// `AUDIT_WAL_FLUSH_INTERVAL_MS` milliseconds â€” whichever comes first.
 /// This is also the stated maximum audit-data-loss window on an unclean
 /// shutdown (power loss, `kill -9`): **at most 200 entries or 50ms of audit
 /// history**, whichever bound is hit first. This number is a documented
-/// protocol contract, not an implementation detail — see `AuditHealth`.
+/// protocol contract, not an implementation detail â€” see `AuditHealth`.
 pub const AUDIT_WAL_FLUSH_EVERY_N_ENTRIES: u64 = 200;
 /// See `AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`.
 pub const AUDIT_WAL_FLUSH_INTERVAL_MS: u64 = 50;
 
-/// L-10 fix: default timeout for [`ImmutableAuditLog::flush`]'s ack wait — used by
+/// L-10 fix: default timeout for [`ImmutableAuditLog::flush`]'s ack wait â€” used by
 /// every graceful-shutdown call site (`daemon.rs`, `transport/ws.rs`,
 /// `transport/tls.rs`, `sidecar.rs`) as the bound on how long shutdown waits for the
 /// WAL worker to confirm a final flush+sync before the process exits.
@@ -425,7 +422,7 @@ pub const AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 /// in-process `verify_chain()`; every appended event was previously kept for the
 /// entire process lifetime, so a long-running daemon accumulated hundreds of MB
 /// (a memory leak, not a bypass). Once the vector exceeds this cap, `append_event`
-/// drains the oldest 20% — the full, authoritative history remains on disk and is
+/// drains the oldest 20% â€” the full, authoritative history remains on disk and is
 /// checked by `verify_chain_disk()`. `event_count` (the running total, used by the
 /// sentinel check) is deliberately NOT reset by the drain, so tamper detection
 /// against the on-disk sentinel is unaffected. `verify_chain()` seeds its expected
@@ -444,7 +441,7 @@ const AUDIT_HEALTH_SATURATED_PCT: f64 = 0.95;
 const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLOCK"
 
 // ---------------------------------------------------------------------------
-// Phase 6 — sharded hash chains + Merkle anchoring
+// Phase 6 â€” sharded hash chains + Merkle anchoring
 // ---------------------------------------------------------------------------
 
 /// Number of independent hash chains the audit log is split across.
@@ -457,7 +454,7 @@ const GENESIS_HASH: &str = "47454e455349535f424c4f434b"; // hex of b"GENESIS_BLO
 /// prev_hash chain in its own right, and the periodic Merkle anchor ties all N
 /// heads together so no shard can be rewritten, reordered, or dropped wholesale.
 ///
-/// **The WAL channel is deliberately NOT sharded** — one `wal_tx`, one worker
+/// **The WAL channel is deliberately NOT sharded** â€” one `wal_tx`, one worker
 /// thread, one queue capacity. The worker was never the bottleneck (362k
 /// events/sec of pure I/O), so `health`, `health_floor`, `dropped_audits`,
 /// `wal_write_failures`, `queue_len`, the sticky-`Fatal` `fetch_update`, and the
@@ -480,7 +477,7 @@ const _: () = assert!(
 
 /// Per-shard cap on retained in-memory entries.
 ///
-/// The aggregate bound stays [`AUDIT_MAX_IN_MEMORY_ENTRIES`] — sharding must not
+/// The aggregate bound stays [`AUDIT_MAX_IN_MEMORY_ENTRIES`] â€” sharding must not
 /// silently multiply the memory this vector can consume, the same split
 /// `RATE_LIMITER_PER_SHARD_MAX_ENTRIES` and `TOKEN_CACHE_PER_SHARD_MAX` use.
 ///
@@ -494,14 +491,14 @@ const AUDIT_PER_SHARD_MAX_IN_MEMORY: usize = AUDIT_MAX_IN_MEMORY_ENTRIES / AUDIT
 
 /// Domain-separation tag for per-shard genesis hashes. Each shard `i` starts
 /// from `SHA256(tag || u16BE(i))` rather than a shared constant, so a record
-/// cannot be relocated from shard `i` to shard `j` and still chain — the first
+/// cannot be relocated from shard `i` to shard `j` and still chain â€” the first
 /// record of every shard commits to that shard's unique genesis.
 const AUDIT_SHARD_GENESIS_TAG: &[u8] = b"SAACP-audit-shard-genesis-v1";
 
 /// Records written by the sharded (v2) code path carry `v: 2`.
 ///
 /// A v1 line has **no** `v` field at all, and that absence is the entire
-/// migration discriminator — `verify_chain_disk` branches on it per line, so a
+/// migration discriminator â€” `verify_chain_disk` branches on it per line, so a
 /// file may contain a v1 prefix followed by a v2 suffix and still verify end to
 /// end. Never emit `v: 1`; doing so would make old and new logs
 /// indistinguishable from each other by structure.
@@ -512,7 +509,7 @@ const AUDIT_ANCHOR_EVERY_N_EVENTS: u64 = 4096;
 /// ...or after this much wall-clock time, whichever comes first.
 const AUDIT_ANCHOR_INTERVAL: Duration = Duration::from_secs(1);
 
-/// RFC 6962 §2.1 domain separation: leaf hashes are `SHA256(0x00 || leaf)`,
+/// RFC 6962 Â§2.1 domain separation: leaf hashes are `SHA256(0x00 || leaf)`,
 /// interior nodes `SHA256(0x01 || left || right)`. Without the distinct
 /// prefixes an attacker could present an interior node as a leaf (second
 /// preimage across tree levels).
@@ -552,7 +549,7 @@ fn merkle_leaf(shard_id: u16, head_hash: &str) -> [u8; 32] {
 /// Merkle root over exactly [`AUDIT_SHARDS`] leaves.
 ///
 /// `AUDIT_SHARDS` is a power of two (statically asserted above), so every level
-/// halves cleanly and the odd-node case simply never arises — no duplication
+/// halves cleanly and the odd-node case simply never arises â€” no duplication
 /// rule, hence no CVE-2012-2459-class ambiguity.
 fn merkle_root(leaves: &[[u8; 32]]) -> String {
     debug_assert_eq!(leaves.len(), AUDIT_SHARDS);
@@ -572,7 +569,7 @@ fn merkle_root(leaves: &[[u8; 32]]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// AuditHealth — Gate 6.0 backpressure contract
+// AuditHealth â€” Gate 6.0 backpressure contract
 // ---------------------------------------------------------------------------
 
 /// Gate 6.0 (audit checkpoint / WAL writer) backpressure health.
@@ -583,19 +580,19 @@ fn merkle_root(leaves: &[[u8; 32]]) -> String {
 /// audit log, that contract is this three-state (plus terminal `Fatal`)
 /// signal:
 ///
-/// - `Healthy` — WAL queue below 70% capacity. Normal async enqueue, zero
+/// - `Healthy` â€” WAL queue below 70% capacity. Normal async enqueue, zero
 ///   packet-path cost beyond the atomic bookkeeping.
-/// - `Degraded` — WAL queue 70-95% capacity. Still enqueuing and writing,
+/// - `Degraded` â€” WAL queue 70-95% capacity. Still enqueuing and writing,
 ///   but behind. `handler::gate_2_5_kinetic_firewall` reads this (via `>=`)
 ///   to start rejecting new IRREVERSIBLE_ACTION packets once the state
-///   reaches `Saturated` — fail-safe, not fail-open.
-/// - `Saturated` — WAL queue >95% capacity. New events are dropped with an
+///   reaches `Saturated` â€” fail-safe, not fail-open.
+/// - `Saturated` â€” WAL queue >95% capacity. New events are dropped with an
 ///   atomic counter (`dropped_audit_count()`), never an inline `eprintln!`
 ///   on the hot path. `Degraded`'s rejection of IRREVERSIBLE_ACTION packets
 ///   is already in effect here, protecting against irreversible actions
 ///   proceeding without a durable audit trail.
 ///
-///   **Sticky on drop.** A queue-full drop is not transient pressure — it is a
+///   **Sticky on drop.** A queue-full drop is not transient pressure â€” it is a
 ///   permanently missing audit record. Recomputing health purely from live
 ///   queue depth would return to `Healthy` the moment the backlog drained,
 ///   re-authorizing IRREVERSIBLE_ACTION under an audit chain that already has
@@ -604,9 +601,9 @@ fn merkle_root(leaves: &[[u8; 32]]) -> String {
 ///   [`ImmutableAuditLog::acknowledge_dropped_audits`]. Gate 2.5 therefore
 ///   keeps rejecting irreversible actions for as long as the gap is
 ///   unacknowledged, rather than for as long as the queue happens to be deep.
-/// - `Fatal` — The WAL writer cannot write at all (log file open failed, or
+/// - `Fatal` â€” The WAL writer cannot write at all (log file open failed, or
 ///   an actual write returned an OS error). Distinguishable from `Saturated`
-///   (queue pressure) — this means the writer tried and failed, not merely
+///   (queue pressure) â€” this means the writer tried and failed, not merely
 ///   that it's behind. Sticky: only constructing a fresh `ImmutableAuditLog`
 ///   clears it.
 ///
@@ -687,18 +684,18 @@ pub struct AuditLogEntry {
 /// Throughput fix: `serde_json::to_string` on a `#[derive(Serialize)]`
 /// struct serializes directly, without building an intermediate
 /// `serde_json::Value` tree the way the `json!` macro does (one boxed
-/// `Value`/`String` per field, plus a `Map`) — measured to meaningfully cut
+/// `Value`/`String` per field, plus a `Map`) â€” measured to meaningfully cut
 /// per-event allocation (see `benches/benchmarks.rs`'s
 /// `T14_WAL_Sustained_Throughput`). Field order here is alphabetical and
-/// MUST stay that way — it's the canonical form the chain hash is computed
+/// MUST stay that way â€” it's the canonical form the chain hash is computed
 /// over, and changing it would silently break `verify_chain()` against any
 /// audit log written before the change. Deliberately a separate borrowed
 /// struct rather than adding `#[derive(Serialize)]` directly to
-/// `AuditRecord` (whose field *declaration* order is not alphabetical) —
+/// `AuditRecord` (whose field *declaration* order is not alphabetical) â€”
 /// that would require reordering `AuditRecord`'s public fields to get the
 /// same output, a much larger and riskier diff for the same result.
 ///
-/// ## Phase 6 — the v1/v2 discriminator lives here
+/// ## Phase 6 â€” the v1/v2 discriminator lives here
 ///
 /// The four sharding fields are `Option`s with `skip_serializing_if`, so when
 /// they are all `None` this struct serializes to **exactly** the eight-field v1
@@ -708,7 +705,7 @@ pub struct AuditLogEntry {
 /// (`tests/test_audit_v1_fixture_rs.rs`) rather than by inspection.
 ///
 /// Field order remains alphabetical **including** the new fields
-/// (`anchor_epoch` first, `v` last) — do not group the v2 fields together for
+/// (`anchor_epoch` first, `v` last) â€” do not group the v2 fields together for
 /// readability, that would change the canonical bytes.
 #[derive(serde::Serialize)]
 struct CanonicalAuditRecord<'a> {
@@ -753,7 +750,7 @@ impl<'a> CanonicalAuditRecord<'a> {
         }
     }
 
-    /// Serialize and HMAC in one step — the single definition of "the chain
+    /// Serialize and HMAC in one step â€” the single definition of "the chain
     /// hash of this record", shared by `append_event`, `verify_chain`, and
     /// `verify_chain_disk` so the three can never drift apart (the M-40 fix,
     /// preserved and extended to the v2 fields).
@@ -799,12 +796,12 @@ enum WalMessage {
     },
     /// L-10 fix: sent by [`ImmutableAuditLog::flush`]; the worker acks on the enclosed
     /// `Sender<()>` only after performing a real flush+`sync_data()` (and sentinel
-    /// write) at this exact point in the FIFO queue — i.e. after every `Entry` message
+    /// write) at this exact point in the FIFO queue â€” i.e. after every `Entry` message
     /// enqueued before it, so a caller that observes the ack knows every
     /// happened-before `append_event` is durable.
     Flush(std::sync::mpsc::Sender<()>),
-    /// Sent by [`ImmutableAuditLog::reset`]: the worker — the single owner of
-    /// the open file handles — drops its writer, deletes both files, reopens
+    /// Sent by [`ImmutableAuditLog::reset`]: the worker â€” the single owner of
+    /// the open file handles â€” drops its writer, deletes both files, reopens
     /// empty, re-genesis-es its anchor bookkeeping, then acks. Deleting from
     /// the caller thread instead raced the worker's `WalWriter::open`: on
     /// Windows a delete landing after the open unlinks the path
@@ -815,7 +812,7 @@ enum WalMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6 — shard state
+// Phase 6 â€” shard state
 // ---------------------------------------------------------------------------
 
 /// One shard's independently-chained state. Exactly the fields the old single
@@ -823,7 +820,7 @@ enum WalMessage {
 /// `count_file`, total event count) which stay global.
 struct ShardInner {
     last_hash: String,
-    /// Number of records appended to THIS shard — the record's `shard_seq`.
+    /// Number of records appended to THIS shard â€” the record's `shard_seq`.
     shard_seq: u64,
     entries: Vec<AuditLogEntry>,
 }
@@ -831,7 +828,7 @@ struct ShardInner {
 /// The value each shard publishes for the Merkle anchor to read.
 ///
 /// Published into an `ArcSwap` **after** the shard's own mutex is released, so
-/// building an anchor never has to acquire all [`AUDIT_SHARDS`] locks at once —
+/// building an anchor never has to acquire all [`AUDIT_SHARDS`] locks at once â€”
 /// which would be both a contention point and a lock-ordering hazard against
 /// the appenders it is supposed to stay out of the way of.
 struct ShardHead {
@@ -870,11 +867,11 @@ struct MerkleAnchor {
 /// If a compromised agent alters a past entry, the chain breaks.
 /// Detects file deletion and partial truncation attacks.
 ///
-/// Disk I/O is handled by a background WAL worker thread (spec §15.2) that
+/// Disk I/O is handled by a background WAL worker thread (spec Â§15.2) that
 /// holds a persistent, buffered file handle for its lifetime (see `WalWriter`)
 /// instead of reopening the file per event. If the WAL queue is full, the
 /// event is dropped and counted (`dropped_audit_count()` / the process-wide
-/// `gate_6_0_audit_drop` telemetry counter) — dropping is preferred over
+/// `gate_6_0_audit_drop` telemetry counter) â€” dropping is preferred over
 /// blocking or rejecting the packet, and the drop path itself does no
 /// blocking I/O. See `AuditHealth` for the full backpressure contract that
 /// feeds `handler::gate_2_5_kinetic_firewall`.
@@ -884,23 +881,23 @@ pub struct ImmutableAuditLog {
     /// serialization + enqueue.
     shards: Vec<Mutex<ShardInner>>,
     /// Lock-free published head of each shard, for the Merkle anchor. Written
-    /// after the corresponding shard mutex is released — see [`ShardHead`].
+    /// after the corresponding shard mutex is released â€” see [`ShardHead`].
     /// Shared with the WAL worker, which builds the anchors.
     shard_heads: Arc<Vec<arc_swap::ArcSwap<ShardHead>>>,
     /// Global lifetime event count. Lock-free, so `event_count()` no longer
     /// takes any mutex while returning the same value it always did.
     global_seq: AtomicU64,
     /// Paths are immutable after construction (no setter exists), so they need
-    /// no lock — they were only inside `AuditInner` because everything was.
+    /// no lock â€” they were only inside `AuditInner` because everything was.
     log_file: String,
     count_file: String,
     /// Current Merkle anchor epoch, stamped into every appended record and
     /// advanced by the WAL worker each time it emits an anchor.
     anchor_epoch: Arc<AtomicU64>,
-    /// WAL worker sender. Always `Some` — even a "" log_file spawns the worker,
+    /// WAL worker sender. Always `Some` â€” even a "" log_file spawns the worker,
     /// but the worker thread no-ops on disk I/O for an empty path (see `new()`).
     wal_tx: Option<mpsc::SyncSender<WalMessage>>,
-    /// Backpressure health shared with the WAL worker thread — see `AuditHealth`.
+    /// Backpressure health shared with the WAL worker thread â€” see `AuditHealth`.
     health: Arc<AtomicU8>,
     /// Count of events dropped because the WAL queue was full (or the worker
     /// thread had already exited after a fatal open failure).
@@ -910,16 +907,16 @@ pub struct ImmutableAuditLog {
     /// `acknowledge_dropped_audits`. A drop means a permanently missing audit
     /// record, so health must not drift back to `Healthy` (re-authorizing
     /// IRREVERSIBLE_ACTION at Gate 2.5) just because the queue later drained
-    /// — see `AuditHealth`'s "Sticky on drop" note.
+    /// â€” see `AuditHealth`'s "Sticky on drop" note.
     health_floor: Arc<AtomicU8>,
-    /// Count of WAL write failures — distinct from queue-full drops: the
+    /// Count of WAL write failures â€” distinct from queue-full drops: the
     /// worker actually attempted a write and the OS returned an error.
     wal_write_failures: Arc<AtomicU64>,
     /// Approximate current WAL queue depth, maintained by hand since
     /// `mpsc::SyncSender` exposes no introspection API.
     queue_len: Arc<AtomicUsize>,
     /// Subscribers notified synchronously on every successful `append_event`
-    /// — after the hash-chain mutex (`inner`) has been released, never
+    /// â€” after the hash-chain mutex (`inner`) has been released, never
     /// while held, matching `trust_decay.rs::emit`'s precedent. Built for
     /// the Command Center dashboard's live-traffic and delegation-edge
     /// feeds; does not participate in the chain-hash/verification logic at
@@ -933,14 +930,14 @@ thread_local! {
     ///
     /// **Deliberately a thread-local slot, not a hash of the record content.**
     /// Hashing `source_agent` (or any other field) would let anyone who controls
-    /// agent ids steer every event onto one shard — a free DoS lever created by
-    /// the optimization itself — and would give zero speedup in the
+    /// agent ids steer every event onto one shard â€” a free DoS lever created by
+    /// the optimization itself â€” and would give zero speedup in the
     /// single-dominant-agent case that a real load test actually looks like,
     /// since all of that agent's events would hash to the same lock.
     ///
     /// A thread slot has neither problem: the gate pipeline runs under
-    /// `spawn_blocking`, so a given pool thread always touches the same mutex —
-    /// an uncontended fast path plus cache locality — and the assignment is
+    /// `spawn_blocking`, so a given pool thread always touches the same mutex â€”
+    /// an uncontended fast path plus cache locality â€” and the assignment is
     /// completely outside any attacker's influence.
     static AUDIT_SHARD_SLOT: usize = {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -952,7 +949,7 @@ impl ImmutableAuditLog {
     /// Create a new ImmutableAuditLog with an explicit log file path.
     ///
     /// The sentinel/count file is derived from `log_file` (`"<log_file>.sentinel"`),
-    /// NOT the global `AUDIT_COUNT_FILE` default — every `new()` instance must own
+    /// NOT the global `AUDIT_COUNT_FILE` default â€” every `new()` instance must own
     /// an independent sentinel, otherwise unrelated `ImmutableAuditLog` instances
     /// (e.g. two different test files, or two subsystems in the same production
     /// process) would clobber one shared counter and `verify_chain()` would fail
@@ -973,7 +970,7 @@ impl ImmutableAuditLog {
 
     /// Create with both log file and sentinel file paths. Rotated audit logs are
     /// gzip-compressed in the background (C-4) but the compressed `.bak.gz` file is
-    /// left in place (`NoopArchivalSink`) — use
+    /// left in place (`NoopArchivalSink`) â€” use
     /// [`with_paths_and_archival_sink`](Self::with_paths_and_archival_sink) to plug in
     /// a real archival destination.
     pub fn with_paths(log_file: &str, count_file: &str) -> Self {
@@ -983,7 +980,7 @@ impl ImmutableAuditLog {
     /// Create with both log file and sentinel file paths, plus a pluggable
     /// [`ArchivalSink`] (C-4) that receives every rotated-and-gzip-compressed audit
     /// log (`<log_file>.<timestamp>.bak.gz`). Compression itself always happens (on a
-    /// dedicated background thread, never delaying the WAL worker) — the sink only
+    /// dedicated background thread, never delaying the WAL worker) â€” the sink only
     /// decides what happens to the compressed file afterward.
     pub fn with_paths_and_archival_sink(
         log_file: &str,
@@ -1031,7 +1028,7 @@ impl ImmutableAuditLog {
         let queue_len: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
         // Phase 6: the published shard heads and the anchor epoch are shared
-        // with the WAL worker, which is the thread that builds Merkle anchors —
+        // with the WAL worker, which is the thread that builds Merkle anchors â€”
         // it is already the single I/O serialization point, so anchoring needs
         // no new thread and no new lock.
         let shard_heads: Arc<Vec<arc_swap::ArcSwap<ShardHead>>> = Arc::new(
@@ -1100,12 +1097,12 @@ impl ImmutableAuditLog {
     /// Register a callback invoked synchronously on every successfully
     /// appended event (i.e. every call to `append_event`/`append_signed`),
     /// with the plaintext `AuditRecord` (before WAL persistence, after the
-    /// hash-chain lock is released). Keep callbacks fast and non-blocking —
+    /// hash-chain lock is released). Keep callbacks fast and non-blocking â€”
     /// they run inline on the packet-processing path that triggered the
     /// append. Mirrors `TrustDecayEngine::subscribe`'s established pattern.
     /// M-38 fix: every `self.inner.lock()`/`self.subscribers.lock()` in this
     /// impl block recovers via `into_inner()` on poison rather than panicking
-    /// — `ImmutableAuditLog::global()` is a process-wide singleton, so one
+    /// â€” `ImmutableAuditLog::global()` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing the ability to append/verify the audit chain.
     pub fn subscribe(&self, cb: Arc<dyn Fn(&AuditRecord) + Send + Sync>) {
@@ -1116,7 +1113,7 @@ impl ImmutableAuditLog {
     }
 
     /// Create a new audit log with default file path (reads from env vars). C-4: also
-    /// honors [`ENV_AUDIT_ARCHIVE_DIR`] — when set, rotated-and-compressed audit logs
+    /// honors [`ENV_AUDIT_ARCHIVE_DIR`] â€” when set, rotated-and-compressed audit logs
     /// are moved into that directory via [`FilesystemArchivalSink`]; when unset, the
     /// compressed `.bak.gz` is simply left beside the live WAL ([`NoopArchivalSink`]).
     pub fn with_default_path() -> Self {
@@ -1148,14 +1145,14 @@ impl ImmutableAuditLog {
 
     /// Initialize the chain from an existing log file (re-reads disk state).
     ///
-    /// SECURITY (H-6): the on-disk tail entry is untrusted input — a corrupted
+    /// SECURITY (H-6): the on-disk tail entry is untrusted input â€” a corrupted
     /// or attacker-tampered log file must not be silently adopted as the new
     /// chain head. This calls `verify_chain_disk()` (full HMAC recomputation +
     /// sentinel check) before trusting the re-read state; on failure the
     /// in-memory chain is reset to genesis and an error is returned, per the
     /// fail-closed architecture principle (never keep unverified state).
     ///
-    /// ## Phase 6 — reconstructing per-shard state, and the migration boundary
+    /// ## Phase 6 â€” reconstructing per-shard state, and the migration boundary
     ///
     /// The file may be pure v1, pure v2, or a v1 prefix followed by a v2 suffix
     /// (a log an older build wrote and this build is now appending to). Each
@@ -1169,13 +1166,13 @@ impl ImmutableAuditLog {
     /// can compute offline, making the upgrade point a free "truncate the
     /// entire v1 history here" edit that still verifies.
     pub fn initialize_chain(&self, issuer_secret: &[u8]) -> Result<(), String> {
-        // Verify BEFORE adopting any on-disk state — the file is untrusted
+        // Verify BEFORE adopting any on-disk state â€” the file is untrusted
         // input, and `verify_chain_disk` reads the file itself rather than the
         // in-memory shards, so it needs no state loaded first.
         if !self.verify_chain_disk(issuer_secret) {
             self.reset_chain_state_to_genesis();
             return Err(
-                "audit chain integrity verification failed on load — chain reset to genesis"
+                "audit chain integrity verification failed on load â€” chain reset to genesis"
                     .to_string(),
             );
         }
@@ -1188,7 +1185,7 @@ impl ImmutableAuditLog {
         };
 
         // Walk the file once, tracking the last v1 hash and each shard's last
-        // v2 head. Anchor lines are skipped — they commit to heads, they are
+        // v2 head. Anchor lines are skipped â€” they commit to heads, they are
         // not themselves part of any shard's chain.
         let mut record_count: u64 = 0;
         let mut final_v1_hash: Option<String> = None;
@@ -1249,7 +1246,7 @@ impl ImmutableAuditLog {
     ///
     /// With no preceding v1 history this is the plain per-shard genesis. When
     /// the file *does* have a v1 region, the seed folds in that region's final
-    /// hash, binding the start of every v2 chain to the end of the v1 chain —
+    /// hash, binding the start of every v2 chain to the end of the v1 chain â€”
     /// see [`Self::initialize_chain`] for why that binding is load-bearing.
     fn migration_seed_hash(&self, shard_id: u16, final_v1_hash: Option<&str>) -> String {
         match final_v1_hash {
@@ -1285,16 +1282,16 @@ impl ImmutableAuditLog {
     /// The chain hash is computed inline (synchronous) so the in-memory chain is
     /// always coherent. Disk I/O is offloaded to the WAL worker thread.
     /// If the WAL queue is full, the event is dropped and counted via
-    /// `telemetry::global_telemetry()`'s `gate_6_0_audit_drop` counter — the
-    /// packet is NOT rejected (spec §15.2: "Dropping an event is preferred over
+    /// `telemetry::global_telemetry()`'s `gate_6_0_audit_drop` counter â€” the
+    /// packet is NOT rejected (spec Â§15.2: "Dropping an event is preferred over
     /// rejecting the packet"), and the drop itself is a lock-free atomic
     /// increment, never blocking I/O.
     ///
-    /// ## Phase 6 — what the lock still covers, and why
+    /// ## Phase 6 â€” what the lock still covers, and why
     ///
     /// P-2 identified the single global mutex held across HMAC + JSON +
     /// `try_send` as the measured throughput ceiling. The chain is genuinely
-    /// sequential — each record's `prev_hash` is the previous record's
+    /// sequential â€” each record's `prev_hash` is the previous record's
     /// `chain_hash`, and the HMAC covers `prev_hash`, so two records in the same
     /// chain cannot have their hashes computed concurrently without breaking the
     /// linkage that `verify_chain` walks.
@@ -1336,7 +1333,7 @@ impl ImmutableAuditLog {
     ///
     /// Feature-gated behind `audit-plaintext` so production builds cannot
     /// accidentally write unencrypted audit logs. Use `append_event` for
-    /// normal operation — it encrypts the intent at rest.
+    /// normal operation â€” it encrypts the intent at rest.
     #[cfg(feature = "audit-plaintext")]
     pub fn append_event_plaintext(
         &self,
@@ -1374,11 +1371,11 @@ impl ImmutableAuditLog {
         // Reserve this record's global sequence number outside the shard lock.
         // `seq` stays globally monotonic and HMAC-covered as an unforgeable
         // ordering hint; cross-shard *ordering* is deliberately relaxed (no
-        // consumer depends on it — see the module docs and `verify_chain`).
+        // consumer depends on it â€” see the module docs and `verify_chain`).
         let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
         let timestamp = now_secs();
 
-        // O-6: non-blocking probe first — on contention, record the observation
+        // O-6: non-blocking probe first â€” on contention, record the observation
         // then fall through to the normal blocking lock() below.
         let mut shard = match self.shards[shard_idx].try_lock() {
             Ok(guard) => guard,
@@ -1405,7 +1402,7 @@ impl ImmutableAuditLog {
             anchor_epoch: Some(anchor_epoch),
         };
 
-        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place —
+        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place â€”
         // `verify_chain`/`verify_chain_disk` call the same helper, so the three
         // can never drift apart (M-40).
         let (record_json, chain_hash) =
@@ -1420,7 +1417,7 @@ impl ImmutableAuditLog {
         // (already serialized once, for the HMAC input) as the nested "record"
         // value instead of re-serializing an identical tree. Safe because
         // `record_json` is already valid, compact, properly-escaped JSON text
-        // and `chain_hash` is `hex::encode` output — pure lowercase ASCII hex,
+        // and `chain_hash` is `hex::encode` output â€” pure lowercase ASCII hex,
         // never containing `"` or a control character. Formatting is cheap and
         // touches no shared state, but the actual enqueue happens after the
         // lock is dropped.
@@ -1447,7 +1444,7 @@ impl ImmutableAuditLog {
         }
 
         // Release the shard lock before enqueueing, touching health, or invoking
-        // subscriber callbacks — none of those participate in the chain linkage,
+        // subscriber callbacks â€” none of those participate in the chain linkage,
         // and a callback must never run while a chain lock is held (same rule
         // `trust_decay.rs::emit` follows).
         drop(shard);
@@ -1469,7 +1466,7 @@ impl ImmutableAuditLog {
         }
     }
 
-    /// Gap D / Fix 6 — fallible variant of [`Self::append_event`] that returns
+    /// Gap D / Fix 6 â€” fallible variant of [`Self::append_event`] that returns
     /// a `Result` instead of silently dropping the event when the WAL queue is
     /// full. Use this from the packet pipeline when you want backpressure
     /// (reject the packet) rather than a silent audit gap. The event's
@@ -1480,7 +1477,7 @@ impl ImmutableAuditLog {
     /// Returns `Ok(())` if the event was enqueued, `Err(SAACPHardDrop)` with
     /// [`SAACPBytecodes::AuditSubsystemDegraded`] if the WAL queue was full
     /// or the worker had exited. Callers that receive `Err` should propagate
-    /// it as a hard drop — the audit trail has a permanent hole until an
+    /// it as a hard drop â€” the audit trail has a permanent hole until an
     /// operator calls [`Self::acknowledge_dropped_audits`].
     pub fn try_append_event(
         &self,
@@ -1496,7 +1493,7 @@ impl ImmutableAuditLog {
         let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
         let timestamp = now_secs();
 
-        // O-6: non-blocking probe first — on contention, record the observation
+        // O-6: non-blocking probe first â€” on contention, record the observation
         // then fall through to the normal blocking lock() below.
         let mut shard = match self.shards[shard_idx].try_lock() {
             Ok(guard) => guard,
@@ -1523,7 +1520,7 @@ impl ImmutableAuditLog {
             anchor_epoch: Some(anchor_epoch),
         };
 
-        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place —
+        // Canonical (alphabetical) JSON + HMAC-SHA256 over it, in one place â€”
         // `verify_chain`/`verify_chain_disk` call the same helper, so the three
         // can never drift apart (M-40).
         let (record_json, chain_hash) =
@@ -1577,14 +1574,14 @@ impl ImmutableAuditLog {
             self.recompute_health();
             Err(SAACPHardDrop::new(
                 SAACPBytecodes::AuditSubsystemDegraded,
-                "Audit WAL saturated — event dropped, backpressure applied.",
+                "Audit WAL saturated â€” event dropped, backpressure applied.",
             ))
         }
     }
 
     /// Enqueue one already-serialized JSONL line for the WAL worker, applying
     /// the full backpressure contract (drop-on-full, sticky floor, health
-    /// recompute). Unchanged from the pre-Phase-6 inline version — factored out
+    /// recompute). Unchanged from the pre-Phase-6 inline version â€” factored out
     /// only so `append_event` can call it after releasing its shard lock.
     ///
     /// Returns `true` if the event was enqueued successfully, `false` if it was
@@ -1604,7 +1601,7 @@ impl ImmutableAuditLog {
             self.queue_len.fetch_add(1, Ordering::Relaxed);
             true
         } else {
-            // FIX 3: rate-limited signal via an atomic counter — never an
+            // FIX 3: rate-limited signal via an atomic counter â€” never an
             // inline eprintln! on this hot path.
             let dropped = self.dropped_audits.fetch_add(1, Ordering::Relaxed) + 1;
             // R-9 fix: structured warn on every drop so operators can alert.
@@ -1613,10 +1610,10 @@ impl ImmutableAuditLog {
             // worth paging on.
             tracing::warn!(
                 dropped_audits = dropped,
-                "Audit event dropped — WAL queue full. IRREVERSIBLE_ACTION now \
+                "Audit event dropped â€” WAL queue full. IRREVERSIBLE_ACTION now \
                  fail-closed until acknowledge_dropped_audits() is called."
             );
-            // This event is now permanently absent from the audit trail — not
+            // This event is now permanently absent from the audit trail â€” not
             // merely late. Raise the sticky floor so health cannot fall back to
             // Healthy when the queue drains, keeping Gate 2.5 fail-closed on
             // IRREVERSIBLE_ACTION until an operator calls
@@ -1628,7 +1625,7 @@ impl ImmutableAuditLog {
             false
         }
 
-        // Health recomputation is intentionally NOT inlined here — it runs
+        // Health recomputation is intentionally NOT inlined here â€” it runs
         // after the caller decides what to do with the enqueue result. This
         // keeps `enqueue_wal_line` focused on the enqueue + drop accounting.
     }
@@ -1637,7 +1634,7 @@ impl ImmutableAuditLog {
     /// Separated from [`Self::enqueue_wal_line`] so callers that apply
     /// backpressure (e.g., `try_append_event`) can recompute health after
     /// deciding whether to drop. `fetch_update` refuses to overwrite a sticky
-    /// `Fatal` — only the WAL worker sets that (on an actual I/O failure), and
+    /// `Fatal` â€” only the WAL worker sets that (on an actual I/O failure), and
     /// only a fresh `ImmutableAuditLog` clears it.
     fn recompute_health(&self) {
         let pct = self.queue_len.load(Ordering::Relaxed) as f64 / AUDIT_WAL_QUEUE_CAPACITY as f64;
@@ -1661,13 +1658,13 @@ impl ImmutableAuditLog {
 
     /// Verify the integrity of the in-memory audit chain.
     ///
-    /// Also validates the sentinel file count if it exists (spec §15.3):
+    /// Also validates the sentinel file count if it exists (spec Â§15.3):
     /// the event count on disk must be >= the sentinel value.
     ///
     /// Phase 6: each of the [`AUDIT_SHARDS`] chains is walked independently
     /// with the same loop body, seeded by the same S-6 rule (first *retained*
     /// entry's `prev_hash`), plus a check that every entry's `shard_id` actually
-    /// matches the shard it was found in — a record moved between shards would
+    /// matches the shard it was found in â€” a record moved between shards would
     /// otherwise only be caught by the HMAC, and this makes the binding explicit.
     ///
     /// Returns `false` on any tampering detection.
@@ -1704,7 +1701,7 @@ impl ImmutableAuditLog {
 
                 // M-40 fix: recompute the HMAC via the SAME `CanonicalAuditRecord`
                 // helper `append_event` uses, instead of an independently
-                // hand-listed field set — any future field added to one but not
+                // hand-listed field set â€” any future field added to one but not
                 // the other would otherwise silently break verification (or
                 // worse, silently stop covering a field with the HMAC).
                 let expected_sig =
@@ -1720,7 +1717,7 @@ impl ImmutableAuditLog {
         }
 
         if total_retained == 0 {
-            // Empty chain — valid iff event_count is also 0.
+            // Empty chain â€” valid iff event_count is also 0.
             if event_count != 0 {
                 return false;
             }
@@ -1735,7 +1732,7 @@ impl ImmutableAuditLog {
             return true;
         }
 
-        // Spec §15.3: Total disk count MUST be >= sentinel count.
+        // Spec Â§15.3: Total disk count MUST be >= sentinel count.
         // The sentinel records how many events were accepted in-memory.
         // If the sentinel exists and shows a count HIGHER than in-memory, something was erased.
         if Path::new(&self.count_file).exists() {
@@ -1751,7 +1748,7 @@ impl ImmutableAuditLog {
         true
     }
 
-    /// Full disk-based chain verification (spec §15.3 complete implementation).
+    /// Full disk-based chain verification (spec Â§15.3 complete implementation).
     ///
     /// Re-reads the log file entry by entry, recomputes HMACs, and checks:
     /// 1. prev_hash of each entry matches chain_hash of previous entry.
@@ -1761,20 +1758,20 @@ impl ImmutableAuditLog {
     /// NOTE: This requires the WAL thread to have flushed pending writes to disk.
     /// Use `verify_chain()` for in-process verification without disk I/O.
     ///
-    /// ## Phase 6 — one pass, three branches
+    /// ## Phase 6 â€” one pass, three branches
     ///
     /// A line is an **anchor**, a **v2 record**, or a **v1 record**, decided per
     /// line by structure alone (an anchor has an `"anchor"` key; a v2 record has
     /// `shard_id`/`shard_seq`; a v1 record has neither). A file may therefore be
     /// pure v1, pure v2, or a v1 prefix followed by a v2 suffix, and all three
     /// verify through this single walk. For a pure-v1 log only the v1 branch
-    /// ever executes, doing character-for-character what it did before Phase 6 —
+    /// ever executes, doing character-for-character what it did before Phase 6 â€”
     /// which is what the pinned fixture in `tests/test_audit_v1_fixture_rs.rs`
     /// exists to prove.
     ///
     /// At the migration boundary each shard's expected hash is re-seeded to
     /// `SHA256(genesis_tag || u16BE(i) || final_v1_hash)`, binding the v2 region
-    /// to the end of the v1 region — see [`Self::initialize_chain`].
+    /// to the end of the v1 region â€” see [`Self::initialize_chain`].
     pub fn verify_chain_disk(&self, issuer_secret: &[u8]) -> bool {
         let log_file = &self.log_file;
         let count_file = &self.count_file;
@@ -1783,14 +1780,14 @@ impl ImmutableAuditLog {
         let content = match fs::read_to_string(log_file) {
             Ok(c) => c,
             Err(_) => {
-                // File missing — valid only if in-memory count is 0.
+                // File missing â€” valid only if in-memory count is 0.
                 return self.global_seq.load(Ordering::Relaxed) == 0;
             }
         };
 
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
 
-        // Anchor lines are metadata, not events — they must not inflate the
+        // Anchor lines are metadata, not events â€” they must not inflate the
         // count the sentinel is compared against.
         let mut record_lines = 0u64;
         for line in &lines {
@@ -1848,7 +1845,7 @@ impl ImmutableAuditLog {
                     return false;
                 }
                 // The committed root must actually be the root of the committed
-                // heads — otherwise the root is a free-form string.
+                // heads â€” otherwise the root is a free-form string.
                 let leaves: Vec<[u8; 32]> = anchor
                     .heads
                     .iter()
@@ -1931,7 +1928,7 @@ impl ImmutableAuditLog {
                     Some(v) => v,
                     None => return false,
                 };
-                // The version marker must be present and exact on a v2 record —
+                // The version marker must be present and exact on a v2 record â€”
                 // an unknown version is rejected rather than guessed at.
                 match rec.get("v").and_then(|v| v.as_u64()) {
                     Some(v) if v == AUDIT_RECORD_VERSION_V2 as u64 => {}
@@ -1939,7 +1936,7 @@ impl ImmutableAuditLog {
                 }
 
                 // Seed this shard on first sight, folding in the final v1 hash
-                // if the file has a v1 region — this is the migration boundary.
+                // if the file has a v1 region â€” this is the migration boundary.
                 let expected = expected_v2[shard_id as usize].get_or_insert_with(|| {
                     self.migration_seed_hash(shard_id, final_v1_hash.as_deref())
                 });
@@ -2045,7 +2042,7 @@ impl ImmutableAuditLog {
     /// Exposed for monitoring and for verifying the retention bound in tests.
     ///
     /// Phase 6: the sum across all [`AUDIT_SHARDS`] windows. The aggregate bound
-    /// is unchanged — each shard is capped at
+    /// is unchanged â€” each shard is capped at
     /// `AUDIT_MAX_IN_MEMORY_ENTRIES / AUDIT_SHARDS`, so sharding cannot silently
     /// multiply the memory this retains.
     pub fn in_memory_entries_len(&self) -> usize {
@@ -2076,7 +2073,7 @@ impl ImmutableAuditLog {
     /// IRREVERSIBLE_ACTION until someone has actually reconciled that gap. Call
     /// this only after the loss has been recorded out-of-band. Does not clear a
     /// `Fatal` health state (a failed *write* is a different, non-recoverable
-    /// condition — only constructing a fresh `ImmutableAuditLog` clears that),
+    /// condition â€” only constructing a fresh `ImmutableAuditLog` clears that),
     /// and does not reset the `dropped_audit_count()` lifetime total.
     pub fn acknowledge_dropped_audits(&self) -> u64 {
         self.health_floor
@@ -2089,7 +2086,7 @@ impl ImmutableAuditLog {
     /// Spawns a Tokio task that periodically checks `dropped_audits`. If no
     /// NEW drops have been recorded within `quiet_window`, calls
     /// [`acknowledge_dropped_audits`] to release the `Saturated` health floor.
-    /// The lifetime `dropped_audits` counter is NEVER reset — only the
+    /// The lifetime `dropped_audits` counter is NEVER reset â€” only the
     /// fail-closed gate-rejection behavior is relaxed.
     ///
     /// # Safety properties
@@ -2126,12 +2123,12 @@ impl ImmutableAuditLog {
                 }
                 let current = me.dropped_audits.load(Ordering::Relaxed);
                 if current == 0 {
-                    // No drops at all — nothing to acknowledge. Reset baseline.
+                    // No drops at all â€” nothing to acknowledge. Reset baseline.
                     last_seen = 0;
                     continue;
                 }
                 if current == last_seen {
-                    // No NEW drops during this quiet window — safe to release
+                    // No NEW drops during this quiet window â€” safe to release
                     // the floor. (Longcat.md Risk 6: previous behavior was a
                     // sticky-forever floor; this auto-relieves transient
                     // bursts without operator action.)
@@ -2143,7 +2140,7 @@ impl ImmutableAuditLog {
                     );
                     last_seen = current;
                 } else {
-                    // New drops observed — re-arm the timer without acking.
+                    // New drops observed â€” re-arm the timer without acking.
                     last_seen = current;
                 }
             }
@@ -2153,14 +2150,14 @@ impl ImmutableAuditLog {
     /// Count of audit events dropped because the WAL queue was full (or the
     /// worker thread had already exited after a fatal open failure).
     ///
-    /// Lifetime total — never reset. A non-zero value means the audit chain has
+    /// Lifetime total â€” never reset. A non-zero value means the audit chain has
     /// a permanent hole, which pins `health()` at `Saturated` until
     /// [`Self::acknowledge_dropped_audits`] is called.
     pub fn dropped_audit_count(&self) -> u64 {
         self.dropped_audits.load(Ordering::Relaxed)
     }
 
-    /// Count of WAL write failures — distinct from queue-full drops: the
+    /// Count of WAL write failures â€” distinct from queue-full drops: the
     /// worker actually attempted a disk write and the OS returned an error.
     pub fn wal_write_failure_count(&self) -> u64 {
         self.wal_write_failures.load(Ordering::Relaxed)
@@ -2177,15 +2174,15 @@ impl ImmutableAuditLog {
     /// `timeout` elapses. Used as the terminal "flush WAL" step of graceful shutdown
     /// (`daemon.rs`, `transport/ws.rs`, `transport/tls.rs`, `sidecar.rs`).
     ///
-    /// This is a **std blocking channel `recv`, not a tokio await point** — the WAL
+    /// This is a **std blocking channel `recv`, not a tokio await point** â€” the WAL
     /// worker is a plain OS thread (see `run_wal_worker`'s doc comment), not a tokio
     /// task, so there is nothing to `.await` here. Callers in an async context MUST
     /// run this via `tokio::task::spawn_blocking` rather than calling it directly on
     /// an async task, or they will block that task's executor thread for up to
     /// `timeout`.
     ///
-    /// Sends via `SyncSender::send` (blocking, not `try_send`) deliberately — unlike
-    /// `append_event`'s drop-on-full policy (spec §15.2, an event that can't be
+    /// Sends via `SyncSender::send` (blocking, not `try_send`) deliberately â€” unlike
+    /// `append_event`'s drop-on-full policy (spec Â§15.2, an event that can't be
     /// enqueued instantly is dropped rather than blocking the packet path), a
     /// deliberate shutdown flush should wait for queue room rather than silently
     /// no-op, since by the time shutdown calls this the caller has already stopped
@@ -2193,7 +2190,7 @@ impl ImmutableAuditLog {
     ///
     /// Returns `false` if the WAL worker is unreachable (e.g. it already exited after
     /// a fatal open failure) or didn't ack within `timeout`. This is a WEAKER
-    /// guarantee than "confirmed lost" — entries already covered by the periodic
+    /// guarantee than "confirmed lost" â€” entries already covered by the periodic
     /// flush cadence (`AUDIT_WAL_FLUSH_EVERY_N_ENTRIES`/`AUDIT_WAL_FLUSH_INTERVAL_MS`)
     /// are not lost just because this call couldn't confirm the very latest ones in
     /// time. Callers should log a warning on `false`, not treat it as fatal.
@@ -2242,7 +2239,7 @@ impl ImmutableAuditLog {
 
     /// Append an audit event with the `intent` field encrypted at rest
     /// (AES-256-GCM; see the "Audit-intent confidentiality" module docs and
-    /// `encrypt_intent`). Opt-in — choose this instead of `append_event` when
+    /// `encrypt_intent`). Opt-in â€” choose this instead of `append_event` when
     /// the deployment's threat model includes an attacker with filesystem
     /// read access to the log but not `issuer_secret`. Chain integrity is
     /// Convenience: append an audit event with encrypted intent.
@@ -2301,7 +2298,7 @@ impl Default for ImmutableAuditLog {
 
 /// Hand-off point for a rotated, gzip-compressed audit log (`<path>.<ts>.bak.gz`).
 /// `maybe_rotate` always compresses; this trait only decides what happens to the
-/// compressed file *after* that — deliberately not a concrete S3/GCS/Azure client
+/// compressed file *after* that â€” deliberately not a concrete S3/GCS/Azure client
 /// baked into this crate (see [`ImmutableAuditLog`]'s module doc for why: a
 /// cloud-vendor-specific dependency in this security-critical audit path is
 /// disproportionate to what "Must-Have" compliance requires generically). A
@@ -2309,8 +2306,8 @@ impl Default for ImmutableAuditLog {
 /// its own client and passes it to [`ImmutableAuditLog::with_paths_and_archival_sink`].
 ///
 /// Invoked on a dedicated background thread (`saacp-audit-archival`, spawned by
-/// `maybe_rotate`) — never the `saacp-wal-worker` thread that services live audit
-/// writes — so blocking I/O here (a network upload, say) never delays the next
+/// `maybe_rotate`) â€” never the `saacp-wal-worker` thread that services live audit
+/// writes â€” so blocking I/O here (a network upload, say) never delays the next
 /// audit-log entry.
 pub trait ArchivalSink: Send + Sync {
     /// Called with the path of a `.bak.gz` file once gzip compression has
@@ -2334,7 +2331,7 @@ impl ArchivalSink for NoopArchivalSink {
 /// Moves the compressed file into `target_dir` (e.g. a mounted backup volume, or a
 /// directory a separate off-box sync process watches) instead of leaving it beside
 /// the live WAL. Configured via [`ENV_AUDIT_ARCHIVE_DIR`] for `with_default_path`/
-/// `global`. Still no cloud-vendor SDK dependency — real object-storage hand-off is
+/// `global`. Still no cloud-vendor SDK dependency â€” real object-storage hand-off is
 /// a deployment's own process watching this directory, or a custom [`ArchivalSink`].
 #[derive(Debug, Clone)]
 pub struct FilesystemArchivalSink {
@@ -2362,9 +2359,9 @@ impl ArchivalSink for FilesystemArchivalSink {
     }
 }
 
-/// Gzip-compresses `src` to `<src>.gz` (via `flate2`, already a project dependency —
+/// Gzip-compresses `src` to `<src>.gz` (via `flate2`, already a project dependency â€”
 /// see `framing.rs`'s zlib usage for the sibling precedent), `fsync`s the compressed
-/// output, then removes `src` — only once the compressed copy is confirmed durable,
+/// output, then removes `src` â€” only once the compressed copy is confirmed durable,
 /// never delete-then-fail-to-compress. Hands the result to `sink`. Errors are logged,
 /// not propagated: this runs detached on a background thread with no caller to
 /// return a `Result` to, matching `run_wal_worker`'s own error-handling idiom for
@@ -2374,19 +2371,19 @@ fn compress_and_archive_rotated_log(rotated_path: String, sink: Arc<dyn Archival
     if let Err(e) = compress_file_to_gzip(&rotated_path, &gz_path) {
         eprintln!(
             "[SAACP audit] gzip compression failed for rotated audit log '{rotated_path}': {e} \
-             — uncompressed .bak left in place, not archived."
+             â€” uncompressed .bak left in place, not archived."
         );
         return;
     }
     if let Err(e) = fs::remove_file(&rotated_path) {
         eprintln!(
             "[SAACP audit] failed to remove uncompressed '{rotated_path}' after successful \
-             compression to '{gz_path}': {e} — both copies left on disk."
+             compression to '{gz_path}': {e} â€” both copies left on disk."
         );
     }
     if let Err(e) = sink.archive(Path::new(&gz_path)) {
         eprintln!(
-            "[SAACP audit] archival sink failed for '{gz_path}': {e} — compressed file left \
+            "[SAACP audit] archival sink failed for '{gz_path}': {e} â€” compressed file left \
              in place at that path."
         );
     }
@@ -2402,11 +2399,11 @@ fn compress_file_to_gzip(src: &str, dst: &str) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// WalWriter — persistent buffered file handle for the WAL worker (Fix 1)
+// WalWriter â€” persistent buffered file handle for the WAL worker (Fix 1)
 // ---------------------------------------------------------------------------
 
 /// Owns a persistent, buffered file handle across the lifetime of the WAL
-/// worker thread so it never pays an open()+close() cost per event — the
+/// worker thread so it never pays an open()+close() cost per event â€” the
 /// original root cause of the Gate 6.0 latency spike: on Windows that cost is
 /// dominated by kernel filter-driver / AV real-time-scan overhead per
 /// syscall, not the syscall itself, and it forced the mpsc queue to
@@ -2416,22 +2413,22 @@ fn compress_file_to_gzip(src: &str, dst: &str) -> io::Result<()> {
 struct WalWriter {
     path: String,
     /// `None` only for the instant between dropping the old handle and
-    /// opening the new one during rotation — never observable from outside
+    /// opening the new one during rotation â€” never observable from outside
     /// `maybe_rotate`.
     writer: Option<BufWriter<File>>,
     size: u64,
     entries_since_flush: u64,
     last_flush: Instant,
-    /// Most recent event_count seen — written to the sentinel file at the
+    /// Most recent event_count seen â€” written to the sentinel file at the
     /// same flush cadence as the WAL entries. Previously the sentinel was
-    /// rewritten via a fresh open()+write()+close() on *every* event — an
+    /// rewritten via a fresh open()+write()+close() on *every* event â€” an
     /// unnoticed second instance of the exact same root-cause bug. Batching
     /// it here means the sentinel can never claim a higher durable count
     /// than the entries it describes.
     pending_event_count: u64,
     /// C-4: where a rotated `.bak` file's compressed copy gets handed off once
     /// `maybe_rotate`'s background compression thread finishes. Defaults to
-    /// [`NoopArchivalSink`] — see [`run_wal_worker`]/[`ImmutableAuditLog::with_paths_and_archival_sink`]
+    /// [`NoopArchivalSink`] â€” see [`run_wal_worker`]/[`ImmutableAuditLog::with_paths_and_archival_sink`]
     /// for how a real sink gets plumbed in.
     archival_sink: Arc<dyn ArchivalSink>,
 }
@@ -2452,7 +2449,7 @@ impl WalWriter {
     }
 
     /// Test-isolation hard reset: drop the handle, delete both files, reopen
-    /// empty. MUST run on the worker thread — it is the single owner of the
+    /// empty. MUST run on the worker thread â€” it is the single owner of the
     /// open file handles (see [`WalMessage::Reset`]).
     fn hard_reset(&mut self, count_file: &str) -> io::Result<()> {
         self.writer = None;
@@ -2465,7 +2462,7 @@ impl WalWriter {
     }
 
     /// Rotate BEFORE writing the next entry if the file is already oversized
-    /// — same pre-write check order as the pre-Fix-1 code. Flushes + syncs +
+    /// â€” same pre-write check order as the pre-Fix-1 code. Flushes + syncs +
     /// drops the handle first: required on Windows, where a file can't be
     /// renamed while a handle to it is open.
     fn maybe_rotate(&mut self) -> io::Result<()> {
@@ -2479,7 +2476,7 @@ impl WalWriter {
         self.writer = None;
         let rotated = format!("{}.{}.bak", self.path, now_secs() as u64);
         // C-4: only kick off background compression/archival if the rename actually
-        // succeeded — a failed rename means `rotated` doesn't exist, and spawning a
+        // succeeded â€” a failed rename means `rotated` doesn't exist, and spawning a
         // thread to compress a nonexistent file would just be a spurious error log.
         if fs::rename(&self.path, &rotated).is_ok() {
             let sink = Arc::clone(&self.archival_sink);
@@ -2488,7 +2485,7 @@ impl WalWriter {
                 .spawn(move || compress_and_archive_rotated_log(rotated, sink));
             if let Err(e) = spawn_result {
                 eprintln!(
-                    "[SAACP audit] failed to spawn background archival thread: {e} — rotated \
+                    "[SAACP audit] failed to spawn background archival thread: {e} â€” rotated \
                      .bak file left uncompressed."
                 );
             }
@@ -2522,7 +2519,7 @@ impl WalWriter {
         self.entries_since_flush += 1;
         self.pending_event_count = event_count;
 
-        // Fix 3: durability window — flush + sync at most every
+        // Fix 3: durability window â€” flush + sync at most every
         // AUDIT_WAL_FLUSH_EVERY_N_ENTRIES entries or AUDIT_WAL_FLUSH_INTERVAL,
         // whichever comes first. `flush()` only moves bytes from the Rust
         // buffer into the OS page cache; `sync_data()` is what actually makes
@@ -2545,14 +2542,14 @@ impl WalWriter {
             w.flush()?;
             w.get_ref().sync_data()?;
         }
-        // Sentinel batched into the same flush boundary — see the
+        // Sentinel batched into the same flush boundary â€” see the
         // `pending_event_count` field doc.
         //
         // C-5: atomic write. A direct `fs::write` overwrites the sentinel
         // in place, which can leave a truncated/corrupt count file if the
         // process is killed mid-write (power loss, `kill -9`). Instead write
         // to a sibling temp file, fsync its contents so they're durable,
-        // then `rename` it over the real sentinel — a rename is atomic on
+        // then `rename` it over the real sentinel â€” a rename is atomic on
         // both POSIX (same-filesystem rename) and Windows (`fs::rename` is
         // backed by `MoveFileExW` with the replace-existing flag).
         let tmp_path = format!("{count_file}.tmp-{}", std::process::id());
@@ -2565,7 +2562,7 @@ impl WalWriter {
         // the destination is momentarily opened elsewhere (e.g. a concurrent
         // reader of the sentinel); retry once after a short backoff before
         // propagating the error. On a second failure the temp file is left
-        // in place deliberately — that's a diagnostic artifact, not silent
+        // in place deliberately â€” that's a diagnostic artifact, not silent
         // data loss, and the real sentinel is guaranteed untouched either way.
         if let Err(first_err) = fs::rename(&tmp_path, count_file) {
             thread::sleep(Duration::from_millis(20));
@@ -2590,7 +2587,7 @@ struct AnchorLine {
 
 /// Build one Merkle anchor over the currently-published shard heads.
 ///
-/// Reads each head from its `ArcSwap` — never takes a shard mutex, so anchoring
+/// Reads each head from its `ArcSwap` â€” never takes a shard mutex, so anchoring
 /// cannot contend with or block appenders. The heads are therefore a slightly
 /// skewed snapshot (shard 3 may have advanced while shard 0 was read), which is
 /// intentional and harmless: the anchor commits to a set of heads that each
@@ -2600,7 +2597,7 @@ struct AnchorLine {
 /// the newest one on disk, which the replay handles because it checks each
 /// anchor against the chain state *at the point the anchor appears in the file*.
 ///
-/// Returns `None` if the anchor cannot be serialized (never expected — the
+/// Returns `None` if the anchor cannot be serialized (never expected â€” the
 /// struct is plain data).
 fn build_anchor_line(
     shard_heads: &[arc_swap::ArcSwap<ShardHead>],
@@ -2616,7 +2613,7 @@ fn build_anchor_line(
         .collect();
     let root = merkle_root(&leaves);
     // Advance the epoch so records appended after this anchor carry the new
-    // value — `fetch_add` returns the previous, which is the epoch this anchor
+    // value â€” `fetch_add` returns the previous, which is the epoch this anchor
     // closes.
     let epoch = anchor_epoch.fetch_add(1, Ordering::Relaxed);
 
@@ -2633,12 +2630,12 @@ fn build_anchor_line(
 }
 
 /// Runs for the lifetime of the `ImmutableAuditLog` instance that spawned it
-/// — exits when `wal_tx` is dropped (closing the channel and ending
+/// â€” exits when `wal_tx` is dropped (closing the channel and ending
 /// `wal_rx.iter()`), or immediately if the log file can't be opened (Fix 2).
 ///
 /// Phase 6: also emits the periodic Merkle anchor. This thread is already the
 /// single I/O serialization point, so anchoring here needs no new thread and no
-/// new lock — it reads each shard's head from the lock-free `ArcSwap` the
+/// new lock â€” it reads each shard's head from the lock-free `ArcSwap` the
 /// appenders publish into, never taking a shard mutex.
 #[allow(clippy::too_many_arguments)]
 fn run_wal_worker(
@@ -2653,9 +2650,9 @@ fn run_wal_worker(
     anchor_epoch: &AtomicU64,
 ) {
     // In-memory-only mode (`ImmutableAuditLog::new("")`): drain without any
-    // disk I/O. This is a deliberate no-persistence mode, not a failure —
+    // disk I/O. This is a deliberate no-persistence mode, not a failure â€”
     // health stays HEALTHY for the life of the instance. L-10 fix: a `Flush`
-    // message must still be acked immediately here — there's nothing to sync,
+    // message must still be acked immediately here â€” there's nothing to sync,
     // but a caller blocking on `flush()`'s ack must not hang forever just
     // because this instance never persists anything.
     if log_file.is_empty() {
@@ -2678,14 +2675,14 @@ fn run_wal_worker(
         Ok(w) => w,
         Err(e) => {
             // Fix 2: a WAL worker that can't open its log file is not
-            // "degraded" — it is completely blind. This must be visible, and
+            // "degraded" â€” it is completely blind. This must be visible, and
             // it must halt here rather than silently no-op forever. The
             // channel disconnects when this thread returns, so every
             // subsequent `append_event` sees its `try_send` fail and counts
             // it as a dropped audit (never a silent no-op).
             health.store(AuditHealth::Fatal as u8, Ordering::SeqCst);
             eprintln!(
-                "[SAACP audit] FATAL: WAL worker cannot open log file '{log_file}': {e} — \
+                "[SAACP audit] FATAL: WAL worker cannot open log file '{log_file}': {e} â€” \
                  audit subsystem is BLIND. No further events from this instance will reach \
                  disk. Restart the process (or construct a fresh ImmutableAuditLog) after \
                  fixing the underlying disk/permission issue."
@@ -2708,7 +2705,7 @@ fn run_wal_worker(
             } => {
                 if let Err(e) = wal.write_entry(&entry_json, event_count, count_file) {
                     // Fix 3: an atomic counter, not an inline eprintln! on this loop
-                    // — a sustained disk fault must not reintroduce the original
+                    // â€” a sustained disk fault must not reintroduce the original
                     // per-event-print hot-path bug.
                     wal_write_failures.fetch_add(1, Ordering::Relaxed);
                     // Fix 4: sticky FATAL. Log only on the transition into FATAL so a
@@ -2717,7 +2714,7 @@ fn run_wal_worker(
                         == AuditHealth::Fatal as u8;
                     if !already_fatal {
                         eprintln!(
-                            "[SAACP audit] FATAL: WAL write failed for '{log_file}': {e} — audit \
+                            "[SAACP audit] FATAL: WAL write failed for '{log_file}': {e} â€” audit \
                              subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
                              referencing this log until a fresh ImmutableAuditLog is constructed."
                         );
@@ -2726,7 +2723,7 @@ fn run_wal_worker(
 
                 // Phase 6: emit a Merkle anchor every N events or T seconds,
                 // whichever comes first. Failure to write an anchor is counted
-                // like any other WAL write failure but does not abort the loop —
+                // like any other WAL write failure but does not abort the loop â€”
                 // the per-shard chains remain individually verifiable, and the
                 // next anchor re-commits to the same heads.
                 events_since_anchor += 1;
@@ -2751,7 +2748,7 @@ fn run_wal_worker(
             }
             WalMessage::Flush(ack_tx) => {
                 // L-10 fix: force a flush+sync outside the periodic cadence, then ack
-                // regardless of outcome — a failed flush here is already covered by
+                // regardless of outcome â€” a failed flush here is already covered by
                 // the same FATAL/wal_write_failures signal path as a failed
                 // `write_entry`, and the caller's `flush()` returning `false` on a
                 // missing/late ack is the documented (non-fatal) failure mode.
@@ -2761,7 +2758,7 @@ fn run_wal_worker(
                         == AuditHealth::Fatal as u8;
                     if !already_fatal {
                         eprintln!(
-                            "[SAACP audit] FATAL: WAL flush failed for '{log_file}': {e} — audit \
+                            "[SAACP audit] FATAL: WAL flush failed for '{log_file}': {e} â€” audit \
                              subsystem degraded. Gate 2.5 will now reject IRREVERSIBLE_ACTION packets \
                              referencing this log until a fresh ImmutableAuditLog is constructed."
                         );
@@ -2780,7 +2777,7 @@ fn run_wal_worker(
                     health.store(AuditHealth::Fatal as u8, Ordering::SeqCst);
                     eprintln!(
                         "[SAACP audit] FATAL: WAL worker cannot reopen log file after reset \
-                         '{log_file}': {e} — audit subsystem is BLIND."
+                         '{log_file}': {e} â€” audit subsystem is BLIND."
                     );
                     let _ = ack_tx.send(());
                     return;
@@ -2852,7 +2849,7 @@ mod tests {
     fn test_nonce_scoped_same_nonce_different_sessions_both_accepted() {
         let tracker = NonceTracker::new();
         // The SAME raw nonce value used by two DIFFERENT sessions must not
-        // collide — each session has its own independent nonce space.
+        // collide â€” each session has its own independent nonce space.
         assert!(tracker.track_scoped("session-A", 42).is_ok());
         assert!(tracker.track_scoped("session-B", 42).is_ok());
         assert_eq!(tracker.count(), 2);
@@ -2890,7 +2887,7 @@ mod tests {
     }
 
     /// Resolve a relative audit fixture path the same way `with_paths` does, so
-    /// test read-backs hit the actual file the WAL worker wrote — under
+    /// test read-backs hit the actual file the WAL worker wrote â€” under
     /// `SAACP_TEST_LOG_DIR` (the RAM disk) when set, else CWD. Without this a
     /// test that writes through the env var but reads a bare relative path looks
     /// on the SSD/repo-root for a file that only exists on R:.
@@ -2994,7 +2991,7 @@ mod tests {
         }
 
         // Before an explicit flush, the periodic cadence (200 entries / 50ms) may not
-        // have fired yet — `flush()` forces it and blocks until acked.
+        // have fired yet â€” `flush()` forces it and blocks until acked.
         assert!(
             log.flush(Duration::from_secs(2)),
             "flush() should confirm within 2s"
@@ -3013,7 +3010,7 @@ mod tests {
     #[test]
     fn test_flush_on_in_memory_only_log_does_not_hang() {
         // `ImmutableAuditLog::new("")` is the deliberate no-persistence mode (see
-        // `run_wal_worker`'s doc comment) — `flush()` must still return promptly
+        // `run_wal_worker`'s doc comment) â€” `flush()` must still return promptly
         // (acked with nothing to sync) rather than blocking until `timeout`.
         let log = ImmutableAuditLog::new("");
         let secret = b"audit_secret_key";
@@ -3097,7 +3094,7 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].source, "agent-a");
         assert_eq!(recs[0].target, "agent-b");
-        // R-3: intent is now encrypted — decrypt to verify plaintext.
+        // R-3: intent is now encrypted â€” decrypt to verify plaintext.
         assert_eq!(
             decrypt_intent(secret, &recs[0].intent).unwrap(),
             plaintext_intent
@@ -3108,7 +3105,7 @@ mod tests {
     #[test]
     fn test_subscribe_does_not_affect_chain_verification() {
         // Adding a subscriber must not change AuditRecord's HMAC input
-        // (that's driven entirely by the separate CanonicalAuditRecord) —
+        // (that's driven entirely by the separate CanonicalAuditRecord) â€”
         // confirm the chain still verifies correctly with a subscriber attached.
         let log = test_audit_log("subscribe_chain_integrity");
         let secret = b"audit_secret_key";
@@ -3216,7 +3213,7 @@ mod tests {
     /// Guarantees every event appended so far is actually flushed+synced to
     /// disk: sleeps past `AUDIT_WAL_FLUSH_INTERVAL_MS` (so the elapsed-time
     /// flush condition is armed on the WAL worker thread), then appends one
-    /// more throwaway event — whose `write_entry()` call observes the
+    /// more throwaway event â€” whose `write_entry()` call observes the
     /// elapsed time and flushes the `BufWriter`, which is cumulative and
     /// therefore also flushes every entry buffered before it.
     ///
@@ -3267,7 +3264,7 @@ mod tests {
     }
 
     /// H-6 regression: a tampered on-disk chain_hash must be rejected, not
-    /// silently adopted as the new chain head — this was the core vulnerability
+    /// silently adopted as the new chain head â€” this was the core vulnerability
     /// (chain integrity bypass via untrusted disk data).
     #[test]
     fn test_initialize_chain_rejects_tampered_disk_state() {
@@ -3323,7 +3320,7 @@ mod tests {
         assert_eq!(ENV_AUDIT_LOG, "SAACP_AUDIT_LOG");
         assert_eq!(ENV_COUNT_FILE, "SAACP_COUNT_FILE");
         // Gate 6.0 backpressure repair: durability window must be a stated,
-        // testable number — not just "we flush periodically".
+        // testable number â€” not just "we flush periodically".
         assert_eq!(AUDIT_WAL_FLUSH_EVERY_N_ENTRIES, 200);
         assert_eq!(AUDIT_WAL_FLUSH_INTERVAL_MS, 50);
     }
@@ -3347,7 +3344,7 @@ mod tests {
     /// queue. The integration test in `tests/test_gate6_backpressure_rs.rs` can
     /// only reach the drop path via a *Fatal* worker (which is sticky on its own
     /// account), so this test raises the floor directly on an otherwise perfectly
-    /// healthy log — isolating the exact behavior the fix adds.
+    /// healthy log â€” isolating the exact behavior the fix adds.
     ///
     /// Pre-fix, `health()` returned `AuditHealth::from_u8(self.health.load(..))`,
     /// which a drained queue had already recomputed back to `Healthy`, letting
@@ -3367,7 +3364,7 @@ mod tests {
         log.health_floor
             .fetch_max(AuditHealth::Saturated as u8, Ordering::Relaxed);
 
-        // Appending again recomputes health from a (still empty) queue — the
+        // Appending again recomputes health from a (still empty) queue â€” the
         // precise condition that used to reset it to Healthy.
         log.append_event(secret, "src", "dst", "sig2", "execute", "tp-sticky2");
         assert!(log.flush(Duration::from_secs(2)));
@@ -3421,7 +3418,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_intent_nonce_uniqueness() {
-        // Same plaintext, same key — different nonces must produce different
+        // Same plaintext, same key â€” different nonces must produce different
         // ciphertexts (no keystream/nonce reuse).
         let secret = b"audit-intent-secret-32-bytes!!!";
         let a = encrypt_intent(secret, "same task text");
@@ -3471,7 +3468,7 @@ mod tests {
         // and decrypts back to the original.
         //
         // Phase 6: both appends came from THIS thread, so they are both on this
-        // thread's shard (`AUDIT_SHARD_SLOT`) and in order — the first entry of
+        // thread's shard (`AUDIT_SHARD_SLOT`) and in order â€” the first entry of
         // that shard is the confidential one. Scoped so the guard drops before
         // `log.reset()` below re-locks the shard (the lock is not reentrant).
         let stored_intent = {
@@ -3522,7 +3519,7 @@ mod tests {
     #[test]
     fn test_noop_archival_sink_is_ok_and_side_effect_free() {
         let sink = NoopArchivalSink;
-        // Deliberately a path that doesn't exist — Noop must never touch the
+        // Deliberately a path that doesn't exist â€” Noop must never touch the
         // filesystem, so a missing file must not surface as an error either.
         let path = Path::new("test_c4_noop_target_need_not_exist.gz");
         assert!(sink.archive(path).is_ok());
@@ -3573,13 +3570,13 @@ mod tests {
         wal.size = AUDIT_MAX_LOG_SIZE + 1;
         wal.maybe_rotate().expect("maybe_rotate must succeed");
 
-        // The rename to `.bak` happens synchronously inside `maybe_rotate` — only
+        // The rename to `.bak` happens synchronously inside `maybe_rotate` â€” only
         // compression happens on the detached `saacp-audit-archival` background
-        // thread — so the `.bak` file is already on disk with a known name the
+        // thread â€” so the `.bak` file is already on disk with a known name the
         // instant `maybe_rotate()` returns, before compression has necessarily
         // finished (`GzEncoder`'s `File::create` for the `.gz` destination happens
         // near-instantly, well before the compressed bytes are fully written and
-        // fsync'd — polling for the `.gz` path to merely *appear* would race).
+        // fsync'd â€” polling for the `.gz` path to merely *appear* would race).
         let bak_path = fs::read_dir(".")
             .unwrap()
             .flatten()
@@ -3590,7 +3587,7 @@ mod tests {
             })
             .expect("expected a *.bak file to exist immediately after maybe_rotate()");
 
-        // Poll for that exact `.bak` file's removal — the background thread only
+        // Poll for that exact `.bak` file's removal â€” the background thread only
         // deletes it after the compressed copy is confirmed written+fsync'd.
         let deadline = Instant::now() + Duration::from_secs(5);
         while bak_path.exists() && Instant::now() < deadline {

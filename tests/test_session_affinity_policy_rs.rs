@@ -94,7 +94,12 @@ fn build_cover_frame(session_key: [u8; 32], session_id: [u8; 16]) -> Vec<u8> {
 
 async fn read_response(stream: &mut TcpStream, max_len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; max_len];
-    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+    // Generous timeout: this test runs inside the full all-features suite
+    // where dozens of other test binaries compete for CPU and the daemon's
+    // spawn_blocking pipeline can stall well past a 2s budget under that
+    // load (observed as a flaky read timeout). The AlertOnly ack still
+    // arrives; give it room.
+    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
         .await
         .expect("read timed out")
         .expect("read failed");

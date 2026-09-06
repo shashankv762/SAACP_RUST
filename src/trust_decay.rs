@@ -1,13 +1,13 @@
-//! trust_decay.rs — Continuous Behavioral Trust Scoring (sidecar, not a gate)
+//! trust_decay.rs â€” Continuous Behavioral Trust Scoring (sidecar, not a gate)
 //!
-//! *New in Rust* — no Python-reference analog.
+//! *New in Rust* â€” no Python-reference analog.
 //!
 //! # Why this exists
 //!
 //! Every gate in the pipeline (`handler.rs`) makes a binary block/allow decision
 //! on a single packet. That's correct and necessary, but it has a blind spot: an
-//! agent that is quietly compromised — still holding a valid capability token,
-//! still sending individually well-formed packets — gets no protocol-level
+//! agent that is quietly compromised â€” still holding a valid capability token,
+//! still sending individually well-formed packets â€” gets no protocol-level
 //! response until a human notices and calls `revoke()`. Real zero-trust
 //! architectures (Google BeyondCorp, SPIFFE/SPIRE in production) don't just gate
 //! each request in isolation; they maintain a decaying trust score per identity
@@ -15,7 +15,7 @@
 //! verification when it drops, without waiting for a human in the loop.
 //!
 //! [`TrustDecayEngine`] is that continuous signal. It is deliberately **not** a
-//! 13th numbered gate in the linear pipeline — it is a sidecar every gate
+//! 13th numbered gate in the linear pipeline â€” it is a sidecar every gate
 //! reports *to*, sitting outside the numbered 16-step list exactly like the
 //! existing `AgentRateLimiter::is_locked()` circuit-breaker check already does
 //! (`handler.rs`, pre-gate). Gate order remains a protocol invariant; nothing
@@ -25,11 +25,11 @@
 //!
 //! Each tracked agent has a behavioral trust `score` in `[0.0, 1.0]`, starting
 //! at [`TRUST_SCORE_INITIAL`] the first time an agent is seen (identity trust
-//! already came from the handshake/capability token — this tracks *behavior*,
+//! already came from the handshake/capability token â€” this tracks *behavior*,
 //! not identity). A gate violation calls [`TrustDecayEngine::penalize`] with a
 //! [`PenaltyKind`], which subtracts a fixed weight (floored at 0.0). Recovery is
 //! **lazy and time-based**: elapsed time since the last touch is folded in
-//! whenever the entry is next read or written — there is no background sweep
+//! whenever the entry is next read or written â€” there is no background sweep
 //! thread and clean traffic never touches this map, so well-behaved agents add
 //! zero overhead beyond the single map lookup already needed to check
 //! [`TrustDecayEngine::scope_cap`] (itself the same cost class as the existing
@@ -37,32 +37,32 @@
 //!
 //! Two thresholds convert the continuous score into concrete protocol effects:
 //!
-//! - `score < TRUST_DOWNGRADE_THRESHOLD` → [`TrustDecayEngine::scope_cap`]
+//! - `score < TRUST_DOWNGRADE_THRESHOLD` â†’ [`TrustDecayEngine::scope_cap`]
 //!   returns `Some(0)` (READ_ONLY only). The handler intersects this into
 //!   `max_action_class_from_token` **once**, at the point that value is first
-//!   bound — every downstream gate that already reads it inherits the
+//!   bound â€” every downstream gate that already reads it inherits the
 //!   downgrade for free.
-//! - `score < TRUST_REAUTH_THRESHOLD` → [`TrustDecayEngine::requires_reauth`]
+//! - `score < TRUST_REAUTH_THRESHOLD` â†’ [`TrustDecayEngine::requires_reauth`]
 //!   is `true`: all non-exempt packets from that agent are rejected
 //!   (`SAACPBytecodes::TrustReauthRequired`) until *both* the score recovers
 //!   above threshold *and* [`TRUST_REAUTH_MIN_COOLDOWN_SECONDS`] has elapsed
-//!   since the lockout began — closing the "trip one big penalty, then flood
+//!   since the lockout began â€” closing the "trip one big penalty, then flood
 //!   clean-looking traffic to instantly reset" gaming loophole.
 //!
 //! # Honest scope (read this before assuming more than is implemented)
 //!
-//! This is a **v1, time/score-based soft reset** — not a cryptographic
+//! This is a **v1, time/score-based soft reset** â€” not a cryptographic
 //! proof-of-rehandshake. The capability token is never revoked; the agent is
 //! merely time-boxed out. A v2 that requires the client to actually complete a
 //! fresh ECDH/HTH exchange to clear `requires_reauth` early would be a real
-//! wire-protocol addition and is explicitly **not** built here — don't assume
+//! wire-protocol addition and is explicitly **not** built here â€” don't assume
 //! it from the name "reauth".
 //!
 //! # Signals
 //!
 //! [`TrustDecayEngine::subscribe`] registers a synchronous callback invoked on
 //! every [`TrustEvent`] transition (`Downgraded` / `ReauthRequired` /
-//! `Recovered`) — an operator or orchestrator can push these onto its own
+//! `Recovered`) â€” an operator or orchestrator can push these onto its own
 //! channel for async handling. Callers are expected to also write a Gate
 //! 6.0-style audit entry and update `telemetry.rs` counters at the call site
 //! (kept out of this module to avoid a dependency cycle with `security.rs`).
@@ -70,13 +70,12 @@
 //! # Bounded memory
 //!
 //! Capped at [`TRUST_MAX_ENTRIES`] with sweep-on-overflow, the same idiom
-//! `memory::FederatedMemory` already uses — only triggers once genuinely over
+//! `memory::FederatedMemory` already uses â€” only triggers once genuinely over
 //! cap, so normal fleets never pay the sweep cost.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -88,10 +87,10 @@ use sha2::{Digest, Sha256};
 /// Starting score for an agent never seen before by this engine instance.
 pub const TRUST_SCORE_INITIAL: f64 = 1.0;
 /// Recovery rate applied lazily based on elapsed wall-clock seconds since the
-/// entry was last touched. ~0.0005/s ⇒ full recovery from 0.0 in ~33 minutes.
+/// entry was last touched. ~0.0005/s â‡’ full recovery from 0.0 in ~33 minutes.
 pub const TRUST_RECOVERY_PER_SECOND: f64 = 0.0005;
 /// L-23 fix: each recorded `penalize()` call against an entry divides its effective
-/// recovery rate by roughly `1.0 + penalty_count * TRUST_REPEAT_PENALTY_DECAY` — so
+/// recovery rate by roughly `1.0 + penalty_count * TRUST_REPEAT_PENALTY_DECAY` â€” so
 /// repeat offenders recover markedly slower than an agent penalized once by accident.
 pub const TRUST_REPEAT_PENALTY_DECAY: f64 = 0.5;
 /// Below this score, `scope_cap()` returns `Some(0)` (READ_ONLY only).
@@ -99,14 +98,14 @@ pub const TRUST_DOWNGRADE_THRESHOLD: f64 = 0.50;
 /// Below this score, `requires_reauth()` is true.
 pub const TRUST_REAUTH_THRESHOLD: f64 = 0.25;
 /// Minimum lockout duration once `requires_reauth` trips, regardless of how
-/// fast the score would otherwise recover — prevents "one big penalty, then
+/// fast the score would otherwise recover â€” prevents "one big penalty, then
 /// immediately flood clean traffic to reset" gaming.
 pub const TRUST_REAUTH_MIN_COOLDOWN_SECONDS: f64 = 60.0;
 /// Maximum tracked agent_ids before a stale-entry sweep runs (see module docs).
 pub const TRUST_MAX_ENTRIES: usize = 10_000;
 /// opusplan.md 6.5 ("Memory Steady-State Targets"): an entry untouched (no `penalize`/
 /// `reward` call) for this long is considered stale and eligible for proactive removal
-/// by [`TrustDecayEngine::sweep_stale`] — 24 hours of complete inactivity is far longer
+/// by [`TrustDecayEngine::sweep_stale`] â€” 24 hours of complete inactivity is far longer
 /// than any legitimate agent's normal traffic gap, so this only reclaims memory from
 /// agents that have genuinely gone away, never one that's merely quiet for a while.
 pub const TRUST_ENTRY_STALENESS_SECONDS: f64 = 86_400.0;
@@ -142,7 +141,7 @@ fn penalty_weight(kind: PenaltyKind) -> f64 {
 // of lockout recovery time with no way to earn it back faster than passive
 // per-second decay. `reward()` adds a bounded, anti-gaming positive signal so
 // continuously well-behaved agents recover meaningfully faster than agents
-// that go quiet and just wait out the passive recovery clock — without
+// that go quiet and just wait out the passive recovery clock â€” without
 // letting an agent grind trivial clean traffic back to full trust instantly
 // after a real violation (which would defeat the entire point of a
 // behavioral signal).
@@ -151,36 +150,36 @@ fn penalty_weight(kind: PenaltyKind) -> f64 {
 /// non-cover-traffic, non-stream-continuation) with no IEVL involvement.
 pub const TRUST_REWARD_CLEAN_PASSAGE: f64 = 0.001;
 /// Reward granted when an `ExecutionReceipt` (IEVL, `ievl.rs`) is verified
-/// `Consistent` with its declared intent — stronger positive evidence than a
+/// `Consistent` with its declared intent â€” stronger positive evidence than a
 /// clean passage alone, since it proves post-execution reality matched the
 /// declaration, not just that the packet was well-formed.
 pub const TRUST_REWARD_VALID_RECEIPT: f64 = 0.005;
-/// Reward alone can never lift a score above this ceiling — prevents an
+/// Reward alone can never lift a score above this ceiling â€” prevents an
 /// agent from grinding trust back to a bit-exact 1.0 through volume alone;
 /// only genuine passive recovery (`TRUST_RECOVERY_PER_SECOND`) or the
 /// combination of both can approach full trust.
 pub const TRUST_REWARD_CEILING: f64 = 0.95;
 /// Reward alone can never lift a score above this floor from a deeper
-/// penalty in one call — i.e. an agent sitting at 0.10 cannot reward its way
+/// penalty in one call â€” i.e. an agent sitting at 0.10 cannot reward its way
 /// past 0.30 no matter how many clean passages it grinds; genuine recovery
 /// from a deep penalty still requires passive time-based decay (or further,
 /// larger rewards accumulating below the floor first). This is the reward
-/// path's mirror of `TRUST_REAUTH_MIN_COOLDOWN_SECONDS` — both exist so "trip
+/// path's mirror of `TRUST_REAUTH_MIN_COOLDOWN_SECONDS` â€” both exist so "trip
 /// one big penalty, then immediately grind/wait it away" never works.
 pub const TRUST_REWARD_FLOOR: f64 = 0.30;
 /// Maximum number of reward calls credited per agent per rolling 60-second
-/// window — anti-grinding: without this an agent could fire clean passages
+/// window â€” anti-grinding: without this an agent could fire clean passages
 /// as fast as the wire allows and approach the ceiling in seconds rather than
 /// the ~3.2-minute active-recovery window the design targets.
 pub const TRUST_MAX_REWARDS_PER_MINUTE: u32 = 10;
 /// Multiplier applied to the base reward when the clean passage/receipt was
-/// for an IRREVERSIBLE-class action — clean handling of the riskiest action
+/// for an IRREVERSIBLE-class action â€” clean handling of the riskiest action
 /// class is stronger positive evidence than a READ_ONLY passage, so it earns
 /// proportionally more trust back.
 pub const TRUST_REWARD_IRREVERSIBLE_MULTIPLIER: f64 = 2.0;
 
 /// The category of positive behavioral signal that triggered a trust reward.
-/// Mirrors `PenaltyKind`'s role for penalties — see module docs.
+/// Mirrors `PenaltyKind`'s role for penalties â€” see module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum RewardKind {
     /// A full pipeline pass with no gate rejection, no cover traffic, no
@@ -198,10 +197,7 @@ fn reward_weight(kind: RewardKind) -> f64 {
 }
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::now_secs_f64()
 }
 
 /// Derive the map key used to track behavioral trust for an agent on a given
@@ -210,24 +206,24 @@ fn now_secs() -> f64 {
 /// Prefers the SHA-256 fingerprint of the agent's Ed25519 public key over the
 /// bare, self-claimed `agent_id` string a capability token's `iss` claim
 /// asserts. The public key comes from a `TranscriptBoundSession`
-/// (`identity_binding.rs`'s C-3 subsystem) registered for `session_id_hex` —
+/// (`identity_binding.rs`'s C-3 subsystem) registered for `session_id_hex` â€”
 /// proven via ECDH possession, an `AgentIdentityCertificate`, and a
 /// proof-of-possession signature at handshake time, not a bearer claim.
 ///
 /// Rationale: without this, an attacker who can mint or replay capability
 /// tokens for more than one `iss` value can "launder" an accumulated trust
 /// penalty by presenting a fresh, never-before-seen `agent_id` on its very
-/// next packet — instantly resetting back to `TRUST_SCORE_INITIAL` and
+/// next packet â€” instantly resetting back to `TRUST_SCORE_INITIAL` and
 /// defeating the entire point of a continuous behavioral signal (this is
 /// exactly the gap `daemon.rs`'s separate IP-keyed `requires_reauth` check
 /// was already working around at the connection level; this closes the same
 /// gap per-packet, at the source, for every gate violation tracked in this
 /// module). A cryptographic keypair cannot be rotated for free the way a
-/// self-chosen string can — doing so requires a genuinely different,
+/// self-chosen string can â€” doing so requires a genuinely different,
 /// CA-certified identity.
 ///
-/// Falls back to a namespaced `agent_id`-keyed entry — preserving prior
-/// behavior exactly — when this connection did not opt into identity binding
+/// Falls back to a namespaced `agent_id`-keyed entry â€” preserving prior
+/// behavior exactly â€” when this connection did not opt into identity binding
 /// (`SAACPNetworkDaemon::with_identity_binding`), i.e. no
 /// `TranscriptBoundSession` is registered for `session_id_hex`. The `pk:`/
 /// `aid:` namespaces can never collide with each other or with the
@@ -252,7 +248,7 @@ pub fn trust_key_for(agent_id: &str, session_id_hex: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The category of gate violation that triggered a trust penalty. Maps 1:1
-/// onto the existing gate-pipeline reject points (`handler.rs`) — see the
+/// onto the existing gate-pipeline reject points (`handler.rs`) â€” see the
 /// module docs for the exact wiring and weight rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum PenaltyKind {
@@ -269,7 +265,7 @@ pub enum PenaltyKind {
     /// IEVL (`ievl.rs`, Phase 6 / Part 8.1): an `ExecutionReceipt`'s
     /// `actual_targets` diverged from the matching `IntentDeclaration`'s
     /// `targets` beyond `overlap_threshold` (but without an action_class
-    /// escalation, which instead triggers immediate revocation — see
+    /// escalation, which instead triggers immediate revocation â€” see
     /// `SAACPBytecodes::IntentClassEscalationDetected`).
     TargetViolation,
     /// IEVL (`ievl.rs`, Phase 6 / Part 8.1): an `IntentDeclaration`'s TTL
@@ -278,7 +274,7 @@ pub enum PenaltyKind {
     /// MACE (`mace.rs`, Phase 6 / Part 8.2): this agent was implicated in a
     /// confirmed circular-delegation cycle or Sybil-cluster match.
     CollusionSuspected,
-    /// Any other `SAACPHardDrop` — the catch-all, lightly weighted.
+    /// Any other `SAACPHardDrop` â€” the catch-all, lightly weighted.
     GenericHardDrop,
 }
 
@@ -294,7 +290,7 @@ pub enum TrustEvent {
     /// Score recovered back above `TRUST_DOWNGRADE_THRESHOLD` after having
     /// been below it.
     Recovered,
-    /// A reward was credited (Phase 6 / Part 8.5) — not fired when a reward
+    /// A reward was credited (Phase 6 / Part 8.5) â€” not fired when a reward
     /// call was rate-limited away with no score change.
     Rewarded(RewardKind),
 }
@@ -330,7 +326,7 @@ struct TrustEntry {
     /// `now` has advanced a full 60s past `reward_window_start`.
     rewards_in_window: u32,
     /// L-23 fix: total `penalize()` calls ever recorded against this entry, used by
-    /// `recover_to` to slow passive recovery for repeat offenders — without this, an
+    /// `recover_to` to slow passive recovery for repeat offenders â€” without this, an
     /// agent penalized many times over recovers at exactly the same rate as one
     /// penalized once by accident, so "get penalized, wait, repeat" costs nothing extra
     /// each time. Reset to 0 once the entry fully recovers to `TRUST_SCORE_INITIAL`
@@ -355,7 +351,7 @@ impl TrustEntry {
         let elapsed = (now - self.last_update).max(0.0);
         if elapsed > 0.0 {
             // L-23 fix: each recorded penalty further dampens the effective recovery
-            // rate, asymptotically approaching (never reaching) a 10%-of-base floor —
+            // rate, asymptotically approaching (never reaching) a 10%-of-base floor â€”
             // recovery always eventually remains possible, just slower for repeat
             // offenders. `penalty_count` is `u32`, so this can't grow unbounded either.
             let effective_rate = (TRUST_RECOVERY_PER_SECOND
@@ -365,7 +361,7 @@ impl TrustEntry {
         }
         self.last_update = now;
         if self.score >= TRUST_SCORE_INITIAL {
-            // Fully recovered — a clean slate going forward, not a permanent record.
+            // Fully recovered â€” a clean slate going forward, not a permanent record.
             self.penalty_count = 0;
         }
     }
@@ -373,7 +369,7 @@ impl TrustEntry {
     /// Returns `true` and books one reward credit if the rolling 60s window
     /// has room left; `false` (no state changed) if the window is already at
     /// `TRUST_MAX_REWARDS_PER_MINUTE`. Lazily rolls the window forward the
-    /// same way `recover_to` lazily folds in elapsed time — no background
+    /// same way `recover_to` lazily folds in elapsed time â€” no background
     /// sweep needed.
     fn try_consume_reward_slot(&mut self, now: f64) -> bool {
         match self.reward_window_start {
@@ -399,16 +395,16 @@ impl TrustEntry {
 
 /// Number of independent lock shards for [`TrustDecayEngine`]'s entry map
 /// (Phase 3 / P-1 / Part 6.3: sharded on `agent_fingerprint[0] % 16`, i.e. the
-/// first byte of the (possibly namespaced — `pk:`/`aid:`/`ip:`) map key).
+/// first byte of the (possibly namespaced â€” `pk:`/`aid:`/`ip:`) map key).
 /// Before sharding, every gate violation across every agent in the entire
-/// fleet serialized behind one process-wide `Mutex` — one busy/compromised
+/// fleet serialized behind one process-wide `Mutex` â€” one busy/compromised
 /// agent's penalty traffic could add lock-contention latency to every other
 /// agent's unrelated packets.
 const TRUST_SHARDS: usize = 16;
 
 /// Per-shard soft capacity, chosen so the aggregate cap across all shards
 /// still matches [`TRUST_MAX_ENTRIES`] under a roughly uniform key
-/// distribution — sharding must not silently multiply the effective capacity
+/// distribution â€” sharding must not silently multiply the effective capacity
 /// bound (Part 12 principle 5, "Bounded Everything"). H-24's "never evict a
 /// locked entry" protection is preserved because it is enforced identically
 /// within each shard's own eviction sweep.
@@ -421,7 +417,7 @@ const TRUST_PER_SHARD_MAX_ENTRIES: usize = TRUST_MAX_ENTRIES / TRUST_SHARDS;
 /// .first()` would always yield one of the constant prefix letters
 /// `'p'`/`'a'`/`'i'`, collapsing each namespace onto a single shard and leaving
 /// 13 of 16 dead. Skipping past the `':'` fixed that, but still sampled ONE
-/// byte — so `pk:` keys (raw SHA-256 hex fingerprints, drawn from `[0-9a-f]`)
+/// byte â€” so `pk:` keys (raw SHA-256 hex fingerprints, drawn from `[0-9a-f]`)
 /// still reached only ten of sixteen shards, and `aid:` keys sharing a common
 /// agent-id prefix still concentrated.
 ///
@@ -435,11 +431,11 @@ fn trust_shard_index(key: &str) -> usize {
 /// [`TrustDecayEngine::unsubscribe`] to stop receiving signals. Previously `subscribe`
 /// returned `()`, so a caller (or a buggy retry loop) that subscribed repeatedly leaked
 /// callback closures in the (then-unbounded) observer list forever, with no way back
-/// out — this gives real callers a way to close that leak at the root.
+/// out â€” this gives real callers a way to close that leak at the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrustObserverHandle(u64);
 
-/// L-25 fix: hard cap on concurrently registered observers — see
+/// L-25 fix: hard cap on concurrently registered observers â€” see
 /// [`TrustDecayEngine::subscribe`].
 pub const TRUST_MAX_OBSERVERS: usize = 64;
 
@@ -472,7 +468,7 @@ impl TrustDecayEngine {
     /// Lock and return the shard responsible for `key`.
     ///
     /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
-    /// poison rather than panicking — `TrustDecayEngine::global()` is a
+    /// poison rather than panicking â€” `TrustDecayEngine::global()` is a
     /// process-wide singleton, so one poisoning panic must not cascade into
     /// every other agent's trust-score checks.
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, TrustEntry>> {
@@ -487,7 +483,7 @@ impl TrustDecayEngine {
         Self::global_arc()
     }
 
-    /// Phase 4: `Arc` handle to the process-wide engine — lets a
+    /// Phase 4: `Arc` handle to the process-wide engine â€” lets a
     /// `crate::context::SaacpContext` default instance alias the exact same
     /// engine (not a copy) while hermetic contexts own their own.
     pub fn global_arc() -> &'static Arc<TrustDecayEngine> {
@@ -497,11 +493,11 @@ impl TrustDecayEngine {
     }
 
     /// Register a callback invoked synchronously on every trust-state
-    /// transition. Keep callbacks fast and non-blocking — they run inline on
+    /// transition. Keep callbacks fast and non-blocking â€” they run inline on
     /// the packet-processing path that triggered the transition.
     ///
     /// L-25 fix: returns a [`TrustObserverHandle`] usable with [`Self::unsubscribe`],
-    /// and registration is capped at [`TRUST_MAX_OBSERVERS`] — previously this list grew
+    /// and registration is capped at [`TRUST_MAX_OBSERVERS`] â€” previously this list grew
     /// without bound and had no way to shrink, a slow leak for any caller (or retry
     /// loop) that subscribed more than once. Returns `None` (no-op, nothing registered)
     /// if already at the cap, rather than evicting an active subscriber a caller may
@@ -529,15 +525,15 @@ impl TrustDecayEngine {
             .is_some()
     }
 
-    /// M-27 fix: snapshot-clone the observer list (a `Vec<Arc<dyn Fn...>>` —
+    /// M-27 fix: snapshot-clone the observer list (a `Vec<Arc<dyn Fn...>>` â€”
     /// cloning is a bounded number of atomic refcount bumps, not a deep
     /// copy) and drop the `observers` lock BEFORE invoking any callback,
     /// instead of holding it for the callback loop's entire duration.
     /// Previously, a slow or blocking observer callback (or simply many
     /// registered observers) held `observers` locked for the whole loop,
-    /// blocking any concurrent `subscribe()` call and — because `emit` runs
+    /// blocking any concurrent `subscribe()` call and â€” because `emit` runs
     /// synchronously on the packet-processing path per this type's own
-    /// `subscribe` doc comment — indirectly extending gate-pipeline latency
+    /// `subscribe` doc comment â€” indirectly extending gate-pipeline latency
     /// for every other in-flight packet touching this engine. Matches the
     /// same "release the lock, then notify" pattern
     /// `security::ImmutableAuditLog`'s subscriber mechanism already uses
@@ -561,7 +557,7 @@ impl TrustDecayEngine {
         }
     }
 
-    /// Current (recovery-adjusted) score for an agent. Never seen ⇒ `TRUST_SCORE_INITIAL`.
+    /// Current (recovery-adjusted) score for an agent. Never seen â‡’ `TRUST_SCORE_INITIAL`.
     pub fn score(&self, agent_id: &str) -> f64 {
         let mut entries = self.shard(agent_id);
         let now = now_secs();
@@ -582,14 +578,14 @@ impl TrustDecayEngine {
         let now = now_secs();
 
         // IoT / low-resource fix: sweep stale entries only once this shard's
-        // (aggregate-cap-preserving) per-shard cap is exceeded — mirrors
+        // (aggregate-cap-preserving) per-shard cap is exceeded â€” mirrors
         // FederatedMemory. Two passes, scoped to this one shard only:
         //   1. Lazily recover every entry, then drop ones that are fully
-        //      recovered (score >= 1.0) and not currently reauth-locked —
+        //      recovered (score >= 1.0) and not currently reauth-locked â€”
         //      those are safe to forget, functionally identical to never
         //      having been tracked.
         //   2. If still over cap (e.g. many distinct agents each penalized
-        //      exactly once and never touched again — recovery alone can't
+        //      exactly once and never touched again â€” recovery alone can't
         //      reclaim those), evict from the *unlocked* remainder only,
         //      closest-to-`TRUST_SCORE_INITIAL` first (H-24).
         if entries.len() >= TRUST_PER_SHARD_MAX_ENTRIES && !entries.contains_key(agent_id) {
@@ -601,14 +597,14 @@ impl TrustDecayEngine {
             if entries.len() >= TRUST_PER_SHARD_MAX_ENTRIES {
                 let evict_count = entries.len() + 1 - TRUST_PER_SHARD_MAX_ENTRIES;
                 // H-24: a reauth-locked entry is precisely the record an
-                // attacker wants purged — flooding the map with fresh
+                // attacker wants purged â€” flooding the map with fresh
                 // agent_ids to force this sweep must never be able to evict
                 // one, even if that means the map temporarily stays over
                 // TRUST_PER_SHARD_MAX_ENTRIES until enough locks clear
                 // naturally. Among the unlocked remainder, entries whose
                 // score sits closest to TRUST_SCORE_INITIAL carry the least
                 // signal (nearly/fully recovered, no active penalty) and are
-                // safest to forget first — evict those before anything with
+                // safest to forget first â€” evict those before anything with
                 // a lower, more diagnostic score.
                 let mut candidates: Vec<(String, f64)> = entries
                     .iter()
@@ -637,7 +633,7 @@ impl TrustDecayEngine {
         let now_downgraded = entry.score < TRUST_DOWNGRADE_THRESHOLD;
         let now_reauth = entry.score < TRUST_REAUTH_THRESHOLD;
         // M-29 fix: `just_locked` captures whether THIS call is the one that
-        // transitions `locked_at` from `None` to `Some` — i.e. the exact
+        // transitions `locked_at` from `None` to `Some` â€” i.e. the exact
         // moment reauth lockout begins. Reusing this existing guard (instead
         // of adding a separate flag) is sufficient: `locked_at.is_none()`
         // here is only ever true on the call that crosses the threshold: any
@@ -673,22 +669,22 @@ impl TrustDecayEngine {
     /// the resulting (recovery-adjusted, then rewarded) score. A no-op on the
     /// score (returns the current recovery-adjusted score unchanged) when the
     /// agent has already used its `TRUST_MAX_REWARDS_PER_MINUTE` budget for
-    /// the current rolling window — anti-grinding (Phase 6 / Part 8.5).
+    /// the current rolling window â€” anti-grinding (Phase 6 / Part 8.5).
     ///
-    /// Never seen before ⇒ starts at `TRUST_SCORE_INITIAL`, so rewarding a
+    /// Never seen before â‡’ starts at `TRUST_SCORE_INITIAL`, so rewarding a
     /// never-penalized agent is a harmless no-op capped at
-    /// `TRUST_SCORE_INITIAL` by `TRUST_REWARD_CEILING`/`.min(1.0)` below —
+    /// `TRUST_SCORE_INITIAL` by `TRUST_REWARD_CEILING`/`.min(1.0)` below â€”
     /// consistent with `penalize()`'s symmetric behavior of creating a fresh
     /// entry on first touch.
     ///
     /// `is_irreversible_class` applies `TRUST_REWARD_IRREVERSIBLE_MULTIPLIER`
-    /// when `true` — clean handling of the riskiest action class is stronger
+    /// when `true` â€” clean handling of the riskiest action class is stronger
     /// positive evidence than a READ_ONLY passage.
     pub fn reward(&self, agent_id: &str, kind: RewardKind, is_irreversible_class: bool) -> f64 {
         let mut entries = self.shard(agent_id);
         let now = now_secs();
 
-        // Same capacity-bounded eviction precedent as `penalize()` — a reward
+        // Same capacity-bounded eviction precedent as `penalize()` â€” a reward
         // call must never be the mechanism by which the per-shard cap is
         // silently exceeded. H-24 protection (never evict a locked entry)
         // applies identically here.
@@ -735,12 +731,12 @@ impl TrustDecayEngine {
 
         // Reward can lift a deeply-penalized score only up to
         // `TRUST_REWARD_FLOOR`, and can never push any score above
-        // `TRUST_REWARD_CEILING` — both anti-gaming bounds are independent of
+        // `TRUST_REWARD_CEILING` â€” both anti-gaming bounds are independent of
         // (and generally tighter than) the `.min(1.0)` hard ceiling
         // `recover_to` uses for passive recovery. The final `.max(entry.score)`
         // guards the case where passive recovery has already carried the
         // score above the applicable cap (e.g. a fully-recovered agent at
-        // 1.0 rewarded again) — reward must never *decrease* a score, only
+        // 1.0 rewarded again) â€” reward must never *decrease* a score, only
         // ever leave it unchanged or raise it.
         let raw_new_score = entry.score + amount;
         let cap = if entry.score < TRUST_REWARD_FLOOR {
@@ -780,7 +776,7 @@ impl TrustDecayEngine {
 
     /// opusplan.md 6.4 item 1: same as [`Self::requires_reauth`], but takes an
     /// already-captured wall-clock reading instead of calling `now_secs()` internally
-    /// — see `gateway::AgentRateLimiter::is_locked_at`'s doc comment for the shared
+    /// â€” see `gateway::AgentRateLimiter::is_locked_at`'s doc comment for the shared
     /// rationale (this method runs immediately alongside `is_locked` at every packet
     /// pipeline's pre-gate checkpoint). `requires_reauth` itself is untouched and
     /// remains the right choice for any caller that doesn't already have a `now` in
@@ -841,12 +837,12 @@ impl TrustDecayEngine {
     /// untouched (no `penalize`/`reward` call) for more than
     /// `TRUST_ENTRY_STALENESS_SECONDS`, independent of whether any shard has hit
     /// `TRUST_PER_SHARD_MAX_ENTRIES`. Before this, a shard under its capacity cap never
-    /// evicted anything — `penalize`/`reward`'s existing eviction only triggers once a
-    /// shard is already full — so an agent that stops sending traffic entirely still
+    /// evicted anything â€” `penalize`/`reward`'s existing eviction only triggers once a
+    /// shard is already full â€” so an agent that stops sending traffic entirely still
     /// held its entry in memory indefinitely as long as the shard never filled up.
     ///
     /// Deliberately does NOT replace the existing score-proximity-to-initial eviction
-    /// heuristic used when a shard IS at capacity (see `penalize`/`reward`) — that
+    /// heuristic used when a shard IS at capacity (see `penalize`/`reward`) â€” that
     /// heuristic protects entries with the most earned trust or the most accumulated
     /// penalty, a genuine behavioral signal, not just "oldest first". This sweep is
     /// purely additive: a second, independent reclaim path keyed on inactivity instead
@@ -854,7 +850,7 @@ impl TrustDecayEngine {
     ///
     /// H-24 is preserved identically to every other eviction path in this type: a
     /// currently reauth-locked entry (`locked_at.is_some()`) is never removed here,
-    /// even if it's gone stale by wall-clock time — the whole point of a lockout is
+    /// even if it's gone stale by wall-clock time â€” the whole point of a lockout is
     /// that it survives until its own cooldown, not until a maintenance sweep runs.
     /// Returns the number of entries removed.
     pub fn sweep_stale(&self) -> usize {
@@ -872,13 +868,13 @@ impl TrustDecayEngine {
     }
 
     /// Snapshot of up to `limit` tracked agents, sorted ascending by score
-    /// (most-concerning-first) — for the Command Center dashboard's live
+    /// (most-concerning-first) â€” for the Command Center dashboard's live
     /// agent list. Bounded by construction: `entries` is already capped at
     /// `TRUST_MAX_ENTRIES`, so a full snapshot is always bounded-size even
     /// without the `limit` truncation.
     ///
     /// `requires_reauth` here mirrors [`Self::requires_reauth`]'s logic
-    /// read-only — it does NOT clear an expired lock or emit a `Recovered`
+    /// read-only â€” it does NOT clear an expired lock or emit a `Recovered`
     /// signal the way the real method does, since a dashboard poll must
     /// never have a side effect on live gate decisions. It may therefore
     /// show `true` for a brief window after the real cooldown+recovery
@@ -888,7 +884,7 @@ impl TrustDecayEngine {
         let now = now_secs();
 
         // Each shard's lock is acquired independently and released before
-        // moving to the next — this never holds more than one shard lock at
+        // moving to the next â€” this never holds more than one shard lock at
         // a time, so a concurrent `penalize()`/`score()` on a different shard
         // is never blocked by a snapshot in progress (only same-shard callers
         // briefly contend, same as before sharding).
@@ -925,7 +921,7 @@ impl TrustDecayEngine {
 }
 
 // ---------------------------------------------------------------------------
-// IntentDriftTracker — chain-wide cumulative divergence ceiling (Gate 1.5)
+// IntentDriftTracker â€” chain-wide cumulative divergence ceiling (Gate 1.5)
 // ---------------------------------------------------------------------------
 
 /// Maximum distinct `session_uuid`s tracked before oldest-first eviction runs.
@@ -944,7 +940,7 @@ pub const CHAIN_DRIFT_CEILING: f64 = 2.0;
 /// based on elapsed wall-clock seconds since that session's last hop.
 /// Mirrors `TrustEntry::recover_to`'s lazy-decay idiom: no background sweep,
 /// folded in on next read/write. Defined relative to `CHAIN_DRIFT_CEILING` so
-/// it stays self-documenting if the ceiling is retuned — a session sitting
+/// it stays self-documenting if the ceiling is retuned â€” a session sitting
 /// exactly at the ceiling decays back to 0.0 after 10 minutes of total
 /// inactivity. Without this, `total` only ever grew, so a long-lived,
 /// otherwise well-behaved session would eventually and permanently trip the
@@ -1003,7 +999,7 @@ impl IntentDriftTracker {
     /// new total. Callers compare this against `CHAIN_DRIFT_CEILING`.
     ///
     /// M-38 fix: every `self.sessions.lock()` in this impl block recovers via
-    /// `into_inner()` on poison rather than panicking — `IntentDriftTracker::global()`
+    /// `into_inner()` on poison rather than panicking â€” `IntentDriftTracker::global()`
     /// is a process-wide singleton, so one poisoning panic must not cascade
     /// into every other session's intent-drift tracking.
     pub fn accumulate(&self, session_uuid: &str, divergence: f64) -> f64 {
@@ -1029,7 +1025,7 @@ impl IntentDriftTracker {
                 last_update: now,
             });
         // (H-30) Decay before accumulating so a burst of hops in quick
-        // succession — the pattern this ceiling actually defends against —
+        // succession â€” the pattern this ceiling actually defends against â€”
         // still accumulates fully (elapsed ~= 0 between hops), while a
         // session that goes quiet for minutes isn't penalized by stale
         // history when it resumes.
@@ -1089,7 +1085,7 @@ mod tests {
         // Not exact equality: lazy time-based recovery means any nonzero
         // wall-clock gap between the last `penalize()` and this `score()`
         // read (even sub-microsecond, as in a tight test loop) adds a tiny
-        // positive residual by design — recovery is monotonic in elapsed
+        // positive residual by design â€” recovery is monotonic in elapsed
         // time, it doesn't wait for a "tick." The design invariant under
         // test is "floors at (effectively) zero," not "stays at bit-exact
         // 0.0 forever," which would contradict lazy recovery entirely.
@@ -1132,7 +1128,7 @@ mod tests {
     }
 
     /// opusplan.md 6.4 item 1: `requires_reauth_at` must agree with `requires_reauth`
-    /// — same answer whether the caller supplies `now` explicitly or lets
+    /// â€” same answer whether the caller supplies `now` explicitly or lets
     /// `requires_reauth` capture it internally.
     #[test]
     fn requires_reauth_at_agrees_with_requires_reauth() {
@@ -1187,8 +1183,8 @@ mod tests {
         ));
     }
 
-    /// M-29 regression: `ReauthRequired` must fire exactly ONCE — on the
-    /// call that actually crosses `TRUST_REAUTH_THRESHOLD` — not on every
+    /// M-29 regression: `ReauthRequired` must fire exactly ONCE â€” on the
+    /// call that actually crosses `TRUST_REAUTH_THRESHOLD` â€” not on every
     /// subsequent `penalize` call while the agent remains locked out.
     #[test]
     fn reauth_required_emitted_exactly_once_on_transition() {
@@ -1201,11 +1197,11 @@ mod tests {
 
         // 1.0 -> 0.60 (ReplaySuspicion weight 0.40): not yet below 0.25.
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
-        // 0.60 -> 0.20: crosses TRUST_REAUTH_THRESHOLD (0.25) — the ONE
+        // 0.60 -> 0.20: crosses TRUST_REAUTH_THRESHOLD (0.25) â€” the ONE
         // call that should emit ReauthRequired.
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         // Score is floored at 0.0 already (0.20 - 0.40 -> 0.0 via .max(0.0)),
-        // still well below threshold — must NOT re-emit ReauthRequired.
+        // still well below threshold â€” must NOT re-emit ReauthRequired.
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
 
@@ -1226,7 +1222,7 @@ mod tests {
     /// M-29: after an agent's tracked state is cleared (`reset`, e.g.
     /// simulating a fully-recovered, forgotten entry the way the natural
     /// recovery path in `requires_reauth` eventually would), a SUBSEQUENT
-    /// lockout on a fresh entry must fire `ReauthRequired` again — the fix
+    /// lockout on a fresh entry must fire `ReauthRequired` again â€” the fix
     /// must not permanently suppress the signal for an agent's whole
     /// lifetime, only within a single ongoing lockout on one `TrustEntry`.
     #[test]
@@ -1243,14 +1239,14 @@ mod tests {
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion); // 0.20, locked
         assert!(e.requires_reauth("agent-a"), "test setup: must be locked");
 
-        // Wipe the tracked entry entirely (test/ops utility) — the next
+        // Wipe the tracked entry entirely (test/ops utility) â€” the next
         // penalize() call creates a brand-new `TrustEntry::fresh` with
         // `locked_at: None`, the same shape a genuinely-recovered-then-
         // forgotten entry would have.
         e.reset(Some("agent-a"));
         events.lock().unwrap().clear();
 
-        // Cross into lockout a SECOND time, on the fresh entry — must emit
+        // Cross into lockout a SECOND time, on the fresh entry â€” must emit
         // ReauthRequired again.
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
         e.penalize("agent-a", PenaltyKind::ReplaySuspicion);
@@ -1286,7 +1282,7 @@ mod tests {
     /// entrant registration, e.g. an observer that wires up a follow-on
     /// observer the first time it fires) must not deadlock. Before the fix,
     /// `emit` held the `observers` lock for the whole callback loop, so a
-    /// callback invoking `subscribe()` — which also locks `observers` —
+    /// callback invoking `subscribe()` â€” which also locks `observers` â€”
     /// would deadlock against itself (same thread, same non-reentrant
     /// `std::sync::Mutex`).
     #[test]
@@ -1306,7 +1302,7 @@ mod tests {
             }));
         }));
 
-        // Must return promptly (no deadlock) — first emit triggers
+        // Must return promptly (no deadlock) â€” first emit triggers
         // subscribe(), which must succeed without blocking on `emit`'s own
         // (already-released, post-fix) observers lock.
         e.penalize("agent-a", PenaltyKind::InjectionAttempt);
@@ -1381,7 +1377,7 @@ mod tests {
         let e = TrustDecayEngine::new();
         // Simulate the worst case for eviction: many distinct agents, each
         // penalized exactly once and never touched again, with essentially no
-        // elapsed wall-clock time between them — so lazy time-based recovery
+        // elapsed wall-clock time between them â€” so lazy time-based recovery
         // cannot reclaim any of them and the closest-to-`TRUST_SCORE_INITIAL`
         // fallback eviction (H-24) must be what bounds the map instead.
         for i in 0..(TRUST_MAX_ENTRIES + 500) {
@@ -1400,7 +1396,7 @@ mod tests {
         // floods the map with fresh agent_ids past TRUST_MAX_ENTRIES, trying
         // to force the locked entry out via the cap-eviction sweep. Before
         // the H-24 fix this succeeded whenever the locked entry happened to
-        // have the oldest `last_update` timestamp among all tracked agents —
+        // have the oldest `last_update` timestamp among all tracked agents â€”
         // silently un-suspecting a compromised identity. It must not happen
         // now, regardless of timestamp ordering.
         let e = TrustDecayEngine::new();
@@ -1430,11 +1426,11 @@ mod tests {
         );
     }
 
-    // ── sweep_stale (opusplan.md 6.5 background staleness sweep) ────────────
+    // â”€â”€ sweep_stale (opusplan.md 6.5 background staleness sweep) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// An entry whose `last_update` is older than `TRUST_ENTRY_STALENESS_SECONDS`
     /// must be removed by `sweep_stale`, even though its shard is nowhere near
-    /// `TRUST_PER_SHARD_MAX_ENTRIES` — proving this is a genuinely independent
+    /// `TRUST_PER_SHARD_MAX_ENTRIES` â€” proving this is a genuinely independent
     /// reclaim path, not just a relabeling of the existing capacity-triggered sweep.
     #[test]
     fn sweep_stale_removes_entries_past_the_staleness_threshold() {
@@ -1442,7 +1438,7 @@ mod tests {
         e.penalize("stale-agent", PenaltyKind::GenericHardDrop);
         assert_eq!(e.tracked_count(), 1);
 
-        // Directly backdate `last_update` past the staleness threshold — this test
+        // Directly backdate `last_update` past the staleness threshold â€” this test
         // lives in `trust_decay`'s own `tests` submodule (`use super::*`), so it can
         // reach the private `shards`/`TrustEntry` fields the same way the module's
         // other white-box tests already do.
@@ -1466,7 +1462,7 @@ mod tests {
         );
     }
 
-    /// A fresh (recently-touched) entry must survive `sweep_stale` untouched —
+    /// A fresh (recently-touched) entry must survive `sweep_stale` untouched â€”
     /// the sweep must not be so aggressive it reclaims active agents.
     #[test]
     fn sweep_stale_leaves_fresh_entries_alone() {
@@ -1479,7 +1475,7 @@ mod tests {
     /// H-24 must hold for `sweep_stale` exactly as it does for the existing
     /// capacity-triggered eviction paths: a currently reauth-locked entry must
     /// never be removed by the staleness sweep either, even once it's gone stale
-    /// by wall-clock time — a lockout must survive until its own cooldown, not
+    /// by wall-clock time â€” a lockout must survive until its own cooldown, not
     /// until a maintenance sweep happens to run.
     #[test]
     fn sweep_stale_never_removes_a_locked_entry_even_if_stale() {
@@ -1510,11 +1506,11 @@ mod tests {
         );
     }
 
-    // ── trust_key_for (S-2 fingerprint-keyed trust) ─────────────────────────
+    // â”€â”€ trust_key_for (S-2 fingerprint-keyed trust) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn trust_key_for_falls_back_to_agent_id_when_not_identity_bound() {
-        // No TranscriptBoundSession registered for this session_id — must fall
+        // No TranscriptBoundSession registered for this session_id â€” must fall
         // back to the namespaced agent_id key, preserving prior behavior.
         let key = trust_key_for("agent-plain", "no-such-session-id-hex");
         assert_eq!(key, "aid:agent-plain");
@@ -1616,19 +1612,19 @@ mod tests {
         );
     }
 
-    // ── trust_shard_index (Part 6.3 sharding) ───────────────────────────────
+    // â”€â”€ trust_shard_index (Part 6.3 sharding) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn trust_shard_index_distributes_across_namespace_prefixes() {
         // Regression test: every key here is namespaced (`pk:` / `aid:` / `ip:`),
         // so a shard function that samples the FIRST byte sees only the constant
-        // prefix letter and collapses each namespace onto a single shard —
+        // prefix letter and collapses each namespace onto a single shard â€”
         // 13 of 16 shards permanently dead, and the one live shard per namespace
         // reproducing the pre-sharding single-`Mutex` bottleneck.
         //
         // Asserted as a DISTRIBUTION over many keys rather than "these two keys
         // differ". Two arbitrary keys collide with probability 1/16 under any
-        // sound hash, so a pairwise assertion would be flaky by construction —
+        // sound hash, so a pairwise assertion would be flaky by construction â€”
         // it only held for the old scheme because it compared bytes that
         // happened to differ. What actually matters is that no namespace
         // concentrates.
@@ -1660,7 +1656,7 @@ mod tests {
             assert!(
                 counts.iter().all(|&c| (c as f64) >= lo && (c as f64) <= hi),
                 "namespace {label} concentrates: {counts:?} \
-                 (ideal {ideal:.0}/shard, tolerance {lo:.0}..={hi:.0}) — the shard \
+                 (ideal {ideal:.0}/shard, tolerance {lo:.0}..={hi:.0}) â€” the shard \
                  function is likely sampling the namespace prefix rather than \
                  mixing the whole key",
             );
@@ -1684,7 +1680,7 @@ mod tests {
         }
     }
 
-    // ── IntentDriftTracker ───────────────────────────────────────────────────
+    // â”€â”€ IntentDriftTracker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn drift_accumulates_across_calls() {
@@ -1693,7 +1689,7 @@ mod tests {
         assert!((total1 - 0.3).abs() < 1e-9);
         // (H-30) `total` now decays lazily by real elapsed wall-clock time
         // between calls, so the second call's result is `0.8` minus however
-        // many microseconds actually passed between these two statements —
+        // many microseconds actually passed between these two statements â€”
         // negligible (< 1e-4 even under heavy CI scheduling jitter) but no
         // longer exactly zero, unlike before decay was introduced.
         let total2 = t.accumulate("session-a", 0.5);
@@ -1742,7 +1738,7 @@ mod tests {
         assert!((total1 - 1.0).abs() < 1e-9);
         std::thread::sleep(std::time::Duration::from_millis(150));
         // Accumulating zero additional divergence after a real delay must
-        // still show the existing total has decayed — proves `total` is no
+        // still show the existing total has decayed â€” proves `total` is no
         // longer purely monotonic (the bug H-30 fixes).
         let total2 = t.accumulate("session-decay", 0.0);
         assert!(
@@ -1750,7 +1746,7 @@ mod tests {
             "cumulative drift must decay over elapsed time (H-30): total1={total1} total2={total2}"
         );
         // Sanity bound: 150ms of decay at DRIFT_DECAY_PER_SECOND should be a
-        // small fraction of the total, not a cliff — confirms the *rate*, not
+        // small fraction of the total, not a cliff â€” confirms the *rate*, not
         // just the direction, is sane.
         let expected_decay = 0.150 * DRIFT_DECAY_PER_SECOND;
         assert!(
@@ -1761,7 +1757,7 @@ mod tests {
 
     #[test]
     fn h30_drift_decay_rate_fully_clears_ceiling_within_documented_window() {
-        // DRIFT_DECAY_PER_SECOND is defined as CHAIN_DRIFT_CEILING / 600.0 —
+        // DRIFT_DECAY_PER_SECOND is defined as CHAIN_DRIFT_CEILING / 600.0 â€”
         // a session sitting exactly at the ceiling must decay to zero after
         // 600s of total inactivity. Assert the relationship holds so a future
         // edit to either constant can't silently break that invariant.

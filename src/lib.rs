@@ -10,6 +10,7 @@ pub mod acsvaf_audit;
 pub mod acsvaf_authority;
 pub mod aegf;
 pub mod attestation;
+pub mod clock;
 pub mod cluster;
 pub mod context;
 pub mod crypto_governance;

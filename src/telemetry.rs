@@ -234,6 +234,11 @@ pub struct Counters {
     /// otherwise. Visibility only — no consensus or routing logic keys off
     /// this (see the audit-node designation docs in README.md).
     pub audit_chain_designated_node: AtomicU64,
+    /// R9 (Phase 4): epoch seconds at which the last valid DRI revocation was
+    /// received via gossip on this node (0 = none received yet this process).
+    /// NOT a counter — a timestamp gauge; `snapshot()`/`render_prometheus()`
+    /// derive `revocation_lag_seconds = now − this` from it at scrape time.
+    pub revocation_last_received_epoch: AtomicU64,
 }
 
 impl Counters {
@@ -315,6 +320,7 @@ impl Counters {
             financial_tokens_rejected: z!(),
             session_affinity_violations: z!(),
             audit_chain_designated_node: z!(),
+            revocation_last_received_epoch: z!(),
         }
     }
 }
@@ -1213,6 +1219,37 @@ impl TelemetryCollector {
             .store(u64::from(designated), Ordering::Relaxed);
     }
 
+    /// R9 (Phase 4): record that a valid DRI revocation was received at
+    /// `epoch_secs` (wall-clock seconds). Keeps the MOST RECENT timestamp
+    /// (`fetch_max`), so out-of-order receipts never regress the lag metric.
+    /// `snapshot()`/`render_prometheus()` derive `revocation_lag_seconds =
+    /// now − this` at scrape time; 0 means no revocation received yet this
+    /// process.
+    pub fn record_revocation_received(&self, epoch_secs: u64) {
+        self.counters
+            .revocation_last_received_epoch
+            .fetch_max(epoch_secs, Ordering::Relaxed);
+    }
+
+    /// R9 (Phase 4): current revocation-convergence lag in whole seconds —
+    /// `now − last-received-DRI-revocation-epoch`, or 0 when no revocation
+    /// has been received yet this process. Alert guidance (documented on the
+    /// Prometheus series): a sustained lag above 300s in a gossiped fleet
+    /// means revocation propagation has stalled — verify peer connectivity
+    /// (revocation is the one message class where eventual delivery is a
+    /// security property, not a convenience).
+    pub fn revocation_lag_seconds(&self) -> u64 {
+        let last = self
+            .counters
+            .revocation_last_received_epoch
+            .load(Ordering::Relaxed);
+        if last == 0 {
+            return 0;
+        }
+        let now = crate::clock::now_secs_f64() as u64;
+        now.saturating_sub(last)
+    }
+
     pub fn record_trust_penalty(&self, kind: crate::trust_decay::PenaltyKind) {
         use crate::trust_decay::PenaltyKind;
         match kind {
@@ -1401,6 +1438,12 @@ impl TelemetryCollector {
         snap!("financial_tokens_rejected", c.financial_tokens_rejected);
         snap!("session_affinity_violations", c.session_affinity_violations);
         snap!("audit_chain_designated_node", c.audit_chain_designated_node);
+        // R9: derived (not stored) — lag is computed at scrape time from the
+        // last-received revocation timestamp gauge.
+        m.insert(
+            "revocation_lag_seconds".to_string(),
+            self.revocation_lag_seconds(),
+        );
         m
     }
 
@@ -1525,6 +1568,18 @@ impl TelemetryCollector {
             snap.get("audit_chain_designated_node")
                 .copied()
                 .unwrap_or(0)
+        ));
+
+        // ── Revocation-convergence lag (R9 / Phase 4) ────────────────────────
+        // Gauge: seconds since the last valid DRI revocation arrived via
+        // gossip. 0 = none received yet this process.
+        out.push_str(
+            "# HELP saacp_revocation_lag_seconds Seconds since the last valid DRI revocation was received via gossip on this node (0 = none received yet). ALERT: sustained lag above 300s in a gossiped fleet means revocation propagation has stalled - verify peer connectivity (R9: eventual delivery of revocations is a security property).\n",
+        );
+        out.push_str("# TYPE saacp_revocation_lag_seconds gauge\n");
+        out.push_str(&format!(
+            "saacp_revocation_lag_seconds {}\n",
+            snap.get("revocation_lag_seconds").copied().unwrap_or(0)
         ));
 
         // ── Trust Decay Engine ────────────────────────────────────────────────
@@ -1831,6 +1886,7 @@ impl TelemetryCollector {
         rst!(c.financial_tokens_rejected);
         rst!(c.session_affinity_violations);
         rst!(c.audit_chain_designated_node);
+        rst!(c.revocation_last_received_epoch);
         self.agent_errors
             .lock()
             .unwrap_or_else(|e| e.into_inner())

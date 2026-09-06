@@ -53,6 +53,24 @@ pub const GOSSIP_DEDUP_TTL_SECONDS: f64 = 3_600.0;
 /// distinct fabricated ids must not grow this map without bound between TTL sweeps.
 pub const SEEN_SET_MAX_ENTRIES: usize = 100_000;
 
+/// R9 (Phase 4): optional bounded retry on the gossip SEND path. `0` (the
+/// default) preserves fire-and-forget delivery byte-for-byte; an operator
+/// raising it to `1` re-sends every fanout payload once after
+/// [`GOSSIP_RETRY_DELAY_MS`].
+///
+/// The `GossipTransport` seam is ack-less (`send_to_peer` returns `()`), so a
+/// retry is an unconditional at-least-once redelivery, not a failure-triggered
+/// retransmission — receiver-side [`SeenSet`] de-duplication makes the
+/// duplicate safe and free. Revocation is the one message class where
+/// eventual delivery is a security property rather than a convenience (R9),
+/// which is why the knob exists at all; regular gossip traffic needs no retry
+/// (fanout + multi-hop redundancy already covers it). Touches the gossip send
+/// path ONLY — zero default-behavior change elsewhere.
+pub const GOSSIP_SEND_RETRIES: u32 = 0;
+
+/// Delay before each bounded retry re-send (see [`GOSSIP_SEND_RETRIES`]).
+pub const GOSSIP_RETRY_DELAY_MS: u64 = 100;
+
 // ---------------------------------------------------------------------------
 // GossipEnvelope
 // ---------------------------------------------------------------------------
@@ -234,6 +252,14 @@ impl GossipEngine {
             return false;
         }
 
+        // R9 (Phase 4): a verified-and-stored revocation updates this node's
+        // last-received-revocation timestamp, from which the
+        // `saacp_revocation_lag_seconds` gauge (telemetry snapshot /
+        // `/metrics`) derives its revocation-convergence lag. Alert guidance
+        // is documented on the Prometheus series: sustained lag > 300s in a
+        // gossiped fleet means propagation stalled.
+        crate::telemetry::global_telemetry().record_revocation_received(now_f64() as u64);
+
         if self.seen.check_and_insert(&envelope.revocation_id) {
             // Already seen — accepted (it verified), but not re-forwarded.
             return true;
@@ -261,7 +287,24 @@ impl GossipEngine {
         let chosen: Vec<&String> = peers.choose_multiple(&mut rng, GOSSIP_FANOUT).collect();
         let payload = envelope.record.to_wire();
         for peer_id in chosen {
-            self.transport.send_to_peer(peer_id, &payload);
+            self.send_with_bounded_retries(peer_id, &payload);
+        }
+    }
+
+    /// R9 (Phase 4): send once, then (only when the operator raised
+    /// [`GOSSIP_SEND_RETRIES`] above 0) re-send up to that many times with a
+    /// [`GOSSIP_RETRY_DELAY_MS`] pause between attempts. With the default `0`
+    /// this is exactly one `send_to_peer` call — the pre-R9 fire-and-forget
+    /// behavior, unchanged. See [`GOSSIP_SEND_RETRIES`]'s doc for why the
+    /// retry is unconditional (the transport seam is ack-less) and why that
+    /// is safe (receiver-side SeenSet dedup).
+    fn send_with_bounded_retries(&self, peer_id: &str, payload: &[u8]) {
+        self.transport.send_to_peer(peer_id, payload);
+        let mut remaining = GOSSIP_SEND_RETRIES;
+        while remaining > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(GOSSIP_RETRY_DELAY_MS));
+            self.transport.send_to_peer(peer_id, payload);
+            remaining -= 1;
         }
     }
 
@@ -587,5 +630,60 @@ mod tests {
         let id1a = GossipEnvelope::derive_revocation_id(&record1);
         let id1b = GossipEnvelope::derive_revocation_id(&record1);
         assert_eq!(id1a, id1b);
+    }
+
+    /// R9 (Phase 4): an accepted (verified + stored) revocation must refresh
+    /// the last-received-revocation timestamp so the
+    /// `saacp_revocation_lag_seconds` gauge stays near zero while gossip is
+    /// healthy. A fleet operator alerts on sustained lag > 300s (documented
+    /// on the Prometheus series).
+    #[test]
+    fn accepted_revocation_updates_revocation_lag_gauge() {
+        let anchor = make_identity("anchor-lag");
+        let record = make_revoked_record(&anchor, "victim-lag");
+        let dri = Arc::new(DistributedRevocationInfrastructure::new());
+        let trust_store = Arc::new(make_trust_store_with_anchor(&anchor));
+        let transport = Arc::new(FakeTransport::new(vec!["p1", "p2", "p3"]));
+        let engine = GossipEngine::new(transport.clone(), dri, trust_store, "node-lag");
+
+        let envelope = GossipEnvelope {
+            record,
+            hop_count: 0,
+            origin_id: "origin-node".to_string(),
+            revocation_id: "rev-lag".to_string(),
+        };
+        assert!(engine.receive(envelope), "signed record must be accepted");
+
+        let lag = crate::telemetry::global_telemetry().revocation_lag_seconds();
+        assert!(
+            lag < 60,
+            "a just-received revocation must leave the lag gauge near zero, got {lag}s"
+        );
+    }
+
+    /// R9 (Phase 4): the bounded-retry send helper sends exactly
+    /// `1 + GOSSIP_SEND_RETRIES` times. With the default const (`0`) this is
+    /// exactly one send — the pre-R9 fire-and-forget behavior, unchanged.
+    /// (The transport seam is ack-less, so a raised retry count is an
+    /// unconditional at-least-once redelivery; receiver SeenSet dedup makes
+    /// duplicates safe.)
+    #[test]
+    fn bounded_retry_helper_sends_once_plus_retries() {
+        assert_eq!(
+            GOSSIP_SEND_RETRIES, 0,
+            "the default must preserve fire-and-forget (zero behavior change)"
+        );
+        let anchor = make_identity("anchor-retry");
+        let transport = Arc::new(FakeTransport::new(vec!["p1"]));
+        let dri = Arc::new(DistributedRevocationInfrastructure::new());
+        let trust_store = Arc::new(make_trust_store_with_anchor(&anchor));
+        let engine = GossipEngine::new(transport.clone(), dri, trust_store, "node-retry");
+
+        engine.send_with_bounded_retries("p1", b"payload");
+        assert_eq!(
+            transport.sent.lock().unwrap().len(),
+            1 + GOSSIP_SEND_RETRIES as usize,
+            "the helper must send exactly 1 + GOSSIP_SEND_RETRIES times"
+        );
     }
 }

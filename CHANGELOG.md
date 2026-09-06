@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **R9 — revocation-convergence lag metric** (Phase 4): an accepted
+  (verified + stored) gossip revocation refreshes a last-received timestamp;
+  `saacp_revocation_lag_seconds` (now − last-received, 0 = none received yet)
+  renders on `/metrics` with a documented alert threshold (sustained > 300s
+  in a gossiped fleet = propagation stalled). Regression-tested in
+  `gossip.rs`'s unit tests.
+- **R9 — optional bounded gossip retry**: `GOSSIP_SEND_RETRIES` (default `0`
+  = fire-and-forget preserved byte-for-byte) + `GOSSIP_RETRY_DELAY_MS`
+  (100ms). Raising it re-sends each fanout payload once; the ack-less
+  transport seam makes this an at-least-once redelivery, safe under
+  receiver-side SeenSet dedup. Gossip send path only.
+- **Clock abstraction** (finding I, Phase 4): new `src/clock.rs` with the
+  `Clock` trait + `SystemClock` default impl; the eight duplicated
+  `now_secs()` helpers (`aca.rs`, `cscs.rs`, `identity_binding.rs`,
+  `ievl.rs`, `memory.rs`, `security.rs`, `temporal.rs`, `trust_decay.rs`)
+  now delegate to it. Pure refactor — zero behavior change, zero wire
+  change, zero test-expectation change.
+
+### Changed
 - **M11 hardening — affinity-violation enforcement policy** (Phase 3):
   `session_affinity::AffinityViolationPolicy` (`AlertOnly` default =
   byte-identical to prior behavior; `HardDrop` = fail closed) selectable via

@@ -1,4 +1,4 @@
-//! identity_binding.rs — Authenticated Identity Binding and Transcript Integrity (C-3)
+//! identity_binding.rs â€” Authenticated Identity Binding and Transcript Integrity (C-3)
 //!
 //! Cryptographically binds agent identity to the authenticated handshake transcript.
 //!
@@ -81,13 +81,13 @@ impl AgentIdentityCertificate {
         };
         // L-3 fix: `.expect(...)` (loud, unreachable-in-practice panic) instead of the
         // old `body_bytes()`'s internal `.unwrap_or_default()` (silent empty-Vec
-        // fallback) — signing over an accidentally-empty body would produce a
+        // fallback) â€” signing over an accidentally-empty body would produce a
         // signature that "verifies" but certifies nothing, a fail-open substitution
         // bug in exactly the kind of thing a signature scheme exists to prevent. See
         // `body_bytes`'s own doc comment for why this specific composition cannot
         // actually fail.
         let body = cert.body_bytes()
-            .expect("AgentIdentityCertificate::body_bytes: see its doc comment — cannot fail for this struct");
+            .expect("AgentIdentityCertificate::body_bytes: see its doc comment â€” cannot fail for this struct");
         let sig = signing_key.sign(&body);
         cert.cert_signature = sig.to_bytes().to_vec();
         cert
@@ -101,8 +101,8 @@ impl AgentIdentityCertificate {
     /// certificate for *any* `agent_id`, so it is precisely the key that should never
     /// exist as bytes in a long-running network daemon's memory. Backing it with a
     /// PKCS#11 token or a cloud KMS means a full compromise of this process yields only
-    /// the ability to request signatures while the compromise lasts — bounded and
-    /// revocable — rather than a permanent, silent power to forge identities.
+    /// the ability to request signatures while the compromise lasts â€” bounded and
+    /// revocable â€” rather than a permanent, silent power to forge identities.
     ///
     /// Identical to [`Self::issue`] in every other respect; the produced certificate is
     /// byte-compatible and verifies through the same [`IdentityVerifier`] path, since an
@@ -135,7 +135,7 @@ impl AgentIdentityCertificate {
             cert_signature: Vec::new(),
         };
         let body = cert.body_bytes()
-            .expect("AgentIdentityCertificate::body_bytes: see its doc comment — cannot fail for this struct");
+            .expect("AgentIdentityCertificate::body_bytes: see its doc comment â€” cannot fail for this struct");
         cert.cert_signature = store.sign(signing_key_id, &body)?;
         Ok(cert)
     }
@@ -144,14 +144,14 @@ impl AgentIdentityCertificate {
     /// Returns deterministic JSON with sorted keys.
     ///
     /// L-3 fix: returns `Result` instead of silently falling back to an empty `Vec` on
-    /// serialization failure. In practice this exact composition — a `serde_json::Map`
-    /// built purely from `String` fields and finite `f64` timestamps — cannot fail
+    /// serialization failure. In practice this exact composition â€” a `serde_json::Map`
+    /// built purely from `String` fields and finite `f64` timestamps â€” cannot fail
     /// `serde_json::to_string`: `String`s are always valid UTF-8 and none of these
     /// fields can hold a non-finite float. But "cannot fail today" is exactly the kind
     /// of invariant that should be enforced, not assumed silently: the old
     /// `.unwrap_or_default()` meant that IF it ever did fail, `issue()`/
     /// `verify_certificate` would sign/verify an empty byte string instead of the real
-    /// certificate body — a fail-open bug, not a fail-closed one.
+    /// certificate body â€” a fail-open bug, not a fail-closed one.
     pub fn body_bytes(&self) -> Result<Vec<u8>, String> {
         let mut map = serde_json::Map::new();
         map.insert(
@@ -448,7 +448,7 @@ struct CAKeyRecord {
 
 /// M-1 fix: use the crate's single canonical constant-time comparison
 /// (`security::constant_time_eq`/`constant_time_eq_hex`) instead of local
-/// byte-identical copies — see `security::constant_time_eq`'s doc comment.
+/// byte-identical copies â€” see `security::constant_time_eq`'s doc comment.
 use crate::security::constant_time_eq_hex;
 
 /// Validates AgentIdentityCertificates and enforces transcript binding.
@@ -459,11 +459,11 @@ pub struct IdentityVerifier {
 }
 
 struct VerifierInner {
-    /// Trusted CA public keys: ca_kid → VerifyingKey
+    /// Trusted CA public keys: ca_kid â†’ VerifyingKey
     ca_keys: HashMap<String, CAKeyRecord>,
     /// Revoked cert_ids
     revoked_certs: HashSet<String>,
-    /// Verified agent_id → cert_id (last verified cert per agent)
+    /// Verified agent_id â†’ cert_id (last verified cert per agent)
     verified: HashMap<String, String>,
 }
 
@@ -483,7 +483,7 @@ impl IdentityVerifier {
     ///
     /// M-38 fix: every `self.inner.lock()` across `IdentityVerifier`,
     /// `IdentityGate`, and `SessionIdentityRegistry` in this file recovers via
-    /// `into_inner()` on poison rather than panicking — each backs a
+    /// `into_inner()` on poison rather than panicking â€” each backs a
     /// process-wide singleton (`DEFAULT_IDENTITY_VERIFIER`,
     /// `DEFAULT_IDENTITY_GATE`/`GLOBAL_IDENTITY_GATE`,
     /// `DEFAULT_IDENTITY_REGISTRY`), so one poisoning panic must not cascade
@@ -503,7 +503,7 @@ impl IdentityVerifier {
     ///
     /// CRIT-8 fix: also purges any `verified` cache entries pinned to this cert_id.
     /// Without this, an agent that completed identity verification before revocation
-    /// would keep passing `is_identity_verified`/`require_identity_verified` forever —
+    /// would keep passing `is_identity_verified`/`require_identity_verified` forever â€”
     /// revocation had no effect on the cached "verified" status.
     pub fn revoke_certificate(&self, cert_id: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -612,12 +612,12 @@ impl IdentityVerifier {
             (&session.server_public_key_hex, &session.server_agent_id)
         };
 
-        // Key mismatch → key-swap attack.
+        // Key mismatch â†’ key-swap attack.
         // H-3 fix: constant-time comparison. `claimed_public_key_hex` is
         // attacker-controlled (a claimed field presented by the connecting
         // party); a naive `!=` on `&str` short-circuits on the first
         // differing byte, leaking timing information about how many leading
-        // hex characters of a guess are correct — the same class of bug
+        // hex characters of a guess are correct â€” the same class of bug
         // fixed for `verify_thash_matches_capability` under H-4. Decoding to
         // bytes and comparing in constant time removes that side channel.
         if !constant_time_eq_hex(claimed_public_key_hex, transcript_key) {
@@ -629,7 +629,7 @@ impl IdentityVerifier {
             ));
         }
 
-        // Agent ID mismatch → identity relabeling attack
+        // Agent ID mismatch â†’ identity relabeling attack
         if agent_id != transcript_agent {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::SessionSpliceDetected,
@@ -661,8 +661,8 @@ impl IdentityVerifier {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::TranscriptHashMismatch,
                 format!(
-                    "C-3: Capability token thash '{}'…' does not match \
-                    session transcript thash '{}'…'. Cross-session replay or transcript \
+                    "C-3: Capability token thash '{}'â€¦' does not match \
+                    session transcript thash '{}'â€¦'. Cross-session replay or transcript \
                     tampering detected.",
                     cap_prefix, thash_prefix
                 ),
@@ -723,7 +723,7 @@ impl Default for IdentityVerifier {
 }
 
 // ---------------------------------------------------------------------------
-// IdentityGate — Pre-authorization ordering guard
+// IdentityGate â€” Pre-authorization ordering guard
 // ---------------------------------------------------------------------------
 
 /// C-3 ordering phases.
@@ -747,16 +747,13 @@ pub const IDENTITY_GATE_MAX_ENTRIES: usize = 10_000;
 pub const SESSION_IDENTITY_REGISTRY_MAX_ENTRIES: usize = 10_000;
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::now_secs_f64()
 }
 
 /// Enforces the C-3 ordering invariant:
 ///
-/// Identity verification → Authorization → Capability validation →
-/// Memory access → Delegation processed → Application execution
+/// Identity verification â†’ Authorization â†’ Capability validation â†’
+/// Memory access â†’ Delegation processed â†’ Application execution
 ///
 /// The gate maintains a per-agent, per-session set of completed phases.
 pub struct IdentityGate {
@@ -764,7 +761,7 @@ pub struct IdentityGate {
 }
 
 struct GateInner {
-    /// (agent_id, sid) → progress record
+    /// (agent_id, sid) â†’ progress record
     progress: HashMap<(String, String), GateProgress>,
 }
 
@@ -792,7 +789,7 @@ impl IdentityGate {
 
     /// M-31 fix: forcibly remove the oldest `evict_count` entries by
     /// `last_touched`, ascending. Called only once `progress` is at or over
-    /// `IDENTITY_GATE_MAX_ENTRIES` and the incoming key is new — an
+    /// `IDENTITY_GATE_MAX_ENTRIES` and the incoming key is new â€” an
     /// evicted (agent_id, sid) pair simply has to redo the C-3 handshake
     /// from the start (`require_phase` already fails closed with no
     /// progress entry present), which is the correct fail-closed outcome:
@@ -886,7 +883,7 @@ impl Default for IdentityGate {
 // SessionIdentityRegistry
 // ---------------------------------------------------------------------------
 
-/// Thread-safe registry: thash → TranscriptBoundSession.
+/// Thread-safe registry: thash â†’ TranscriptBoundSession.
 pub struct SessionIdentityRegistry {
     inner: Mutex<RegistryInner>,
 }
@@ -911,7 +908,7 @@ impl SessionIdentityRegistry {
     /// registry is at `SESSION_IDENTITY_REGISTRY_MAX_ENTRIES` and the
     /// incoming thash is new. An evicted session simply requires the client
     /// to re-establish (its Gate C-3/identity-binding handshake must run
-    /// again) — fail-closed, matching `IdentityGate::evict_oldest`'s same
+    /// again) â€” fail-closed, matching `IdentityGate::evict_oldest`'s same
     /// posture on the sibling structure this finding also targets.
     pub fn register(&self, session: TranscriptBoundSession) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -935,7 +932,7 @@ impl SessionIdentityRegistry {
     /// Look up a session by its transcript hash.
     ///
     /// M-38 fix: recovers via `into_inner()` on poison instead of `.ok()?`-mapping
-    /// poison to `None` (indistinguishable from "no session with this thash") —
+    /// poison to `None` (indistinguishable from "no session with this thash") â€”
     /// `DEFAULT_IDENTITY_REGISTRY` is a process-wide singleton.
     pub fn get_by_thash<F, R>(&self, thash: &str, f: F) -> Option<R>
     where
@@ -947,7 +944,7 @@ impl SessionIdentityRegistry {
 
     /// Look up a session by its session ID hex string.
     ///
-    /// M-38 fix: see `get_by_thash`'s doc comment — same poison-recovery fix.
+    /// M-38 fix: see `get_by_thash`'s doc comment â€” same poison-recovery fix.
     pub fn get_by_session_id<F, R>(&self, session_id_hex: &str, f: F) -> Option<R>
     where
         F: FnOnce(&TranscriptBoundSession) -> R,
@@ -1208,7 +1205,7 @@ mod tests {
 
     /// CRIT-8 regression test: revoking a certificate AFTER the agent has already
     /// completed identity verification must immediately invalidate the cached
-    /// "verified" status — not leave it valid until some unrelated re-verification.
+    /// "verified" status â€” not leave it valid until some unrelated re-verification.
     #[test]
     fn test_crit8_revocation_invalidates_verified_cache() {
         let (ca_sk, ca_vk) = make_ca_keypair();
@@ -1228,7 +1225,7 @@ mod tests {
         let verifier = IdentityVerifier::new();
         verifier.register_ca_key("ca-01", ca_vk);
 
-        // Agent completes identity verification — cached as verified.
+        // Agent completes identity verification â€” cached as verified.
         assert!(verifier.verify_certificate(&cert).is_ok());
         assert!(verifier.is_identity_verified("agent-cached"));
         assert!(verifier
@@ -1240,7 +1237,7 @@ mod tests {
 
         // The cached "verified" status must no longer be trusted. `revoke_certificate`
         // eagerly purges the `verified` entry, so the subsequent read sees no cached
-        // entry at all (IdentityNotVerified) rather than a revoked one (KeyRevoked) —
+        // entry at all (IdentityNotVerified) rather than a revoked one (KeyRevoked) â€”
         // either way it fails closed, which is what matters here.
         assert!(
             !verifier.is_identity_verified("agent-cached"),
@@ -1375,7 +1372,7 @@ mod tests {
     /// use `constant_time_eq_hex` rather than a short-circuiting `&str` `!=`
     /// (mirrors the H-4 fix for `verify_thash_matches_capability`). Exercises
     /// exact match, well-formed-but-wrong hex differing only in the last byte,
-    /// and malformed non-hex input — all must produce the same pass/fail
+    /// and malformed non-hex input â€” all must produce the same pass/fail
     /// outcome as before the fix, without the timing side-channel.
     #[test]
     fn test_verify_transcript_binding_constant_time() {
@@ -1447,7 +1444,7 @@ mod tests {
     /// exercises the three cases the fix must preserve correctness for: exact match,
     /// well-formed-but-wrong-content hex (differs only in the last byte, so a
     /// short-circuiting compare would previously have leaked the most timing signal
-    /// here), and malformed non-hex input — all with the same pass/fail outcome as
+    /// here), and malformed non-hex input â€” all with the same pass/fail outcome as
     /// before the fix, just without the timing side-channel.
     #[test]
     fn test_verify_thash_matches_capability_constant_time() {
@@ -1529,7 +1526,7 @@ mod tests {
             let mut inner = gate.inner.lock().unwrap();
             // Fill to exactly capacity with DESCENDING last_touched (so
             // HashMap iteration/key order is the exact opposite of age
-            // order) — proves eviction sorts by actual age, not by
+            // order) â€” proves eviction sorts by actual age, not by
             // arbitrary map order.
             for i in 0..IDENTITY_GATE_MAX_ENTRIES {
                 let last_touched = (IDENTITY_GATE_MAX_ENTRIES - i) as f64;
@@ -1564,7 +1561,7 @@ mod tests {
             "the just-advanced entry must not be evicted"
         );
         // Every surviving pre-existing entry must have a last_touched
-        // STRICTLY GREATER than the smallest possible value (1.0) — i.e.
+        // STRICTLY GREATER than the smallest possible value (1.0) â€” i.e.
         // the genuinely oldest entries (last_touched near 1..few) were
         // evicted first, not entries chosen by key/hash order.
         let min_surviving_prefilled = inner
@@ -1614,7 +1611,7 @@ mod tests {
             .unwrap();
 
         // agent-000000 had the smallest last_touched (0.0) and must now have
-        // been evicted — requiring the SAME phase it had already completed
+        // been evicted â€” requiring the SAME phase it had already completed
         // must now fail (no progress entry at all), proving eviction
         // actually removed real, previously-satisfied progress rather than
         // just failing to complete a phase it never had.
