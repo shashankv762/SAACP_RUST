@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-06
+
+Production-readiness audit remediations (see PRODUCTION_READINESS_AUDIT.md —
+each fix carries its audit gap/risk ID). All knobs default off/unchanged unless
+noted.
+
+### Added
+- **Audit-chain recovery at startup** (M-A, G1/R1): with
+  `SAACP_AUDIT_RECOVER=1` (or `SAACPNetworkDaemon::with_audit_chain_recovery`),
+  `start_with_shutdown` verifies the persisted chain via
+  `ImmutableAuditLog::initialize_chain` against the configured issuer secret
+  and adopts it — restarts continue the on-disk chain instead of silently
+  starting from genesis. Fail-closed: an unverifiable chain refuses startup
+  (H-6: a torn tail is indistinguishable from tampering; no auto-quarantine).
+  Regression: `tests/test_audit_recovery_rs.rs`.
+- **External alert delivery** (M-B, G2/R2): new `alert_sink` module — RFC 5424
+  syslog over UDP. When `SAACP_ALERT_SYSLOG=<host:port>` is set, every
+  `SecurityAlert` is forwarded best-effort; failures increment
+  `saacp_security_events_total{event="alert_sink_failures_total"}`. Payloads
+  carry only the coarse `/api/alerts` fields (CRIT-10 preserved). Sink tests
+  cover RFC 5424 shape, SD escaping, real loopback delivery, timestamp edges.
+- **Seed/pin mismatch warning** (M-I, R11): configuring peer pins without
+  `SAACP_SERVER_SEED_FILE` now prints a loud startup warning (ephemeral seed
+  invalidates pins at restart). Regression-tested in the sidecar binary.
+
+### Changed
+- **Demo telemetry is opt-in** (M-G, R7/G6 — BREAKING for demo users): the
+  command center's demo daemon + synthetic activity generator are now disabled
+  by default; enable with `SAACP_DEMO_MODE=1` or
+  `[command_center] demo_mode = true`. `SAACP_DISABLE_DEMO_DAEMON=1` still
+  forces off and wins over the opt-in. Regression-tested in the binary.
+- **Bounded SessionAffinityTracker** (M-D, G4/R4): capped at 100k entries with
+  FIFO eviction (was unbounded growth for process lifetime). Evicted sessions
+  lose violation memory — documented tradeoff.
+- **Bounded InMemoryBackend** (M-D, G4/R4): new-key inserts capped at 100k
+  entries with FIFO eviction of live entries, stale-skip for
+  deleted/expired entries, and amortized queue compaction. Eviction direction
+  is fail-safe (loosens enforcement memory, never forges it).
+- **Bounded gossip send path** (M-E, G5/R5): `StaticPeerListTransport` now
+  sends through a fixed 4-worker pool with a 1024-slot queue instead of one
+  detached thread per send (unbounded thread creation under a revocation
+  storm). Dropped sends and failed connects/writes are counted as
+  `saacp_security_events_total{event="gossip_send_failures_total"}`.
+- **Docker image** (M-C, G3 partial): `health-endpoint` feature now compiled
+  into the shipped binaries so orchestrators can use the daemon health/metrics
+  server. `redis-backend` deliberately still absent (no binary wiring yet).
+
+### Fixed
+- **Gate 1.5 chain-drift tracking ignored per-tenant contexts** (Longcat Gap B
+  completion): the unfinished `gate_1_5_reinforcement_with_ctx` variant took
+  `ctx` but hardcoded `IntentDriftTracker::global()`, so hermetic per-tenant
+  drift isolation never happened (and the unused parameter tripped rustc
+  warnings). The body now tracks on `ctx.intent_drift` (aliases the global for
+  the shared default — behavior-identical there), and the pipeline passes its
+  context. Regression: `gate_1_5_drift_isolation_per_context`.
+- **cp1252 mojibake repaired across the Phase-4 clock modules** (Longcat
+  re-verification Step 1): an editor had double-encoded UTF-8 as cp1252, so
+  em-dashes/box-drawing/arrows in comments AND user-facing `SAACPHardDrop`
+  message strings in the eight clock-refactor modules were corrupted
+  (`â€""`-style). Repaired by the exact inverse transform; new
+  `tests/test_no_mojibake_rs.rs` guard fails if any artifact character
+  reappears.
+
 ## [0.2.0] - 2026-09-06
 
 ### Added

@@ -63,9 +63,7 @@ use crate::schemas::PreCompiledSchemas;
 use crate::security::ImmutableAuditLog;
 use crate::telemetry::report_gate_rejection;
 use crate::temporal::DeadMansSwitch;
-use crate::trust_decay::{
-    trust_key_for, IntentDriftTracker, PenaltyKind, RewardKind, CHAIN_DRIFT_CEILING,
-};
+use crate::trust_decay::{trust_key_for, PenaltyKind, RewardKind, CHAIN_DRIFT_CEILING};
 
 /// Wrap a gate call expression with latency instrumentation (Phase 5
 /// Observability, O-1). Records the elapsed wall-clock time under `$name`'s
@@ -1802,6 +1800,28 @@ impl SAACPProtocolHandler {
         delegation_depth: u32,
         session_uuid: &str,
     ) -> Result<(), SAACPHardDrop> {
+        Self::gate_1_5_reinforcement_with_ctx(
+            SaacpContext::shared_default(),
+            root_intent,
+            payload_dict,
+            delegation_depth,
+            session_uuid,
+        )
+    }
+
+    /// Longcat re-verification (Gap B): context-aware variant of
+    /// [`Self::gate_1_5_reinforcement`] — the cumulative chain-drift tracker
+    /// lands on `ctx.intent_drift` instead of the process global, so hermetic
+    /// (per-tenant) contexts isolate their delegation chains. Behavior for
+    /// the shared default is identical: its `intent_drift` aliases
+    /// `IntentDriftTracker::global()`.
+    pub fn gate_1_5_reinforcement_with_ctx(
+        ctx: &SaacpContext,
+        root_intent: &str,
+        payload_dict: &HashMap<String, JsonValue>,
+        delegation_depth: u32,
+        session_uuid: &str,
+    ) -> Result<(), SAACPHardDrop> {
         let Some(task_str) = Self::extract_task_str(payload_dict) else {
             return Ok(());
         };
@@ -1855,7 +1875,14 @@ impl SAACPProtocolHandler {
         // Chain-wide cumulative ceiling: independent of any single hop
         // passing its own check, the running total across this session's
         // delegation chain must not exceed CHAIN_DRIFT_CEILING.
-        let cumulative = IntentDriftTracker::global().accumulate(session_uuid, divergence);
+        // Longcat Gap B completion: land the tracker on the CONTEXT's drift
+        // engine, not the process global — `ctx.intent_drift` aliases
+        // `IntentDriftTracker::global()` for the shared default (so the
+        // `gate_1_5_reinforcement` wrapper stays behavior-identical), while
+        // hermetic per-tenant contexts isolate their delegation chains as
+        // this function's doc promises. (The unfinished first draft of this
+        // variant hardcoded the global, silently ignoring `ctx`.)
+        let cumulative = ctx.intent_drift.accumulate(session_uuid, divergence);
         if cumulative > CHAIN_DRIFT_CEILING {
             return Err(SAACPHardDrop::new(
                 SAACPBytecodes::IntentChainDriftExceeded,
@@ -2795,9 +2822,15 @@ impl SAACPProtocolHandler {
             }
 
             // ── Reinforcement: per-hop tightening + chain-wide drift ceiling ──
+            // Longcat Gap B: pass the pipeline's context so hermetic
+            // (per-tenant) contexts track chain drift on their own
+            // `intent_drift` engine; for the shared default the context's
+            // tracker aliases the process global, so this is
+            // behavior-identical there.
             if let Err(e) = timed_gate!(
                 "gate_1_5_intent",
-                Self::gate_1_5_reinforcement(
+                Self::gate_1_5_reinforcement_with_ctx(
+                    ctx,
                     rint,
                     &parsed.payload_dict,
                     delegation_depth,
@@ -3963,6 +3996,66 @@ fn extract_token_exp(token_b64: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Longcat Gap B regression: `gate_1_5_reinforcement_with_ctx` must track
+    /// chain drift on the CONTEXT's `intent_drift` engine, not the process
+    /// global — two hermetic contexts replaying the same session stay
+    /// isolated, and the per-hop floor still passes each individual hop (each
+    /// task shares exactly one of the root's three terms ⇒ divergence 2/3 per
+    /// hop, so the 2.0 ceiling trips on the FOURTH hop of one session).
+    #[test]
+    fn gate_1_5_drift_isolation_per_context() {
+        let root = "alpha beta gamma";
+        let hop_payload = |word: &str| {
+            HashMap::from([(
+                "task".to_string(),
+                JsonValue::String(format!("alpha {word}")),
+            )])
+        };
+        let ctx_a = SaacpContext::new();
+        let ctx_b = SaacpContext::new();
+
+        for hop in ["h1", "h2", "h3"] {
+            let r = SAACPProtocolHandler::gate_1_5_reinforcement_with_ctx(
+                &ctx_a,
+                root,
+                &hop_payload(hop),
+                0,
+                "iso-session",
+            );
+            assert!(
+                r.is_ok(),
+                "hop {hop} (cumulative 2/3, 4/3) must stay under the 2.0 ceiling: {r:?}"
+            );
+        }
+        let fourth = SAACPProtocolHandler::gate_1_5_reinforcement_with_ctx(
+            &ctx_a,
+            root,
+            &hop_payload("h4"),
+            0,
+            "iso-session",
+        )
+        .expect_err("4th hop (cumulative 8/3 > 2.0) must trip the chain-drift ceiling");
+        assert_eq!(
+            fourth.bytecode,
+            SAACPBytecodes::IntentChainDriftExceeded,
+            "the refusal must be the chain-drift ceiling, not the per-hop floor"
+        );
+
+        // The SAME session's first hop in a different hermetic context must
+        // not be blocked by ctx A's accumulated drift.
+        assert!(
+            SAACPProtocolHandler::gate_1_5_reinforcement_with_ctx(
+                &ctx_b,
+                root,
+                &hop_payload("b1"),
+                0,
+                "iso-session"
+            )
+            .is_ok(),
+            "ctx B must be isolated from ctx A's accumulated drift (per-tenant isolation)"
+        );
+    }
 
     /// F6 regression (kimiplan BUG): a token whose 4-byte `json_len` prefix is
     /// near `u32::MAX` made `4 + json_len` wrap on 32-bit targets, pass the

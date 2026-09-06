@@ -1,6 +1,6 @@
 [package]
 name = "saacp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # MSRV (audit G7: "declare the real MSRV" — resolves the previous TODO).
 # The de-facto floor is pinned by rust-toolchain.toml (1.96.0) and is what

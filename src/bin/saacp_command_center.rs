@@ -34,7 +34,12 @@
 //!                                 (default: 127.0.0.1:9090)
 //!   SAACP_DOLLARS_PER_TOKEN    — override the illustrative $/token conversion used by
 //!                                 /api/financial (default: COMMAND_CENTER_DEFAULT_DOLLARS_PER_TOKEN)
-//!   SAACP_DISABLE_DEMO_DAEMON  — set to "1" to skip starting the demo SAACPNetworkDaemon
+//!   SAACP_DEMO_MODE            — set to "1" to ENABLE the demo SAACPNetworkDaemon
+//!                               + synthetic activity generator (OPT-IN since
+//!                               v0.2.1; the demo used to be default-on, which
+//!                               let synthetic data masquerade as real telemetry)
+//!   SAACP_DISABLE_DEMO_DAEMON  — legacy force-off switch: set to "1" to skip the
+//!                               demo SAACPNetworkDaemon (wins over SAACP_DEMO_MODE)
 //!   SAACP_DEMO_DAEMON_ADDR     — address the demo daemon binds, if not disabled
 //!                                 (default: 127.0.0.1:7444)
 //!   SAACP_DASHBOARD_ALLOWED_ORIGINS — comma-separated exact-match browser Origin CORS
@@ -115,6 +120,26 @@ fn config_error_exit(err: CommandCenterConfigError) -> ! {
     tracing::error!(error = %err, "saacp-command-center startup failed");
     eprintln!("[saacp-command-center] startup failed: {err}");
     std::process::exit(1);
+}
+
+/// M-G remediation (production audit R7/G6): the demo daemon + synthetic
+/// activity generator are OPT-IN since v0.2.1 — they were default-on, so an
+/// operator using the dashboard as an ops console could mistake synthetic
+/// telemetry for real data. `env_demo`/`toml_demo` opt in; the legacy
+/// `SAACP_DISABLE_DEMO_DAEMON` switch (env or TOML) still forces the demo
+/// off and wins, preserving its meaning for existing deployments.
+fn demo_mode_enabled(
+    env_demo: Option<String>,
+    env_disable: Option<String>,
+    toml_demo: Option<bool>,
+    toml_disable: Option<bool>,
+) -> bool {
+    let force_off = matches!(env_disable.as_deref(), Some("1")) || toml_disable == Some(true);
+    if force_off {
+        return false;
+    }
+    matches!(env_demo.as_deref(), Some("1") | Some("true") | Some("TRUE"))
+        || toml_demo == Some(true)
 }
 
 fn parse_secret_with_var(
@@ -281,12 +306,20 @@ async fn main() -> std::io::Result<()> {
             .collect();
     }
 
-    let disable_demo = match std::env::var("SAACP_DISABLE_DEMO_DAEMON").as_deref() {
-        Ok("1") => true,
-        Ok(_) => false,
-        Err(_) => bin_cfg.command_center.disable_demo_daemon.unwrap_or(false),
-    };
-    if !disable_demo {
+    // M-G remediation (production audit R7/G6): the demo daemon + synthetic
+    // activity generator are now OPT-IN. They were default-on, so an operator
+    // using the dashboard as an ops console saw synthetic data mistaken for
+    // real telemetry. Enable explicitly with SAACP_DEMO_MODE=1 (or
+    // `[command_center] demo_mode = true` in the SAACP_CONFIG file);
+    // SAACP_DISABLE_DEMO_DAEMON=1 (and the config field of the same name)
+    // still force the demo off and win over the opt-in.
+    let demo_enabled = demo_mode_enabled(
+        std::env::var("SAACP_DEMO_MODE").ok(),
+        std::env::var("SAACP_DISABLE_DEMO_DAEMON").ok(),
+        bin_cfg.command_center.demo_mode,
+        bin_cfg.command_center.disable_demo_daemon,
+    );
+    if demo_enabled {
         let demo_addr: SocketAddr = resolve(
             "SAACP_DEMO_DAEMON_ADDR",
             bin_cfg.command_center.demo_daemon_addr.as_deref(),
@@ -298,16 +331,21 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(async move {
             let _ = daemon.start().await;
         });
-        eprintln!("[SAACP Command Center] Demo daemon listening on {demo_addr} (set SAACP_DISABLE_DEMO_DAEMON=1 to skip)");
+        eprintln!("[SAACP Command Center] Demo daemon listening on {demo_addr} (set SAACP_DEMO_MODE=0 or unset to disable)");
 
         // A listening daemon with no client connecting to it generates zero packets, so the
         // gate pipeline never runs and every dashboard panel stays (correctly) empty — which
         // read as "the dashboard is broken". Drive synthetic activity through the same global
         // engines a real gateway drives so the panels populate out of the box. This is
-        // demo-only and shares the daemon's opt-out: run against a real gateway with
-        // SAACP_DISABLE_DEMO_DAEMON=1 and no synthetic data is produced.
+        // demo-only, OPT-IN since v0.2.1 (M-G), and shares the force-off switch.
         tokio::spawn(saacp::command_center_demo::run());
         eprintln!("[SAACP Command Center] Demo activity generator started (feeds live agents, mesh, alerts, financial)");
+    } else {
+        eprintln!(
+            "[SAACP Command Center] Demo daemon DISABLED (default since v0.2.1 — set \
+             SAACP_DEMO_MODE=1 to enable the synthetic demo). Point the dashboard at a \
+             real gateway process for live data."
+        );
     }
 
     // R-6 fix: the gate pipeline (`handler.rs`) processes packets through several
@@ -376,4 +414,39 @@ async fn main() -> std::io::Result<()> {
     let _maintenance_handle = Arc::clone(&maintenance).start();
 
     run(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M-G regression: the demo is OFF by default and requires an explicit
+    /// opt-in through either channel; the legacy force-off switch wins over
+    /// the opt-in.
+    #[test]
+    fn demo_mode_is_opt_in() {
+        let none: Option<String> = None;
+        // Default posture (no env, no TOML): OFF.
+        assert!(!demo_mode_enabled(none.clone(), None, None, None));
+        // Explicit opt-in via env or TOML enables it.
+        assert!(demo_mode_enabled(Some("1".into()), None, None, None));
+        assert!(demo_mode_enabled(Some("true".into()), None, None, None));
+        assert!(demo_mode_enabled(none.clone(), None, Some(true), None));
+        // The legacy force-off switch wins over the opt-in (both channels).
+        assert!(!demo_mode_enabled(
+            Some("1".into()),
+            Some("1".into()),
+            Some(true),
+            None
+        ));
+        assert!(!demo_mode_enabled(
+            Some("1".into()),
+            None,
+            Some(true),
+            Some(true)
+        ));
+        // Any other env value is not an opt-in ("0", garbage).
+        assert!(!demo_mode_enabled(Some("0".into()), None, None, None));
+        assert!(!demo_mode_enabled(Some("yes".into()), None, None, None));
+    }
 }

@@ -1,21 +1,21 @@
-//! ievl.rs â€” Intent-Execution Verification Loop (Phase 6 / Part 8.1)
+//! ievl.rs — Intent-Execution Verification Loop (Phase 6 / Part 8.1)
 //!
-//! *New in Rust* â€” no Python-reference analog.
+//! *New in Rust* — no Python-reference analog.
 //!
 //! # Why this exists
 //!
 //! Gate 1.5 (`handler.rs`) already checks that a packet's *declared* task text is
-//! consistent with the session's signed root intent â€” but that check is purely
+//! consistent with the session's signed root intent — but that check is purely
 //! prospective. Nothing in the pipeline ever asks "did the agent actually do what
 //! it said it would?" after the fact. An agent (or a compromised one) can pass
 //! every gate honestly while declaring an IRREVERSIBLE action, then execute
-//! something materially different â€” a wider blast radius, a different target set,
-//! or a more dangerous action class than it declared â€” with no protocol-level
+//! something materially different — a wider blast radius, a different target set,
+//! or a more dangerous action class than it declared — with no protocol-level
 //! consequence. IEVL closes that gap for the highest-stakes action class by asking
 //! for a signed, after-the-fact `ExecutionReceipt` and comparing it against the
 //! `IntentDeclaration` captured at Gate 1.5 time.
 //!
-//! # Architecture â€” NOT a gate
+//! # Architecture — NOT a gate
 //!
 //! Like [`crate::trust_decay::TrustDecayEngine`], IEVL is deliberately **not** a
 //! 13th numbered gate. It is three additive pieces bolted onto the existing
@@ -23,37 +23,37 @@
 //!
 //! 1. A **registration hook** at Gate 1.5 (`handler.rs`, inside the
 //!    `root_intent_hash` branch, immediately after the existing intent checks
-//!    succeed) â€” captures an [`IntentDeclaration`] for IRREVERSIBLE-class packets
+//!    succeed) — captures an [`IntentDeclaration`] for IRREVERSIBLE-class packets
 //!    only (`RECEIPT_REQUIRED_ACTION_CLASS`). Every other action class is a no-op
 //!    here: this hook never touches READ_ONLY/REVERSIBLE traffic.
 //! 2. A **new inbound message handler** for schema_id=10 (`ExecutionReceipt`,
 //!    `schemas.rs`), dispatched from `daemon.rs` *after* the full gate pipeline
-//!    has already cleared the receipt packet â€” mirroring exactly how the
+//!    has already cleared the receipt packet — mirroring exactly how the
 //!    schema_id=11 Gossip Envelope is dispatched post-pipeline in `daemon.rs`
 //!    (see `decode_gossip_envelope`'s call site). [`handle_execution_receipt`] is
 //!    that handler's entry point.
 //! 3. A **background sweep** ([`IevlEngine::start_sweep`]) that turns a declared-
 //!    but-never-fulfilled `IntentDeclaration` into a `ReceiptTimeout` penalty once
-//!    its TTL elapses â€” opt-in, matching `gossip::GossipEngine::start_sweep`'s own
+//!    its TTL elapses — opt-in, matching `gossip::GossipEngine::start_sweep`'s own
 //!    "caller decides whether to spawn it" convention.
 //!
 //! # Enforcement
 //!
 //! [`VerificationVerdict`] is deliberately finer-grained than pass/fail because
-//! the two things a receipt can misreport â€” *what* was targeted and *how* the
-//! action was described â€” are independent axes, and only some of the ways they
+//! the two things a receipt can misreport — *what* was targeted and *how* the
+//! action was described — are independent axes, and only some of the ways they
 //! can diverge warrant full revocation:
 //!
-//! - [`VerificationVerdict::ClassEscalation`] â€” the agent executed something
-//!   *more* dangerous than it promised â€” is Monotonic-Security-critical and
+//! - [`VerificationVerdict::ClassEscalation`] — the agent executed something
+//!   *more* dangerous than it promised — is Monotonic-Security-critical and
 //!   triggers immediate [`crate::faitf::DistributedRevocationInfrastructure::revoke`],
 //!   not just a trust penalty (Part 12 principle 9). Detected two ways: (1) the
-//!   receipt's own packet-level `action_class` exceeds what was declared â€”
+//!   receipt's own packet-level `action_class` exceeds what was declared —
 //!   only reachable if a deployment lowers `RECEIPT_REQUIRED_ACTION_CLASS`
 //!   below the protocol's ceiling, since at the documented default
 //!   (IRREVERSIBLE only) a declaration already sits at the maximum class; or
 //!   (2) `actual_action`'s text names a [`crate::handler::DANGEROUS_ACTION_TERMS`]
-//!   verb absent from the declaration â€” the same denylist Gate 1.5c already
+//!   verb absent from the declaration — the same denylist Gate 1.5c already
 //!   applies prospectively, reused here retrospectively so escalation stays
 //!   detectable even when every tracked declaration is already at the
 //!   numeric ceiling.
@@ -62,18 +62,18 @@
 //!   [`VerificationVerdict::MajorDivergence`] (the *described* action itself
 //!   diverges that far from what was declared, reusing
 //!   `SAACPProtocolHandler::intent_divergence`) both apply
-//!   `PenaltyKind::TargetViolation` â€” real but recoverable evidence, not grounds
+//!   `PenaltyKind::TargetViolation` — real but recoverable evidence, not grounds
 //!   for outright revocation.
 //! - [`VerificationVerdict::MinorDrift`] (either axis sits between the minor and
-//!   full overlap thresholds) is informational only â€” logged nowhere beyond the
+//!   full overlap thresholds) is informational only — logged nowhere beyond the
 //!   ordinary metrics a passing receipt produces, no trust action, since overlap
 //!   this close is plausibly just paraphrasing rather than a real substitution.
-//! - [`VerificationVerdict::Consistent`] rewards `RewardKind::ValidReceipt` â€”
+//! - [`VerificationVerdict::Consistent`] rewards `RewardKind::ValidReceipt` —
 //!   stronger positive evidence than a bare clean pipeline pass, since it proves
-//!   post-execution reality matched the declaration (the "IEVL â†’ Trust â†’ Recovery"
+//!   post-execution reality matched the declaration (the "IEVL → Trust → Recovery"
 //!   loop, Part A.10).
 //! - [`VerificationVerdict::ReceiptMissing`] (no declaration matches the receipt's
-//!   reference â€” already swept, or a bogus/forged reference) and
+//!   reference — already swept, or a bogus/forged reference) and
 //!   [`VerificationVerdict::SignatureInvalid`] (the receipt's signature does not
 //!   verify against the presenting session's bound public key) are both
 //!   deliberately inert beyond telemetry: neither can be reliably attributed to
@@ -85,7 +85,7 @@
 //! handshake time (`identity_binding::DEFAULT_IDENTITY_REGISTRY`, exactly as
 //! `trust_decay::trust_key_for` already looks it up) over a length-prefixed
 //! canonical encoding of its own claimed fields
-//! ([`verify_receipt_signature`]/`canonical_receipt_bytes`) â€” the same
+//! ([`verify_receipt_signature`]/`canonical_receipt_bytes`) — the same
 //! length-prefixed-field idiom `identity_binding.rs`'s transcript hash and
 //! `faitf.rs`'s `AgentCredential`/`SignedRevocationRecord` body bytes already use,
 //! so two fields can never be concatenation-ambiguous with each other.
@@ -93,7 +93,7 @@
 //! # Declaration IDs need no extra round-trip
 //!
 //! An `IntentDeclaration` is keyed by [`declaration_id`], a pure function of the
-//! declaring packet's own `(session_uuid, sequence_id)` â€” both values the
+//! declaring packet's own `(session_uuid, sequence_id)` — both values the
 //! declaring agent already knows (it sent that packet), so the client can compute
 //! the same ID independently when it later sends the matching receipt. No wire
 //! message ever needs to hand a declaration ID back to the client.
@@ -102,7 +102,7 @@
 //!
 //! Sharded (16-way) `Mutex<HashMap>`, same idiom as `trust_decay.rs`. Capacity
 //! eviction never drops a declaration for an agent currently below
-//! `TRUST_REAUTH_THRESHOLD` â€” mirroring `trust_decay.rs`'s H-24 protected-eviction
+//! `TRUST_REAUTH_THRESHOLD` — mirroring `trust_decay.rs`'s H-24 protected-eviction
 //! precedent, since that is exactly the agent IEVL should be watching most
 //! closely. See [`IevlEngine::register_declaration`].
 
@@ -151,7 +151,7 @@ fn now_secs() -> f64 {
 
 /// Maps an IEVL key to its shard index, hashing the whole key.
 ///
-/// Keys are `declaration_id` values â€” SHA-256 hex, whose first byte spans only
+/// Keys are `declaration_id` values — SHA-256 hex, whose first byte spans only
 /// `[0-9a-f]` and so reached just ten of the sixteen shards under the previous
 /// first-byte scheme. See `shard.rs`.
 fn ievl_shard_index(key: &str) -> usize {
@@ -159,7 +159,7 @@ fn ievl_shard_index(key: &str) -> usize {
 }
 
 /// Deterministic declaration ID both the declaring agent and this engine can
-/// compute independently â€” see the module docs' "Declaration IDs need no extra
+/// compute independently — see the module docs' "Declaration IDs need no extra
 /// round-trip" section.
 pub fn declaration_id(session_uuid: &str, sequence_id: u64) -> String {
     let mut hasher = Sha256::new();
@@ -226,8 +226,15 @@ impl IevlEngine {
     /// Process-wide singleton, matching `TrustDecayEngine::global()`'s
     /// established pattern.
     pub fn global() -> &'static IevlEngine {
-        static GLOBAL: OnceLock<IevlEngine> = OnceLock::new();
-        GLOBAL.get_or_init(IevlEngine::new)
+        Self::global_arc()
+    }
+
+    /// Longcat re-verification (Gap B): `Arc` handle to the process-wide
+    /// engine — lets `SaacpContext::shared_default_arc()` alias the EXACT
+    /// same instance (not a copy) while hermetic contexts own their own.
+    pub fn global_arc() -> &'static std::sync::Arc<IevlEngine> {
+        static GLOBAL: OnceLock<std::sync::Arc<IevlEngine>> = OnceLock::new();
+        GLOBAL.get_or_init(|| std::sync::Arc::new(IevlEngine::new()))
     }
 
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, IntentDeclaration>> {
@@ -236,7 +243,7 @@ impl IevlEngine {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Registration hook â€” called from `handler.rs`'s Gate 1.5 block, only for
+    /// Registration hook — called from `handler.rs`'s Gate 1.5 block, only for
     /// packets whose resolved `action_class` meets `RECEIPT_REQUIRED_ACTION_CLASS`.
     /// Not a gate: never rejects, only records.
     pub fn register_declaration(
@@ -257,7 +264,7 @@ impl IevlEngine {
 
             if shard.len() >= IEVL_PER_SHARD_MAX_ENTRIES && !shard.contains_key(&id) {
                 // Pass 1: anything already past its own TTL is a safe capacity
-                // victim â€” `ReceiptTimeout` is exactly the penalty it would have
+                // victim — `ReceiptTimeout` is exactly the penalty it would have
                 // earned via `sweep_expired` moments later anyway, so evicting it
                 // here doesn't skip that consequence, just applies it slightly
                 // early.
@@ -272,7 +279,7 @@ impl IevlEngine {
                     }
                 }
 
-                // Pass 2: still over cap â€” evict the oldest still-live
+                // Pass 2: still over cap — evict the oldest still-live
                 // declaration whose owning agent is NOT currently reauth-locked
                 // (H-24 precedent, `trust_decay.rs`: never forget a pending
                 // declaration for an agent IEVL should be watching most
@@ -323,7 +330,7 @@ impl IevlEngine {
 
     /// Look up and consume (remove) the declaration matching `declaration_ref`,
     /// compare it against the reported receipt fields, and return the verdict.
-    /// A declaration is consumed at most once â€” a replayed/duplicate receipt for
+    /// A declaration is consumed at most once — a replayed/duplicate receipt for
     /// the same reference always resolves `ReceiptMissing` on its second and
     /// later submissions.
     pub fn process_receipt(
@@ -347,7 +354,7 @@ impl IevlEngine {
 
         // Numeric action_class alone can only ever signal escalation when a
         // deployment lowers `RECEIPT_REQUIRED_ACTION_CLASS` below the
-        // protocol's ceiling â€” at the documented default (IRREVERSIBLE only,
+        // protocol's ceiling — at the documented default (IRREVERSIBLE only,
         // already the maximum class), a declaration is always AT the ceiling,
         // so there is never a higher class left to escalate to and the check
         // above can never fire. Reuse the exact same dangerous-action-term
@@ -421,10 +428,10 @@ impl IevlEngine {
     }
 
     /// Spawn a background OS thread that calls [`Self::sweep_expired`] every 60
-    /// seconds â€” matches `gossip::GossipEngine::start_sweep`'s and
+    /// seconds — matches `gossip::GossipEngine::start_sweep`'s and
     /// `klms::KeyLifecycleManager::start_auto_rotation`'s cadence and "caller
     /// decides whether to spawn it" opt-in convention. Returns the thread's
-    /// `JoinHandle` â€” the thread runs for the lifetime of the process.
+    /// `JoinHandle` — the thread runs for the lifetime of the process.
     pub fn start_sweep(self: Arc<Self>) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name("ievl-sweep".to_string())
@@ -437,7 +444,7 @@ impl IevlEngine {
 }
 
 /// Jaccard overlap between two target sets, case/whitespace-normalized.
-/// Both empty â‡’ `1.0` (vacuously consistent â€” nothing was declared, nothing was
+/// Both empty ⇒ `1.0` (vacuously consistent — nothing was declared, nothing was
 /// reported touched).
 fn jaccard_overlap(declared: &[String], actual: &[String]) -> f64 {
     let normalize = |v: &[String]| -> HashSet<String> {
@@ -461,7 +468,7 @@ fn jaccard_overlap(declared: &[String], actual: &[String]) -> f64 {
 /// Extract a declaration's target list from a Gate-1.5-bound payload: prefers a
 /// `targets` array, falls back to a single `target` string (schema 2 "Action"
 /// shape), defaults to empty (an IRREVERSIBLE action with no identifiable
-/// targets still gets a declaration â€” action-text/class comparison still
+/// targets still gets a declaration — action-text/class comparison still
 /// applies, just with `target_overlap` trivially `1.0` when both sides report
 /// none).
 pub fn extract_targets(payload_dict: &HashMap<String, JsonValue>) -> Vec<String> {
@@ -488,7 +495,7 @@ pub fn extract_targets(payload_dict: &HashMap<String, JsonValue>) -> Vec<String>
 /// four required fields. `PreCompiledSchemas::validate_payload` has already
 /// confirmed all four keys are present by the time this runs (schema
 /// validation happens inside `handler.rs`'s gate pipeline, before `Ok(parsed)`
-/// is ever returned) â€” this only handles type coercion from loosely-typed
+/// is ever returned) — this only handles type coercion from loosely-typed
 /// `JsonValue`s. Returns `None` on any type mismatch, mirroring
 /// `daemon.rs::decode_gossip_envelope`'s "drop and log nothing further"
 /// philosophy for malformed/adversarial peer traffic.
@@ -525,7 +532,7 @@ fn decode_execution_receipt(
     ))
 }
 
-/// Canonical length-prefixed encoding of a receipt's claimed fields â€” the same
+/// Canonical length-prefixed encoding of a receipt's claimed fields — the same
 /// idiom `identity_binding.rs`'s transcript hash and `faitf.rs`'s
 /// `AgentCredential`/`SignedRevocationRecord` body bytes already use, so no two
 /// fields can ever be concatenation-ambiguous with each other.
@@ -552,7 +559,7 @@ fn canonical_receipt_bytes(
 /// Sign a receipt's claimed fields with the presenting session's private key,
 /// producing the base64 `receipt_signature` a client attaches to its
 /// `ExecutionReceipt` wire payload. The counterpart to
-/// [`verify_receipt_signature`] â€” both sides must agree on
+/// [`verify_receipt_signature`] — both sides must agree on
 /// `canonical_receipt_bytes`'s exact encoding, so this reuses it directly
 /// rather than duplicating the field layout.
 pub fn sign_receipt(
@@ -571,7 +578,7 @@ pub fn sign_receipt(
 /// the presenting session's bound public key
 /// (`identity_binding::DEFAULT_IDENTITY_REGISTRY`, exactly as
 /// `trust_decay::trust_key_for` already looks it up). `false` on any decode
-/// failure or missing session binding â€” an unverifiable receipt must never be
+/// failure or missing session binding — an unverifiable receipt must never be
 /// treated as trusted.
 pub fn verify_receipt_signature(
     session_uuid: &str,
@@ -616,11 +623,11 @@ pub fn verify_receipt_signature(
 
 /// Handle a schema_id=10 `ExecutionReceipt` packet that has already cleared the
 /// full gate pipeline (`daemon.rs` dispatches here exactly as it dispatches a
-/// schema_id=11 Gossip Envelope to `gossip::GossipEngine::receive` â€” see that
+/// schema_id=11 Gossip Envelope to `gossip::GossipEngine::receive` — see that
 /// call site). Decodes, verifies the signature, resolves the verdict against
 /// [`IevlEngine::global`], and applies the enforcement the module docs'
 /// "Enforcement" section describes. Never panics and never affects the wire
-/// response for the receipt packet itself â€” enforcement here is a side effect
+/// response for the receipt packet itself — enforcement here is a side effect
 /// (trust penalty/reward or revocation), not a rejection of the
 /// already-accepted receipt.
 pub fn handle_execution_receipt(parsed: &ParsedPacket) {
@@ -665,7 +672,7 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
             );
         }
         VerificationVerdict::MinorDrift => {
-            // Informational only â€” plausibly paraphrasing rather than a real
+            // Informational only — plausibly paraphrasing rather than a real
             // substitution; no trust action.
         }
         VerificationVerdict::TargetViolation | VerificationVerdict::MajorDivergence => {
@@ -677,7 +684,7 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
                 &parsed.source_agent,
                 &SAACPHardDrop::new(
                     SAACPBytecodes::IntentClassEscalationDetected,
-                    "IEVL: ExecutionReceipt reports an action_class exceeding its declared IntentDeclaration â€” revoking.",
+                    "IEVL: ExecutionReceipt reports an action_class exceeding its declared IntentDeclaration — revoking.",
                 ),
             );
             let revoker = system_revoker_identity();
@@ -690,7 +697,7 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
         }
         VerificationVerdict::ReceiptMissing | VerificationVerdict::SignatureInvalid => {
             // No matching declaration (already swept, or a bogus/forged
-            // reference) â€” nothing further to enforce against a receipt with
+            // reference) — nothing further to enforce against a receipt with
             // no corresponding declaration; cannot be reliably attributed to
             // the declaring agent's own behavior.
         }
@@ -699,7 +706,7 @@ pub fn handle_execution_receipt(parsed: &ParsedPacket) {
 
 /// Lazily-generated protocol-internal identity used as the `revoker_identity`
 /// for IEVL's own automated (non-human) `DistributedRevocationInfrastructure::revoke`
-/// calls â€” distinct from any agent's own identity, matching how a real
+/// calls — distinct from any agent's own identity, matching how a real
 /// automated security control has its own signing identity separate from human
 /// operators. Generated once per process; the private key never leaves this
 /// process's memory.
@@ -726,7 +733,7 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    // â”€â”€ declaration_id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── declaration_id ──────────────────────────────────────────────────
 
     #[test]
     fn declaration_id_is_deterministic() {
@@ -742,7 +749,7 @@ mod tests {
         assert_ne!(base, declaration_id("session-1", 43));
     }
 
-    // â”€â”€ jaccard_overlap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── jaccard_overlap ──────────────────────────────────────────────────
 
     #[test]
     fn jaccard_overlap_identical_sets_is_one() {
@@ -777,7 +784,7 @@ mod tests {
         assert_eq!(jaccard_overlap(&a, &b), 0.5);
     }
 
-    // â”€â”€ extract_targets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── extract_targets ──────────────────────────────────────────────────
 
     #[test]
     fn extract_targets_prefers_array() {
@@ -809,7 +816,7 @@ mod tests {
         assert!(extract_targets(&payload).is_empty());
     }
 
-    // â”€â”€ register_declaration / process_receipt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── register_declaration / process_receipt ──────────────────────────
 
     #[test]
     fn consistent_receipt_verified() {
@@ -879,7 +886,7 @@ mod tests {
     #[test]
     fn class_escalation_detected_via_dangerous_action_term_at_ceiling() {
         // Both declared and actual sit at the protocol's ceiling
-        // (IRREVERSIBLE, 0x02) â€” the numeric check alone could never fire
+        // (IRREVERSIBLE, 0x02) — the numeric check alone could never fire
         // here, since there is no higher class to escalate to. This is the
         // realistic production shape: `RECEIPT_REQUIRED_ACTION_CLASS`'s
         // documented default only ever registers IRREVERSIBLE declarations.
@@ -904,7 +911,7 @@ mod tests {
     #[test]
     fn dangerous_term_present_in_both_declared_and_actual_is_not_escalation() {
         // A root intent that legitimately declares a dangerous verb ("delete")
-        // must not falsely flag a receipt that also (honestly) reports it â€”
+        // must not falsely flag a receipt that also (honestly) reports it —
         // mirrors `gate_1_5c_dangerous_action_consistency`'s own
         // "relative to the declaration's own vocabulary" false-positive guard.
         let engine = IevlEngine::new();
@@ -1000,7 +1007,7 @@ mod tests {
         assert_eq!(engine.tracked_count(), 1); // only the fresh one remains
     }
 
-    // â”€â”€ signature verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── signature verification ──────────────────────────────────────────
 
     #[test]
     fn verify_receipt_signature_fails_with_no_bound_session() {

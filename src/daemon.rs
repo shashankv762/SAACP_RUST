@@ -432,6 +432,11 @@ pub struct SAACPNetworkDaemon {
     /// this (documented scope). Initialized from `SAACP_AUDIT_NODE` and
     /// overridable via [`Self::audit_node`].
     audit_node_designated: bool,
+    /// M-A remediation (production audit G1/R1): opt-in startup recovery of
+    /// the persisted audit chain. Off by default so construction and tests
+    /// stay byte-identical to pre-recovery behavior; enabled via
+    /// [`Self::with_audit_chain_recovery`] or `SAACP_AUDIT_RECOVER=1`.
+    audit_chain_recovery: bool,
 }
 
 impl SAACPNetworkDaemon {
@@ -503,6 +508,7 @@ impl SAACPNetworkDaemon {
             audit_node_designated: std::env::var("SAACP_AUDIT_NODE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            audit_chain_recovery: false,
         }
     }
 
@@ -802,6 +808,71 @@ impl SAACPNetworkDaemon {
         self
     }
 
+    /// M-A remediation (production audit G1/R1): adopt + verify the persisted
+    /// audit chain before the listener binds.
+    ///
+    /// Off by default so construction, tests, and existing deployments stay
+    /// byte-identical to pre-recovery behavior; this builder or the
+    /// `SAACP_AUDIT_RECOVER=1` environment variable (checked at `start`)
+    /// enables it. When enabled, `start_with_shutdown` calls
+    /// `ImmutableAuditLog::initialize_chain` on the process-global log with
+    /// this daemon's `token_issuer_secret` — the same secret the gate
+    /// pipeline HMAC-binds chain entries with — so a restarted process
+    /// continues the on-disk chain instead of silently starting from genesis.
+    ///
+    /// Fail-closed semantics (deliberate): if the on-disk chain fails
+    /// verification (H-6 — the tail is untrusted input; a crash-torn final
+    /// line is indistinguishable from tampering), `start` returns `Err` and
+    /// the listener never binds. There is no automatic quarantine: the
+    /// operator preserves the file for forensics, moves it aside, and
+    /// restarts. Recovery is skipped with a startup note when no stable
+    /// issuer secret is configured — entries written under the per-connection
+    /// fallback key cannot be verified against any single secret.
+    pub fn with_audit_chain_recovery(mut self, enabled: bool) -> Self {
+        self.audit_chain_recovery = enabled;
+        self
+    }
+
+    /// M-A recovery body — see [`Self::with_audit_chain_recovery`]. Uses the
+    /// process-global log (the same instance the gate pipeline and the
+    /// health/audit-ack paths use). Blocking disk I/O, but only at startup,
+    /// before the listener binds.
+    fn recover_audit_chain(issuer_secret: &Option<Vec<u8>>) -> std::io::Result<()> {
+        let log = crate::security::ImmutableAuditLog::global();
+        let Some(secret) = issuer_secret else {
+            eprintln!(
+                "[SAACP Daemon] audit-chain recovery requested (SAACP_AUDIT_RECOVER) but no \
+                 stable token_issuer_secret is configured — entries written under the \
+                 per-connection fallback key cannot be verified against any single secret. \
+                 Recovery SKIPPED; starting with an empty in-memory chain."
+            );
+            return Ok(());
+        };
+        match log.initialize_chain(secret) {
+            Ok(()) => {
+                eprintln!(
+                    "[SAACP Daemon] audit chain verified against the configured issuer secret \
+                     and adopted from disk — this process continues the persisted chain."
+                );
+                Ok(())
+            }
+            Err(detail) => {
+                // Fail closed: never accept traffic on top of an unverifiable
+                // chain, and never auto-quarantine (an operator must preserve
+                // the file for forensics and decide).
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "audit-chain recovery failed and SAACP_AUDIT_RECOVER is enabled: \
+                         {detail}. Preserve the file (SAACP_AUDIT_LOG or the default \
+                         saacp_audit.log) for forensics, move it aside, and restart — or \
+                         unset SAACP_AUDIT_RECOVER to start without recovery."
+                    ),
+                ))
+            }
+        }
+    }
+
     /// Opt in to the revocation gossip mesh (Phase 6 / item 4, see the `gossip` field doc
     /// comment). The caller constructs the `GossipEngine` itself (wiring its own
     /// `GossipTransport`, `DistributedRevocationInfrastructure`, and `TrustStore` — see
@@ -967,6 +1038,36 @@ impl SAACPNetworkDaemon {
         if let Some(cluster) = self.cluster.clone() {
             let interval = cluster.suspect_timeout_interval_hint();
             cluster.start(interval);
+        }
+        // M-A remediation: opt-in audit-chain recovery, BEFORE the listener
+        // binds — a verification failure refuses startup (`Err`) so the node
+        // never accepts traffic while its chain of record is unverifiable.
+        let recovery_requested = self.audit_chain_recovery
+            || matches!(
+                std::env::var("SAACP_AUDIT_RECOVER").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            );
+        if recovery_requested {
+            Self::recover_audit_chain(&self.token_issuer_secret)?;
+        }
+        // M-B remediation: optional external alert sink. When
+        // SAACP_ALERT_SYSLOG=<host:port> is set, every SecurityAlert recorded
+        // by this process is forwarded best-effort as an RFC 5424 syslog
+        // datagram (see `alert_sink.rs`). Installation failures are loud but
+        // fail-open — an unreachable collector never blocks startup.
+        if let Ok(target) = std::env::var("SAACP_ALERT_SYSLOG") {
+            if !target.trim().is_empty() {
+                match crate::alert_sink::SyslogAlertSink::install_global(target.trim()) {
+                    Ok(()) => eprintln!(
+                        "[SAACP Daemon] security alerts will be forwarded to syslog \
+                         collector at {target} (RFC 5424 over UDP, best-effort)"
+                    ),
+                    Err(e) => eprintln!(
+                        "[SAACP Daemon] WARNING: could not install syslog alert sink \
+                         ({e}) — security alerts stay process-local (Prometheus / dashboard)"
+                    ),
+                }
+            }
         }
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr).await?;

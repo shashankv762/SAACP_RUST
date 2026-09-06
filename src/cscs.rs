@@ -12,25 +12,25 @@ pub const CSCS_WINDOW_SIZE: usize = 128;
 /// Maximum distinct session_ids tracked by the outer history map before a
 /// least-recently-seen sweep runs. IoT / low-resource fix: each per-session
 /// window was already capped at `CSCS_WINDOW_SIZE`, but the outer
-/// `HashMap<session_id, _>` itself had no cap â€” long-running deployments with
+/// `HashMap<session_id, _>` itself had no cap — long-running deployments with
 /// many short-lived sessions accumulated one permanent entry per session_id
 /// ever seen. Mirrors `streaming::StreamRegistry`'s oldest-first eviction.
 pub const CSCS_MAX_TRACKED_SESSIONS: usize = 50_000;
 /// P-1 fix: number of independent lock shards for `OscillationFingerprinter`'s
 /// session-history map, mirroring `gateway::RATE_LIMITER_SHARDS` /
 /// `trust_decay::TRUST_SHARDS`. Before sharding, every session's fingerprint
-/// recording across the entire process serialized behind ONE `Mutex` â€” the WC11
-/// benchmark showed 2msâ€“209ms median variance under 1000 concurrent sessions,
+/// recording across the entire process serialized behind ONE `Mutex` — the WC11
+/// benchmark showed 2ms–209ms median variance under 1000 concurrent sessions,
 /// because `record_and_count` runs on essentially every packet (Gate 12.0).
 const CSCS_SHARDS: usize = 16;
 /// Per-shard soft capacity, chosen so the aggregate across all shards still equals
-/// `CSCS_MAX_TRACKED_SESSIONS` â€” sharding must not silently multiply the effective
+/// `CSCS_MAX_TRACKED_SESSIONS` — sharding must not silently multiply the effective
 /// capacity of this bounded map (same invariant as
 /// `gateway::RATE_LIMITER_PER_SHARD_MAX_ENTRIES`).
 const CSCS_PER_SHARD_MAX_SESSIONS: usize = CSCS_MAX_TRACKED_SESSIONS / CSCS_SHARDS;
 /// Bounded capacity of the best-effort trip-event mirror channel used by
 /// `CSCSLoopDetector::with_backend`. A full channel silently drops the event
-/// (forensic visibility only â€” never consulted by `cs_detect_loop`'s own
+/// (forensic visibility only — never consulted by `cs_detect_loop`'s own
 /// decision), rather than blocking the hot path.
 pub const CSCS_MIRROR_QUEUE_CAPACITY: usize = 256;
 /// TTL for a mirrored trip event in the backend, in seconds.
@@ -55,21 +55,21 @@ pub struct OscillationFingerprinter {
     /// (plus a last-seen timestamp used only for outer-map eviction).
     ///
     /// P-1 fix: sharded `CSCS_SHARDS`-way on a whole-key hash (see
-    /// `cscs_shard_index`) â€” access via `shard()`, never directly.
+    /// `cscs_shard_index`) — access via `shard()`, never directly.
     history: Vec<Mutex<HashMap<String, SessionHistory>>>,
 }
 
 /// Maps a `session_id` to its shard index.
 ///
-/// P-1 fix â€” deliberately NOT a first-byte `% N` scheme. A CSCS `session_id` is
+/// P-1 fix — deliberately NOT a first-byte `% N` scheme. A CSCS `session_id` is
 /// `handler.rs`'s `ParsedPacket::session_uuid`, which on the encrypted path is
-/// `hex::encode(session_id)` â€” a HEX string, so its first byte is drawn only
-/// from `[0-9a-f]`. Those 16 codepoints (0x30â€“0x39, 0x61â€“0x66) collapse onto
+/// `hex::encode(session_id)` — a HEX string, so its first byte is drawn only
+/// from `[0-9a-f]`. Those 16 codepoints (0x30–0x39, 0x61–0x66) collapse onto
 /// just 10 distinct values mod 16, leaving 6 of 16 shards permanently dead and
 /// loading the hottest shard ~2x above ideal (measured over 120k uuid4 hex ids).
 ///
 /// Delegates to the crate-wide [`crate::shard::fnv1a_shard`], which mixes every
-/// byte â€” same algorithm and constants this function used inline, so shard
+/// byte — same algorithm and constants this function used inline, so shard
 /// assignment is unchanged. That helper now backs every sharded structure in the
 /// crate, since the same first-byte failure mode applied to all of them.
 fn cscs_shard_index(session_id: &str) -> usize {
@@ -96,7 +96,7 @@ impl OscillationFingerprinter {
     }
 
     /// Lock the shard owning `session_id`. M-38 fix: recover from poison via
-    /// `into_inner()` â€” `GLOBAL_CSCS` is a process-wide singleton, so one
+    /// `into_inner()` — `GLOBAL_CSCS` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other session's
     /// loop-detection calls.
     fn shard(
@@ -110,7 +110,7 @@ impl OscillationFingerprinter {
 
     /// Hashes stable causal identity (oaid+cid+action_class) to detect oscillation.
     ///
-    /// SECURITY: `rid` is intentionally excluded â€” it is unique per request and would
+    /// SECURITY: `rid` is intentionally excluded — it is unique per request and would
     /// make every fingerprint unique, defeating detection. `hc` is also excluded:
     /// an attacker who controls hop count can increment it each step, producing a new
     /// fingerprint per iteration and rendering the sliding-window count permanently < 3.
@@ -118,8 +118,8 @@ impl OscillationFingerprinter {
     /// The stable causal anchor is: who (oaid) + in what conversation (cid) + what (action_class).
     pub fn compute_fingerprint(meta: &AEGFMetadata, action_class: u8) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(meta.oaid.as_bytes()); // agent identity â€” stable across a cascade
-        hasher.update(meta.cid.as_bytes()); // conversation context â€” stable within a session
+        hasher.update(meta.oaid.as_bytes()); // agent identity — stable across a cascade
+        hasher.update(meta.cid.as_bytes()); // conversation context — stable within a session
         hasher.update([action_class]); // what action is being requested
                                        // hc excluded: attacker-controlled hop count would defeat detection by making
                                        // each step in a cascade appear as a distinct fingerprint.
@@ -136,7 +136,7 @@ impl OscillationFingerprinter {
 
         // IoT / low-resource fix: sweep the least-recently-seen sessions once this
         // shard exceeds its cap, so the process can't accumulate one entry per
-        // session_id ever seen. Only triggers when actually over cap â€” active
+        // session_id ever seen. Only triggers when actually over cap — active
         // fleets under the limit never pay this cost. P-1: the bound is now
         // per-shard (`CSCS_PER_SHARD_MAX_SESSIONS`), and the aggregate across all
         // shards still equals `CSCS_MAX_TRACKED_SESSIONS`, so sharding does not
@@ -209,11 +209,11 @@ impl CSCSLoopDetector {
     /// Construct with a shared [`StateBackend`] for best-effort, forensic-only
     /// cross-node visibility of oscillation trips. Unlike
     /// `AgentRateLimiter::with_backend`, this is deliberately **not** atomic
-    /// or hot-path-synchronous â€” see `state_backend.rs`'s module doc for the
+    /// or hot-path-synchronous — see `state_backend.rs`'s module doc for the
     /// full rationale (CSCS is a heuristic anomaly detector, not a hard
     /// security boundary, and `cs_detect_loop` runs on essentially every
     /// packet). Only the rare trip event is mirrored, via a non-blocking
-    /// bounded channel â€” zero cost on the common non-tripping path.
+    /// bounded channel — zero cost on the common non-tripping path.
     pub fn with_backend(
         daeg: Arc<DistributedExecutionGraph>,
         backend: Arc<dyn StateBackend>,
@@ -257,7 +257,7 @@ impl CSCSLoopDetector {
 
         if count >= CSCS_MAX_OSCILLATION_COUNT {
             if let Some(tx) = &self.mirror_tx {
-                // Non-blocking, best-effort â€” silently dropped if the mirror
+                // Non-blocking, best-effort — silently dropped if the mirror
                 // thread is behind. Never affects this decision.
                 let _ = tx.try_send(CscsTripEvent {
                     session_id: session_id.to_string(),
@@ -293,8 +293,11 @@ impl Default for CSCSLoopDetector {
     }
 }
 
-pub static GLOBAL_CSCS: LazyLock<CSCSLoopDetector> =
-    LazyLock::new(|| CSCSLoopDetector::new(crate::aegf::GLOBAL_DAEG.clone()));
+/// Longcat re-verification (Gap B): held as `LazyLock<Arc<_>>` so
+/// `SaacpContext::shared_default_arc()` can alias this exact allocation;
+/// method-call sites auto-deref through `LazyLock` → `Arc` unchanged.
+pub static GLOBAL_CSCS: LazyLock<std::sync::Arc<CSCSLoopDetector>> =
+    LazyLock::new(|| std::sync::Arc::new(CSCSLoopDetector::new(crate::aegf::GLOBAL_DAEG.clone())));
 
 #[cfg(test)]
 mod tests {
@@ -340,7 +343,7 @@ mod tests {
         }
         assert!(tripped);
 
-        // The mirror thread is async â€” poll with a bounded retry loop for the
+        // The mirror thread is async — poll with a bounded retry loop for the
         // trip key to appear rather than sleeping a fixed guess.
         let mut found = false;
         for _ in 0..200 {
@@ -357,7 +360,7 @@ mod tests {
     }
 
     /// P-1 regression: `cscs_shard_index` must keep ALL 16 shards live over the
-    /// real key space â€” hex-encoded session uuids. The codebase's usual
+    /// real key space — hex-encoded session uuids. The codebase's usual
     /// first-byte-`% N` convention collapses here, because a hex string's first
     /// byte is only ever `[0-9a-f]`; those 16 codepoints map onto just 10 distinct
     /// values mod 16, leaving 6 shards permanently dead. This test fails loudly if
@@ -380,7 +383,7 @@ mod tests {
         assert_eq!(
             used.len(),
             CSCS_SHARDS,
-            "all {} shards must be reachable over hex session ids â€” got {}. A \
+            "all {} shards must be reachable over hex session ids — got {}. A \
              first-byte-sampling shard index would show ~10 here.",
             CSCS_SHARDS,
             used.len()
@@ -415,7 +418,7 @@ mod tests {
         assert!(
             tracked <= CSCS_MAX_TRACKED_SESSIONS,
             "aggregate tracked sessions ({tracked}) must stay within \
-             CSCS_MAX_TRACKED_SESSIONS ({CSCS_MAX_TRACKED_SESSIONS}) â€” sharding must \
+             CSCS_MAX_TRACKED_SESSIONS ({CSCS_MAX_TRACKED_SESSIONS}) — sharding must \
              not multiply capacity"
         );
     }

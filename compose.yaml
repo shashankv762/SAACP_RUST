@@ -68,9 +68,10 @@ services:
     entrypoint: ["/usr/local/bin/saacp-command-center"]
     environment:
       SAACP_COMMAND_CENTER_ADDR: 0.0.0.0:9090
-      # Demo daemon feeds the dashboard with synthetic activity; disable to
-      # run against a real gateway's shared state (SAACP_DISABLE_DEMO_DAEMON=1).
-      # SAACP_DISABLE_DEMO_DAEMON: "1"
+      # Demo daemon + synthetic activity generator are OPT-IN since v0.2.1
+      # (M-G: default-off so synthetic data can't masquerade as real telemetry).
+      # Set to enable:
+      # SAACP_DEMO_MODE: "1"
       # Secret reference (mount the file read-only):
       # SAACP_DASHBOARD_TOKEN_FILE: /run/secrets/saacp_dashboard_token
       # Rule-pack push trust anchor (both required to enable POST /api/rules/reload):

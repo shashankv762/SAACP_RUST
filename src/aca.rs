@@ -1,28 +1,28 @@
-//! aca.rs â€” Agent Capability Attestation (ACA, Phase 6 / Part 8.4)
+//! aca.rs — Agent Capability Attestation (ACA, Phase 6 / Part 8.4)
 //!
-//! *New in Rust* â€” no Python-reference analog.
+//! *New in Rust* — no Python-reference analog.
 //!
 //! # Why this exists
 //!
 //! A capability token (`gateway.rs`/`acsvaf.rs`) answers "is this agent
-//! *authorized* to perform this action class?" â€” a policy question, purely
+//! *authorized* to perform this action class?" — a policy question, purely
 //! about scope. It says nothing about whether the agent's underlying model or
 //! execution environment has actually been vetted to be *safe enough* to
 //! exercise that authorization responsibly. ACA adds a second, independent,
-//! operator-signed claim â€” [`AttestationClaim`] â€” that answers exactly that:
+//! operator-signed claim — [`AttestationClaim`] — that answers exactly that:
 //! "has this agent's deployment been attested to a given safety level?" The
 //! two checks are deliberately orthogonal: a capability token grants scope, an
 //! attestation claim vouches for the executor. Neither can substitute for the
 //! other.
 //!
-//! # Architecture â€” additive, gate-adjacent, NOT a new gate
+//! # Architecture — additive, gate-adjacent, NOT a new gate
 //!
 //! [`enforce_attestation`] is called from `handler.rs` immediately after Gate
-//! 2.5 (kinetic firewall) succeeds â€” the point where `parsed.action_class` is
-//! already resolved against the validated token's ceiling â€” rather than
+//! 2.5 (kinetic firewall) succeeds — the point where `parsed.action_class` is
+//! already resolved against the validated token's ceiling — rather than
 //! becoming a 13th numbered gate. Deliberately additive: nothing about the
 //! existing gate pipeline's control flow, numbering, or behavior changes when
-//! ACA is disabled (the documented default â€” see [`is_required`]'s doc
+//! ACA is disabled (the documented default — see [`is_required`]'s doc
 //! comment), consistent with Part 12 principle 3 ("fail-closed only applies
 //! once a feature is actually enabled").
 //!
@@ -39,14 +39,14 @@
 //! # Signature scheme
 //!
 //! An [`AttestationAuthority`] (the deployment's attestation-issuing operator)
-//! signs [`AttestationClaim`]'s canonical, length-prefixed field encoding â€” the
+//! signs [`AttestationClaim`]'s canonical, length-prefixed field encoding — the
 //! same idiom `identity_binding.rs`'s transcript hash, `faitf.rs`'s
 //! `AgentCredential`/`SignedRevocationRecord` body bytes, and `ievl.rs`'s
 //! `ExecutionReceipt` signing already use, so two fields can never be
 //! concatenation-ambiguous. [`AttestationRegistry::install_claim`] verifies
 //! that signature against a registry of explicitly-trusted operator keys
 //! before a claim can ever affect [`AttestationRegistry::current_safety_level`]
-//! â€” an untrusted or forged claim is never installed, matching the same
+//! — an untrusted or forged claim is never installed, matching the same
 //! trust-anchor idiom `factf.rs`'s threshold-token verification and
 //! `identity_binding.rs`'s CA-key verification already use.
 //!
@@ -54,7 +54,7 @@
 //!
 //! [`AttestationRegistry`]'s claim map is capped at [`ACA_MAX_CLAIMS`] with
 //! oldest-issued-first eviction on overflow (see
-//! [`AttestationRegistry::install_claim`]) â€” the same "Bounded Everything"
+//! [`AttestationRegistry::install_claim`]) — the same "Bounded Everything"
 //! principle (Part 12 principle 5) every other tracked map in this codebase
 //! already follows.
 
@@ -87,7 +87,7 @@ pub const ACA_MAX_CLAIMS: usize = 10_000;
 // ---------------------------------------------------------------------------
 
 /// Attested safety tier, ascending in the exact order the `Ord` derive below
-/// relies on â€” see the module docs' "Safety level hierarchy" section.
+/// relies on — see the module docs' "Safety level hierarchy" section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum SafetyLevel {
@@ -105,7 +105,7 @@ impl SafetyLevel {
 }
 
 /// The default policy's minimum required [`SafetyLevel`] for a given
-/// `action_class` â€” see the module docs' "Safety level hierarchy" section.
+/// `action_class` — see the module docs' "Safety level hierarchy" section.
 pub fn minimum_safety_level_for(action_class: u8) -> SafetyLevel {
     match action_class {
         0 => SafetyLevel::Unattested,
@@ -119,14 +119,14 @@ pub fn minimum_safety_level_for(action_class: u8) -> SafetyLevel {
 // ---------------------------------------------------------------------------
 
 /// An operator-signed vouch for one agent's execution environment, riding
-/// alongside (never replacing) that agent's own capability token â€” see the
+/// alongside (never replacing) that agent's own capability token — see the
 /// module docs' "Why this exists" section.
 #[derive(Debug, Clone)]
 pub struct AttestationClaim {
     pub agent_id: String,
     pub safety_level: SafetyLevel,
     /// Free-text sandbox/network-policy declaration (e.g.
-    /// `"docker: no-network, read-only-fs"`) â€” informational, not itself
+    /// `"docker: no-network, read-only-fs"`) — informational, not itself
     /// verified beyond being part of the signed body.
     pub execution_environment: String,
     pub issued_at: f64,
@@ -138,7 +138,7 @@ pub struct AttestationClaim {
 }
 
 impl AttestationClaim {
-    /// Canonical length-prefixed encoding of a claim's signed fields â€” see
+    /// Canonical length-prefixed encoding of a claim's signed fields — see
     /// the module docs' "Signature scheme" section.
     fn canonical_bytes(
         agent_id: &str,
@@ -167,14 +167,14 @@ impl AttestationClaim {
 }
 
 // ---------------------------------------------------------------------------
-// AttestationAuthority â€” the operator's issuing keypair
+// AttestationAuthority — the operator's issuing keypair
 // ---------------------------------------------------------------------------
 
 /// Where an [`AttestationAuthority`]'s signing key actually lives.
 ///
 /// `Local` is the original behavior: a `SigningKey` value held in this process's memory.
-/// `Hardware` routes signing through an [`crate::hrt::HardwareKeyStore`] â€” a PKCS#11
-/// token, AWS KMS, or GCP KMS â€” so the private key is never present in the address space
+/// `Hardware` routes signing through an [`crate::hrt::HardwareKeyStore`] — a PKCS#11
+/// token, AWS KMS, or GCP KMS — so the private key is never present in the address space
 /// and cannot be exfiltrated by a memory-disclosure bug or a core dump.
 enum AttestationKeySource {
     Local(SigningKey),
@@ -185,7 +185,7 @@ enum AttestationKeySource {
 }
 
 /// The deployment's attestation-issuing operator. Distinct from any agent's
-/// own identity â€” mirrors how `faitf.rs`'s `AgentCredential::issue` is signed
+/// own identity — mirrors how `faitf.rs`'s `AgentCredential::issue` is signed
 /// by a separate issuer keypair, not the agent's own.
 pub struct AttestationAuthority {
     source: AttestationKeySource,
@@ -210,7 +210,7 @@ impl AttestationAuthority {
     ///
     /// `key_id` is resolved by the backend: a PKCS#11 `CKA_LABEL`, a KMS key id / ARN /
     /// alias, or a Cloud KMS CryptoKeyVersion resource name. The public key is fetched
-    /// once here, which also serves as an eager health check â€” a misconfigured key id or
+    /// once here, which also serves as an eager health check — a misconfigured key id or
     /// an unreachable HSM fails at construction rather than at the first attempt to issue
     /// an attestation, when it would be far more disruptive.
     pub fn with_keystore(
@@ -248,7 +248,7 @@ impl AttestationAuthority {
     /// # Panics
     ///
     /// Panics if a hardware-backed signing call fails. Use [`Self::try_issue`] on any
-    /// authority built with [`Self::with_keystore`] â€” a network KMS can fail
+    /// authority built with [`Self::with_keystore`] — a network KMS can fail
     /// transiently, and this signature (kept for backward compatibility with the
     /// software path, where signing is infallible) has no way to report that.
     pub fn issue(
@@ -259,7 +259,7 @@ impl AttestationAuthority {
         ttl_seconds: u64,
     ) -> AttestationClaim {
         self.try_issue(agent_id, safety_level, execution_environment, ttl_seconds)
-            .expect("attestation signing failed â€” use try_issue() with a hardware key store")
+            .expect("attestation signing failed — use try_issue() with a hardware key store")
     }
 
     /// Fallible form of [`Self::issue`]. Always succeeds for a software key; may return
@@ -359,7 +359,7 @@ impl AttestationRegistry {
 
     /// Trust `verifying_key` as a valid attestation-issuing operator. Claims
     /// signed by any other key are rejected by [`Self::install_claim`] with
-    /// [`AcaError::UntrustedOperator`] â€” an ACA deployment must call this at
+    /// [`AcaError::UntrustedOperator`] — an ACA deployment must call this at
     /// least once before any claim can ever be installed.
     pub fn trust_operator(&self, verifying_key: VerifyingKey) {
         let key_id = key_id_for(&verifying_key);
@@ -372,7 +372,7 @@ impl AttestationRegistry {
     /// Verify `claim`'s signature against a trusted operator key and, if
     /// valid and not expired, install it as `claim.agent_id`'s current claim
     /// (replacing any prior claim for that agent). Bounded: on overflow,
-    /// evicts the currently-tracked claim with the oldest `issued_at` â€”
+    /// evicts the currently-tracked claim with the oldest `issued_at` —
     /// mirroring `faitf.rs::DistributedRevocationInfrastructure`'s own
     /// capacity-eviction precedent, just without a high-severity exemption
     /// (an attestation claim has no analogous "this one must never be
@@ -426,7 +426,7 @@ impl AttestationRegistry {
         Ok(())
     }
 
-    /// `agent_id`'s currently-active safety level â€” [`SafetyLevel::Unattested`]
+    /// `agent_id`'s currently-active safety level — [`SafetyLevel::Unattested`]
     /// if no claim is on record, or the on-record claim has expired.
     pub fn current_safety_level(&self, agent_id: &str) -> SafetyLevel {
         let claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
@@ -449,7 +449,7 @@ impl AttestationRegistry {
 static ACA_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable ACA enforcement process-wide. Defaults to `false` (off)
-/// â€” deployments that never provision attestation-issuing infrastructure are
+/// — deployments that never provision attestation-issuing infrastructure are
 /// completely unaffected: [`enforce_attestation`] is an unconditional no-op
 /// while this is `false`, matching Part 12 principle 3 ("fail-closed only
 /// applies once a feature is actually enabled").
@@ -464,7 +464,7 @@ pub fn is_required() -> bool {
 }
 
 /// Gate-2.5-adjacent enforcement (`handler.rs`, called immediately after Gate
-/// 2.5 succeeds â€” see the module docs' "Architecture" section). A pure no-op
+/// 2.5 succeeds — see the module docs' "Architecture" section). A pure no-op
 /// (returns `Ok(())` without even touching [`AttestationRegistry`]) unless
 /// [`is_required`] is `true`.
 pub fn enforce_attestation(agent_id: &str, action_class: u8) -> Result<(), SAACPHardDrop> {
@@ -490,7 +490,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // â”€â”€ SafetyLevel ordering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── SafetyLevel ordering ────────────────────────────────────────────
 
     #[test]
     fn safety_level_ordering_is_ascending() {
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(minimum_safety_level_for(0x02), SafetyLevel::AlignedModel);
     }
 
-    // â”€â”€ AttestationAuthority / signing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── AttestationAuthority / signing ──────────────────────────────────
 
     #[test]
     fn issued_claim_carries_requested_fields() {
@@ -531,7 +531,7 @@ mod tests {
         assert!(claim.is_expired());
     }
 
-    // â”€â”€ AttestationRegistry::install_claim â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── AttestationRegistry::install_claim ──────────────────────────────
 
     #[test]
     fn install_claim_from_trusted_operator_succeeds() {
@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(registry.tracked_count(), 2);
     }
 
-    // â”€â”€ enforce_attestation / is_required â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── enforce_attestation / is_required ───────────────────────────────
 
     #[test]
     #[serial]
@@ -695,7 +695,7 @@ mod tests {
         set_required(false);
         assert!(
             result.is_ok(),
-            "READ_ONLY's minimum SafetyLevel is Unattested â€” every agent already meets it"
+            "READ_ONLY's minimum SafetyLevel is Unattested — every agent already meets it"
         );
     }
 }

@@ -598,8 +598,15 @@ impl AgentRateLimiter {
     /// Enforces GAP-3 (circuit breaker always checked) and GAP-10 (record_error
     /// always called on SAACPHardDrop) per Python `intercept_packet` parity.
     pub fn global() -> &'static AgentRateLimiter {
-        static GLOBAL: OnceLock<AgentRateLimiter> = OnceLock::new();
-        GLOBAL.get_or_init(AgentRateLimiter::new)
+        Self::global_arc()
+    }
+
+    /// Longcat re-verification (Gap B): `Arc` handle to the process-wide
+    /// limiter — lets `SaacpContext::shared_default_arc()` alias the EXACT
+    /// same instance (not a copy) while hermetic contexts own their own.
+    pub fn global_arc() -> &'static std::sync::Arc<AgentRateLimiter> {
+        static GLOBAL: OnceLock<std::sync::Arc<AgentRateLimiter>> = OnceLock::new();
+        GLOBAL.get_or_init(|| std::sync::Arc::new(AgentRateLimiter::new()))
     }
 
     /// Reset records for an agent (or all agents if None).
@@ -774,7 +781,18 @@ impl ZeroTrustGateway {
     /// global gateway are honoured by stream-continuation checks even without a per-call
     /// gateway reference.
     pub fn global() -> &'static ZeroTrustGateway {
-        static GLOBAL_ZTG: LazyLock<ZeroTrustGateway> = LazyLock::new(ZeroTrustGateway::new);
+        Self::global_arc()
+    }
+
+    /// Longcat re-verification (Gap B): `Arc` handle to the process-wide
+    /// gateway — lets `SaacpContext::shared_default_arc()` alias the EXACT
+    /// same revocation state (not a copy) while hermetic contexts own their
+    /// own. NOTE: this aliases the fallback gateway only; a daemon that
+    /// injects its own gateway via `with_gateway` keeps using that one on
+    /// the Gate 1.0 path.
+    pub fn global_arc() -> &'static std::sync::Arc<ZeroTrustGateway> {
+        static GLOBAL_ZTG: LazyLock<std::sync::Arc<ZeroTrustGateway>> =
+            LazyLock::new(|| std::sync::Arc::new(ZeroTrustGateway::new()));
         &GLOBAL_ZTG
     }
 

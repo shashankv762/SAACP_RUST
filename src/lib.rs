@@ -9,6 +9,7 @@ pub mod acsvaf;
 pub mod acsvaf_audit;
 pub mod acsvaf_authority;
 pub mod aegf;
+pub mod alert_sink;
 pub mod attestation;
 pub mod clock;
 pub mod cluster;

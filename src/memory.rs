@@ -1,4 +1,4 @@
-//! memory.rs â€” Federated Memory + Secure Context Store
+//! memory.rs — Federated Memory + Secure Context Store
 //!
 //! Implements:
 //! - `CheckpointedSession`: Stateful Asynchrony Model for Flaky Infrastructure
@@ -51,13 +51,13 @@ struct CheckpointEntry {
 
 /// Maximum entries before eviction.
 pub const CHECKPOINT_MAX_ENTRIES: usize = 10_000;
-/// 30 minutes â€” hard abort threshold.
+/// 30 minutes — hard abort threshold.
 pub const CHECKPOINT_TTL_SECONDS: f64 = 1800.0;
-/// 2 minutes â€” log warning.
+/// 2 minutes — log warning.
 pub const STALL_WARN_SECONDS: f64 = 120.0;
-/// 10 minutes â€” force checkpoint.
+/// 10 minutes — force checkpoint.
 pub const STALL_CHECKPOINT_SECONDS: f64 = 600.0;
-/// 30 minutes â€” hard abort.
+/// 30 minutes — hard abort.
 pub const STALL_ABORT_SECONDS: f64 = 1800.0;
 
 /// Pipeline stall detection result.
@@ -155,7 +155,7 @@ impl CheckpointedSession {
 
     /// M-26 fix: proactively remove every checkpoint older than
     /// `CHECKPOINT_TTL_SECONDS`, instead of relying purely on the reactive
-    /// cleanup paths that already exist â€” `save_checkpoint`'s
+    /// cleanup paths that already exist — `save_checkpoint`'s
     /// over-capacity retain (only triggers once the map exceeds
     /// `CHECKPOINT_MAX_ENTRIES`), `resume_checkpoint`'s lazy per-key check
     /// (only runs if that exact context_state_id is looked up again), and
@@ -163,7 +163,7 @@ impl CheckpointedSession {
     /// that have crossed `STALL_ABORT_SECONDS`, a much longer threshold than
     /// `CHECKPOINT_TTL_SECONDS`). A checkpoint whose agent never reconnects
     /// and is never looked up again previously sat in memory until either
-    /// threshold was crossed or the map filled up â€” this gives a
+    /// threshold was crossed or the map filled up — this gives a
     /// caller (see `maintenance::MaintenanceCoordinator::with_checkpointed_session`)
     /// a way to reclaim that memory on a regular cadence instead. Returns the
     /// number of checkpoints removed.
@@ -199,7 +199,7 @@ pub const INTENT_MAX_LIFETIME: f64 = 86400.0;
 /// caller storing an arbitrarily large `massive_context_string`/`data` blob could make
 /// this store's true memory footprint far exceed `FEDERATED_MAX_ENTRIES * <expected
 /// per-entry size>` even while staying under the entry-count cap. Enforced by rejecting
-/// (not truncating) oversized writes â€” see `put_record`'s doc comment for why silent
+/// (not truncating) oversized writes — see `put_record`'s doc comment for why silent
 /// truncation is the wrong failure mode here.
 pub const FEDERATED_MAX_VALUE_BYTES: usize = 65_536;
 
@@ -208,12 +208,12 @@ pub const FEDERATED_MAX_VALUE_BYTES: usize = 65_536;
 /// using a 32-byte Context-State-ID hash and enforcing TTLs.
 ///
 /// Backed by a process-local, **sharded** `HashMap` by default (`::new()` /
-/// `::global()`) â€” see [`FEDERATED_MEMORY_SHARDS`] and [`shard_index`] below
+/// `::global()`) — see [`FEDERATED_MEMORY_SHARDS`] and [`shard_index`] below
 /// (Phase 3 / P-1: a single process-wide `Mutex` serialized every context
 /// store/fetch across every agent and session, regardless of which entry was
 /// being touched). [`FederatedMemory::with_backend`] instead routes every
 /// record through a shared [`StateBackend`] (e.g. Redis) so multiple SAACP
-/// gateway nodes can see the same context store â€” see `state_backend.rs` for
+/// gateway nodes can see the same context store — see `state_backend.rs` for
 /// the rationale and which other subsystems this is (and isn't) safe to do
 /// for; that mode is unaffected by sharding (Redis handles its own
 /// concurrency).
@@ -250,14 +250,14 @@ const FEDERATED_MEMORY_SHARDS: usize = 16;
 
 /// Per-shard soft capacity, chosen so the aggregate cap across all shards still
 /// matches [`FEDERATED_MAX_ENTRIES`] under a roughly uniform key distribution
-/// (SHA-256-derived Context-State-IDs are effectively uniformly distributed) â€”
+/// (SHA-256-derived Context-State-IDs are effectively uniformly distributed) —
 /// sharding must not silently multiply the effective capacity bound (Part 12
 /// principle 5, "Bounded Everything").
 const FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES: usize =
     FEDERATED_MAX_ENTRIES / FEDERATED_MEMORY_SHARDS;
 
 /// Maps a Context-State-ID (or intent-envelope hash) to its shard index, using
-/// the first two bytes as a big-endian `u16` modulo the shard count â€” ids
+/// the first two bytes as a big-endian `u16` modulo the shard count — ids
 /// shorter than 2 bytes (never produced by this module's own hashing, but
 /// guarded defensively since `save_context`/`fetch_context` accept
 /// caller-supplied byte slices) fall back to shard 0.
@@ -271,7 +271,14 @@ fn shard_index(id: &[u8]) -> usize {
 }
 
 /// Backing store for [`FederatedMemory::global`] / [`FederatedMemory::set_global_backend`] (H-29).
-static FEDERATED_MEMORY_GLOBAL: std::sync::OnceLock<FederatedMemory> = std::sync::OnceLock::new();
+///
+/// Longcat re-verification (Gap B): holds the singleton behind an `Arc` so
+/// [`FederatedMemory::global_arc`] can hand the EXACT same instance to
+/// `SaacpContext::shared_default_arc()` (hermetic contexts construct their
+/// own). `OnceLock` is kept (not `LazyLock`) because `set_global_backend`
+/// needs the explicit `.set()` pre-initialization semantics.
+static FEDERATED_MEMORY_GLOBAL: std::sync::OnceLock<std::sync::Arc<FederatedMemory>> =
+    std::sync::OnceLock::new();
 
 impl FederatedMemory {
     fn new_shards() -> Vec<Mutex<FederatedInner>> {
@@ -294,7 +301,7 @@ impl FederatedMemory {
 
     /// Create a FederatedMemory store backed by a shared [`StateBackend`]
     /// (e.g. Redis) instead of a process-local `HashMap`. Every method below
-    /// consults the backend exclusively when one is configured â€” the two
+    /// consults the backend exclusively when one is configured — the two
     /// storage modes are never mixed within one instance.
     pub fn with_backend(backend: Arc<dyn StateBackend>) -> Self {
         Self {
@@ -308,13 +315,13 @@ impl FederatedMemory {
     /// `agent_id` is folded into the hash so two agents that happen to submit
     /// byte-identical content never collide on the same Context-State-ID and
     /// silently alias each other's storage slot (H-25). The agent_id is
-    /// length-prefixed before the content rather than plainly concatenated â€”
+    /// length-prefixed before the content rather than plainly concatenated —
     /// otherwise `("ab", "cdef")` and `("abcd", "ef")` would hash identically,
     /// the same boundary-ambiguity class already fixed elsewhere in this
     /// crate for `NegotiationTranscript` suite lists (H-9).
     ///
     /// Returns `Err` (storing nothing) if `massive_context_string` exceeds
-    /// `FEDERATED_MAX_VALUE_BYTES` â€” see `put_record`'s doc comment for the
+    /// `FEDERATED_MAX_VALUE_BYTES` — see `put_record`'s doc comment for the
     /// reject-don't-truncate rationale (opusplan.md 6.5).
     pub fn store_context(
         &self,
@@ -367,12 +374,12 @@ impl FederatedMemory {
 
     /// Provenance-tracking sibling of [`Self::save_context`]. `save_context`
     /// itself is left unchanged (no signature/behavior change, no blast
-    /// radius on its existing callers/tests) â€” this is a purely additive,
+    /// radius on its existing callers/tests) — this is a purely additive,
     /// opt-in API for callers that want to record *who* wrote a context
     /// entry, so a reader can later check provenance before trusting shared
     /// content instead of treating the store as write-by-anyone,
     /// trust-unconditionally. Defense-in-depth against cross-agent context
-    /// poisoning â€” `save_context`/`fetch_context` currently have no caller
+    /// poisoning — `save_context`/`fetch_context` currently have no caller
     /// anywhere in this crate outside their own unit tests, so this hardens
     /// the primitive ahead of any future live wiring rather than closing an
     /// actively-exploited gap.
@@ -399,7 +406,7 @@ impl FederatedMemory {
     /// `writer_agent` if the entry was written via
     /// [`Self::save_context_with_provenance`]. Entries written via the plain
     /// `save_context`/`store_context` (or any pre-existing data with no
-    /// provenance tag) return `writer_agent: None` â€” provenance is strictly
+    /// provenance tag) return `writer_agent: None` — provenance is strictly
     /// opt-in and never retroactive, so this never breaks reads of
     /// non-provenance-tagged entries. Internally delegates to the unchanged
     /// `fetch_context` for the actual lookup/expiry/version checks.
@@ -426,7 +433,7 @@ impl FederatedMemory {
         }
     }
 
-    // â”€â”€ Local/backend storage primitives â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Local/backend storage primitives ────────────────────────────────────
     // Every public method above (and the intent-envelope methods below) goes
     // through these three helpers, matching the single flat key space the
     // original in-process HashMap always had (context records and intent
@@ -434,7 +441,7 @@ impl FederatedMemory {
 
     /// Lock and return the shard responsible for `id` (process-local mode only).
     ///
-    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking â€”
+    /// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
     /// `FederatedMemory::global()` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other caller sharing this
     /// shard losing access to its memory records.
@@ -447,7 +454,7 @@ impl FederatedMemory {
     /// opusplan.md 6.5: rejects (returns `Err`, stores nothing) any `data` payload
     /// exceeding `FEDERATED_MAX_VALUE_BYTES` instead of silently truncating it. A
     /// truncated context blob, credential-adjacent payload, or signed intent envelope
-    /// is a correctness/integrity hazard â€” a caller reading back a silently-shortened
+    /// is a correctness/integrity hazard — a caller reading back a silently-shortened
     /// value has no way to detect the corruption, whereas a loud, immediate rejection
     /// at write time can be handled by the caller (e.g. split into multiple records,
     /// or reject the originating request). This mirrors how `MAX_PAYLOAD_SIZE` is
@@ -475,7 +482,7 @@ impl FederatedMemory {
                 };
                 // Propagate both the serialization and the backend-write failure:
                 // returning `Ok(())` when the record never reached the backend is a
-                // silent data-loss / false-success bug â€” a caller that got `Ok` would
+                // silent data-loss / false-success bug — a caller that got `Ok` would
                 // later read `None` for a record it believes it durably stored. All
                 // callers already surface this `Result` via `?`.
                 let bytes = serde_json::to_vec(&record)
@@ -499,7 +506,7 @@ impl FederatedMemory {
                     },
                 );
                 // Evict expired entries if this shard is over its (aggregate-cap-
-                // preserving) per-shard capacity â€” in-process mode only, the
+                // preserving) per-shard capacity — in-process mode only, the
                 // backend mode relies on the backend's own TTL expiry.
                 if inner.store.len() > FEDERATED_MEMORY_PER_SHARD_MAX_ENTRIES {
                     let now = now_secs();
@@ -555,7 +562,7 @@ impl FederatedMemory {
     /// metadata (root_signature) is never part of the signed payload.
     ///
     /// Returns `Err` (storing nothing) if the serialized envelope exceeds
-    /// `FEDERATED_MAX_VALUE_BYTES` â€” see `put_record`'s doc comment for the
+    /// `FEDERATED_MAX_VALUE_BYTES` — see `put_record`'s doc comment for the
     /// reject-don't-truncate rationale (opusplan.md 6.5).
     pub fn create_intent_envelope(
         &self,
@@ -563,7 +570,7 @@ impl FederatedMemory {
         root_issuer: &str,
         secret_key: &[u8],
     ) -> Result<String, String> {
-        // f64â†’u64: epoch seconds are positive and fractional part is not needed.
+        // f64→u64: epoch seconds are positive and fractional part is not needed.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ts_u64 = now_secs() as u64;
 
@@ -618,12 +625,12 @@ impl FederatedMemory {
 
     /// Evicts all expired entries. Returns count evicted.
     ///
-    /// In backend mode this is a no-op that always returns 0 â€” the backend
+    /// In backend mode this is a no-op that always returns 0 — the backend
     /// (e.g. Redis `EX`) enforces TTL expiry itself; there's no generically
     /// safe way to enumerate every key across the shared keyspace to sweep
     /// them client-side without a full scan on every call.
     ///
-    /// In process-local mode this sweeps every shard in turn â€” each shard's
+    /// In process-local mode this sweeps every shard in turn — each shard's
     /// lock is held only for its own sweep, never all at once, so this never
     /// blocks the whole store the way the pre-sharding single-lock sweep did.
     pub fn evict_expired(&self) -> usize {
@@ -687,7 +694,7 @@ impl FederatedMemory {
 
         // Reconstruct the EXACT canonical JSON that was signed at creation:
         // BTreeMap-sorted, only the three payload fields, no root_signature.
-        // This is the only valid signed payload â€” no field stripping needed.
+        // This is the only valid signed payload — no field stripping needed.
         let root_intent_str = obj
             .get("root_intent")
             .and_then(|v| v.as_str())
@@ -734,7 +741,7 @@ impl FederatedMemory {
     /// Return number of stored entries.
     ///
     /// In backend mode this performs a `scan_prefix` over the whole `fedmem:`
-    /// namespace â€” an O(n) diagnostic operation (matching Redis `SCAN`
+    /// namespace — an O(n) diagnostic operation (matching Redis `SCAN`
     /// semantics), not something to call on a hot path.
     pub fn count(&self) -> usize {
         match &self.backend {
@@ -751,7 +758,14 @@ impl FederatedMemory {
     /// storage unless [`FederatedMemory::set_global_backend`] was called
     /// first (see H-29).
     pub fn global() -> &'static FederatedMemory {
-        FEDERATED_MEMORY_GLOBAL.get_or_init(FederatedMemory::new)
+        Self::global_arc()
+    }
+
+    /// Longcat re-verification (Gap B): `Arc` handle to the process-wide
+    /// instance — lets `SaacpContext::shared_default_arc()` alias the EXACT
+    /// same memory (not a copy) while hermetic contexts own their own.
+    pub fn global_arc() -> &'static std::sync::Arc<FederatedMemory> {
+        FEDERATED_MEMORY_GLOBAL.get_or_init(|| std::sync::Arc::new(FederatedMemory::new()))
     }
 
     /// (H-29) Configure the process-wide [`FederatedMemory::global`]
@@ -761,15 +775,15 @@ impl FederatedMemory {
     /// (`handler.rs`), not just from manually-constructed instances.
     ///
     /// Must be called before the first call to [`FederatedMemory::global`]
-    /// â€” typically once at process startup, before the gateway starts
+    /// — typically once at process startup, before the gateway starts
     /// accepting connections. Returns `Err` if the singleton was already
     /// initialized (by a prior call to this function, or by an earlier
     /// `global()` call defaulting to process-local storage) rather than
-    /// silently discarding the caller's intent â€” a misordered startup
+    /// silently discarding the caller's intent — a misordered startup
     /// sequence should be observable, not a silent correctness gap.
     pub fn set_global_backend(backend: Arc<dyn StateBackend>) -> Result<(), String> {
         FEDERATED_MEMORY_GLOBAL
-            .set(FederatedMemory::with_backend(backend))
+            .set(std::sync::Arc::new(FederatedMemory::with_backend(backend)))
             .map_err(|_| {
                 "FederatedMemory::global() singleton already initialized; \
                  set_global_backend() must be called before the first use of global()."
@@ -844,18 +858,18 @@ struct ScrRecord {
     /// M-25 fix: wall-clock time this record was inserted, used by
     /// `evict_if_needed`'s capacity-forced fallback to evict oldest-first
     /// instead of by arbitrary `HashMap` key order. Deliberately distinct
-    /// from `expiry` (`now_secs() + ttl_seconds` at creation) â€” a
+    /// from `expiry` (`now_secs() + ttl_seconds` at creation) — a
     /// long-TTL record created recently and a short-TTL record created long
     /// ago can have the same `expiry`, but only `created_at` answers "which
     /// one is actually older".
     created_at: f64,
 }
 
-/// Secure Context References (SCR) â€” AEGF replacement for content-derived
+/// Secure Context References (SCR) — AEGF replacement for content-derived
 /// context_state_id.
 ///
 /// Security model:
-/// - SCR = HKDF-SHA256(master_key, fresh_salt) â€” crypto-random, not content-derived.
+/// - SCR = HKDF-SHA256(master_key, fresh_salt) — crypto-random, not content-derived.
 /// - Stored content encrypted with AES-256-GCM before indexing.
 /// - Ownership, audience, expiry metadata bound as AEAD AAD.
 /// - Two identical context objects produce different SCRs (different salt each time).
@@ -944,7 +958,7 @@ impl SecureContextStore {
     /// between lock release and decrypt completion would still let this call
     /// return plaintext for a context that is, by the time the caller sees
     /// it, already revoked. Holding the lock across the (microsecond-scale,
-    /// in-memory) decrypt closes that window entirely â€” `revoke()` takes the
+    /// in-memory) decrypt closes that window entirely — `revoke()` takes the
     /// same `Mutex<ScrInner>`, so the two can never interleave.
     pub fn retrieve(
         &self,
@@ -991,7 +1005,7 @@ impl SecureContextStore {
                 ));
             }
 
-            // AES-GCM decryption â€” still inside the lock (see doc comment above).
+            // AES-GCM decryption — still inside the lock (see doc comment above).
             let iv = derive_iv(master_key, &scr);
             let key = Key::<Aes256Gcm>::from_slice(&master_key[..32]);
             let cipher = Aes256Gcm::new(key);
@@ -1003,7 +1017,7 @@ impl SecureContextStore {
                 .map_err(|_| {
                     SAACPHardDrop::new(
                         SAACPBytecodes::InvalidSignature,
-                        "Secure Context Reference authentication failed â€” tampering detected.",
+                        "Secure Context Reference authentication failed — tampering detected.",
                     )
                 })?;
             buffer
@@ -1053,7 +1067,7 @@ impl SecureContextStore {
         // High-water mark: trigger eviction before the store is completely full so
         // there is always room for incoming entries. The old approach only evicted
         // at exactly SCR_MAX_ENTRIES and silently dropped new entries if all existing
-        // ones were still valid â€” enabling a DoS by pre-filling with long-TTL SCRs.
+        // ones were still valid — enabling a DoS by pre-filling with long-TTL SCRs.
         const HIGH_WATER: usize = SCR_MAX_ENTRIES - SCR_MAX_ENTRIES / 5; // 40,000
         if inner.store.len() < HIGH_WATER {
             return;
@@ -1061,8 +1075,8 @@ impl SecureContextStore {
         let now = now_secs();
         inner.store.retain(|_, v| v.expiry > now && !v.revoked);
         // If expiry eviction wasn't enough (all entries still valid), forcibly remove
-        // the oldest half â€” by actual insertion time (`created_at`), not arbitrary
-        // `HashMap` key order (M-25 fix) â€” to keep memory bounded.
+        // the oldest half — by actual insertion time (`created_at`), not arbitrary
+        // `HashMap` key order (M-25 fix) — to keep memory bounded.
         if inner.store.len() >= SCR_MAX_ENTRIES {
             let target = SCR_MAX_ENTRIES / 2;
             let excess = inner.store.len().saturating_sub(target);
@@ -1282,7 +1296,7 @@ mod tests {
 
     /// opusplan.md 6.5: a `store_context` payload over `FEDERATED_MAX_VALUE_BYTES` must
     /// be rejected outright (`Err`, nothing stored) rather than silently truncated or
-    /// accepted â€” the whole point of the cap is a hard per-entry memory ceiling.
+    /// accepted — the whole point of the cap is a hard per-entry memory ceiling.
     #[test]
     fn test_store_context_rejects_oversized_value() {
         let fm = FederatedMemory::new();
@@ -1295,7 +1309,7 @@ mod tests {
         );
     }
 
-    /// A payload exactly at the cap must still be accepted â€” the cap is an upper
+    /// A payload exactly at the cap must still be accepted — the cap is an upper
     /// bound, not an off-by-one-stricter ceiling.
     #[test]
     fn test_store_context_accepts_value_at_exact_cap() {
@@ -1305,7 +1319,7 @@ mod tests {
     }
 
     /// `save_context` and `create_intent_envelope` funnel through the same
-    /// `put_record` choke point as `store_context` â€” confirm they enforce the
+    /// `put_record` choke point as `store_context` — confirm they enforce the
     /// identical cap rather than only one call path being protected.
     #[test]
     fn test_save_context_and_intent_envelope_reject_oversized_value() {
@@ -1322,7 +1336,7 @@ mod tests {
     // `FEDERATED_MEMORY_GLOBAL` is a genuine process-wide static shared by
     // every test in this binary (and by `handler.rs` in a real process), so
     // these tests only assert invariants that hold regardless of which test
-    // happens to touch the singleton first â€” they must not assume they win
+    // happens to touch the singleton first — they must not assume they win
     // the initialization race.
 
     #[test]
@@ -1435,13 +1449,13 @@ mod tests {
         let local = FederatedMemory::new();
         let backend = backend_fm();
         let state_id = local.store_context("agent-alpha", "only-local", 1).unwrap();
-        // The backend-mode instance has an entirely separate store â€” it must
+        // The backend-mode instance has an entirely separate store — it must
         // not see data written to the local, process-only instance.
         assert!(backend.fetch_context(&state_id, 1).is_err());
     }
 
     /// H-25: two different agents storing byte-identical content must land on
-    /// different Context-State-IDs â€” the state_id must not be a pure content
+    /// different Context-State-IDs — the state_id must not be a pure content
     /// hash an attacker can collide across identities.
     #[test]
     fn test_store_context_cross_agent_no_collision() {
@@ -1455,7 +1469,7 @@ mod tests {
     }
 
     /// H-25: the hash input must be unambiguous about the agent_id/content
-    /// boundary â€” a naive concatenation would let ("ab","cdef") collide with
+    /// boundary — a naive concatenation would let ("ab","cdef") collide with
     /// ("abcd","ef"). The length-prefixed hash must not.
     #[test]
     fn test_store_context_boundary_ambiguity_no_collision() {
@@ -1567,7 +1581,7 @@ mod tests {
             // Check the flag BEFORE calling retrieve(): if it's already true,
             // revoke() has fully completed (Acquire pairs with the Release
             // above), so this retrieve() call is guaranteed to start after
-            // the revocation â€” under the H-27 fix it must therefore fail.
+            // the revocation — under the H-27 fix it must therefore fail.
             let already_revoked = revoked.load(Ordering::Acquire);
             let res = scs.retrieve(&scr_hex, "agent-a", &key);
             if already_revoked {
@@ -1581,7 +1595,7 @@ mod tests {
 
         assert_eq!(
             violations, 0,
-            "retrieve() returned plaintext for an already-revoked SCR â€” H-27 TOCTOU regression"
+            "retrieve() returned plaintext for an already-revoked SCR — H-27 TOCTOU regression"
         );
         assert!(
             post_revoke_calls > 0,
@@ -1629,7 +1643,7 @@ mod tests {
         let scr2 = scs
             .store("same_data", "agent-a", &audience, 300.0, &key, "INTERNAL")
             .unwrap();
-        // Different salt each time â†’ different SCR
+        // Different salt each time → different SCR
         assert_ne!(scr1, scr2);
     }
 
@@ -1686,7 +1700,7 @@ mod tests {
         };
         // Populate exactly SCR_MAX_ENTRIES never-expiring records with
         // DESCENDING created_at (so HashMap key/insertion order is the exact
-        // opposite of age order â€” if eviction fell back to key order, it
+        // opposite of age order — if eviction fell back to key order, it
         // would evict the NEWEST records instead of the oldest).
         for i in 0..SCR_MAX_ENTRIES {
             let created_at = (SCR_MAX_ENTRIES - i) as f64; // last-inserted has smallest created_at
@@ -1704,7 +1718,7 @@ mod tests {
         assert_eq!(inner.store.len(), SCR_MAX_ENTRIES / 2);
 
         // Every SURVIVING record must have created_at STRICTLY GREATER than
-        // every REMOVED record's created_at â€” i.e. the newest half survived,
+        // every REMOVED record's created_at — i.e. the newest half survived,
         // the oldest half was evicted, regardless of HashMap key order.
         let min_surviving = inner
             .store
@@ -1714,7 +1728,7 @@ mod tests {
         let max_possible_created_at = SCR_MAX_ENTRIES as f64;
         assert!(
             min_surviving > max_possible_created_at / 2.0,
-            "M-25: the oldest half must be evicted first â€” found a surviving \
+            "M-25: the oldest half must be evicted first — found a surviving \
              record with created_at={min_surviving}, expected > {}",
             max_possible_created_at / 2.0
         );

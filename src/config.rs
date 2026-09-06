@@ -129,6 +129,11 @@ pub struct CommandCenterSection {
     pub dashboard_token_file: Option<String>,
     pub dollars_per_token: Option<f64>,
     pub disable_demo_daemon: Option<bool>,
+    /// M-G remediation (v0.2.1): the demo daemon + synthetic activity
+    /// generator are OPT-IN — set `demo_mode = true` (or `SAACP_DEMO_MODE=1`)
+    /// to enable them. `disable_demo_daemon = true` still forces the demo
+    /// off and wins over this field.
+    pub demo_mode: Option<bool>,
     pub demo_daemon_addr: Option<String>,
     /// TOML-native array form of the CORS allowlist (the env var is the
     /// comma-separated form of the same list; the set-but-empty fail-closed
@@ -302,6 +307,7 @@ impl SaacpConfig {
         }
         for (k, v) in [
             ("disable_demo_daemon", fmt_bool(c.disable_demo_daemon)),
+            ("demo_mode", fmt_bool(c.demo_mode)),
             ("enable_mace", fmt_bool(c.enable_mace)),
         ] {
             if v != "unset" {

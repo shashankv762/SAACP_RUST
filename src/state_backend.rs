@@ -96,7 +96,7 @@
 
 #[cfg(feature = "redis-backend")]
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -216,6 +216,17 @@ impl Entry {
     }
 }
 
+/// M-D remediation (production audit G4/R4): the in-memory backend's map was
+/// unbounded — every subsystem pointing at it keys by attacker-influenced ids
+/// (agent names, session ids), so a process could grow its entry count without
+/// limit. New-key inserts are now capped at this many entries; when the cap is
+/// exceeded, the oldest-inserted LIVE entry is evicted FIFO-style (stale
+/// order entries left behind by expiry/deletion are skipped and amortized-
+/// compacted). The direction is fail-safe: losing a rate-limit error count or
+/// a lease can only loosen an enforcement memory or refuse a leadership claim,
+/// never forge one.
+pub const BACKEND_MAX_ENTRIES: usize = 100_000;
+
 /// Default backend — a process-local `RwLock<HashMap<...>>`. Behaviourally
 /// equivalent to what every EASY-tier subsystem already did before
 /// `with_backend()` existed; used implicitly whenever a subsystem is
@@ -231,16 +242,75 @@ impl Entry {
 /// are unconditionally exclusive either way, so they keep the same concurrency
 /// characteristics as before — this fix targets the specific case the finding raised
 /// (reads blocking on other reads), not scan's O(n) sweep, which is a genuine write.
-#[derive(Default)]
 pub struct InMemoryBackend {
     store: RwLock<HashMap<String, Entry>>,
+    /// Insertion order of NEW keys, for FIFO eviction of live entries at the
+    /// cap. Separate mutex so the `get()` read-lock fast path never touches
+    /// it. May hold stale keys (entry expired or deleted after insert);
+    /// eviction skips those and a compaction pass trims them when the queue
+    /// grows to twice the entry cap.
+    order: std::sync::Mutex<VecDeque<String>>,
+    max_entries: usize,
 }
 
 impl InMemoryBackend {
     pub fn new() -> Self {
+        Self::with_max_entries(BACKEND_MAX_ENTRIES)
+    }
+
+    /// Bounded backend with an explicit cap (tests use a small cap; production
+    /// uses [`BACKEND_MAX_ENTRIES`]).
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             store: RwLock::new(HashMap::new()),
+            order: std::sync::Mutex::new(VecDeque::new()),
+            max_entries,
         }
+    }
+
+    /// Bookkeeping for a NEW-key insert (store WRITE lock held): push the
+    /// insertion order, compact the queue when stale entries dominate (an
+    /// expiry/delete-heavy workload never triggers eviction, so compaction
+    /// must also run here), then evict down to the cap.
+    fn track_new_key(&self, store: &mut HashMap<String, Entry>, key: &str) {
+        {
+            let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+            order.push_back(key.to_string());
+            if order.len() > self.max_entries.saturating_mul(2) {
+                order.retain(|k| store.contains_key(k));
+            }
+        }
+        if store.len() > self.max_entries {
+            self.evict_over_cap(store);
+        }
+    }
+
+    /// Called with the store WRITE lock held after inserting a NEW key:
+    /// while over the cap, pop order entries until a live one is evicted (or
+    /// the queue is exhausted), and compact when stale entries dominate.
+    fn evict_over_cap(&self, store: &mut HashMap<String, Entry>) {
+        let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        while store.len() > self.max_entries {
+            match order.pop_front() {
+                // Live entry — evict it; the loop re-checks the cap.
+                Some(key) => {
+                    store.remove(&key);
+                }
+                None => break,
+            }
+        }
+        // Compaction: if expiry/deletion left the queue dominated by stale
+        // keys, drop them in one O(n) pass (amortized: only after the queue
+        // has grown to twice the live-entry cap).
+        if order.len() > self.max_entries.saturating_mul(2) {
+            order.retain(|k| store.contains_key(k));
+        }
+    }
+}
+
+impl Default for InMemoryBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -272,6 +342,7 @@ impl StateBackend for InMemoryBackend {
 
     fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> BackendResult<()> {
         let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        let is_new_key = !store.contains_key(key);
         store.insert(
             key.to_string(),
             Entry {
@@ -279,6 +350,11 @@ impl StateBackend for InMemoryBackend {
                 expires_at: ttl.map(|d| Instant::now() + d),
             },
         );
+        if is_new_key {
+            // M-D: bound new-key growth — track insertion order, evict the
+            // oldest live entry if this key pushed the map past the cap.
+            self.track_new_key(&mut store, key);
+        }
         Ok(())
     }
 
@@ -309,6 +385,7 @@ impl StateBackend for InMemoryBackend {
             _ => (0, None),
         };
         let next = current.saturating_add(by);
+        let is_new_key = current == 0 && !store.contains_key(key);
         store.insert(
             key.to_string(),
             Entry {
@@ -316,6 +393,9 @@ impl StateBackend for InMemoryBackend {
                 expires_at: existing_ttl,
             },
         );
+        if is_new_key {
+            self.track_new_key(&mut store, key);
+        }
         Ok(next)
     }
 
@@ -350,6 +430,7 @@ impl StateBackend for InMemoryBackend {
             }
             _ => {
                 let next = by;
+                let was_absent = !store.contains_key(key);
                 store.insert(
                     key.to_string(),
                     Entry {
@@ -357,6 +438,9 @@ impl StateBackend for InMemoryBackend {
                         expires_at: Some(Instant::now() + ttl),
                     },
                 );
+                if was_absent {
+                    self.track_new_key(&mut store, key);
+                }
                 Ok(next)
             }
         }
@@ -663,6 +747,79 @@ impl StateBackend for RedisBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-D regression: new-key inserts are bounded — the oldest-inserted LIVE
+    /// entry is evicted FIFO once the cap is exceeded, across `set`/`incr`/
+    /// `incr_with_ttl` alike, and overwrites never grow the map.
+    #[test]
+    fn backend_is_bounded_with_fifo_eviction() {
+        let b = InMemoryBackend::with_max_entries(4);
+        for n in 0..6 {
+            b.set(&format!("set-{n}"), b"v", None).unwrap();
+        }
+        assert_eq!(
+            b.store.read().unwrap_or_else(|e| e.into_inner()).len(),
+            4,
+            "set must be capped"
+        );
+        // FIFO: set-0 and set-1 evicted; set-2..set-5 live.
+        assert_eq!(b.get("set-0").unwrap(), None);
+        assert_eq!(b.get("set-1").unwrap(), None);
+        for n in 2..6 {
+            assert_eq!(b.get(&format!("set-{n}")).unwrap(), Some(b"v".to_vec()));
+        }
+        // Overwriting an existing key must not evict anything.
+        b.set("set-5", b"v2", None).unwrap();
+        assert_eq!(b.store.read().unwrap_or_else(|e| e.into_inner()).len(), 4);
+
+        // incr / incr_with_ttl new-key creation is capped by the same sweep.
+        for n in 0..10 {
+            b.incr(&format!("incr-{n}"), 1).unwrap();
+        }
+        assert_eq!(
+            b.store.read().unwrap_or_else(|e| e.into_inner()).len(),
+            4,
+            "incr new-key creation must evict down to the cap"
+        );
+        for n in 0..10 {
+            b.incr_with_ttl(&format!("iwt-{n}"), 1, Duration::from_secs(60))
+                .unwrap();
+        }
+        assert_eq!(
+            b.store.read().unwrap_or_else(|e| e.into_inner()).len(),
+            4,
+            "incr_with_ttl new-key creation must evict down to the cap"
+        );
+    }
+
+    /// M-D regression: eviction only removes LIVE entries — stale order
+    /// entries left behind by deletion are skipped, so a delete-heavy
+    /// workload neither breaks eviction nor evicts the wrong key.
+    #[test]
+    fn eviction_skips_deleted_entries() {
+        let b = InMemoryBackend::with_max_entries(2);
+        b.set("a", b"v", None).unwrap();
+        b.set("b", b"v", None).unwrap();
+        b.delete("a").unwrap();
+        // Order queue now holds stale "a" then live "b".
+        b.set("c", b"v", None).unwrap();
+        b.set("d", b"v", None).unwrap();
+        // Inserting "d" pushed the map to 3 > cap: eviction must skip stale
+        // "a" and evict the oldest LIVE entry "b" — not "c".
+        assert_eq!(b.get("b").unwrap(), None, "oldest live entry evicted");
+        assert_eq!(b.get("c").unwrap(), Some(b"v".to_vec()), "newer entry kept");
+        assert_eq!(
+            b.get("d").unwrap(),
+            Some(b"v".to_vec()),
+            "newest entry kept"
+        );
+        assert_eq!(b.store.read().unwrap_or_else(|e| e.into_inner()).len(), 2);
+
+        // TTL expiry path: expired entries stop being visible.
+        b.set("exp", b"v", Some(Duration::ZERO)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(b.get("exp").unwrap(), None, "expired entry must be gone");
+    }
 
     #[test]
     fn get_missing_key_returns_none() {

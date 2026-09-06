@@ -24,7 +24,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
 # Build release binaries with all features
-RUN cargo build --release --bins --features "transport-ws transport-tls sidecar command-center"
+# M-C remediation (production audit G3/R3): `health-endpoint` is compiled in
+# so the daemon health/metrics server (/healthz /readyz /metrics) is available
+# to container orchestrators, not just the sidecar's own HTTP API. Note:
+# `redis-backend` is deliberately NOT enabled — no shipped binary constructs a
+# Redis backend yet (library-API only), so the feature would be dead weight.
+RUN cargo build --release --bins --features "transport-ws transport-tls sidecar command-center health-endpoint"
 
 # ── Runtime stage ──────────────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot

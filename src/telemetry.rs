@@ -229,6 +229,15 @@ pub struct Counters {
     /// violation regardless of the configured `AffinityViolationPolicy`; the
     /// policy only decides whether the connection is additionally hard-dropped.
     pub session_affinity_violations: AtomicU64,
+    /// M-E remediation (production audit G5/R5): gossip send failures —
+    /// connect/write errors and bounded-queue drops in
+    /// `StaticPeerListTransport`'s send pool. Fire-and-forget semantics are
+    /// unchanged; this makes the drops visible instead of silent.
+    pub gossip_send_failures_total: AtomicU64,
+    /// M-B remediation (production audit G2/R2): syslog alert-sink delivery
+    /// failures. The sink is best-effort/fail-open — a UDP send error is
+    /// counted here and never blocks or panics the packet path.
+    pub alert_sink_failures_total: AtomicU64,
     /// R8 (finding H): 1 when this process is the designated audit-chain node
     /// (`SAACP_AUDIT_NODE=1` / `DaemonBuilder::audit_node(true)`), 0
     /// otherwise. Visibility only — no consensus or routing logic keys off
@@ -319,6 +328,8 @@ impl Counters {
             trust_rewards_valid_receipt: z!(),
             financial_tokens_rejected: z!(),
             session_affinity_violations: z!(),
+            gossip_send_failures_total: z!(),
+            alert_sink_failures_total: z!(),
             audit_chain_designated_node: z!(),
             revocation_last_received_epoch: z!(),
         }
@@ -1209,6 +1220,23 @@ impl TelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// M-E (production audit G5/R5): count one gossip send failure — a
+    /// connect/write error on a pool worker, or a send dropped because the
+    /// bounded send queue was momentarily full. See `gossip.rs`.
+    pub fn record_gossip_send_failure(&self) {
+        self.counters
+            .gossip_send_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M-B (production audit G2/R2): count one failed best-effort delivery of
+    /// a security alert to the installed external sink (see `alert_sink.rs`).
+    pub fn record_alert_sink_failure(&self) {
+        self.counters
+            .alert_sink_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// R8 (finding H): set the audit-chain designation gauge (1 = this
     /// process is the designated audit-chain node, 0 = not). Called once at
     /// daemon startup from the `SAACP_AUDIT_NODE` env var / `audit_node(true)`
@@ -1440,6 +1468,8 @@ impl TelemetryCollector {
             "session_affinity_violations_total",
             c.session_affinity_violations
         );
+        snap!("gossip_send_failures_total", c.gossip_send_failures_total);
+        snap!("alert_sink_failures_total", c.alert_sink_failures_total);
         snap!("audit_chain_designated_node", c.audit_chain_designated_node);
         // R9: derived (not stored) — lag is computed at scrape time from the
         // last-received revocation timestamp gauge.
@@ -1542,6 +1572,8 @@ impl TelemetryCollector {
             "rulepack_rejections_total",
             "rulepack_expirations_total",
             "session_affinity_violations_total",
+            "gossip_send_failures_total",
+            "alert_sink_failures_total",
         ] {
             out.push_str(&format!(
                 "saacp_security_events_total{{event=\"{event}\"}} {}\n",
@@ -1887,6 +1919,8 @@ impl TelemetryCollector {
         rst!(c.trust_rewards_clean_passage);
         rst!(c.trust_rewards_valid_receipt);
         rst!(c.financial_tokens_rejected);
+        rst!(c.gossip_send_failures_total);
+        rst!(c.alert_sink_failures_total);
         rst!(c.session_affinity_violations);
         rst!(c.audit_chain_designated_node);
         rst!(c.revocation_last_received_epoch);
@@ -2004,6 +2038,12 @@ impl SecurityAlertFeed {
         let subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         for entry in subs.iter() {
             (entry.callback)(&alert);
+        }
+        // M-B remediation: best-effort forwarding to the process-wide
+        // external sink (RFC 5424 syslog over UDP — see `alert_sink.rs`).
+        // Absent sink (env unset) = zero overhead, byte-identical behavior.
+        if let Some(sink) = crate::alert_sink::syslog_sink() {
+            sink.emit(&alert);
         }
     }
 

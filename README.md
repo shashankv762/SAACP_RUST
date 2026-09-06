@@ -677,7 +677,52 @@ Suggested alert rules: `rate(saacp_security_events_total{event="session_affinity
 (mis-routed traffic), and `saacp_audit_chain_designated_node == 0` on the node
 you *believe* is the audit node (designation drifted).
 
-### 5. File-based configuration (`SAACP_CONFIG`)
+### 5. Operational hardening (v0.2.1 audit remediations)
+
+These knobs ship **off by default** — setting none of them keeps a deployment
+byte-identical to 0.2.0 behavior.
+
+- **Audit-chain recovery** (`SAACP_AUDIT_RECOVER=1`): on startup the daemon
+  verifies the persisted audit chain (`ImmutableAuditLog::initialize_chain`)
+  against the configured `token_issuer_secret` and adopts it, so a restarted
+  process continues the on-disk chain instead of silently starting from
+  genesis. Fail-closed: if the on-disk chain fails verification (a crash-torn
+  final line is indistinguishable from tampering — H-6), the daemon **refuses
+  to start**. Preserve the file for forensics, move it aside, restart. Skipped
+  with a note when no stable issuer secret is configured.
+- **External alert delivery** (`SAACP_ALERT_SYSLOG=<host:port>`): every
+  `SecurityAlert` (gate rejections) is forwarded best-effort as an RFC 5424
+  syslog datagram, so a standalone node is no longer blind without a
+  Prometheus scraper. Fail-open: a dead collector costs one counter increment
+  (`saacp_security_events_total{event="alert_sink_failures_total"}`), never a
+  stall. Payloads carry only the coarse `/api/alerts` fields (no CRIT-10
+  material).
+- **Demo telemetry is now opt-in** (breaking for demo users): the command
+  center's demo daemon + synthetic activity generator previously ran by
+  default — set `SAACP_DEMO_MODE=1` (or `[command_center] demo_mode = true`)
+  to enable them. `SAACP_DISABLE_DEMO_DAEMON=1` still forces the demo off.
+- **Bounded state** (G4/R4): `SessionAffinityTracker` (100k entries, FIFO
+  evict) and `InMemoryBackend` (100k entries, FIFO evict + amortized
+  compaction) can no longer grow without bound under session/agent churn.
+  Evicted entries lose their violation/enforcement memory — the same
+  bounded-memory tradeoff as every other capped store.
+- **Gossip send pool** (G5/R5): revocation gossip sends flow through a fixed
+  4-worker pool with a 1024-slot bounded queue instead of one OS thread per
+  send. Drops (saturated queue, refused peer) are counted as
+  `saacp_security_events_total{event="gossip_send_failures_total"}` — pair it
+  with the revocation-lag alert.
+- **Seed/pin mismatch warning** (R11): configuring peer pins without a
+  persisted `SAACP_SERVER_SEED_FILE` now prints a loud startup warning — an
+  ephemeral seed invalidates every pin at the next restart.
+
+Audit-node failover runbook: the chain of record lives on the designated node
+(`SAACP_AUDIT_NODE=1`). To move it: stop the designated node, copy the audit
+log (and its `.count` sentinel) to the new node, point `SAACP_AUDIT_LOG` at
+it, start the new node with `SAACP_AUDIT_RECOVER=1` (it verifies before
+adopting), then re-designate. The old node restarts WITHOUT recovery and
+appends to a fresh chain — verify and archive its file before re-enabling.
+
+### 6. File-based configuration (`SAACP_CONFIG`)
 
 Both binaries (`saacp-sidecar`, `saacp-command-center`) accept an optional TOML
 configuration file pointed at by `SAACP_CONFIG` (see `saacp::config`):
@@ -711,7 +756,7 @@ peer_secrets_file = "/run/secrets/saacp_peer_secrets"
 The sample `compose.yaml` at the repo root wires both binaries with this
 pattern (secret files mounted read-only, `*_FILE` env references).
 
-### 6. Release runbook (v0.2.0)
+### 7. Release runbook (v0.2.0)
 
 1. All gates green on the release commit: `cargo fmt --all -- --check`,
    `cargo clippy --all-targets --all-features -- -D warnings`,

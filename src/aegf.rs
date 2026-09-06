@@ -1317,7 +1317,12 @@ pub static GLOBAL_DAEG: LazyLock<std::sync::Arc<DistributedExecutionGraph>> =
 /// Used by Gate 11.0 in `SAACPProtocolHandler::_intercept_packet_inner()` when
 /// no AEGFGovernor is explicitly injected. Shares `GLOBAL_DAEG` with the CSCS
 /// loop detector so both see the same causal graph state.
-pub static GLOBAL_AEGF_GOVERNOR: LazyLock<AEGFGovernor> = LazyLock::new(|| AEGFGovernor::new(None));
+///
+/// Longcat re-verification (Gap B): held as `LazyLock<Arc<_>>` so
+/// `SaacpContext::shared_default_arc()` can alias this exact allocation;
+/// method-call sites auto-deref through `LazyLock` → `Arc` unchanged.
+pub static GLOBAL_AEGF_GOVERNOR: LazyLock<std::sync::Arc<AEGFGovernor>> =
+    LazyLock::new(|| std::sync::Arc::new(AEGFGovernor::new(None)));
 
 #[cfg(test)]
 mod tests {

@@ -346,8 +346,28 @@ impl GossipEngine {
 /// `sidecar.rs::connect_with_retry` already uses safely for its single outbound relay
 /// target). Send failures are logged and dropped (fire-and-forget) rather than retried —
 /// gossip's reliability comes from fanout + multi-hop redundancy, not per-send retries.
+///
+/// M-E remediation (production audit G5/R5): sends flow through a small fixed
+/// worker pool with a bounded queue ([`GOSSIP_SEND_POOL_WORKERS`] /
+/// [`GOSSIP_SEND_QUEUE_CAP`]) instead of one detached OS thread per send —
+/// a revocation storm previously meant unbounded thread creation. When the
+/// queue is momentarily full the send is DROPPED and counted
+/// (`saacp_security_events_total{event="gossip_send_failures_total"}`);
+/// fire-and-forget semantics are preserved.
+pub const GOSSIP_SEND_POOL_WORKERS: usize = 4;
+/// Bounded job-queue capacity shared by the send-pool workers.
+pub const GOSSIP_SEND_QUEUE_CAP: usize = 1024;
+
+struct SendJob {
+    addr: SocketAddr,
+    bytes: Vec<u8>,
+}
+
 pub struct StaticPeerListTransport {
     peers: Mutex<HashMap<String, SocketAddr>>,
+    /// Lazily-initialized bounded send pool (first `send_to_peer` starts the
+    /// workers). Construction stays side-effect-free for tests.
+    pool: std::sync::OnceLock<std::sync::mpsc::SyncSender<SendJob>>,
 }
 
 impl StaticPeerListTransport {
@@ -355,6 +375,54 @@ impl StaticPeerListTransport {
     pub fn new(peers: Vec<(String, SocketAddr)>) -> Self {
         Self {
             peers: Mutex::new(peers.into_iter().collect()),
+            pool: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Start the fixed worker pool once and return its job sender.
+    fn pool_sender(&self) -> &std::sync::mpsc::SyncSender<SendJob> {
+        self.pool.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<SendJob>(GOSSIP_SEND_QUEUE_CAP);
+            let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+            for worker in 0..GOSSIP_SEND_POOL_WORKERS {
+                let rx = std::sync::Arc::clone(&rx);
+                let spawned = std::thread::Builder::new()
+                    .name(format!("gossip-send-{worker}"))
+                    .spawn(move || loop {
+                        let Ok(job) = rx.lock().unwrap_or_else(|e| e.into_inner()).recv() else {
+                            return; // all senders dropped — transport is gone
+                        };
+                        deliver_gossip_payload(&job.addr, &job.bytes);
+                    });
+                if spawned.is_err() {
+                    // Thread spawn refused (resource exhaustion) — degrade to
+                    // fewer workers rather than panicking; fewer workers only
+                    // means the bounded queue fills sooner and drops get
+                    // counted, which is the same fire-and-forget posture.
+                    eprintln!(
+                        "[saacp gossip] send-pool worker {worker} failed to spawn; \
+                         continuing with fewer workers"
+                    );
+                }
+            }
+            tx
+        })
+    }
+}
+
+/// One delivery attempt (blocking connect + write, failures counted). Runs on
+/// the send-pool workers — never on the caller's thread.
+fn deliver_gossip_payload(addr: &SocketAddr, bytes: &[u8]) {
+    use std::io::Write;
+    match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(2)) {
+        Ok(mut stream) => {
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            if stream.write_all(bytes).is_err() {
+                crate::telemetry::global_telemetry().record_gossip_send_failure();
+            }
+        }
+        Err(_) => {
+            crate::telemetry::global_telemetry().record_gossip_send_failure();
         }
     }
 }
@@ -377,20 +445,19 @@ impl GossipTransport for StaticPeerListTransport {
                 None => return,
             }
         };
-        let bytes = bytes.to_vec();
-        // Fire-and-forget: spawn a short-lived blocking send on a plain OS thread so
-        // `send_to_peer` (a sync trait method, matching `DistributedRevocationInfrastructure::
-        // revoke`'s sync call chain) never blocks its caller on network I/O. A failed
-        // connect/write is dropped silently by design — see the module/struct docs.
-        std::thread::spawn(move || {
-            use std::io::Write;
-            if let Ok(mut stream) =
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
-            {
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-                let _ = stream.write_all(&bytes);
-            }
-        });
+        // Bounded hand-off: when the queue is full (all workers busy on a
+        // 2s-timeout backlog) the send is dropped and COUNTED instead of
+        // blocking the caller or spawning an unbounded thread.
+        if self
+            .pool_sender()
+            .try_send(SendJob {
+                addr,
+                bytes: bytes.to_vec(),
+            })
+            .is_err()
+        {
+            crate::telemetry::global_telemetry().record_gossip_send_failure();
+        }
     }
 }
 
@@ -685,5 +752,47 @@ mod tests {
             1 + GOSSIP_SEND_RETRIES as usize,
             "the helper must send exactly 1 + GOSSIP_SEND_RETRIES times"
         );
+    }
+
+    /// M-E regression (single sequential fn — the telemetry counter is
+    /// process-global and this binary's tests run in parallel): an unknown
+    /// peer is a no-op (no count), and a send to an unreachable peer lands on
+    /// the send pool and IS counted (`gossip_send_failures_total`) instead of
+    /// being dropped silently — the audit's "fires but nobody sees it" gap.
+    #[test]
+    fn send_pool_counts_failures_and_ignores_unknown_peers() {
+        use std::net::SocketAddr;
+        let snapshot =
+            || crate::telemetry::global_telemetry().snapshot()["gossip_send_failures_total"];
+        let before = snapshot();
+
+        // Port 1 on loopback: connection refused immediately, deterministically.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("static addr");
+        let transport = StaticPeerListTransport::new(vec![("dead".to_string(), addr)]);
+
+        // 1) Unknown peer: no pool job, no counter movement.
+        transport.send_to_peer("nobody", b"payload");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            snapshot(),
+            before,
+            "unknown peer must not touch the failure counter"
+        );
+
+        // 2) Known-but-unreachable peer: the pool worker's refused connect
+        //    must be counted. Poll with a deadline instead of assuming
+        //    scheduling.
+        transport.send_to_peer("dead", b"payload");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if snapshot() > before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refused connect must increment gossip_send_failures_total within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

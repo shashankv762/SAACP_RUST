@@ -627,6 +627,15 @@ async fn main() {
         config.pinned_peers = parse_peer_pins_file(&path);
     }
 
+    // M-I remediation (production audit R11): a fresh ephemeral server seed
+    // is generated per boot when SAACP_SERVER_SEED_FILE is unset. With
+    // `PREFER_PINNED`/`REQUIRE_PINNED` the peer pins verify against THIS
+    // boot's verifying key — so every restart would silently fail pin
+    // verification (REQUIRE) or downgrade every connection to plain ECDH
+    // (PREFER) until the new key is re-pinned out-of-band. That combination
+    // is almost always a configuration mistake: say so, loudly, at startup.
+    warn_if_pins_without_seed(&config.server_seed, &config.pinned_peers);
+
     // R-6 fix: same rationale as `saacp_command_center.rs`'s identical wiring — this
     // binary's inner `SAACPNetworkDaemon` (constructed inside `sidecar::run_with_shutdown`)
     // drives packets through the same `handler.rs` gate pipeline, which mutates the same
@@ -700,6 +709,28 @@ async fn main() {
             eprintln!("[saacp-sidecar] fatal: {e}");
             std::process::exit(1);
         });
+}
+
+/// M-I remediation (production audit R11): warn when peer pins are configured
+/// against an ephemeral (per-boot) server seed. Returns `true` when the
+/// warning fired — exposed for the regression test.
+fn warn_if_pins_without_seed(
+    server_seed: &Option<[u8; 32]>,
+    pinned_peers: &HashMap<String, [u8; 32]>,
+) -> bool {
+    if server_seed.is_none() && !pinned_peers.is_empty() {
+        eprintln!(
+            "[saacp-sidecar] WARNING: {} peer pin(s) are configured but no server identity \
+             seed is (SAACP_SERVER_SEED_FILE unset) — a fresh ephemeral seed is generated \
+             EACH BOOT, so the verifying key every peer pinned will stop matching after \
+             this process restarts. REQUIRE_PINNED will then refuse every connection and \
+             PREFER_PINNED will downgrade to plain ECDH. Persist a stable seed via \
+             SAACP_SERVER_SEED_FILE and re-pin its fingerprint once.",
+            pinned_peers.len()
+        );
+        return true;
+    }
+    false
 }
 
 /// M1 (R1): parse `SAACP_HANDSHAKE_MODE`. Unset defaults to `PreferPinned`
@@ -889,6 +920,21 @@ mod tests {
     /// test is the regression guard for that property — if a future
     /// change flips the default to `PreferPinned`, it will break this
     /// test and force the change to be a deliberate, breaking one.
+    /// M-I regression (production audit R11): the pins-without-seed warning
+    /// fires exactly for the dangerous combination (pins configured + no
+    /// persisted seed) and stays quiet otherwise.
+    #[test]
+    fn pins_without_seed_warning_fires_only_for_dangerous_combo() {
+        let mut pins = HashMap::new();
+        pins.insert("peer-b".to_string(), [7u8; 32]);
+        // Pins + ephemeral seed: warn.
+        assert!(warn_if_pins_without_seed(&None, &pins));
+        // Persisted seed + pins: fine.
+        assert!(!warn_if_pins_without_seed(&Some([9u8; 32]), &pins));
+        // No seed and no pins (bare dev sidecar): fine.
+        assert!(!warn_if_pins_without_seed(&None, &HashMap::new()));
+    }
+
     #[test]
     fn sidecar_config_new_defaults_handshake_to_legacy_only() {
         let cfg = saacp::sidecar::SidecarConfig::new(

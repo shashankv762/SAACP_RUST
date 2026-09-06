@@ -4,8 +4,19 @@
 //! which indicates a non-affine load balancer is silently breaking the
 //! protocol's replay-protection guarantee.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+
+/// M-D remediation (production audit G4/R4): the tracker previously grew with
+/// every session ever seen for the life of the process — an attacker (or just
+/// churn) minting unique 16-byte session ids grew it without bound. Entries
+/// are now capped at this many; the oldest-inserted session is evicted
+/// FIFO-style when the cap is exceeded (same "bounded everything, evict on
+/// overflow" idiom as the other engine stores). An evicted session loses its
+/// violation memory — reappearing on a foreign node re-records it instead of
+/// alerting — which is the deliberate bounded-memory tradeoff, identical in
+/// kind to every other capped store in this codebase.
+pub const AFFINITY_MAX_ENTRIES: usize = 100_000;
 
 /// Tracks which daemon node accepted each session.
 ///
@@ -14,13 +25,33 @@ use std::sync::{Arc, Mutex};
 /// records the accepting node per session_id and detects violations.
 #[derive(Clone)]
 pub struct SessionAffinityTracker {
-    inner: Arc<Mutex<HashMap<String, String>>>,
+    inner: Arc<Mutex<AffinityMap>>,
+}
+
+#[derive(Default)]
+struct AffinityMap {
+    map: HashMap<String, String>,
+    /// Insertion order for FIFO eviction — keys are pushed exactly once (on
+    /// first insert); no other removal path exists, so map and queue stay in
+    /// sync by construction.
+    order: VecDeque<String>,
+    max_entries: usize,
 }
 
 impl SessionAffinityTracker {
     pub fn new() -> Self {
+        Self::with_max_entries(AFFINITY_MAX_ENTRIES)
+    }
+
+    /// Bounded tracker with an explicit cap (unit/integration tests use a
+    /// small cap; production uses [`AFFINITY_MAX_ENTRIES`]).
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(AffinityMap {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                max_entries,
+            })),
         }
     }
 
@@ -30,8 +61,8 @@ impl SessionAffinityTracker {
     /// previously created the session — an affinity violation.
     pub fn record_session(&self, session_id: &[u8; 16], node_id: &str) -> Result<(), String> {
         let key = hex::encode(session_id);
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(&key) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = inner.map.get(&key) {
             if existing != node_id {
                 return Err(format!(
                     "SessionAffinityViolation: session {} created by node '{}' \
@@ -39,23 +70,37 @@ impl SessionAffinityTracker {
                     key, existing, node_id
                 ));
             }
+            // Idempotent re-record: deliberately NOT re-pushed onto `order` —
+            // the FIFO eviction order tracks first-seen, and duplicating the
+            // key would desync queue from map.
             return Ok(());
         }
-        map.insert(key, node_id.to_string());
+        inner.map.insert(key.clone(), node_id.to_string());
+        inner.order.push_back(key);
+        if inner.map.len() > inner.max_entries {
+            if let Some(oldest) = inner.order.pop_front() {
+                inner.map.remove(&oldest);
+            }
+        }
         Ok(())
     }
 
     /// Check if `session_id` was created by `node_id` without recording.
-    /// Returns `true` if the session is affine to this node.
+    /// Returns `true` if the session is affine to this node. Unknown sessions
+    /// (including FIFO-evicted ones) count as affine.
     pub fn check_affine(&self, session_id: &[u8; 16], node_id: &str) -> bool {
         let key = hex::encode(session_id);
-        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&key).is_none_or(|n| n == node_id)
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.map.get(&key).is_none_or(|n| n == node_id)
     }
 
-    /// Current number of tracked sessions.
+    /// Current number of tracked sessions (bounded by the cap).
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,4 +139,79 @@ pub enum AffinityViolationPolicy {
     AlertOnly,
     /// Additionally hard-drop the connection (fail closed).
     HardDrop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid(n: u8) -> [u8; 16] {
+        let mut s = [0u8; 16];
+        s[0] = n;
+        s
+    }
+
+    /// M-D regression: the tracker is bounded — inserting past the cap evicts
+    /// the oldest-inserted session FIFO-style, len stays at the cap, and the
+    /// default constructor carries the production cap.
+    #[test]
+    fn tracker_is_bounded_with_fifo_eviction() {
+        let t = SessionAffinityTracker::with_max_entries(4);
+        for n in 0..6u8 {
+            t.record_session(&sid(n), "node-1")
+                .unwrap_or_else(|e| panic!("record {n} failed: {e}"));
+        }
+        assert_eq!(t.len(), 4, "cap must hold at max_entries");
+        // FIFO order: the two oldest (sid 0, 1) must be evicted; sid 2..5 remain.
+        assert!(
+            t.check_affine(&sid(0), "node-1"),
+            "evicted sid 0 counts as affine/unknown"
+        );
+        assert!(
+            t.check_affine(&sid(1), "node-1"),
+            "evicted sid 1 counts as affine/unknown"
+        );
+        for n in 2..6u8 {
+            assert!(
+                !t.check_affine(&sid(n), "node-2"),
+                "sid {n} must still be tracked as node-1's"
+            );
+        }
+        // A re-record of a live session must not grow the map past the cap.
+        t.record_session(&sid(5), "node-1")
+            .expect("idempotent re-record");
+        assert_eq!(t.len(), 4, "idempotent re-record must not insert");
+    }
+
+    /// M-D regression: the production cap constant is the documented 100,000.
+    #[test]
+    fn default_tracker_uses_production_cap() {
+        let t = SessionAffinityTracker::new();
+        for n in 0..AFFINITY_MAX_ENTRIES as u32 + 1 {
+            let mut s = [0u8; 16];
+            s[..4].copy_from_slice(&n.to_be_bytes());
+            t.record_session(&s, "node-1").expect("record");
+        }
+        assert_eq!(
+            t.len(),
+            AFFINITY_MAX_ENTRIES,
+            "default tracker must stay bounded at AFFINITY_MAX_ENTRIES"
+        );
+    }
+
+    /// Violation detection is unchanged by the bounding work: a foreign node
+    /// re-recording a still-tracked session still errs.
+    #[test]
+    fn violation_detection_unchanged() {
+        let t = SessionAffinityTracker::with_max_entries(4);
+        t.record_session(&sid(1), "node-1").expect("first record");
+        let err = t
+            .record_session(&sid(1), "node-2")
+            .expect_err("foreign re-record must be a violation");
+        assert!(err.contains("SessionAffinityViolation"), "got: {err}");
+        assert!(
+            t.check_affine(&sid(9), "node-9"),
+            "unknown session is affine"
+        );
+    }
 }
