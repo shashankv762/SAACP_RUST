@@ -5,7 +5,7 @@
 //! the load balancer is not session-affine):
 //!
 //! 1. **AlertOnly (the default)**: the violation is counted in the new
-//!    `session_affinity_violations` telemetry counter, alerted, and fed to the
+//!    `session_affinity_violations_total` telemetry counter, alerted, and fed to the
 //!    per-IP error counter — but the packet is still processed (the connection
 //!    gets a normal SUCCESS ack). Byte-identical to the pre-Phase-3 behavior.
 //! 2. **HardDrop**: the same violation additionally terminates the connection
@@ -110,7 +110,7 @@ async fn read_response(stream: &mut TcpStream, max_len: usize) -> Vec<u8> {
 #[tokio::test]
 async fn affinity_violation_alert_only_processes_but_hard_drop_terminates() {
     let snap = || global_telemetry().snapshot();
-    let violations_before = snap()["session_affinity_violations"];
+    let violations_before = snap()["session_affinity_violations_total"];
 
     // Shared tracker: the session is ALREADY recorded under "node-a", so any
     // daemon presenting it as another node is an affinity violation.
@@ -144,9 +144,9 @@ async fn affinity_violation_alert_only_processes_but_hard_drop_terminates() {
          become a self-inflicted outage), got: {response:?}"
     );
     assert_eq!(
-        snap()["session_affinity_violations"],
+        snap()["session_affinity_violations_total"],
         violations_before + 1,
-        "the AlertOnly violation must be counted in session_affinity_violations"
+        "the AlertOnly violation must be counted in session_affinity_violations_total"
     );
 
     // ── Scenario 2: HardDrop — same violation terminates the connection ────
@@ -173,7 +173,7 @@ async fn affinity_violation_alert_only_processes_but_hard_drop_terminates() {
          (fail closed), got: {response2:?}"
     );
     assert_eq!(
-        snap()["session_affinity_violations"],
+        snap()["session_affinity_violations_total"],
         violations_before + 2,
         "the HardDrop violation must be counted too — the policy decides only \
          whether the connection is dropped, never whether detection is counted"

@@ -275,7 +275,7 @@ fn health_body(state: &HealthState, health: AuditHealth) -> HealthResponse {
     let violations = state
         .telemetry
         .snapshot()
-        .get("session_affinity_violations")
+        .get("session_affinity_violations_total")
         .copied()
         .unwrap_or(0);
     HealthResponse {

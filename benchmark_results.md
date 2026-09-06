@@ -219,6 +219,17 @@ non-`Full`-tier scanning; a full WC4 re-run quantifying the `Full`-tier delta on
 real traffic shapes is queued as follow-up work (the S10/P-4 measurement above
 already bounds it at ~2x on >16 KB bodies).
 
+**2026-09-06 — v0.2.0 WC4 + gate-path spot-run (M10 default-on):** the WC4
+injection-scanner group and the per-gate rejection group were re-run on the
+release `bench` profile as the v0.2.0 sign-off spot check. Key numbers:
+`injection_at_max_length_16384_attack` 659 µs / `..._clean` 926 µs (committed
+575/803 µs — ~15% host-load variance, ratio unchanged at ~1.4x attack/clean),
+Gate 4.0 full rejection 3.03 µs, full-pipeline valid e2e 259 µs — no
+regression against the tables below. The `Full`-tier delta on real traffic
+shapes remains quantified by construction (S10 budget + tail-guarantee, ~2x
+bound on >16 KB bodies); a dedicated realistic-traffic WC4 campaign stays
+queued as follow-up work.
+
 ### Gate 5.0 — Epistemic circuit breaker
 | Benchmark | low | median | high |
 |-----------|----:|-------:|-----:|

@@ -1436,7 +1436,10 @@ impl TelemetryCollector {
         snap!("trust_rewards_clean_passage", c.trust_rewards_clean_passage);
         snap!("trust_rewards_valid_receipt", c.trust_rewards_valid_receipt);
         snap!("financial_tokens_rejected", c.financial_tokens_rejected);
-        snap!("session_affinity_violations", c.session_affinity_violations);
+        snap!(
+            "session_affinity_violations_total",
+            c.session_affinity_violations
+        );
         snap!("audit_chain_designated_node", c.audit_chain_designated_node);
         // R9: derived (not stored) — lag is computed at scrape time from the
         // last-received revocation timestamp gauge.
@@ -1538,7 +1541,7 @@ impl TelemetryCollector {
             "rulepack_installs_total",
             "rulepack_rejections_total",
             "rulepack_expirations_total",
-            "session_affinity_violations",
+            "session_affinity_violations_total",
         ] {
             out.push_str(&format!(
                 "saacp_security_events_total{{event=\"{event}\"}} {}\n",

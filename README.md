@@ -602,7 +602,7 @@ state) checks every packet's header session_id against the node that first
 recorded it.
 
 - **Default — `AlertOnly`**: violation logged (once per connection), counted in
-  the `session_affinity_violations` telemetry counter, alerted on the
+  the `session_affinity_violations_total` telemetry counter, alerted on the
   `SecurityAlertFeed` (gate `session_affinity`), and fed to the per-IP error
   counter so a persistently mis-routed peer trips the existing IP circuit
   breaker. The packet is still processed.
@@ -670,10 +670,10 @@ Authorization: Bearer <token>
 |---|---|---|
 | `/healthz` | none | liveness probe (503 on `Fatal` audit state) |
 | `/readyz` | none | readiness probe (503 on `Saturated`/`Fatal`); includes `session_affinity` |
-| `/metrics` | bearer on non-loopback | Prometheus (`saacp_session_affinity_violations` rides the security-events series; `saacp_audit_chain_designated_node` is a gauge) |
+| `/metrics` | bearer on non-loopback | Prometheus (`saacp_security_events_total{event="session_affinity_violations_total"}` rides the security-events series; `saacp_audit_chain_designated_node` is a gauge) |
 | `/api/audit/ack` | bearer always | operator audit acknowledgement |
 
-Suggested alert rules: `rate(saacp_security_events_total{event="session_affinity_violations"}[5m]) > 0`
+Suggested alert rules: `rate(saacp_security_events_total{event="session_affinity_violations_total"}[5m]) > 0`
 (mis-routed traffic), and `saacp_audit_chain_designated_node == 0` on the node
 you *believe* is the audit node (designation drifted).
 

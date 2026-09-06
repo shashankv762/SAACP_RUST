@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-06
+
 ### Added
+- **Scoped binary configuration** (`SaacpConfig`, `src/config.rs`): optional
+  TOML file for `saacp-sidecar` / `saacp-command-center` via `SAACP_CONFIG`
+  (`[sidecar]` / `[command_center]` sections), validated once before any bind;
+  env vars override file values and unset env = byte-identical pre-file
+  behavior. Raw secrets have no field in the schema — only `*_file` paths —
+  preserving the S-8 `_FILE` indirection; the resolved posture is dumped once
+  at startup. Library APIs unchanged.
+- **`compose.yaml` sample deployment**: both binaries from the
+  distroless-nonroot Dockerfile with `/healthz` + `/readyz` probe guidance and
+  secret `*_FILE` mounts.
+- **README release runbook** (v0.2.0 sign-off steps) and file-based
+  configuration section.
 - **R9 — revocation-convergence lag metric** (Phase 4): an accepted
   (verified + stored) gossip revocation refreshes a last-received timestamp;
   `saacp_revocation_lag_seconds` (now − last-received, 0 = none received yet)
@@ -32,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-identical to prior behavior; `HardDrop` = fail closed) selectable via
   `SAACPNetworkDaemon::affinity_violation_policy` (TCP, WS, and TLS daemons),
   plus `with_affinity_tracker(node_id, tracker)` for shared-tracker fleets.
-  Violations are now counted in the new `session_affinity_violations`
+  Violations are now counted in the new `session_affinity_violations_total`
   telemetry counter and alerted (gate `session_affinity`) under BOTH
   policies. Regression-tested in `tests/test_session_affinity_policy_rs.rs`.
 - **Session-affinity health on `/readyz`** (Phase 3):
@@ -52,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affinity config (`ip_hash` / L4 `sourceIP` / k8s `sessionAffinity: ClientIP`),
   the `HardDrop` fleet posture, affinity health on `/readyz`, and audit-node
   designation.
+
+- **Affinity metric renamed for Prometheus counter convention**:
+  `saacp_security_events_total{event="session_affinity_violations"}` →
+  `event="session_affinity_violations_total"` (matching the sibling
+  `rulepack_*_total` label values); the telemetry snapshot key and
+  `/readyz` read path renamed to match. Alert-rule expressions in the README
+  updated.
 
 ### Changed
 - **Pinned CI toolchain** (audit G7): every non-nightly CI job now runs
