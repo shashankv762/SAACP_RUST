@@ -12,6 +12,7 @@ pub mod aegf;
 pub mod attestation;
 pub mod clock;
 pub mod cluster;
+pub mod config;
 pub mod context;
 pub mod crypto_governance;
 pub mod cryptosuite;

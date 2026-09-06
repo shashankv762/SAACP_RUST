@@ -30,6 +30,15 @@
 //! instead — the fail-closed posture for production.
 //!
 //! Environment variables:
+//!   SAACP_CONFIG              — OPTIONAL path to a TOML configuration file
+//!                               (`[sidecar]` section; see `saacp::config`).
+//!                               Every variable below can be set there instead
+//!                               (names drop the `SAACP_` prefix, e.g.
+//!                               `agent_id`, `listen_addr`); secrets may only
+//!                               be referenced via their `*_file` path fields.
+//!                               An env var, when set, always overrides the
+//!                               file value. Unset ⇒ identical behavior to
+//!                               pre-file releases.
 //!   SAACP_AGENT_ID            — this sidecar's agent identity (required)
 //!   SAACP_TOKEN_SECRET        — base64-encoded 32-byte shared mesh secret (required
 //!                               unless SAACP_TOKEN_SECRET_FILE is set). Shared by every
@@ -77,13 +86,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use saacp::config::{resolve, resolve_flag, SaacpConfig};
 use saacp::maintenance::MaintenanceCoordinator;
 use saacp::sidecar::{run_with_shutdown, SidecarConfig, SidecarHandshakeMode};
 use sha2::Digest;
-
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
-}
 
 /// Plan item 3: typed configuration errors for the sidecar binary. Every
 /// startup-time parse / IO failure goes through this enum so `main()`
@@ -229,9 +235,25 @@ fn parse_token_secret_with_var(
 /// one-time notice because process environments are world-readable to the same
 /// user via `/proc/<pid>/environ` and leak into crash dumps and child
 /// processes. The `_FILE` variants are the recommended production default.
-fn read_token_secret() -> Result<[u8; 32], SidecarConfigError> {
+fn read_token_secret(cfg: &SaacpConfig) -> Result<[u8; 32], SidecarConfigError> {
     use zeroize::Zeroizing;
     if let Ok(path) = std::env::var("SAACP_TOKEN_SECRET_FILE") {
+        let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
+            SidecarConfigError::FileRead {
+                path: path.clone(),
+                source,
+            }
+        })?);
+        return parse_token_secret_with_var(raw.trim(), "SAACP_TOKEN_SECRET_FILE");
+    }
+    let toml_file = cfg.sidecar.token_secret_file.as_deref();
+    if let Some(path) = std::env::var("SAACP_TOKEN_SECRET_FILE")
+        .ok()
+        .or_else(|| toml_file.map(str::to_string))
+    {
+        // Env `_FILE` (precedence rule) or the config file's `token_secret_file`
+        // — the file-config fallback keeps the S-8 `_FILE` indirection (raw
+        // secrets have no field in the TOML schema, by construction).
         let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
             SidecarConfigError::FileRead {
                 path: path.clone(),
@@ -263,10 +285,14 @@ fn read_token_secret() -> Result<[u8; 32], SidecarConfigError> {
 ///
 /// S8: the file's plaintext JSON (which holds every peer secret in one
 /// string) is held in a `Zeroizing` buffer and scrubbed after parsing.
-fn read_peer_secrets() -> Result<HashMap<String, [u8; 32]>, SidecarConfigError> {
+fn read_peer_secrets(cfg: &SaacpConfig) -> Result<HashMap<String, [u8; 32]>, SidecarConfigError> {
     use zeroize::Zeroizing;
-    let Ok(path) = std::env::var("SAACP_PEER_SECRETS_FILE") else {
-        return Ok(HashMap::new());
+    let path = match resolve(
+        "SAACP_PEER_SECRETS_FILE",
+        cfg.sidecar.peer_secrets_file.as_deref(),
+    ) {
+        Some(p) => p.into_owned(),
+        None => return Ok(HashMap::new()),
     };
     let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
         SidecarConfigError::FileRead {
@@ -303,13 +329,17 @@ fn read_peer_secrets() -> Result<HashMap<String, [u8; 32]>, SidecarConfigError> 
 /// `SAACP_REQUIRE_PEER_SECRETS=1` upgrades that warning to a hard startup failure, which
 /// is the correct posture for a production mesh: fail closed instead of silently running
 /// mesh-wide-forgeable.
-fn enforce_peer_secret_posture(peer_secrets: &HashMap<String, [u8; 32]>, agent_id: &str) {
+fn enforce_peer_secret_posture(
+    cfg: &SaacpConfig,
+    peer_secrets: &HashMap<String, [u8; 32]>,
+    agent_id: &str,
+) {
     if !peer_secrets.is_empty() {
         return;
     }
-    let required = matches!(
-        std::env::var("SAACP_REQUIRE_PEER_SECRETS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
+    let required = resolve_flag(
+        "SAACP_REQUIRE_PEER_SECRETS",
+        cfg.sidecar.require_peer_secrets,
     );
     if required {
         panic!(
@@ -338,9 +368,14 @@ fn enforce_peer_secret_posture(peer_secrets: &HashMap<String, [u8; 32]>, agent_i
 /// S8: raw token strings are held in `Zeroizing` buffers while parsed; the
 /// returned token necessarily lives on in the sidecar config (it is compared
 /// on every request) — only the intermediates are scrubbed.
-fn read_http_bearer_token() -> Option<String> {
+fn read_http_bearer_token(cfg: &SaacpConfig) -> Option<String> {
     use zeroize::Zeroizing;
-    let raw = if let Ok(path) = std::env::var("SAACP_HTTP_BEARER_TOKEN_FILE") {
+    let raw = if let Some(path) = std::env::var("SAACP_HTTP_BEARER_TOKEN_FILE")
+        .ok()
+        .or_else(|| cfg.sidecar.http_bearer_token_file.clone())
+    {
+        // Env `_FILE` (precedence rule) or the config file's
+        // `http_bearer_token_file` — `_FILE` indirection preserved.
         Zeroizing::new(std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("failed to read SAACP_HTTP_BEARER_TOKEN_FILE '{path}': {e}")
         }))
@@ -407,6 +442,23 @@ async fn main() {
     // rebuild.
     saacp::logging::init_logging(saacp::logging::LogConfig::default());
 
+    // §2.4 mitigation: load the optional TOML config file (SAACP_CONFIG) once,
+    // validated, before anything binds. `default()` (env unset) is behavior-
+    // identical to pre-file releases.
+    let bin_cfg = match SaacpConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[saacp-sidecar] startup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if matches!(std::env::var("SAACP_CONFIG").as_deref(), Ok(p) if !p.trim().is_empty()) {
+        eprintln!(
+            "[saacp-sidecar] config file posture: {}",
+            bin_cfg.redacted_summary()
+        );
+    }
+
     // Plan item 3: surface every startup configuration failure as a
     // typed `SidecarConfigError` (redacted message + non-zero exit),
     // never a panic. Two of the env reads are still `unwrap_or_else`
@@ -414,35 +466,41 @@ async fn main() {
     // paths — those are addressed by the follow-up in the same audit
     // pass; the most security-sensitive reads (token secret + peer
     // secrets) are converted first because they handle secret material.
-    let agent_id = std::env::var("SAACP_AGENT_ID").unwrap_or_else(|_| {
-        config_error_exit(SidecarConfigError::MissingEnv {
+    let agent_id = match resolve("SAACP_AGENT_ID", bin_cfg.sidecar.agent_id.as_deref()) {
+        Some(id) => id.into_owned(),
+        None => config_error_exit(SidecarConfigError::MissingEnv {
             var: "SAACP_AGENT_ID",
-            hint: "set SAACP_AGENT_ID to this sidecar's unique agent identity string",
-        })
-    });
-    let token_issuer_secret = match read_token_secret() {
+            hint: "set SAACP_AGENT_ID (or sidecar.agent_id in the SAACP_CONFIG file) to this \
+                   sidecar's unique agent identity string",
+        }),
+    };
+    let token_issuer_secret = match read_token_secret(&bin_cfg) {
         Ok(s) => s,
         Err(e) => config_error_exit(e),
     };
-    let peer_secrets = match read_peer_secrets() {
+    let peer_secrets = match read_peer_secrets(&bin_cfg) {
         Ok(s) => s,
         Err(e) => config_error_exit(e),
     };
-    enforce_peer_secret_posture(&peer_secrets, &agent_id);
+    enforce_peer_secret_posture(&bin_cfg, &peer_secrets, &agent_id);
 
-    let saacp_listen_addr: SocketAddr = env_or("SAACP_LISTEN_ADDR", "127.0.0.1:7443")
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid SAACP_LISTEN_ADDR: {e}"));
-    let http_listen_addr: SocketAddr = env_or("SAACP_HTTP_ADDR", "127.0.0.1:8787")
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid SAACP_HTTP_ADDR: {e}"));
+    let saacp_listen_addr: SocketAddr =
+        resolve("SAACP_LISTEN_ADDR", bin_cfg.sidecar.listen_addr.as_deref())
+            .unwrap_or_else(|| "127.0.0.1:7443".into())
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid SAACP_LISTEN_ADDR: {e}"));
+    let http_listen_addr: SocketAddr =
+        resolve("SAACP_HTTP_ADDR", bin_cfg.sidecar.http_addr.as_deref())
+            .unwrap_or_else(|| "127.0.0.1:8787".into())
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid SAACP_HTTP_ADDR: {e}"));
 
     // Fail closed: the local HTTP/JSON API can issue outbound messages and drain
     // this agent's inbox, so it must never be reachable from off-host without
     // authentication. If the operator binds a non-loopback interface, a bearer
     // token is mandatory. On loopback (the default) it stays optional, matching
     // the library's opt-in default for the co-located-agent case.
-    let mut http_bearer_token = read_http_bearer_token();
+    let mut http_bearer_token = read_http_bearer_token(&bin_cfg);
     if !http_listen_addr.ip().is_loopback() && http_bearer_token.is_none() {
         panic!(
             "SAACP_HTTP_ADDR binds non-loopback address {http_listen_addr} but no \
@@ -460,9 +518,10 @@ async fn main() {
     // the explicit, auditable escape hatch for legacy hand-started agents
     // and prints a loud warning instead.
     if http_bearer_token.is_none() {
-        let opted_out = std::env::var("SAACP_ALLOW_UNAUTHENTICATED_HTTP")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let opted_out = match std::env::var("SAACP_ALLOW_UNAUTHENTICATED_HTTP") {
+            Ok(v) => v == "1",
+            Err(_) => bin_cfg.sidecar.allow_unauthenticated_http.unwrap_or(false),
+        };
         if opted_out {
             eprintln!(
                 "[saacp-sidecar] WARNING: SAACP_ALLOW_UNAUTHENTICATED_HTTP=1 — the local \
@@ -472,8 +531,11 @@ async fn main() {
                  removed in a future release."
             );
         } else {
-            match std::env::var("SAACP_HTTP_TOKEN_OUT_FILE") {
-                Ok(path) if !path.trim().is_empty() => {
+            match resolve(
+                "SAACP_HTTP_TOKEN_OUT_FILE",
+                bin_cfg.sidecar.http_token_out_file.as_deref(),
+            ) {
+                Some(path) if !path.trim().is_empty() => {
                     http_bearer_token = Some(generate_and_write_http_token(path.trim()));
                     eprintln!(
                         "[saacp-sidecar] no bearer token supplied — generated one and wrote it \
@@ -511,16 +573,30 @@ async fn main() {
     );
     config.peer_secrets = peer_secrets;
     config.http_bearer_token = http_bearer_token;
-    if let Ok(v) = std::env::var("SAACP_MAX_CONCURRENT_SENDS") {
+    if let Some(v) = resolve(
+        "SAACP_MAX_CONCURRENT_SENDS",
+        bin_cfg
+            .sidecar
+            .max_concurrent_sends
+            .map(|v| v.to_string())
+            .as_deref(),
+    ) {
         config.max_concurrent_sends = v
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_MAX_CONCURRENT_SENDS: {e}"));
     }
     // C4 (MPF): bucket-pad outbound payloads (opt-in, mirrors SAACP_ENABLE_MACE).
-    if let Ok(v) = std::env::var("SAACP_ENABLE_MPF") {
-        config.payload_padding = v == "1";
+    if resolve_flag("SAACP_ENABLE_MPF", bin_cfg.sidecar.enable_mpf) {
+        config.payload_padding = true;
     }
-    if let Ok(v) = std::env::var("SAACP_SEND_RETRY_ATTEMPTS") {
+    if let Some(v) = resolve(
+        "SAACP_SEND_RETRY_ATTEMPTS",
+        bin_cfg
+            .sidecar
+            .send_retry_attempts
+            .map(|v| v.to_string())
+            .as_deref(),
+    ) {
         config.send_retry_attempts = v
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_SEND_RETRY_ATTEMPTS: {e}"));
@@ -531,12 +607,23 @@ async fn main() {
     // plain fallback for legacy peers) — the library default stays
     // `LegacyOnly` so embedded `SidecarConfig` consumers keep v1 wire
     // compatibility. `SAACP_HANDSHAKE_MODE=LEGACY_ONLY` restores v1 exactly.
-    config.handshake_mode =
-        parse_handshake_mode(std::env::var("SAACP_HANDSHAKE_MODE").ok().as_deref());
-    if let Ok(path) = std::env::var("SAACP_SERVER_SEED_FILE") {
+    config.handshake_mode = parse_handshake_mode(
+        resolve(
+            "SAACP_HANDSHAKE_MODE",
+            bin_cfg.sidecar.handshake_mode.as_deref(),
+        )
+        .as_deref(),
+    );
+    if let Some(path) = resolve(
+        "SAACP_SERVER_SEED_FILE",
+        bin_cfg.sidecar.server_seed_file.as_deref(),
+    ) {
         config.server_seed = Some(parse_server_seed_file(&path));
     }
-    if let Ok(path) = std::env::var("SAACP_PEER_PINS_FILE") {
+    if let Some(path) = resolve(
+        "SAACP_PEER_PINS_FILE",
+        bin_cfg.sidecar.peer_pins_file.as_deref(),
+    ) {
         config.pinned_peers = parse_peer_pins_file(&path);
     }
 
@@ -554,10 +641,7 @@ async fn main() {
     // registered `mace_global` sweeper then runs the detectors + enforcement
     // every cycle off the packet path. Left off by default so deployments that
     // never opt in get zero MACE observation or background work.
-    let mace_enabled = matches!(
-        std::env::var("SAACP_ENABLE_MACE").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    );
+    let mace_enabled = resolve_flag("SAACP_ENABLE_MACE", bin_cfg.sidecar.enable_mace);
     if mace_enabled {
         saacp::mace::activate();
     }
@@ -624,17 +708,17 @@ async fn main() {
 fn parse_handshake_mode(raw: Option<&str>) -> SidecarHandshakeMode {
     match raw {
         None => SidecarHandshakeMode::PreferPinned,
-        Some("LegacyOnly" | "LEGACY_ONLY" | "legacy_only") => SidecarHandshakeMode::LegacyOnly,
-        Some("PreferPinned" | "PREFER_PINNED" | "prefer_pinned") => {
-            SidecarHandshakeMode::PreferPinned
-        }
-        Some("RequirePinned" | "REQUIRE_PINNED" | "require_pinned") => {
-            SidecarHandshakeMode::RequirePinned
-        }
-        Some(other) => panic!(
-            "invalid SAACP_HANDSHAKE_MODE '{other}': expected \
-             LEGACY_ONLY | PREFER_PINNED | REQUIRE_PINNED"
-        ),
+        Some(s) => match saacp::config::parse_handshake_mode_str(s) {
+            Some("LegacyOnly") => SidecarHandshakeMode::LegacyOnly,
+            Some("PreferPinned") => SidecarHandshakeMode::PreferPinned,
+            Some("RequirePinned") => SidecarHandshakeMode::RequirePinned,
+            // Validation in `SaacpConfig` rejects file values with the same
+            // accepted set; this panic remains the backstop for env values.
+            _ => panic!(
+                "invalid SAACP_HANDSHAKE_MODE '{s}': expected \
+                 LEGACY_ONLY | PREFER_PINNED | REQUIRE_PINNED"
+            ),
+        },
     }
 }
 

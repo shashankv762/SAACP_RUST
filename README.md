@@ -677,6 +677,55 @@ Suggested alert rules: `rate(saacp_security_events_total{event="session_affinity
 (mis-routed traffic), and `saacp_audit_chain_designated_node == 0` on the node
 you *believe* is the audit node (designation drifted).
 
+### 5. File-based configuration (`SAACP_CONFIG`)
+
+Both binaries (`saacp-sidecar`, `saacp-command-center`) accept an optional TOML
+configuration file pointed at by `SAACP_CONFIG` (see `saacp::config`):
+
+- Section names are `[sidecar]` and `[command_center]`; keys drop the `SAACP_`
+  prefix (`agent_id`, `listen_addr`, `max_concurrent_sends`, …).
+- **Precedence: an environment variable, when set at all, overrides the file.**
+  Unset env vars fall back to the file, then to the built-in defaults — so
+  existing env-only deployments behave byte-identically.
+- The file is **parsed and validated once before any listener binds**
+  (addresses, numeric ranges, enum spellings); unknown keys are rejected
+  (`deny_unknown_fields`), so a typo'd key fails loudly instead of silently
+  leaving the default in place.
+- **Raw secrets have no field to land in.** The schema only carries `*_file`
+  *paths* (`token_secret_file`, `http_bearer_token_file`,
+  `dashboard_token_file`, `peer_secrets_file`), preserving the S-8 secret
+  indirection. The resolved posture is printed once at startup.
+
+```toml
+# /etc/saacp/saacp.toml
+[sidecar]
+agent_id = "agent-prod-1"
+listen_addr = "0.0.0.0:7443"
+http_addr = "0.0.0.0:8787"
+handshake_mode = "REQUIRE_PINNED"
+require_peer_secrets = true
+token_secret_file = "/run/secrets/saacp_token_secret"
+peer_secrets_file = "/run/secrets/saacp_peer_secrets"
+```
+
+The sample `compose.yaml` at the repo root wires both binaries with this
+pattern (secret files mounted read-only, `*_FILE` env references).
+
+### 6. Release runbook (v0.2.0)
+
+1. All gates green on the release commit: `cargo fmt --all -- --check`,
+   `cargo clippy --all-targets --all-features -- -D warnings`,
+   `cargo test` and `cargo test --all-features`, every feature-gated test
+   target individually, the 5 fuzz targets smoke-run (60s each), the
+   `python/` pytest suite, and the cross-language wire-compat vectors
+   (`test_cross_lang_vectors_rs` + the pinned `audit_v1` fixture).
+2. `CHANGELOG.md`'s `[Unreleased]` section is folded into the version entry
+   with the M1/M8/M10 hardening IDs and audit cross-references.
+3. `cargo bench --no-run` compiles clean; spot-run the WC4 and gate-path
+   benches before publishing refreshed numbers to `benchmark_results.md`.
+4. Only then tag (`v0.2.0`) and build/push the distroless image from the
+   repo `Dockerfile` (nonroot runtime, no shell, rustls-only TLS).
+
 The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
 **56 integration/adversarial test files** under `tests/`, and **5 fuzz targets**.
 

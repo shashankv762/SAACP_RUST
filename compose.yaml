@@ -1,0 +1,91 @@
+# SAACP-rs sample Compose deployment — both binaries from the repo Dockerfile
+# (multi-stage rust builder → gcr.io/distroless/cc-debian12:nonroot).
+#
+# This file is a *sample*, not a production topology: it runs one sidecar and
+# the command-center dashboard on a single host so operators can exercise the
+# health probes, the config-file layer (`SAACP_CONFIG`), and the audit-node
+# designation locally. For multi-node fleets see the README "Deployment Guide
+# (Fleets & Load Balancers)" — session affinity (ip_hash / source / ClientIP)
+# is MANDATORY behind any load balancer, and exactly one node must be
+# designated the audit node (SAACP_AUDIT_NODE=1).
+#
+# Secrets: no secret values appear here. Each service references secrets via
+# the *_FILE indirection (S-8 posture) — mount the secret files read-only and
+# point the env vars / SAACP_CONFIG file at their paths. Raw secrets in
+# environment variables work but are the weaker, warned-at-startup posture.
+#
+# Health probes: the distroless runtime image deliberately contains no shell,
+# curl, or wget, so `healthcheck:` blocks cannot be expressed here — Docker
+# HEALTHCHECK needs an executable inside the container. The endpoints are
+# served and ready for whoever can reach them:
+#
+#   sidecar (http API, 127.0.0.1:8787 inside the container network):
+#     GET /healthz — liveness (503 on Fatal audit state)
+#     GET /readyz  — readiness (503 on Saturated/Fatal; includes
+#                    session_affinity { tracked, violations })
+#     GET /metrics — Prometheus (bearer-gated on non-loopback binds)
+#   command center (127.0.0.1:9090): same /healthz and /readyz semantics.
+#
+# Kubernetes probes map directly:
+#   livenessProbe:  httpGet { path: /healthz, port: 8787 }
+#   readinessProbe: httpGet { path: /readyz,  port: 8787 }
+
+services:
+  saacp-sidecar:
+    build:
+      context: .
+    # The Dockerfile ENTRYPOINT is the sidecar; command-center overrides below.
+    environment:
+      # Required identity + addresses. Loopback binds inside the container net;
+      # publish only what you must, and set SAACP_HTTP_BEARER_TOKEN_FILE when
+      # binding a non-loopback interface (the binary refuses unauthenticated
+      # non-loopback binds — fail closed).
+      SAACP_AGENT_ID: agent-compose-1
+      SAACP_LISTEN_ADDR: 0.0.0.0:7443
+      SAACP_HTTP_ADDR: 0.0.0.0:8787
+      # Optional file-based config (validated before any bind; env vars above
+      # override file values). Uncomment and mount to use:
+      # SAACP_CONFIG: /etc/saacp/saacp.toml
+      # Secret references (mount the files read-only):
+      # SAACP_TOKEN_SECRET_FILE: /run/secrets/saacp_token_secret
+      # SAACP_PEER_SECRETS_FILE: /run/secrets/saacp_peer_secrets
+      # Recommended production posture: fail closed without per-peer secrets.
+      # SAACP_REQUIRE_PEER_SECRETS: "1"
+    ports:
+      - "7443:7443" # SAACP protocol listener
+      - "8787:8787" # local HTTP/JSON API (/healthz /readyz /metrics)
+    # volumes:
+    #   - ./saacp.toml:/etc/saacp/saacp.toml:ro
+    # secrets:
+    #   - saacp_token_secret
+    #   - saacp_peer_secrets
+    restart: unless-stopped
+
+  saacp-command-center:
+    build:
+      context: .
+    # Override the image ENTRYPOINT for the dashboard backend.
+    entrypoint: ["/usr/local/bin/saacp-command-center"]
+    environment:
+      SAACP_COMMAND_CENTER_ADDR: 0.0.0.0:9090
+      # Demo daemon feeds the dashboard with synthetic activity; disable to
+      # run against a real gateway's shared state (SAACP_DISABLE_DEMO_DAEMON=1).
+      # SAACP_DISABLE_DEMO_DAEMON: "1"
+      # Secret reference (mount the file read-only):
+      # SAACP_DASHBOARD_TOKEN_FILE: /run/secrets/saacp_dashboard_token
+      # Rule-pack push trust anchor (both required to enable POST /api/rules/reload):
+      # SAACP_RULEPACK_ISSUER: ops
+      # SAACP_RULEPACK_KEY: "<64 hex chars, Ed25519 public key>"
+    ports:
+      - "9090:9090" # REST+SSE dashboard API (/healthz /readyz)
+    restart: unless-stopped
+    depends_on:
+      - saacp-sidecar
+
+# secrets:
+#   saacp_token_secret:
+#     file: ./secrets/token_secret.b64
+#   saacp_peer_secrets:
+#     file: ./secrets/peer_secrets.json
+#   saacp_dashboard_token:
+#     file: ./secrets/dashboard_token.b64

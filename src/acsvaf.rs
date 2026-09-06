@@ -894,7 +894,7 @@ mod tests {
             .as_nanos()
             .to_le_bytes();
         h.update(t);
-        hex::encode(h.finalize()[..16].as_ref())
+        hex::encode(&h.finalize()[..16])
     }
 
     #[test]

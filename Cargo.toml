@@ -22,6 +22,11 @@ sha2 = "0.10"
 hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 serde = { version = "1", features = ["derive"] }
+# Scoped binary configuration (§2.4 mitigation): `src/config.rs` parses the
+# optional `SAACP_CONFIG` TOML file for the `saacp-sidecar` and
+# `saacp-command-center` binaries. Library-only consumers never pay for it
+# beyond compiling the small module — no library API reads it.
+toml = "0.8"
 # `float_roundtrip`: H-6 fix uncovered that without it, `serde_json::from_str`
 # can lose a few ULPs of precision on high-precision f64 values (e.g. our
 # sub-second audit-log timestamps), so parse(print(x)) != x in rare cases —

@@ -15,6 +15,15 @@
 //! **in-process** alongside a real gateway, not as a separate observer).
 //!
 //! Environment variables:
+//!   SAACP_CONFIG              — OPTIONAL path to a TOML configuration file
+//!                               (`[command_center]` section; see
+//!                               `saacp::config`). Every variable below can
+//!                               be set there instead (names drop the
+//!                               `SAACP_` prefix); the dashboard secret may
+//!                               only be referenced via `dashboard_token_file`.
+//!                               An env var, when set, always overrides the
+//!                               file value. Unset ⇒ identical behavior to
+//!                               pre-file releases.
 //!   SAACP_DASHBOARD_TOKEN       — base64-encoded 32-byte shared dashboard bearer secret
 //!                                 (required unless SAACP_DASHBOARD_TOKEN_FILE is set)
 //!   SAACP_DASHBOARD_TOKEN_FILE  — path to a file containing the base64 secret instead of
@@ -45,12 +54,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use saacp::command_center::{run, CommandCenterConfig};
+use saacp::config::{resolve, resolve_flag, SaacpConfig};
 use saacp::daemon::SAACPNetworkDaemon;
 use saacp::maintenance::MaintenanceCoordinator;
-
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
-}
 
 /// Plan item 3: typed configuration errors for the command-center
 /// binary. Mirror of `saacp_sidecar::SidecarConfigError` with the
@@ -127,17 +133,28 @@ fn parse_secret_with_var(
     })
 }
 
-fn read_dashboard_token() -> Result<[u8; 32], CommandCenterConfigError> {
+fn read_dashboard_token(cfg: &SaacpConfig) -> Result<[u8; 32], CommandCenterConfigError> {
     use zeroize::Zeroizing;
-    if let Ok(path) = std::env::var("SAACP_DASHBOARD_TOKEN_FILE") {
-        let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
-            CommandCenterConfigError::FileRead {
-                path: path.clone(),
-                source,
-            }
-        })?);
-        return parse_secret_with_var(raw.trim(), "SAACP_DASHBOARD_TOKEN_FILE");
-    }
+    let path = match std::env::var("SAACP_DASHBOARD_TOKEN_FILE")
+        .ok()
+        .or_else(|| cfg.command_center.dashboard_token_file.clone())
+    {
+        Some(p) => p,
+        None => {
+            return parse_env_dashboard_token();
+        }
+    };
+    let raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|source| {
+        CommandCenterConfigError::FileRead {
+            path: path.clone(),
+            source,
+        }
+    })?);
+    parse_secret_with_var(raw.trim(), "SAACP_DASHBOARD_TOKEN_FILE")
+}
+
+fn parse_env_dashboard_token() -> Result<[u8; 32], CommandCenterConfigError> {
+    use zeroize::Zeroizing;
     tracing::warn!(
         "dashboard token read from the SAACP_DASHBOARD_TOKEN environment variable — prefer \
          SAACP_DASHBOARD_TOKEN_FILE in production (process environments are readable via \
@@ -146,7 +163,8 @@ fn read_dashboard_token() -> Result<[u8; 32], CommandCenterConfigError> {
     let raw = Zeroizing::new(std::env::var("SAACP_DASHBOARD_TOKEN").map_err(|_| {
         CommandCenterConfigError::MissingEnv {
             var: "SAACP_DASHBOARD_TOKEN",
-            hint: "set SAACP_DASHBOARD_TOKEN (or SAACP_DASHBOARD_TOKEN_FILE) to a \
+            hint: "set SAACP_DASHBOARD_TOKEN (or SAACP_DASHBOARD_TOKEN_FILE, or \
+                   command_center.dashboard_token_file in the SAACP_CONFIG file) to a \
                    base64-encoded 32-byte secret. The command center refuses to start \
                    without one — see the binary's module doc for details.",
         }
@@ -164,11 +182,16 @@ fn read_dashboard_token() -> Result<[u8; 32], CommandCenterConfigError> {
 /// authority over injection rules must require a full re-provisioning restart to
 /// change, which is what makes hot-reloading the *rules* compatible with
 /// Architecture Principle #3/#4 (see `rulepack.rs`'s module doc).
-fn provision_rulepack_anchor() {
-    let (Ok(issuer), Ok(key_hex)) = (
-        std::env::var("SAACP_RULEPACK_ISSUER"),
-        std::env::var("SAACP_RULEPACK_KEY"),
-    ) else {
+fn provision_rulepack_anchor(cfg: &SaacpConfig) {
+    let issuer = resolve(
+        "SAACP_RULEPACK_ISSUER",
+        cfg.command_center.rulepack_issuer.as_deref(),
+    );
+    let key_hex = resolve(
+        "SAACP_RULEPACK_KEY",
+        cfg.command_center.rulepack_key.as_deref(),
+    );
+    let (Some(issuer), Some(key_hex)) = (issuer, key_hex) else {
         eprintln!(
             "[SAACP Command Center] No rule-pack trust anchor configured \
              (set SAACP_RULEPACK_ISSUER + SAACP_RULEPACK_KEY to enable \
@@ -194,18 +217,46 @@ async fn main() -> std::io::Result<()> {
     // Plan item 2c: structured logging (idempotent). See `src/logging.rs`.
     saacp::logging::init_logging(saacp::logging::LogConfig::default());
 
-    let dashboard_token = match read_dashboard_token() {
+    // §2.4 mitigation: load the optional TOML config file (SAACP_CONFIG) once,
+    // validated, before anything binds. `default()` (env unset) is behavior-
+    // identical to pre-file releases.
+    let bin_cfg = match SaacpConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[saacp-command-center] startup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if matches!(std::env::var("SAACP_CONFIG").as_deref(), Ok(p) if !p.trim().is_empty()) {
+        eprintln!(
+            "[SAACP Command Center] config file posture: {}",
+            bin_cfg.redacted_summary()
+        );
+    }
+
+    let dashboard_token = match read_dashboard_token(&bin_cfg) {
         Ok(t) => t,
         Err(e) => config_error_exit(e),
     };
-    provision_rulepack_anchor();
+    provision_rulepack_anchor(&bin_cfg);
 
-    let listen_addr: SocketAddr = env_or("SAACP_COMMAND_CENTER_ADDR", "127.0.0.1:9090")
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid SAACP_COMMAND_CENTER_ADDR: {e}"));
+    let listen_addr: SocketAddr = resolve(
+        "SAACP_COMMAND_CENTER_ADDR",
+        bin_cfg.command_center.listen_addr.as_deref(),
+    )
+    .unwrap_or_else(|| "127.0.0.1:9090".into())
+    .parse()
+    .unwrap_or_else(|e| panic!("invalid SAACP_COMMAND_CENTER_ADDR: {e}"));
 
     let mut config = CommandCenterConfig::new(listen_addr, dashboard_token);
-    if let Ok(v) = std::env::var("SAACP_DOLLARS_PER_TOKEN") {
+    if let Some(v) = resolve(
+        "SAACP_DOLLARS_PER_TOKEN",
+        bin_cfg
+            .command_center
+            .dollars_per_token
+            .map(|d| d.to_string())
+            .as_deref(),
+    ) {
         config.dollars_per_token = v
             .parse()
             .unwrap_or_else(|e| panic!("invalid SAACP_DOLLARS_PER_TOKEN: {e}"));
@@ -221,12 +272,28 @@ async fn main() -> std::io::Result<()> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+    } else if let Some(origins) = &bin_cfg.command_center.dashboard_allowed_origins {
+        // Env-unset + file-provided: same exact-match list semantics, trimmed.
+        config.allowed_origins = origins
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
 
-    if std::env::var("SAACP_DISABLE_DEMO_DAEMON").as_deref() != Ok("1") {
-        let demo_addr: SocketAddr = env_or("SAACP_DEMO_DAEMON_ADDR", "127.0.0.1:7444")
-            .parse()
-            .unwrap_or_else(|e| panic!("invalid SAACP_DEMO_DAEMON_ADDR: {e}"));
+    let disable_demo = match std::env::var("SAACP_DISABLE_DEMO_DAEMON").as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => bin_cfg.command_center.disable_demo_daemon.unwrap_or(false),
+    };
+    if !disable_demo {
+        let demo_addr: SocketAddr = resolve(
+            "SAACP_DEMO_DAEMON_ADDR",
+            bin_cfg.command_center.demo_daemon_addr.as_deref(),
+        )
+        .unwrap_or_else(|| "127.0.0.1:7444".into())
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid SAACP_DEMO_DAEMON_ADDR: {e}"));
         let daemon = SAACPNetworkDaemon::new(&demo_addr.ip().to_string(), demo_addr.port(), None);
         tokio::spawn(async move {
             let _ = daemon.start().await;
@@ -262,10 +329,7 @@ async fn main() -> std::io::Result<()> {
     // `T::global().sweep_*()` directly is the only way to reach the state that matters.
     // Multi-Agent Collusion Detection (MACE, Part 8.2) — opt-in via
     // `SAACP_ENABLE_MACE=1`; see `saacp_sidecar.rs`'s identical wiring comment.
-    let mace_enabled = matches!(
-        std::env::var("SAACP_ENABLE_MACE").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    );
+    let mace_enabled = resolve_flag("SAACP_ENABLE_MACE", bin_cfg.command_center.enable_mace);
     if mace_enabled {
         saacp::mace::activate();
     }

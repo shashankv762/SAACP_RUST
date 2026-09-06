@@ -6,6 +6,10 @@ fuzz/artifacts/
 *.sentinel
 !tests/fixtures/*.sentinel
 
+# Transient exit-code capture files from gate verification runs, and scratch UI notes.
+*_exit.txt
+commandUI .md
+
 # Dev-only benchmark artifacts (regenerable, not source)
 benches_output.txt
 *.bak
