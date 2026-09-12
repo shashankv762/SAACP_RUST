@@ -80,6 +80,7 @@ tokio-tungstenite = { version = "0.24", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 redis = { version = "0.27", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.7", optional = true }
 # TLS-wrapped raw-TCP transport (src/transport/tls.rs) — TLS-terminates an accepted
 # TcpStream, then hands the resulting rustls TlsStream directly to the existing generic
@@ -153,6 +154,9 @@ transport-wss = ["transport-ws", "transport-tls"]
 # across nodes instead of each node holding an isolated in-memory view. Off
 # by default so a single-node deployment never pulls in the redis crate.
 redis-backend = ["dep:redis"]
+# M5: HTTP webhook alert sink (alert_sink.rs::WebhookAlertSink). Off by default
+# so deployments that don't need webhook alerts never pull in reqwest.
+webhook-alerts = ["dep:reqwest"]
 # Metadata Privacy Filter (src/mpf.rs) — cover traffic, adaptive padding, and
 # timing-jitter recommendations for traffic-analysis resistance. This is not,
 # and never has been, wired into the mandatory gate pipeline (it's opt-in

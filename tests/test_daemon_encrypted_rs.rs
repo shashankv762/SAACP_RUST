@@ -136,6 +136,7 @@ async fn daemon_encrypted_valid_signed_token_accepted_and_decodes() {
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
             .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false)
             .with_on_delivered(Arc::new(move |parsed| {
                 if let Some(saacp::handler::JsonValue::String(task)) =
                     parsed.payload_dict.get("task")
@@ -187,7 +188,8 @@ async fn daemon_encrypted_tampered_ciphertext_rejected() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -218,7 +220,8 @@ async fn daemon_encrypted_wrong_issuer_secret_rejected() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -311,6 +314,7 @@ async fn daemon_encrypted_two_independent_sessions() {
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
             .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false)
             .with_on_delivered(Arc::new(move |_parsed| {
                 count_cb.fetch_add(1, Ordering::SeqCst);
             }));

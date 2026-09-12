@@ -312,12 +312,23 @@ pub struct SAACPNetworkDaemon {
     circuit_breakers: SharedCircuitBreakers,
     /// DAEMON-MTLS: optional Ed25519 signing key seed (32 bytes) for server auth.
     server_ed25519_seed: Option<[u8; 32]>,
-    /// Opt-in real Gate 1.0 token verification (DAEMON-NO-TOKEN-VERIFY fix). `None`
-    /// preserves today's existing behavior byte-for-byte: `handle_client` calls the 4-arg
-    /// `intercept_packet` wrapper, which always passes `gateway: None` into Gate 1.0 and
-    /// grants every token a hardcoded `max_action_class = 0` / `source_agent = "unknown"`
-    /// without ever checking its HMAC signature. `Some` routes through
-    /// `intercept_packet_full`/`intercept_packet_encrypted` with a real gateway instead.
+    /// Opt-in real Gate 1.0 token verification (DAEMON-NO-TOKEN-VERIFY fix).
+    /// `Some` routes through `intercept_packet_full`/`intercept_packet_encrypted`
+    /// with a real gateway. `None` (the default) is FAIL-CLOSED in any build
+    /// without the `dangerously-skip-gateway` feature: Gate 1.0 hard-drops
+    /// every token-bearing packet with `LateralMovementBlocked`, because a
+    /// capability token cannot be verified without a trust anchor. The old
+    /// synthetic READ_ONLY grant (`max_action_class = 0`,
+    /// `source_agent = "unknown"`, no signature check) was removed as an
+    /// unauthenticated-transaction anti-pattern; it survives ONLY in builds
+    /// explicitly compiled with `dangerously-skip-gateway` (local dev parity).
+    ///
+    /// Note the corresponding **availability cliff** (longcat.md Steps 3-4):
+    /// Gate 6.0's fail-closed audit contract hard-drops IRREVERSIBLE traffic
+    /// (action_class >= 0x02) whenever the audit WAL cannot durably record
+    /// it. See `crate::security::AuditHealth` for the health model and
+    /// [`Self::with_dropped_audit_autoack`] for the opt-in quiet-window
+    /// recovery of the Gate 2.5 sticky floor.
     gateway: Option<Arc<crate::gateway::ZeroTrustGateway>>,
     /// Opt-in real AES-256-GCM decryption (DAEMON-NO-AEAD fix). `None` preserves today's
     /// existing behavior: Gate 0 uses the structural-only `framing::MEASCFrame::parse_header`,
@@ -432,11 +443,28 @@ pub struct SAACPNetworkDaemon {
     /// this (documented scope). Initialized from `SAACP_AUDIT_NODE` and
     /// overridable via [`Self::audit_node`].
     audit_node_designated: bool,
-    /// M-A remediation (production audit G1/R1): opt-in startup recovery of
-    /// the persisted audit chain. Off by default so construction and tests
-    /// stay byte-identical to pre-recovery behavior; enabled via
-    /// [`Self::with_audit_chain_recovery`] or `SAACP_AUDIT_RECOVER=1`.
+    /// M-A remediation (production audit G1/R1): startup recovery of the
+    /// persisted audit chain.
+    ///
+    /// **Default behavior (v0.2.2+):** auto-enabled when `token_issuer_secret`
+    /// is `Some`. The `insecure_for_testing()` path passes its caller's
+    /// secret through unchanged, so this only matters when you actually
+    /// configure one. Explicitly controllable via
+    /// [`Self::with_audit_chain_recovery`], `SAACP_AUDIT_RECOVER=1` (force
+    /// on), or `SAACP_AUDIT_NO_RECOVER=1` (force off — preserves the file
+    /// for forensics without blocking startup).
     audit_chain_recovery: bool,
+    /// longcat.md Step 4: opt-in quiet-window auto-acknowledgement of dropped
+    /// audit events (see
+    /// [`crate::security::ImmutableAuditLog::spawn_dropped_audit_autoack`]).
+    /// `None` (the default) keeps the strictly operator-driven posture: once a
+    /// single audit event has been dropped, the sticky health floor pins Gate
+    /// 2.5 fail-closed on IRREVERSIBLE_ACTION until an operator calls
+    /// `acknowledge_dropped_audits` — this is the availability-cliff tradeoff
+    /// to understand before opting in: with a `Some(window)` an unattended
+    /// node re-authorizes irreversible traffic `window` after the last drop.
+    /// The lifetime `dropped_audit_count()` total is NEVER reset either way.
+    dropped_audit_autoack: Option<Duration>,
 }
 
 impl SAACPNetworkDaemon {
@@ -482,6 +510,10 @@ impl SAACPNetworkDaemon {
              PERMISSIVE daemon (unauthenticated handshake, structural-only frames). \
              Use SAACPNetworkDaemon::new() or ::secure() in production."
         );
+        // M1 remediation: auto-enable audit chain recovery when a stable
+        // issuer secret is available (production posture). Computed BEFORE the
+        // struct literal below moves `token_issuer_secret` into the field.
+        let auto_recovery = token_issuer_secret.is_some();
         Self {
             host: host.to_string(),
             port,
@@ -508,7 +540,14 @@ impl SAACPNetworkDaemon {
             audit_node_designated: std::env::var("SAACP_AUDIT_NODE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            audit_chain_recovery: false,
+            // M1 remediation: auto-enable audit chain recovery when a
+            // stable issuer secret is available (production posture).
+            // `insecure_for_testing()` itself never flips this on when the
+            // caller passed `None` — and `::new()`/`::secure()` forward the
+            // caller's secret, so production constructors that DO configure
+            // one start with recovery enabled.
+            audit_chain_recovery: auto_recovery,
+            dropped_audit_autoack: None,
         }
     }
 
@@ -811,10 +850,15 @@ impl SAACPNetworkDaemon {
     /// M-A remediation (production audit G1/R1): adopt + verify the persisted
     /// audit chain before the listener binds.
     ///
-    /// Off by default so construction, tests, and existing deployments stay
-    /// byte-identical to pre-recovery behavior; this builder or the
-    /// `SAACP_AUDIT_RECOVER=1` environment variable (checked at `start`)
-    /// enables it. When enabled, `start_with_shutdown` calls
+    /// **Default (v0.2.2+):** auto-enabled when `token_issuer_secret` is
+    /// `Some` — the caller-provided option is forwarded to
+    /// `insecure_for_testing`, which computes `is_some()` on it, so any
+    /// constructor path that actually sets a secret also turns recovery on.
+    /// The environment variables `SAACP_AUDIT_RECOVER=1` (force on)
+    /// and `SAACP_AUDIT_NO_RECOVER=1` (force off) override both this builder
+    /// and the auto-detect.
+    ///
+    /// When enabled, `start_with_shutdown` calls
     /// `ImmutableAuditLog::initialize_chain` on the process-global log with
     /// this daemon's `token_issuer_secret` — the same secret the gate
     /// pipeline HMAC-binds chain entries with — so a restarted process
@@ -833,12 +877,27 @@ impl SAACPNetworkDaemon {
         self
     }
 
-    /// M-A recovery body — see [`Self::with_audit_chain_recovery`]. Uses the
-    /// process-global log (the same instance the gate pipeline and the
-    /// health/audit-ack paths use). Blocking disk I/O, but only at startup,
-    /// before the listener binds.
-    fn recover_audit_chain(issuer_secret: &Option<Vec<u8>>) -> std::io::Result<()> {
-        let log = crate::security::ImmutableAuditLog::global();
+    /// longcat.md Step 4: opt-in auto-acknowledgement of dropped audit events
+    /// after a quiet window with no new drops (see
+    /// [`crate::security::ImmutableAuditLog::spawn_dropped_audit_autoack`]).
+    /// The task is spawned in `start_with_shutdown`, bound to the same
+    /// shutdown token, and joined during the drain phase. `None` (the default)
+    /// keeps the operator-ack-only fail-closed posture — see the
+    /// `dropped_audit_autoack` field doc for the availability-cliff tradeoff.
+    pub fn with_dropped_audit_autoack(mut self, quiet_window: Duration) -> Self {
+        self.dropped_audit_autoack = Some(quiet_window);
+        self
+    }
+
+    /// M-A recovery body — see [`Self::with_audit_chain_recovery`]. Operates on
+    /// THIS daemon's audit log (Gap B / longcat.md Step 2): the context's chain
+    /// when a context is configured, else the shared default — which aliases the
+    /// exact instance the gate pipeline and the health/audit-ack paths use.
+    /// Blocking disk I/O, but only at startup, before the listener binds.
+    fn recover_audit_chain(
+        log: &crate::security::ImmutableAuditLog,
+        issuer_secret: &Option<Vec<u8>>,
+    ) -> std::io::Result<()> {
         let Some(secret) = issuer_secret else {
             eprintln!(
                 "[SAACP Daemon] audit-chain recovery requested (SAACP_AUDIT_RECOVER) but no \
@@ -1039,16 +1098,38 @@ impl SAACPNetworkDaemon {
             let interval = cluster.suspect_timeout_interval_hint();
             cluster.start(interval);
         }
-        // M-A remediation: opt-in audit-chain recovery, BEFORE the listener
-        // binds — a verification failure refuses startup (`Err`) so the node
-        // never accepts traffic while its chain of record is unverifiable.
-        let recovery_requested = self.audit_chain_recovery
-            || matches!(
-                std::env::var("SAACP_AUDIT_RECOVER").ok().as_deref(),
-                Some("1") | Some("true") | Some("TRUE")
+        // M-A remediation (M1 upgrade): audit-chain recovery runs BEFORE the
+        // listener binds — a verification failure refuses startup (`Err`) so
+        // the node never accepts traffic while its chain of record is
+        // unverifiable.
+        //
+        // Priority (highest to lowest):
+        //   1. SAACP_AUDIT_NO_RECOVER=1  → force off (operator escape hatch)
+        //   2. SAACP_AUDIT_RECOVER=1     → force on  (legacy env compat)
+        //   3. self.audit_chain_recovery → auto-detected from constructor
+        //      (true when token_issuer_secret is Some, false for insecure)
+        let no_recover = matches!(
+            std::env::var("SAACP_AUDIT_NO_RECOVER").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        let force_recover = matches!(
+            std::env::var("SAACP_AUDIT_RECOVER").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        let recovery_requested = if no_recover {
+            eprintln!(
+                "[SAACP Daemon] SAACP_AUDIT_NO_RECOVER=1 — audit chain recovery \
+                 explicitly disabled. The on-disk chain (if any) is NOT verified; \
+                 the process starts with an empty in-memory chain."
             );
+            false
+        } else {
+            force_recover || self.audit_chain_recovery
+        };
         if recovery_requested {
-            Self::recover_audit_chain(&self.token_issuer_secret)?;
+            let recovery_ctx =
+                crate::context::SaacpContext::or_shared_default(self.context.as_deref());
+            Self::recover_audit_chain(recovery_ctx.audit.as_ref(), &self.token_issuer_secret)?;
         }
         // M-B remediation: optional external alert sink. When
         // SAACP_ALERT_SYSLOG=<host:port> is set, every SecurityAlert recorded
@@ -1064,6 +1145,25 @@ impl SAACPNetworkDaemon {
                     ),
                     Err(e) => eprintln!(
                         "[SAACP Daemon] WARNING: could not install syslog alert sink \
+                         ({e}) — security alerts stay process-local (Prometheus / dashboard)"
+                    ),
+                }
+            }
+        }
+        // M5 remediation: optional webhook alert sink. When
+        // SAACP_ALERT_WEBHOOK=<url> is set, every SecurityAlert is POSTed as
+        // JSON to the URL (best-effort, bounded channel, 5s timeout). Both
+        // sinks can be active simultaneously (syslog + webhook).
+        #[cfg(feature = "webhook-alerts")]
+        if let Ok(url) = std::env::var("SAACP_ALERT_WEBHOOK") {
+            if !url.trim().is_empty() {
+                match crate::alert_sink::WebhookAlertSink::install_global(url.trim()) {
+                    Ok(()) => eprintln!(
+                        "[SAACP Daemon] security alerts will be forwarded to webhook \
+                         at {url} (JSON POST, best-effort)"
+                    ),
+                    Err(e) => eprintln!(
+                        "[SAACP Daemon] WARNING: could not install webhook alert sink \
                          ({e}) — security alerts stay process-local (Prometheus / dashboard)"
                     ),
                 }
@@ -1086,6 +1186,18 @@ impl SAACPNetworkDaemon {
         };
         #[cfg(not(feature = "health-endpoint"))]
         let _health_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+
+        // longcat.md Step 4: opt-in dropped-audit auto-acknowledgement task —
+        // spawned only when `with_dropped_audit_autoack` set a quiet window,
+        // bound to the same shutdown token, and joined during the drain phase
+        // (mirroring the health-server handle above). The default `None`
+        // preserves the operator-ack-only fail-closed posture exactly.
+        let autoack_handle = self.dropped_audit_autoack.map(|quiet_window| {
+            let audit = std::sync::Arc::clone(
+                &crate::context::SaacpContext::or_shared_default(self.context.as_deref()).audit,
+            );
+            audit.spawn_dropped_audit_autoack(quiet_window, shutdown.clone())
+        });
 
         let auth_mode = if self.server_ed25519_seed.is_some() {
             "authenticated"
@@ -1138,7 +1250,7 @@ impl SAACPNetworkDaemon {
                 eprintln!("[SAACP Daemon]   - Encrypted transport OFF: Gate 0 is structural-only, incoming packets are not AEAD-decrypted or replay-checked");
             }
             if self.gateway.is_none() {
-                eprintln!("[SAACP Daemon]   - Gateway token verification OFF: Gate 1.0 grants tokens without HMAC/Ed25519 signature validation");
+                eprintln!("[SAACP Daemon]   - No ZeroTrustGateway configured: Gate 1.0 is FAIL-CLOSED in this build — every token-bearing packet is rejected with LateralMovementBlocked (the unauthenticated READ_ONLY grant exists only in `dangerously-skip-gateway` builds)");
             }
             eprintln!(
                 "[SAACP Daemon]  Use SAACPNetworkDaemon::secure(...) for the hardened profile."
@@ -1254,10 +1366,23 @@ impl SAACPNetworkDaemon {
             let _ = h.await;
         }
 
+        // longcat.md Step 4: join the opt-in auto-ack task — it returned on
+        // the same shutdown token cancel; awaiting it here keeps the
+        // no-task-outlives-`start_with_shutdown` invariant.
+        if let Some(h) = autoack_handle {
+            let _ = h.await;
+        }
+
         // Terminal step (R-2's stated sequence: "stop accepting → drain → flush WAL → exit").
         // `ImmutableAuditLog::flush` is a std blocking call — run it off the async executor.
-        let flushed = tokio::task::spawn_blocking(|| {
-            crate::security::ImmutableAuditLog::global().flush(Duration::from_secs(
+        // Gap B / longcat.md Step 2: flush THIS daemon's audit chain (the
+        // context's log when configured; the shared default — which aliases the
+        // legacy process global — otherwise).
+        let audit_for_flush = std::sync::Arc::clone(
+            &crate::context::SaacpContext::or_shared_default(self.context.as_deref()).audit,
+        );
+        let flushed = tokio::task::spawn_blocking(move || {
+            audit_for_flush.flush(Duration::from_secs(
                 crate::security::AUDIT_FLUSH_ON_SHUTDOWN_TIMEOUT_SECS,
             ))
         })
@@ -1336,6 +1461,27 @@ pub(crate) async fn handle_client<S>(
     let ip_key = peer_addr.ip().to_string();
     let ip_trust_key = ip_trust_key(&ip_key);
 
+    // Gap B completion (longcat.md Step 2): resolve this connection's context
+    // ONCE and route every per-connection security decision through it —
+    // IP-level trust gating, revocation-epoch pinning, hard-drop penalties,
+    // and C-3 identity-gate bookkeeping. `None` resolves to the shared
+    // default, whose fields alias the exact legacy process globals, so an
+    // unconfigured daemon is byte-identical to the pre-context behavior; a
+    // hermetic `with_context` daemon now stays strictly on its own tenant's
+    // engines. Previously the sites below silently hit the process globals —
+    // including the IP-trust penalize on the hard-drop path, which was a
+    // cross-tenant leak (one tenant's abusive peer polluted every other
+    // tenant's trust state in the same process).
+    let conn_ctx: &crate::context::SaacpContext =
+        crate::context::SaacpContext::or_shared_default(context.as_deref());
+    // The gateway Gate 1.0 will actually consult for this connection: the
+    // daemon-injected one when configured, else the context's revocation
+    // fallback. Revocation-epoch bookkeeping must observe the same gateway the
+    // gate pipeline validates tokens against, not always the process global.
+    let connection_gateway: &crate::gateway::ZeroTrustGateway = gateway
+        .as_deref()
+        .unwrap_or_else(|| conn_ctx.gateway.as_ref());
+
     // ── Step 0: Circuit breaker check ────────────────────────────────────────
     {
         // L-18 fix: `parking_lot::Mutex` never poisons, so the H-22 poison-recovery
@@ -1372,7 +1518,7 @@ pub(crate) async fn handle_client<S>(
     // claims next. Checked once per connection (mirroring the IP circuit
     // breaker's own check above, which is likewise only evaluated at connect
     // time, not per-packet) and penalized on every hard drop below.
-    if crate::trust_decay::TrustDecayEngine::global().requires_reauth(&ip_trust_key) {
+    if conn_ctx.trust.requires_reauth(&ip_trust_key) {
         // Silent drop — no response, no logging (same DDoS-defence rationale
         // as the circuit breaker check above: don't give a probing attacker
         // a distinguishable signal for which defense tripped).
@@ -1387,7 +1533,12 @@ pub(crate) async fn handle_client<S>(
     };
     let (session_key, verified_identity) = match timeout(
         Duration::from_secs_f64(handshake_timeout_secs),
-        ecdh_handshake(&mut stream, server_ed25519_seed, server_agent_id.as_deref()),
+        ecdh_handshake(
+            &mut stream,
+            server_ed25519_seed,
+            server_agent_id.as_deref(),
+            conn_ctx.identity_gate.as_ref(),
+        ),
     )
     .await
     {
@@ -1427,8 +1578,7 @@ pub(crate) async fn handle_client<S>(
     // Track the revocation epoch at the time of last successful validation.
     // If the global epoch advances (i.e. all tokens are revoked), this connection
     // must be disconnected — continuing would accept a revoked token.
-    let mut pinned_revocation_epoch: u64 =
-        crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
+    let mut pinned_revocation_epoch: u64 = connection_gateway.get_revocation_epoch();
 
     // ── C-3 Identity Gate ──────────────────────────────────────────────────────
     // NOTE: no phase is advanced here at connection-init time beyond what
@@ -1618,14 +1768,9 @@ pub(crate) async fn handle_client<S>(
                         // policy only decides whether the connection is
                         // additionally hard-dropped, never whether the
                         // detection is counted or surfaced.
-                        let ctx =
-                            crate::context::SaacpContext::or_shared_default(context.as_deref());
-                        ctx.telemetry.record_session_affinity_violation();
-                        ctx.alerts.record(crate::telemetry::SecurityAlert {
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64())
-                                .unwrap_or_default(),
+                        conn_ctx.telemetry.record_session_affinity_violation();
+                        conn_ctx.alerts.record(crate::telemetry::SecurityAlert {
+                            timestamp: crate::clock::now_secs_f64(),
                             agent_id: peer_addr.to_string(),
                             gate: "session_affinity",
                             bytecode: SAACPBytecodes::SessionSpliceDetected.to_string(),
@@ -1661,7 +1806,7 @@ pub(crate) async fn handle_client<S>(
         // validated, all previously-accepted tokens are revoked. Force disconnect
         // so the client must re-authenticate with a fresh token.
         {
-            let current_rev = crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
+            let current_rev = connection_gateway.get_revocation_epoch();
             if pinned_agent.is_some() && current_rev > pinned_revocation_epoch {
                 send_hard_drop(
                     &mut stream,
@@ -1931,8 +2076,7 @@ pub(crate) async fn handle_client<S>(
                     last_validated_at = Some(Instant::now());
                     // Snapshot the current revocation epoch so future revocations
                     // trigger disconnect (C1 fix).
-                    pinned_revocation_epoch =
-                        crate::gateway::ZeroTrustGateway::global().get_revocation_epoch();
+                    pinned_revocation_epoch = connection_gateway.get_revocation_epoch();
                     // C-3 Identity Gate bookkeeping: by the time `intercept_packet`
                     // returns `Ok`, Gate 1.0 (capability token validation) through
                     // Gate 12.0 have all already passed for this packet, so both
@@ -1942,12 +2086,12 @@ pub(crate) async fn handle_client<S>(
                     // `"authenticated"`, which is not one of the six canonical
                     // phases and silently failed every single time (see the
                     // removed connection-init call above for the same bug).
-                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
+                    let _ = conn_ctx.identity_gate.advance(
                         &parsed.source_agent,
                         &parsed.session_uuid,
                         "IDENTITY_VERIFIED",
                     );
-                    let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
+                    let _ = conn_ctx.identity_gate.advance(
                         &parsed.source_agent,
                         &parsed.session_uuid,
                         "AUTHORIZED",
@@ -2009,7 +2153,11 @@ pub(crate) async fn handle_client<S>(
                 // Step 0b comment above): applied unconditionally on every
                 // hard drop, independent of whatever identity this packet
                 // claimed, so switching identities cannot reset it.
-                let _ = crate::trust_decay::TrustDecayEngine::global().penalize(
+                // Gap B: penalize THIS context's trust engine — penalizing the
+                // process global was the longcat.md cross-tenant leak (one
+                // hermetic tenant's hostile peer poisoned every tenant's IP
+                // trust bucket in the same process).
+                let _ = conn_ctx.trust.penalize(
                     &ip_trust_key,
                     crate::trust_decay::PenaltyKind::GenericHardDrop,
                 );
@@ -2064,13 +2212,19 @@ pub(crate) async fn handle_client<S>(
 /// capability token alone can never produce — closing the gap where any holder of a
 /// leaked token could otherwise impersonate the agent it names. On success, a
 /// `TranscriptBoundSession` is registered in `identity_binding::DEFAULT_IDENTITY_REGISTRY`
-/// keyed by this `session_id`, and `IDENTITY_VERIFIED` is advanced in
-/// `identity_binding::GLOBAL_IDENTITY_GATE` for (agent_id, session_id). See
+/// keyed by this `session_id`, and `IDENTITY_VERIFIED` is advanced for
+/// (agent_id, session_id) in the caller-supplied identity gate (Gap B /
+/// longcat.md Step 2 — per-connection context scoping; the shared default
+/// continues to alias the legacy `GLOBAL_IDENTITY_GATE` instance). The
+/// session registry itself stays process-global: `handler.rs`'s Gate 1.0
+/// cross-check reads the same registry, so scoping it per context would
+/// sever that cross-check from this connection-init registration path. See
 /// `handler.rs`'s Gate 1.0 for the corresponding capability-token cross-check.
 async fn ecdh_handshake<S>(
     stream: &mut S,
     server_ed25519_seed: Option<[u8; 32]>,
     identity_binding_server_agent_id: Option<&str>,
+    identity_gate: &crate::identity_binding::IdentityGate,
 ) -> Result<(Zeroizing<[u8; 32]>, Option<VerifiedClientIdentity>), SAACPHardDrop>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2267,11 +2421,7 @@ where
         let agent_id = cert.agent_id.clone();
         let session_id_hex = hex::encode(session_id);
         crate::identity_binding::DEFAULT_IDENTITY_REGISTRY.register(session);
-        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
-            &agent_id,
-            &session_id_hex,
-            "IDENTITY_VERIFIED",
-        );
+        let _ = identity_gate.advance(&agent_id, &session_id_hex, "IDENTITY_VERIFIED");
 
         Some(VerifiedClientIdentity {
             agent_id,
@@ -3050,7 +3200,10 @@ mod tests {
         // Client sends a 32-byte nonce followed by the all-zero "public key".
         client.write_all(&[0x11u8; 32]).await.unwrap();
         client.write_all(&[0u8; 32]).await.unwrap();
-        let result = ecdh_handshake(&mut server, None, None).await;
+        // Fresh throwaway gate: this test exercises the contributory-key
+        // rejection, which never reaches the identity-gate advance.
+        let gate = crate::identity_binding::IdentityGate::new();
+        let result = ecdh_handshake(&mut server, None, None, &gate).await;
         assert!(
             result.is_err(),
             "all-zero peer public key must be rejected (contributory check)"

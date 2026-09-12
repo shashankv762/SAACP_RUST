@@ -56,7 +56,8 @@ async fn test_preauth_rejects_large_payload_before_verified_frame() {
 
     // Start daemon with inflight payload budget enabled
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", addr.port(), Some(mesh_secret.to_vec()))
-        .with_inflight_payload_budget(Some(MAX_INFLIGHT_PAYLOAD_BYTES));
+        .with_inflight_payload_budget(Some(MAX_INFLIGHT_PAYLOAD_BYTES))
+        .with_audit_chain_recovery(false);
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown_clone = shutdown.clone();
@@ -118,7 +119,8 @@ async fn test_preauth_allows_small_payload() {
 
     // Start daemon with inflight payload budget enabled
     let daemon = SAACPNetworkDaemon::new("127.0.0.1", addr.port(), Some(mesh_secret.to_vec()))
-        .with_inflight_payload_budget(Some(MAX_INFLIGHT_PAYLOAD_BYTES));
+        .with_inflight_payload_budget(Some(MAX_INFLIGHT_PAYLOAD_BYTES))
+        .with_audit_chain_recovery(false);
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown_clone = shutdown.clone();

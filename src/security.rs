@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -945,6 +945,14 @@ thread_local! {
     };
 }
 
+/// Audit-path hygiene notices fire exactly once per process even though
+/// hundreds of logs may be constructed (a full test run builds one per test;
+/// a daemon builds its context's log at startup). Both flags guard STDERR
+/// noise, not behavior — the redirect / in-memory semantics themselves are
+/// unchanged.
+static WARNED_TEST_LOG_DIR_REDIRECT: AtomicBool = AtomicBool::new(false);
+static WARNED_IN_MEMORY_AUDIT: AtomicBool = AtomicBool::new(false);
+
 impl ImmutableAuditLog {
     /// Create a new ImmutableAuditLog with an explicit log file path.
     ///
@@ -987,6 +995,28 @@ impl ImmutableAuditLog {
         count_file: &str,
         archival_sink: Arc<dyn ArchivalSink>,
     ) -> Self {
+        // Audit-path hygiene notice (production-audit follow-up): the
+        // SAACP_TEST_LOG_DIR redirect is a test-harness affordance honored in
+        // every build profile — including release. A leftover env var in a
+        // production container silently relocates the audit trail, so its
+        // engagement is surfaced once per process on stderr. Visibility only:
+        // the redirect behavior itself is unchanged.
+        if let Ok(dir) = std::env::var("SAACP_TEST_LOG_DIR") {
+            let relative_redirected = (!log_file.is_empty() && Path::new(log_file).is_relative())
+                || (!count_file.is_empty() && Path::new(count_file).is_relative());
+            if !dir.is_empty()
+                && relative_redirected
+                && !WARNED_TEST_LOG_DIR_REDIRECT.swap(true, Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[SAACP audit] WARNING: SAACP_TEST_LOG_DIR is set — relative audit log \
+                     paths are being redirected to '{dir}'. This env var is a test-harness \
+                     affordance; if this is a production process, unset it or pass absolute \
+                     paths, or the audit trail will silently live in the redirected location."
+                );
+            }
+        }
+
         let resolved_log_file = if log_file.is_empty() {
             String::new()
         } else if let Ok(test_log_dir) = std::env::var("SAACP_TEST_LOG_DIR") {
@@ -1019,6 +1049,20 @@ impl ImmutableAuditLog {
             count_file.to_string()
         };
 
+        // Audit-durability notice (production-audit follow-up): an empty WAL
+        // path means every append is dropped at process exit — no durable,
+        // verifiable chain exists. Intended for tests and explicitly ephemeral
+        // deployments; surfaced once per process so a misconfigured daemon
+        // cannot run blind silently. Visibility only: behavior unchanged.
+        if resolved_log_file.is_empty() && !WARNED_IN_MEMORY_AUDIT.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[SAACP audit] WARNING: audit log constructed in in-memory-only mode \
+                 (empty WAL path) — no durable, verifiable audit trail is persisted; all \
+                 entries evaporate at process exit. Intended for tests and explicitly \
+                 ephemeral deployments only."
+            );
+        }
+
         let (wal_tx, wal_rx) = mpsc::sync_channel::<WalMessage>(AUDIT_WAL_QUEUE_CAPACITY);
 
         let health: Arc<AtomicU8> = Arc::new(AtomicU8::new(AuditHealth::Healthy as u8));
@@ -1041,6 +1085,12 @@ impl ImmutableAuditLog {
                 .collect(),
         );
         let anchor_epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        // longcat.md Step 5 / Risk 5: capture what the startup orphan-`.bak`
+        // sweep needs before the WAL worker thread takes ownership of
+        // `archival_sink` and the struct takes ownership of `resolved_log_file`.
+        let sweep_log_file = resolved_log_file.clone();
+        let sweep_sink = Arc::clone(&archival_sink);
 
         // Spawn WAL worker daemon thread. `log_file`/`count_file` never change
         // after construction (no setter exists), so the worker captures its own
@@ -1069,7 +1119,7 @@ impl ImmutableAuditLog {
             })
             .expect("WAL worker thread spawn failed");
 
-        Self {
+        let log = Self {
             shards: (0..AUDIT_SHARDS)
                 .map(|i| {
                     Mutex::new(ShardInner {
@@ -1091,7 +1141,12 @@ impl ImmutableAuditLog {
             wal_write_failures,
             queue_len,
             subscribers: Mutex::new(Vec::new()),
-        }
+        };
+        // longcat.md Step 5 / Risk 5: one-shot repair of orphaned uncompressed
+        // `.bak` rotations (crash between rename and compression). See
+        // `sweep_orphaned_bak_files`'s doc comment for the guarantee set.
+        sweep_orphaned_bak_files(&sweep_log_file, &sweep_sink);
+        log
     }
 
     /// Register a callback invoked synchronously on every successfully
@@ -2366,16 +2421,48 @@ impl ArchivalSink for FilesystemArchivalSink {
 /// not propagated: this runs detached on a background thread with no caller to
 /// return a `Result` to, matching `run_wal_worker`'s own error-handling idiom for
 /// this module (log + leave the uncompressed artifact in place, never panic).
+/// Process-wide dedup for `.bak` compression: claimed centrally inside
+/// `compress_and_archive_rotated_log` (by canonicalized path) so the
+/// rotation-time thread AND the startup-sweep repair of the SAME file can
+/// never run concurrently — two `File::create` writers on the same `.bak.gz`
+/// would interleave bytes and corrupt the archive.
+static BAK_COMPRESSION_IN_FLIGHT: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 fn compress_and_archive_rotated_log(rotated_path: String, sink: Arc<dyn ArchivalSink>) {
+    // Claims are keyed by the canonicalized path so producers that spell the
+    // same file differently (absolute rotation path vs `<dir>`-relative sweep
+    // entry) still dedup. If the file vanished before we could canonicalize
+    // (already repaired by a sibling), the inner path's open() will fail and
+    // warn — never panic.
+    let key = fs::canonicalize(&rotated_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| rotated_path.clone());
+    {
+        let mut in_flight = BAK_COMPRESSION_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !in_flight.insert(key.clone()) {
+            return; // another thread is already compressing this exact file
+        }
+    }
+    compress_and_archive_rotated_log_inner(&rotated_path, sink);
+    BAK_COMPRESSION_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+fn compress_and_archive_rotated_log_inner(rotated_path: &str, sink: Arc<dyn ArchivalSink>) {
     let gz_path = format!("{rotated_path}.gz");
-    if let Err(e) = compress_file_to_gzip(&rotated_path, &gz_path) {
+    if let Err(e) = compress_file_to_gzip(rotated_path, &gz_path) {
         eprintln!(
             "[SAACP audit] gzip compression failed for rotated audit log '{rotated_path}': {e} \
              — uncompressed .bak left in place, not archived."
         );
         return;
     }
-    if let Err(e) = fs::remove_file(&rotated_path) {
+    if let Err(e) = fs::remove_file(rotated_path) {
         eprintln!(
             "[SAACP audit] failed to remove uncompressed '{rotated_path}' after successful \
              compression to '{gz_path}': {e} — both copies left on disk."
@@ -2396,6 +2483,81 @@ fn compress_file_to_gzip(src: &str, dst: &str) -> io::Result<()> {
     io::copy(&mut input, &mut encoder)?;
     let output = encoder.finish()?;
     output.sync_all()
+}
+
+/// longcat.md Step 5 / Risk 5: `WalWriter::maybe_rotate` renames the live WAL
+/// to `<path>.<ts>.bak` and compresses it on a detached thread; a crash or
+/// kill between the rename and the compression used to leave that `.bak` on
+/// disk forever — uncompressed, unarchived, and invisible to the C-4 archival
+/// sink. Every [`ImmutableAuditLog`] construction now sweeps the WAL's
+/// directory once and re-runs the exact rotation-time compression+archival
+/// path ([`compress_and_archive_rotated_log`]) on each orphan (which removes
+/// the `.bak` only after its `.bak.gz` is fully written and fsync'd).
+///
+/// Never-panic posture (same as the rotation path itself): an unreadable
+/// directory or a failed spawn/compression logs a warning and leaves the
+/// orphan in place for the operator; the sweep never refuses startup or
+/// panics. Sibling artifacts that are NOT crash orphans are untouched:
+/// `.bak.gz` files (their compression already completed — `ends_with(".bak")`
+/// excludes them), the live WAL, the sentinel, and any unrelated filename.
+///
+/// Idempotency comes from the shared claim inside
+/// [`compress_and_archive_rotated_log`] (`BAK_COMPRESSION_IN_FLIGHT`): two
+/// sweeps of the same WAL dir — or a sweep racing a live rotation of the
+/// same file — cannot double-compress an orphan.
+fn sweep_orphaned_bak_files(wal_path: &str, archival_sink: &Arc<dyn ArchivalSink>) {
+    if wal_path.is_empty() {
+        return; // in-memory-only mode — nothing on disk to sweep
+    }
+    let wal = Path::new(wal_path);
+    let Some(basename) = wal.file_name().and_then(|n| n.to_str()) else {
+        return; // a bare directory path has no WAL basename to match against
+    };
+    let dir = match wal.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            // Warn-only: a genuine open problem with the WAL itself surfaces
+            // loudly through the Fatal health path; the sweep merely reports.
+            eprintln!(
+                "[SAACP audit] startup .bak sweep could not read WAL directory '{}': {e}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let prefix = format!("{basename}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue; // non-UTF-8 names cannot match the ASCII pattern anyway
+        };
+        if !(name.starts_with(&prefix) && name.ends_with(".bak")) {
+            continue;
+        }
+        let path_str = entry.path().to_string_lossy().to_string();
+        eprintln!(
+            "[SAACP audit] startup sweep scheduling repair of orphaned uncompressed audit \
+             log '{path_str}' (crash between rotation and compression)"
+        );
+        let sink = Arc::clone(archival_sink);
+        // Dedup happens inside `compress_and_archive_rotated_log` (canonicalized
+        // path claim in `BAK_COMPRESSION_IN_FLIGHT`): if a rotation or another
+        // construction's sweep is already compressing this exact file, the
+        // spawned thread exits immediately without touching the filesystem.
+        let spawn_result = thread::Builder::new()
+            .name("saacp-audit-bak-sweep".into())
+            .spawn(move || compress_and_archive_rotated_log(path_str.clone(), sink));
+        if let Err(e) = spawn_result {
+            eprintln!(
+                "[SAACP audit] failed to spawn .bak sweep thread: {e} — orphan left in \
+                 place for the operator"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3605,5 +3767,123 @@ mod tests {
         );
 
         cleanup();
+    }
+
+    /// longcat.md Step 4: the (opt-in, daemon-wired) auto-acknowledge task must
+    /// release the sticky drop floor after a quiet window with no new drops —
+    /// while leaving the lifetime `dropped_audits` counter untouched. The
+    /// post-drop state is seeded directly (identical mutation to
+    /// `enqueue_wal_line`'s failure branch), which isolates this test from the
+    /// probabilistic fill-a-100k-entry-queue race.
+    #[tokio::test]
+    async fn dropped_audit_autoack_releases_floor_after_quiet_window() {
+        let log_file = std::env::temp_dir().join(format!(
+            "saacp_autoack_{}_{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let count_file = format!("{}.sentinel", log_file.to_str().unwrap());
+        let _ = fs::remove_file(&log_file);
+        let _ = fs::remove_file(&count_file);
+
+        let log = Arc::new(ImmutableAuditLog::with_paths(
+            log_file.to_str().unwrap(),
+            &count_file,
+        ));
+        assert_eq!(log.health(), AuditHealth::Healthy);
+
+        // Seed post-drop state: one lifetime drop + the sticky floor raised.
+        log.dropped_audits.store(1, Ordering::Relaxed);
+        log.health_floor
+            .store(AuditHealth::Saturated as u8, Ordering::Relaxed);
+        assert_eq!(
+            log.health(),
+            AuditHealth::Saturated,
+            "seeded floor must pin health at Saturated (queue empty → live is Healthy)"
+        );
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle =
+            Arc::clone(&log).spawn_dropped_audit_autoack(Duration::from_secs(1), shutdown.clone());
+
+        // The task clamps its tick to >= 1s; poll generously past one tick.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while log.health() != AuditHealth::Healthy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            log.health(),
+            AuditHealth::Healthy,
+            "the floor must be released after one quiet window with no new drops"
+        );
+        assert_eq!(
+            log.dropped_audit_count(),
+            1,
+            "the lifetime drop counter is never reset by auto-ack"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+        let _ = fs::remove_file(&log_file);
+        let _ = fs::remove_file(&count_file);
+    }
+
+    /// longcat.md Step 5 / Risk 5: constructing a log must sweep orphaned
+    /// uncompressed `.bak` rotations (the crash-between-rename-and-compression
+    /// window) through the exact C-4 compression path — each orphan becomes a
+    /// `.bak.gz` and the `.bak` is removed. A pre-existing `.bak.gz` sibling
+    /// must be left untouched, and the sweep must never prevent startup.
+    #[test]
+    fn startup_sweep_repairs_orphaned_bak_files() {
+        let dir =
+            std::env::temp_dir().join(format!("saacp_baksweep_{}_{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("sweep_target.log");
+        let wal_str = wal_path.to_str().unwrap().to_string();
+        let sentinel = format!("{wal_str}.sentinel");
+
+        // Plant two crash orphans plus one already-compressed control file.
+        let orphan1 = dir.join("sweep_target.log.1700000001.bak");
+        let orphan2 = dir.join("sweep_target.log.1700000002.bak");
+        fs::write(&orphan1, "{\"record\":1}\n").unwrap();
+        fs::write(&orphan2, "{\"record\":2}\n").unwrap();
+        let stale_gz = dir.join("sweep_target.log.1699999999.bak.gz");
+        fs::write(&stale_gz, b"already-compressed").unwrap();
+
+        let _log = ImmutableAuditLog::with_paths(&wal_str, &sentinel);
+
+        // Compression runs on detached sweep threads — poll for completion.
+        let orphan1_gz = dir.join("sweep_target.log.1700000001.bak.gz");
+        let orphan2_gz = dir.join("sweep_target.log.1700000002.bak.gz");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (!orphan1_gz.exists() || !orphan2_gz.exists() || orphan1.exists() || orphan2.exists())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            orphan1_gz.exists() && orphan2_gz.exists(),
+            "each orphaned .bak must become a compressed .bak.gz"
+        );
+        assert!(
+            !orphan1.exists() && !orphan2.exists(),
+            "the uncompressed orphans must be removed after a successful repair"
+        );
+        assert!(
+            stale_gz.exists(),
+            "a pre-existing .bak.gz sibling must be left untouched"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Step 5, negative leg: construction with an empty (in-memory-only) WAL
+    /// path must not touch the filesystem and must not panic.
+    #[test]
+    fn startup_sweep_is_noop_for_in_memory_log() {
+        let _log = ImmutableAuditLog::new("");
+        // Nothing to assert beyond reaching here — the sweep must be a no-op
+        // and must never panic for the empty path.
     }
 }

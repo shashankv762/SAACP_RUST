@@ -612,7 +612,8 @@ async fn inbound_schema_12_packet_reaches_the_wired_cluster_engine() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_cluster_engine(Arc::clone(&daemon_engine));
+            .with_cluster_engine(Arc::clone(&daemon_engine))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -690,7 +691,8 @@ async fn forged_cluster_message_over_a_real_connection_changes_nothing() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_cluster_engine(Arc::clone(&daemon_engine));
+            .with_cluster_engine(Arc::clone(&daemon_engine))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -748,7 +750,8 @@ async fn tampered_envelope_routing_fields_are_rejected_over_a_real_connection() 
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_cluster_engine(Arc::clone(&daemon_engine));
+            .with_cluster_engine(Arc::clone(&daemon_engine))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });
@@ -804,11 +807,18 @@ async fn daemon_without_a_cluster_engine_ignores_schema_12_packets() {
     // No `.with_cluster_engine(...)` — the opt-in default must be a safe no-op.
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
-            .with_gateway(Arc::new(ZeroTrustGateway::new()));
+            .with_gateway(Arc::new(ZeroTrustGateway::new()))
+            .with_audit_chain_recovery(false);
+    let (err_tx, mut err_rx) = tokio::sync::oneshot::channel::<String>();
     tokio::spawn(async move {
-        let _ = daemon.start().await;
+        if let Err(e) = daemon.start().await {
+            let _ = err_tx.send(format!("{e}"));
+        }
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
+    if let Ok(e) = err_rx.try_recv() {
+        panic!("daemon startup failed: {e}");
+    }
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await

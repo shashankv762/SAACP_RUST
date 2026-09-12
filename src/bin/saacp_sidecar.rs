@@ -703,6 +703,45 @@ async fn main() {
     });
     let _maintenance_handle = Arc::clone(&maintenance).start();
 
+    // M2 remediation: when SAACP_STATE_BACKEND_URL_FILE (or the TOML
+    // `sidecar.state_backend_url_file`) points to a file containing a Redis
+    // URL, construct a circuit-breaker-wrapped RedisBackend for cross-node
+    // shared rate-limit and session state.
+    #[cfg(feature = "redis-backend")]
+    {
+        if let Some(url_file_path) = resolve(
+            "SAACP_STATE_BACKEND_URL_FILE",
+            bin_cfg.sidecar.state_backend_url_file.as_deref(),
+        ) {
+            let url = std::fs::read_to_string(url_file_path.trim())
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "[saacp-sidecar] FATAL: could not read state backend URL \
+                         file {}: {e}",
+                        url_file_path.trim()
+                    );
+                    std::process::exit(1);
+                })
+                .trim()
+                .to_string();
+            let backend = saacp::state_backend::RedisBackend::new(&url)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "[saacp-sidecar] FATAL: RedisBackend::new failed: {e}"
+                    );
+                    std::process::exit(1);
+                });
+            let breaker =
+                saacp::state_backend::CircuitBreakerBackend::wrap(backend);
+            eprintln!(
+                "[saacp-sidecar] state backend: Redis (circuit-breaker wrapped) \
+                 from file {}",
+                url_file_path.trim()
+            );
+            config.state_backend = Some(std::sync::Arc::new(breaker));
+        }
+    }
+
     run_with_shutdown(config, tokio_util::sync::CancellationToken::new())
         .await
         .unwrap_or_else(|e| {

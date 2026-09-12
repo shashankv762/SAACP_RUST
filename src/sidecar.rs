@@ -80,7 +80,7 @@ use crate::daemon::{
     client_handshake_with_pinned_server_or_plain, SAACPNetworkDaemon,
 };
 use crate::faitf_audit::FAITFAuditLog;
-use crate::gateway::ZeroTrustGateway;
+use crate::gateway::{AgentRateLimiter, ZeroTrustGateway};
 use crate::handler::{JsonValue, ParsedPacket};
 use crate::measc::{
     MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
@@ -222,6 +222,12 @@ pub struct SidecarConfig {
     /// the outbound `send_message` will refuse to dial a peer whose
     /// handshake response does not match the pinned fingerprint.
     pub pinned_peers: HashMap<String, [u8; 32]>,
+    /// M2 remediation: optional shared `StateBackend` for cross-node rate-limit
+    /// and session state. When `Some`, `run_with_shutdown` constructs an
+    /// `AgentRateLimiter::with_backend(backend)` so the gate pipeline shares
+    /// state across horizontally-scaled sidecar replicas. `None` (the default)
+    /// uses an in-memory-only limiter identical to pre-M2 behavior.
+    pub state_backend: Option<std::sync::Arc<dyn crate::state_backend::StateBackend>>,
 }
 
 /// Plan item 3: how the sidecar negotiates its server-side handshake
@@ -267,15 +273,15 @@ impl SidecarConfig {
             http_bearer_token: None,
             connection_pooling: true,
             payload_padding: false,
-            // Plan item 3: default to LegacyOnly so the sidecar is a
-            // drop-in replacement for any pre-plan mesh (an embedded
-            // `SidecarConfig` consumer keeps v1 wire compatibility).
-            // The `saacp-sidecar` binary defaults its OWN posture to
-            // PreferPinned via the `SAACP_HANDSHAKE_MODE` env var;
-            // library callers opt in by setting the field directly.
-            handshake_mode: SidecarHandshakeMode::LegacyOnly,
+            // M4 remediation (v0.2.2+): default to PreferPinned — authenticated
+            // handshakes with graceful fallback to plain ECDH if the peer has
+            // not been upgraded yet. Operators who explicitly need the v1 plain
+            // ECDH behavior can set `handshake_mode: LegacyOnly` or
+            // `SAACP_HANDSHAKE_MODE=LEGACY_ONLY`.
+            handshake_mode: SidecarHandshakeMode::PreferPinned,
             server_seed: None,
             pinned_peers: HashMap::new(),
+            state_backend: None,
         }
     }
 }
@@ -1609,6 +1615,22 @@ pub async fn run_with_shutdown(
     let gateway = Arc::new(ZeroTrustGateway::new());
     let epoch_manager = Arc::new(SessionEpochManager::new());
 
+    // M2 remediation: when a shared state backend is configured, construct a
+    // backend-backed rate limiter so the gate pipeline shares rate-limit and
+    // session state across horizontally-scaled sidecar replicas.
+    let sidecar_context: Option<std::sync::Arc<crate::context::SaacpContext>> =
+        config.state_backend.as_ref().map(|backend| {
+            let rl = AgentRateLimiter::with_backend(Arc::clone(backend));
+            eprintln!(
+                "[SAACP Sidecar] state backend configured — rate limiter is \
+                 backend-backed (cross-node shared state enabled)"
+            );
+            std::sync::Arc::new(
+                crate::context::SaacpContext::new()
+                    .with_rate_limiter(std::sync::Arc::new(rl)),
+            )
+        });
+
     // Per-peer issuer secrets (see module doc): once any entry is registered, the
     // registry becomes authoritative for every subsequent token — no more falling back
     // to a shared secret for anyone. Empty `peer_secrets` (default) never calls this, so
@@ -1671,6 +1693,13 @@ pub async fn run_with_shutdown(
             }
         }
     }));
+    // M2: if a state backend was configured, inject the backend-backed context
+    // into the daemon so the gate pipeline uses cross-node shared state.
+    let daemon = if let Some(ctx) = sidecar_context {
+        daemon.with_context(ctx)
+    } else {
+        daemon
+    };
 
     let daemon_shutdown = shutdown.clone();
     let protocol_listener_healthy = Arc::new(AtomicBool::new(true));

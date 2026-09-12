@@ -126,6 +126,118 @@ impl SyslogAlertSink {
     }
 }
 
+// ─── WebhookAlertSink (M5 remediation) ───────────────────────────────────────
+
+#[cfg(feature = "webhook-alerts")]
+mod webhook {
+    use super::*;
+    use std::sync::OnceLock;
+
+    static WEBHOOK_SINK: OnceLock<WebhookAlertSink> = OnceLock::new();
+
+    /// The process-wide webhook sink, when installed.
+    pub fn webhook_sink() -> Option<&'static WebhookAlertSink> {
+        WEBHOOK_SINK.get()
+    }
+
+    /// M5 remediation (production audit R2): HTTP webhook alert delivery.
+    ///
+    /// Sends a JSON POST for each `SecurityAlert` to a configured URL. Same
+    /// CRIT-10 contract as `SyslogAlertSink` — only coarse fields (gate,
+    /// bytecode, agent_id, timestamp, cost) are included; no
+    /// `SAACPHardDrop::message` detail.
+    ///
+    /// ## Delivery contract (deliberate)
+    ///
+    /// - **Fail-open, best-effort**: `emit` pushes to a bounded channel
+    ///   (`WEBHOOK_CHANNEL_CAPACITY`). A background tokio task drains the
+    ///   channel and POSTs each alert. Failed POSTs increment
+    ///   `alert_sink_failures_total` and are dropped. A full channel drops
+    ///   the newest alert (same semantics as the sidecar inbox).
+    /// - **Timeout**: connect + request timeout is 5 seconds. A slow webhook
+    ///   endpoint cannot stall the gate pipeline.
+    /// - **One sink per process**, installed once via
+    ///   [`WebhookAlertSink::install_global`].
+    pub struct WebhookAlertSink {
+        tx: tokio::sync::mpsc::Sender<WebhookPayload>,
+    }
+
+    /// Bounded channel capacity for queued webhook alerts.
+    const WEBHOOK_CHANNEL_CAPACITY: usize = 256;
+
+    /// The JSON body POSTed to the webhook URL.
+    #[derive(serde::Serialize)]
+    struct WebhookPayload {
+        timestamp: String,
+        gate: String,
+        bytecode: String,
+        agent_id: String,
+        estimated_cost: Option<f64>,
+    }
+
+    impl WebhookAlertSink {
+        /// Install the process-wide webhook sink. Spawns a background tokio
+        /// task that drains the channel and POSTs each alert. Returns an
+        /// error when a sink is already installed or the URL is invalid.
+        pub fn install_global(url: &str) -> Result<(), String> {
+            let url = url.to_string();
+            // Validate URL shape before installing.
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!(
+                    "webhook URL must start with http:// or https://, got: {url:?}"
+                ));
+            }
+
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<WebhookPayload>(WEBHOOK_CHANNEL_CAPACITY);
+            let sink = WebhookAlertSink { tx };
+
+            WEBHOOK_SINK
+                .set(sink)
+                .map_err(|_| "webhook alert sink already installed".to_string())?;
+
+            // Spawn the background sender task. This task owns `rx` and lives
+            // for the process lifetime — no graceful shutdown drain (same as
+            // the syslog sink: alerts are best-effort).
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .connect_timeout(std::time::Duration::from_secs(3))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+
+                while let Some(payload) = rx.recv().await {
+                    if let Err(_e) = client.post(&url).json(&payload).send().await {
+                        crate::telemetry::global_telemetry().record_alert_sink_failure();
+                    }
+                }
+            });
+
+            Ok(())
+        }
+
+        /// Best-effort delivery: pushes to the bounded channel; drops on
+        /// overflow.
+        pub fn emit(&self, alert: &SecurityAlert) {
+            let payload = WebhookPayload {
+                timestamp: super::format_rfc5424_timestamp(alert.timestamp),
+                gate: alert.gate.to_string(),
+                bytecode: alert.bytecode.clone(),
+                agent_id: alert.agent_id.clone(),
+                estimated_cost: alert.estimated_cost,
+            };
+            // try_send never blocks — bounded channel drops on overflow.
+            if self.tx.try_send(payload).is_err() {
+                crate::telemetry::global_telemetry().record_alert_sink_failure();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "webhook-alerts")]
+pub use webhook::{webhook_sink, WebhookAlertSink};
+
+
 /// Format a unix-epoch f64 as RFC 3339 UTC with millisecond precision
 /// (`2026-09-06T12:34:56.789Z`) — dependency-free civil-from-days conversion
 /// (Howard Hinnant's algorithm).

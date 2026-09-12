@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Longcat.md re-verification residuals (see the "Re-verification addendum
+(2026-09)" section of longcat.md). All behavior is byte-identical to
+v0.2.1 under the single-tenant shared-default context; the context-aware
+behavior only differs for hermetic `SaacpContext::new()` deployments or when
+the new opt-ins are enabled.
+
+### Changed
+- **`SaacpContext` owns the full hot-path subsystem set** (Gap B completion):
+  the handler's remaining global fallbacks (rate limiter, dead-man's-switch,
+  federated memory, identity gate, IEVL engine, AEGF governor, CSCS loop
+  detector, stream revocation gateway) and the daemon's per-connection checks
+  (IP-level trust gating/penalties, revocation-epoch pinning, identity-gate
+  advancement including the identity-bound handshake, shutdown WAL flush,
+  audit-chain recovery) now resolve through the connection's context.
+  `SaacpContext::shared_default()` aliases the exact legacy `::global()`
+  instances, so existing deployments observe zero behavior change; hermetic
+  per-tenant contexts no longer leak into the process globals — notably the
+  daemon's hard-drop IP trust penalty, which previously penalized the GLOBAL
+  trust engine even for hermetic contexts (cross-tenant leak, fixed).
+- **Clock seam extended to the packet hot path**: the six remaining
+  `SystemTime::now()` sites in `handler.rs` (pregate rate-limit/reauth reads,
+  Gate 11.0/12.0's shared TTL read, stream token-expiry reads, injection
+  corroboration window) plus the daemon affinity-alert timestamp now use
+  `crate::clock::now_secs_f64()`. Semantics identical (same
+  `unwrap_or_default` behavior); enables future deterministic-time testing.
+
+### Added
+- **Gate 6.0 fail-closed on the write itself** (Gap D follow-up): the audit
+  checkpoint now uses the fallible `ImmutableAuditLog::try_append_event`. An
+  IRREVERSIBLE packet (action_class >= 0x02) whose own audit entry cannot be
+  enqueued is hard-dropped with `AuditSubsystemDegraded` instead of executing
+  with a silently missing audit record — closing the race window between Gate
+  2.5's pre-write health check and Gate 6.0's write. Reversible/read-only
+  packets keep the legacy count-only flow (drop is already counted with the
+  sticky health floor). Cover-traffic and stream-core audit writes are
+  unchanged. Pinned by three white-box unit tests in `handler.rs` plus
+  end-to-end contract tests in `tests/test_gate6_backpressure_rs.rs`.
+- **Opt-in dropped-audit auto-acknowledgement**: `SAACPNetworkDaemon::
+  with_dropped_audit_autoack(quiet_window)` spawns the previously-unwired
+  `ImmutableAuditLog::spawn_dropped_audit_autoack` task at startup (bound to
+  the daemon shutdown token, joined during drain). After `quiet_window` with
+  no NEW drops it releases the sticky Gate-2.5 fail-closed floor; the lifetime
+  `dropped_audit_count()` is never reset. Default `None` keeps the
+  operator-ack-only posture — the field doc names the availability-cliff
+  tradeoff.
+- **Startup sweep for orphaned WAL `.bak` files** (Risk 5): every
+  `ImmutableAuditLog` construction scans the WAL's directory for
+  `<basename>.<ts>.bak` orphans left by a crash between rotation-rename and
+  gzip compression, and re-runs the C-4 compression/archival path on each
+  (background thread; failures warn and leave the orphan in place — never
+  panics, never refuses startup). A process-local in-flight registry, claimed
+  inside the compression entry point itself, prevents double-compression of
+  the same file — whether the race is sweep-vs-sweep across constructions
+  sharing a WAL path or sweep-vs-live-rotation.
+
+### Hardened (v0.2.2 items — integrated from the audit remediation branch)
+- **S2 / secure-by-default**: `SAACPNetworkDaemon::new()` is now the
+  hardened profile (authenticated ECDH handshake + AEAD encrypted transport
+  composed automatically); the permissive pre-S2 shape is reachable only via
+  the explicitly-named `insecure_for_testing()`, which prints a loud warning.
+- **M1 (audit auto-recovery)**: `audit_chain_recovery` now auto-enables when
+  a stable `token_issuer_secret` is configured, with the
+  `SAACP_AUDIT_NO_RECOVER=1` / `SAACP_AUDIT_RECOVER=1` force-offs/on taking
+  precedence over both the builder and the auto-detect (documented priority).
+- **M3 (state-backend circuit breaker)**: new public
+  `state_backend::CircuitBreakerBackend<B>` decorator — wraps any
+  `StateBackend` with CLOSED → OPEN → HALF_OPEN semantics (fail-fast while a
+  degraded backend recovers, single-probe half-open recovery, instant reopen
+  on a failed probe). Reports the new gauge
+  `saacp_state_backend_circuit_breaker_state` (0/1/2) via
+  `TelemetryCollector::set_state_backend_circuit_breaker_state`.
+
+### Documentation
+- Corrected `SAACPNetworkDaemon.gateway` field docs + the startup warning:
+  the no-gateway path has been fail-closed (`LateralMovementBlocked`) since
+  the `dangerously-skip-gateway` hardening; the previous text described the
+  removed synthetic READ_ONLY fallback, which now exists only under that
+  feature.
+- `intercept_packet`'s doc now spells out the 4-arg default-build behavior,
+  and the `SaacpContext` scope note documents the two deliberately
+  process-global remainders (cluster/gossip engines, the identity session
+  registry).
+- README test-suite counts corrected (57 `test_*.rs` + 4 harness/fixture
+  files = 61; 7 breakit suites) and the module count corrected (52 -> 68
+  source modules + 2 `src/bin` binaries).
+- `SaacpContext::new`'s doc now discloses that hermetic contexts share the
+  default WAL file path (logical per-context state, one interleaved on-disk
+  chain) and points at `with_paths`/`with_audit` for physical separation.
+
+### Operational hygiene
+- The `SAACP_TEST_LOG_DIR` audit-path redirect is honored in every build
+  profile — including release — so its engagement now emits a once-per-process
+  stderr warning naming the redirect target; a leftover env var in a
+  production container can no longer silently relocate the audit trail.
+- Constructing an audit log in in-memory-only mode (empty WAL path — no
+  durable, verifiable chain) now emits a once-per-process stderr warning so
+  a misconfigured daemon cannot run blind silently. Both notices are
+  visibility-only: no behavior change.
+
 ## [0.2.1] - 2026-09-06
 
 Production-readiness audit remediations (see PRODUCTION_READINESS_AUDIT.md —

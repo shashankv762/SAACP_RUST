@@ -742,6 +742,197 @@ impl StateBackend for RedisBackend {
     }
 }
 
+// ─── CircuitBreakerBackend (M3 remediation) ──────────────────────────────────
+
+/// M3 remediation (production audit R9): a decorator that wraps any
+/// `StateBackend` with circuit-breaker semantics. Prevents a degraded backend
+/// (e.g. Redis unreachable) from stalling every gate-pipeline call at the
+/// connect timeout.
+///
+/// ## State transitions
+///
+/// ```text
+///   CLOSED ──(N consecutive failures)──► OPEN
+///   OPEN   ──(cooldown elapsed)────────► HALF_OPEN
+///   HALF_OPEN ──(single success)───────► CLOSED
+///   HALF_OPEN ──(single failure)───────► OPEN (cooldown resets)
+/// ```
+///
+/// While OPEN, all calls return `Err(BackendError("circuit breaker open"))`
+/// immediately — no underlying backend call is attempted. This is fail-fast,
+/// not fail-silent: the caller (e.g. `AgentRateLimiter`) gets an error and can
+/// fall back to its in-memory path.
+///
+/// ## Telemetry
+///
+/// State changes are reported via
+/// `saacp_state_backend_circuit_breaker_state` (0=closed, 1=half-open, 2=open)
+/// on the global telemetry collector.
+pub struct CircuitBreakerBackend<B: StateBackend> {
+    inner: B,
+    state: std::sync::Mutex<CircuitBreakerState>,
+    /// Number of consecutive failures before the breaker opens.
+    threshold: u32,
+    /// How long the breaker stays open before transitioning to half-open.
+    cooldown: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerPosition {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+struct CircuitBreakerState {
+    position: BreakerPosition,
+    consecutive_failures: u32,
+    opened_at: Option<Instant>,
+}
+
+/// Default consecutive failures before the breaker opens.
+pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+/// Default cooldown before the breaker transitions from open → half-open.
+pub const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(10);
+
+impl<B: StateBackend> CircuitBreakerBackend<B> {
+    /// Wrap `inner` with the default threshold (5 failures) and cooldown (10s).
+    pub fn wrap(inner: B) -> Self {
+        Self::with_config(inner, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_COOLDOWN)
+    }
+
+    /// Wrap `inner` with explicit threshold and cooldown.
+    pub fn with_config(inner: B, threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            inner,
+            state: std::sync::Mutex::new(CircuitBreakerState {
+                position: BreakerPosition::Closed,
+                consecutive_failures: 0,
+                opened_at: None,
+            }),
+            threshold: threshold.max(1),
+            cooldown,
+        }
+    }
+
+    /// Probe the wrapped backend (M3): accessors are minimal and immutable —
+    /// this is for tests and downstream health checks.
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+
+    /// Check whether a call should be allowed. Returns `Ok(())` if the call
+    /// should proceed, `Err(...)` if the breaker is open.
+    fn check_state(&self) -> BackendResult<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.position {
+            BreakerPosition::Closed => Ok(()),
+            BreakerPosition::HalfOpen => Ok(()),
+            BreakerPosition::Open => {
+                // Check if cooldown has elapsed → transition to half-open.
+                if let Some(opened_at) = state.opened_at {
+                    if opened_at.elapsed() >= self.cooldown {
+                        state.position = BreakerPosition::HalfOpen;
+                        self.report_state(1); // half-open
+                        return Ok(());
+                    }
+                }
+                Err(BackendError(
+                    "state backend circuit breaker is OPEN — calls are rejected to \
+                     prevent stalling on a degraded backend. The breaker will \
+                     probe again after the cooldown period."
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Record the outcome of a call and transition state if needed.
+    fn record_outcome(&self, success: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if success {
+            if state.position != BreakerPosition::Closed {
+                eprintln!("[SAACP state-backend] circuit breaker CLOSED — backend recovered.");
+            }
+            state.position = BreakerPosition::Closed;
+            state.consecutive_failures = 0;
+            state.opened_at = None;
+            self.report_state(0); // closed
+        } else {
+            state.consecutive_failures += 1;
+            if state.position == BreakerPosition::HalfOpen {
+                // Half-open probe failed → reopen immediately.
+                state.position = BreakerPosition::Open;
+                state.opened_at = Some(Instant::now());
+                eprintln!(
+                    "[SAACP state-backend] circuit breaker re-OPENED (half-open probe \
+                     failed). Next probe in {:?}.",
+                    self.cooldown
+                );
+                self.report_state(2); // open
+            } else if state.consecutive_failures >= self.threshold {
+                state.position = BreakerPosition::Open;
+                state.opened_at = Some(Instant::now());
+                eprintln!(
+                    "[SAACP state-backend] circuit breaker OPENED after {} consecutive \
+                     failures. All calls will fast-fail for {:?}.",
+                    state.consecutive_failures, self.cooldown
+                );
+                self.report_state(2); // open
+            }
+        }
+    }
+
+    /// Report breaker state to telemetry (0=closed, 1=half-open, 2=open).
+    fn report_state(&self, state_code: u64) {
+        crate::telemetry::global_telemetry().set_state_backend_circuit_breaker_state(state_code);
+    }
+
+    /// Run `f` through the circuit breaker: check state, call, record outcome.
+    fn guarded<T>(&self, f: impl FnOnce(&B) -> BackendResult<T>) -> BackendResult<T> {
+        self.check_state()?;
+        let result = f(&self.inner);
+        self.record_outcome(result.is_ok());
+        result
+    }
+}
+
+impl<B: StateBackend> StateBackend for CircuitBreakerBackend<B> {
+    fn get(&self, key: &str) -> BackendResult<Option<Vec<u8>>> {
+        self.guarded(|b| b.get(key))
+    }
+
+    fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> BackendResult<()> {
+        self.guarded(|b| b.set(key, value, ttl))
+    }
+
+    fn delete(&self, key: &str) -> BackendResult<bool> {
+        self.guarded(|b| b.delete(key))
+    }
+
+    fn incr(&self, key: &str, by: i64) -> BackendResult<i64> {
+        self.guarded(|b| b.incr(key, by))
+    }
+
+    fn scan_prefix(&self, prefix: &str) -> BackendResult<Vec<String>> {
+        self.guarded(|b| b.scan_prefix(prefix))
+    }
+
+    fn incr_with_ttl(&self, key: &str, by: i64, ttl: Duration) -> BackendResult<i64> {
+        self.guarded(|b| b.incr_with_ttl(key, by, ttl))
+    }
+
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+        ttl: Option<Duration>,
+    ) -> BackendResult<bool> {
+        self.guarded(|b| b.compare_and_swap(key, expected, new, ttl))
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1131,5 +1322,164 @@ mod tests {
         // Exactly one racer should observe the original "v0" and win the swap — all
         // others must see the post-swap value and fail, proving no lost updates.
         assert_eq!(successes.load(Ordering::SeqCst), 1);
+    }
+
+    // ── CircuitBreakerBackend (M3) ───────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Switchable failing backend: when `failing` is set, every operation
+    /// returns `Err(BackendError)`; otherwise operations succeed trivially.
+    /// `calls` counts how often the inner backend was actually invoked, which
+    /// is what a fast-failing OPEN breaker must keep at zero.
+    struct FlakyBackend {
+        failing: std::sync::atomic::AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl FlakyBackend {
+        fn new(failing: bool) -> Self {
+            Self {
+                failing: std::sync::atomic::AtomicBool::new(failing),
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn fail_one<T>(&self) -> BackendResult<T> {
+            Err(BackendError("injected test failure".to_string()))
+        }
+        fn called(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn set_failing(&self, f: bool) {
+            self.failing.store(f, Ordering::SeqCst);
+        }
+    }
+
+    macro_rules! flaky_op {
+        ($self:ident) => {{
+            $self.calls.fetch_add(1, Ordering::SeqCst);
+            if $self.failing.load(Ordering::SeqCst) {
+                return $self.fail_one();
+            }
+        }};
+    }
+
+    impl StateBackend for FlakyBackend {
+        fn get(&self, _key: &str) -> BackendResult<Option<Vec<u8>>> {
+            flaky_op!(self);
+            Ok(None)
+        }
+        fn set(&self, _key: &str, _value: &[u8], _ttl: Option<Duration>) -> BackendResult<()> {
+            flaky_op!(self);
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> BackendResult<bool> {
+            flaky_op!(self);
+            Ok(false)
+        }
+        fn incr(&self, _key: &str, _by: i64) -> BackendResult<i64> {
+            flaky_op!(self);
+            Ok(0)
+        }
+        fn scan_prefix(&self, _prefix: &str) -> BackendResult<Vec<String>> {
+            flaky_op!(self);
+            Ok(Vec::new())
+        }
+        fn incr_with_ttl(&self, _key: &str, _by: i64, _ttl: Duration) -> BackendResult<i64> {
+            flaky_op!(self);
+            Ok(0)
+        }
+        fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+            _ttl: Option<Duration>,
+        ) -> BackendResult<bool> {
+            flaky_op!(self);
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold_and_fast_fails() {
+        let inner = FlakyBackend::new(true);
+        let breaker = CircuitBreakerBackend::with_config(inner, 2, Duration::from_secs(60));
+        // Threshold = 2 consecutive failures opens the breaker.
+        assert!(breaker.get("k").is_err(), "first failure");
+        assert!(breaker.get("k").is_err(), "second failure — breaker opens");
+        assert_eq!(
+            breaker.inner().called(),
+            2,
+            "both failures reached the inner"
+        );
+        let calls_before = breaker.inner().called();
+        let err = breaker.get("k").expect_err("OPEN breaker must fast-fail");
+        assert!(
+            err.0.contains("circuit breaker is OPEN"),
+            "fast-fail error must identify the breaker: {}",
+            err.0
+        );
+        assert_eq!(
+            breaker.inner().called(),
+            calls_before,
+            "an OPEN breaker must not forward calls to the degraded backend"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_half_open_recovers_on_first_success() {
+        let inner = FlakyBackend::new(true);
+        let breaker = CircuitBreakerBackend::with_config(inner, 1, Duration::from_millis(30));
+        assert!(breaker.get("k").is_err(), "one failure opens (threshold=1)");
+        std::thread::sleep(Duration::from_millis(60)); // let cooldown elapse
+        assert!(
+            breaker.get("k").is_err(),
+            "still failing during half-open probe"
+        );
+        // The failed half-open probe reopens the breaker AND resets the
+        // cooldown clock — we must wait out a fresh cooldown before the
+        // next probe is allowed through.
+        std::thread::sleep(Duration::from_millis(60));
+        breaker.inner().set_failing(false);
+        assert!(
+            breaker.get("k").is_ok(),
+            "half-open probe success must close the breaker"
+        );
+        assert!(
+            breaker.get("k").is_ok(),
+            "closed breaker forwards calls again"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_half_open_failure_reopens_immediately() {
+        let inner = FlakyBackend::new(true);
+        let breaker = CircuitBreakerBackend::with_config(inner, 1, Duration::from_millis(30));
+        assert!(breaker.get("k").is_err());
+        std::thread::sleep(Duration::from_millis(60));
+        // half-open probe fails → reopen WITHOUT needing to hit `threshold` again.
+        assert!(breaker.get("k").is_err(), "half-open probe fails");
+        let calls = breaker.inner().called();
+        let err = breaker.get("k").expect_err("reopened breaker fast-fails");
+        assert!(err.0.contains("circuit breaker is OPEN"));
+        assert_eq!(
+            breaker.inner().called(),
+            calls,
+            "reopened breaker must fast-fail again"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_closed_passes_through() {
+        let inner = FlakyBackend::new(false);
+        let breaker = CircuitBreakerBackend::wrap(inner);
+        assert!(breaker.set("k", b"v", None).is_ok());
+        assert!(breaker.get("k").is_ok());
+        assert_eq!(
+            breaker.inner().called(),
+            2,
+            "healthy backend sees both calls"
+        );
     }
 }

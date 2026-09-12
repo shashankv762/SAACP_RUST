@@ -288,3 +288,179 @@ fn wal_unclean_shutdown_data_loss_bound() {
     let _ = std::fs::remove_file(&log_file);
     let _ = std::fs::remove_file(&sentinel);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// longcat.md Step 3 — Gate 6.0 fail-closed on the write itself
+// (end-to-end contract; the class-aware write decision itself is pinned by
+// the `test_gate_6_0_*` white-box unit tests in `handler.rs`'s test module)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a 128-byte-header, AEAD-encrypted SAACP frame carrying `payload` —
+/// mirrors the helper in `tests/test_production_readiness_fixes_rs.rs`.
+fn build_frame(
+    secret: &[u8],
+    payload: &[u8],
+    schema_id: u16,
+    flags: u8,
+    action_class: u8,
+) -> Vec<u8> {
+    use saacp::framing::MEASCFrame;
+    let frame = MEASCFrame {
+        schema_id,
+        status_code: 0x10,
+        flags,
+        action_class,
+        payload_length: payload.len() as u32,
+        session_id: [0xCCu8; 16],
+        epoch_id: 0,
+        psn: 1,
+        context_ref_id: [0u8; 32],
+        context_version: 0,
+        w3c_traceparent: [0u8; 24],
+    };
+    frame
+        .encode_encrypted(payload, secret)
+        .expect("test helper: AEAD frame build failed")
+}
+
+/// An audit log whose WAL worker cannot open its file: health becomes Fatal
+/// and every subsequent enqueue fails — the steady-state form of "the audit
+/// subsystem cannot durably record this packet".
+fn doomed_audit_log(tag: &str) -> ImmutableAuditLog {
+    let bad_dir = std::env::temp_dir().join(format!(
+        "saacp_no_such_dir_{}_{}_gate6_e2e",
+        std::process::id(),
+        tag
+    ));
+    let log_file = bad_dir.join("audit.log");
+    let log = ImmutableAuditLog::with_paths(
+        log_file.to_str().unwrap(),
+        &format!("{}.sentinel", log_file.to_str().unwrap()),
+    );
+    // Bounded poll for the real open() failure to be observed (same pattern
+    // as `wal_open_failure_is_fatal_not_silent` above).
+    let mut waited = Duration::ZERO;
+    while log.health() != AuditHealth::Fatal && waited < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+        waited += Duration::from_millis(5);
+    }
+    assert_eq!(
+        log.health(),
+        AuditHealth::Fatal,
+        "harness: WAL against a nonexistent directory must become Fatal"
+    );
+    log
+}
+
+/// Step 3 end-to-end: an IRREVERSIBLE packet whose audit entry cannot be
+/// durably recorded must be rejected with `AuditSubsystemDegraded` —
+/// fail-closed. (Observationally the rejection fires at Gate 2.5's pre-write
+/// health check in this steady state; Gate 6.0's own fallible write covers
+/// the residual race window, pinned by the white-box unit tests.)
+#[test]
+fn gate6_irreversible_packet_rejected_when_audit_unwritable() {
+    let secret = [0xC6u8; 32];
+    let gw = saacp::ZeroTrustGateway::new();
+    let token_bytes = gw.issue_capability_token(
+        &secret,
+        "gate6-e2e-issuer",
+        &["gate6-e2e-target"],
+        &[],
+        3600,
+        None,
+        0x02, // ceiling: IRREVERSIBLE
+        None,
+    );
+    let token = String::from_utf8(token_bytes).expect("token must be base64 utf8");
+    let payload = serde_json::json!({
+        "task": "irreversible operation",
+        "priority": 1,
+        "_capability_token": token,
+    })
+    .to_string();
+    let frame = build_frame(&secret, payload.as_bytes(), 1, 0x10, 0x02);
+    let rl = saacp::AgentRateLimiter::new();
+    let log = doomed_audit_log("irr");
+
+    let r = saacp::SAACPProtocolHandler::intercept_packet_full(
+        &frame,
+        &secret,
+        "gate6-e2e-target",
+        false,
+        Some(&gw),
+        Some(&rl),
+        Some(&log),
+        None,
+        None,
+    );
+    let err = r.expect_err(
+        "an irreversible packet must be rejected when the audit subsystem cannot \
+         durably record it",
+    );
+    assert_eq!(
+        err.bytecode,
+        saacp::errors::SAACPBytecodes::AuditSubsystemDegraded,
+        "rejection bytecode must be AuditSubsystemDegraded, got {:?}",
+        err.bytecode
+    );
+    assert_eq!(
+        log.dropped_audit_count(),
+        0,
+        "the rejection must happen BEFORE this packet's own audit write, leaving \
+         no partial audit state behind"
+    );
+}
+
+/// The availability half of Step 3: a REVERSIBLE packet under the same
+/// unwritable-audit conditions still succeeds end to end — its failed audit
+/// write is converted to the recorded count-only flow (lifetime drop counter
+/// and sticky health floor), not a packet drop. Blocking reversible traffic on
+/// audit pressure would be a self-inflicted availability cliff.
+#[test]
+fn gate6_reversible_packet_succeeds_when_audit_unwritable() {
+    let secret = [0xC7u8; 32];
+    let gw = saacp::ZeroTrustGateway::new();
+    let token_bytes = gw.issue_capability_token(
+        &secret,
+        "gate6-e2e-issuer-rev",
+        &["gate6-e2e-target-rev"],
+        &[],
+        3600,
+        None,
+        0x00, // ceiling: READ_ONLY
+        None,
+    );
+    let token = String::from_utf8(token_bytes).expect("token must be base64 utf8");
+    let payload = serde_json::json!({
+        "task": "read-only inspection",
+        "priority": 1,
+        "_capability_token": token,
+    })
+    .to_string();
+    let frame = build_frame(&secret, payload.as_bytes(), 1, 0x10, 0x00);
+    let rl = saacp::AgentRateLimiter::new();
+    let log = doomed_audit_log("rev");
+
+    let r = saacp::SAACPProtocolHandler::intercept_packet_full(
+        &frame,
+        &secret,
+        "gate6-e2e-target-rev",
+        false,
+        Some(&gw),
+        Some(&rl),
+        Some(&log),
+        None,
+        None,
+    );
+    assert!(
+        r.is_ok(),
+        "a reversible packet must still succeed when its audit entry cannot be \
+         enqueued (count-only flow), got {:?}",
+        r.err()
+    );
+    assert!(
+        log.dropped_audit_count() >= 1,
+        "the Gate 6.0 write was attempted and dropped — the drop must be counted \
+         so the sticky health floor keeps later irreversible traffic fail-closed"
+    );
+}

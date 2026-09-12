@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-sidecar
+  labels:
+    app.kubernetes.io/name: saacp-sidecar
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.sidecar.port }}
+      targetPort: saacp
+      protocol: TCP
+      name: saacp
+    - port: {{ .Values.sidecar.httpPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: saacp-sidecar
+    app.kubernetes.io/instance: {{ .Release.Name }}

@@ -336,3 +336,39 @@ The SAACP-RS codebase is a **security-first, well-engineered protocol implementa
 3. **Fail-safety**: The no-gateway fallback silently degrades security, and the WAL drops events under load
 
 The remediation plan above addresses each gap with specific, implementable changes. With these fixes applied, the codebase would rate **8.5/10** for production readiness.
+
+---
+
+## Re-verification addendum (2026-09-07)
+
+Re-verified at `35ca8d8` plus the subsequent remediation pass tracked in
+`CHANGELOG.md` under `[Unreleased]`. Statuses: **CLOSED** (fix + dedicated
+tests), **DEFERRED** (accepted future work, documented reason).
+
+### Original findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| Gap A — dual JSON parse per packet | CLOSED | Phase 3 / P-3: `payload_dict` built once; Gate 9.0 reuses `parsed_payload_json` with bytecode-identical error mapping |
+| Gap B — global singleton coupling | CLOSED | `SaacpContext` owns all 15 hot-path subsystems. Handler fallbacks are `param → ctx` (the shared default aliases the exact legacy globals); daemon per-connection checks (IP trust gating + hard-drop penalty, revocation-epoch pinning, identity-gate advancement incl. the handshake, chain recovery, shutdown WAL flush) resolve through the connection's context — the hard-drop penalty no longer hits the global trust engine for hermetic contexts (cross-tenant leak fixed). Deliberately process-global: `identity_binding::DEFAULT_IDENTITY_REGISTRY` (the daemon-handshake ↔ Gate-1.0 pairing) and the daemon-owned cluster/gossip engines |
+| Gap C — synchronous gate pipeline on `spawn_blocking` | DEFERRED | Full async-native Gate 0-12 rewrite judged regression-disproportionate: the M12 `pipeline_semaphore` and per-packet `spawn_blocking` already bound concurrency and queue latency |
+| Gap D — no backpressure on audit WAL | CLOSED | `dropped_audit_count` lifetime counter, sticky health floor, Gate 2.5 `AuditHealth` gating, `acknowledge_dropped_audits`; plus Gate-6.0-write fail-closed (new items, below) |
+| Gap E — missing observability integration | CLOSED | opt-in `health-endpoint` feature: `/healthz`, `/readyz`, Prometheus `/metrics` (bearer-gated off-loopback) |
+| Risk 1 — nonce `TOCTOU` / prune lock spike | CLOSED | counter-gated amortized prune (Fix 4 as sketched here) |
+| Risk 2 — `SystemTime::now()` 3-5x per packet | CLOSED | Phase 4 clock seam + consolidation, completed by migrating the last 6 `handler.rs` + 1 `daemon.rs` sites onto `crate::clock::now_secs_f64()` |
+| Risk 3 — unbounded `payload_dict` | CLOSED | `MAX_PAYLOAD_KEYS = 4096` + 8 MiB byte budget, enforced pre-allocation |
+| Risk 4 — `serde_json::Value` recursion | CLOSED | bounded `serde_value_to_json_value_bounded` (+ `MalformedDepthExceeded` sentinel) at depth 8 |
+| Risk 5 — audit rotation race (orphan `.bak`) | CLOSED | startup sweep in every `ImmutableAuditLog` construction re-runs the C-4 compression on `<basename>.<ts>.bak` orphans; never-panic; process-local dedup claimed inside the compression entry point covers sweep-vs-sweep AND sweep-vs-live-rotation double-compression |
+| Risk 6 — fail-open gateway fallback | CLOSED | default builds fail closed at Gate 1.0 (`LateralMovementBlocked`); the synthetic READ_ONLY grant exists only under `dangerously-skip-gateway` |
+
+### Defects found by the re-verification itself (and now closed)
+
+| Item | Evidence |
+|---|---|
+| cp1252 double-encoded mojibake across the 8 Phase-4 clock modules (including user-facing `SAACPHardDrop` strings) | Byte-exact inverse transform repair (commit `35ca8d8`); standing guard `tests/test_no_mojibake_rs.rs` |
+| `ImmutableAuditLog::try_append_event` had zero production callers — a packet whose own audit entry was dropped still executed | Gate 6.0 now routes through `gate_6_0_audit_checkpoint`: IRREVERSIBLE (action_class >= 0x02) packets hard-drop with `AuditSubsystemDegraded`; reversible traffic keeps the count-only flow. Pinned by 3 white-box unit tests (`handler.rs`) + 2 end-to-end tests (`tests/test_gate6_backpressure_rs.rs`) |
+| `spawn_dropped_audit_autoack` was dead code | Opt-in daemon wiring: `SAACPNetworkDaemon::with_dropped_audit_autoack(window)` spawns it at startup (shutdown-token bound, joined at drain); floor-release unit test in `security.rs` |
+| Stale docs: daemon no-gateway field doc + startup warning described the removed READ_ONLY grant; README test counts said 56 | Both describe the fail-closed default now; README reports 61 test files / 7 breakit suites |
+
+With the above, every actionable item in this report is closed; the codebase
+is at the 8.5/10 posture projected here.

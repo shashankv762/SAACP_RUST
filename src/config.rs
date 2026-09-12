@@ -119,6 +119,12 @@ pub struct SidecarSection {
     pub send_retry_attempts: Option<u32>,
     pub enable_mpf: Option<bool>,
     pub enable_mace: Option<bool>,
+    /// M2 remediation: path to a file containing a Redis URL (e.g.
+    /// `rediss://user:pass@host:6379/`). The URL itself is secret material
+    /// (may contain credentials), so only a file path is accepted — no raw
+    /// URL in TOML or env. When set, the sidecar constructs a
+    /// `RedisBackend` wrapped in `CircuitBreakerBackend`.
+    pub state_backend_url_file: Option<String>,
 }
 
 /// `[command_center]` section — consumed by `saacp_command_center.rs`.
@@ -232,6 +238,14 @@ impl SaacpConfig {
                 ));
             }
         }
+        // M2 remediation: reject an explicitly-set but empty URL file path.
+        if let Some(ref path) = self.sidecar.state_backend_url_file {
+            if path.trim().is_empty() {
+                return bad(
+                    "sidecar.state_backend_url_file must not be empty when set".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -259,6 +273,10 @@ impl SaacpConfig {
                 s.http_bearer_token_file.as_deref(),
             ),
             ("http_token_out_file", s.http_token_out_file.as_deref()),
+            (
+                "state_backend_url_file",
+                s.state_backend_url_file.as_deref(),
+            ),
             (
                 "max_concurrent_sends",
                 s.max_concurrent_sends.map(|v| v.to_string()).as_deref(),

@@ -58,11 +58,9 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::framing::{MEASCFrame, ParsedFrame, FLAG_BINARY_STREAM, FLAG_COVER_TRAFFIC};
 use crate::gateway::{AgentRateLimiter, ZeroTrustGateway};
 use crate::measc::SessionEpochManager;
-use crate::memory::FederatedMemory;
 use crate::schemas::PreCompiledSchemas;
 use crate::security::ImmutableAuditLog;
 use crate::telemetry::report_gate_rejection;
-use crate::temporal::DeadMansSwitch;
 use crate::trust_decay::{trust_key_for, PenaltyKind, RewardKind, CHAIN_DRIFT_CEILING};
 
 /// Wrap a gate call expression with latency instrumentation (Phase 5
@@ -630,10 +628,7 @@ fn gate_4_0_should_penalize(
     if action_class != crate::framing::ACTION_CLASS_READ_ONLY {
         return true;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or_default();
+    let now = crate::clock::now_secs_f64();
     let mut solo = INJECTION_SOLO_HITS.lock();
     if solo.len() >= INJECTION_CORROBORATION_MAX_ENTRIES {
         solo.retain(|_, t| now - *t <= INJECTION_CORROBORATION_WINDOW_SECS);
@@ -1370,6 +1365,57 @@ impl SAACPProtocolHandler {
         Ok(())
     }
 
+    /// Gate 6.0 write leg (longcat.md Step 3 — audit fail-closed on the write
+    /// itself, complementing Gate 2.5's pre-write health check).
+    ///
+    /// Sends this packet's checkpoint entry through the FALLIBLE
+    /// [`ImmutableAuditLog::try_append_event`] and enforces a class-aware
+    /// outcome:
+    ///
+    /// - **IRREVERSIBLE actions** (`action_class >= 0x02`, the same threshold
+    ///   Gate 2.5 uses): a failed enqueue (WAL queue full / worker exited) is
+    ///   returned as `Err` carrying [`SAACPBytecodes::AuditSubsystemDegraded`]
+    ///   — the caller MUST hard-drop the packet. A packet whose own action
+    ///   cannot be durably recorded must not execute; that combination would
+    ///   punch a silent hole in the audit trail exactly where accountability
+    ///   matters most. Gate 2.5 cannot catch this case: it consults
+    ///   `health()` BEFORE this packet's write attempt, so it misses a queue
+    ///   that fills (or a worker that dies) between the two points.
+    /// - **Reversible / read-only actions** (`< 0x02`): the legacy count-only
+    ///   flow is preserved — `try_append_event` already increments
+    ///   `dropped_audit_count`, raises the sticky health floor (keeping Gate
+    ///   2.5 fail-closed for subsequent IRREVERSIBLE traffic), and emits its
+    ///   warn-on-drop signal; the packet itself still succeeds.
+    ///
+    /// Returns `Ok(())` when the entry was enqueued, or when the enqueue
+    /// failed for a non-irreversible action.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_6_0_audit_checkpoint(
+        audit_log: &ImmutableAuditLog,
+        issuer_secret: &[u8],
+        source_agent: &str,
+        target_agent: &str,
+        token_signature: &str,
+        evaluated_intent: &str,
+        traceparent: &str,
+        action_class: u8,
+    ) -> Result<(), SAACPHardDrop> {
+        match audit_log.try_append_event(
+            issuer_secret,
+            source_agent,
+            target_agent,
+            token_signature,
+            evaluated_intent,
+            traceparent,
+        ) {
+            Ok(()) => Ok(()),
+            // 0x02 == IRREVERSIBLE_ACTION — the same class threshold as
+            // Gate 2.5's health check above.
+            Err(e) if action_class >= 0x02 => Err(e),
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Gate 5.0: Epistemic Circuit Breaker.
     /// Checks confidence score for schema_id == 3 payloads.
     ///
@@ -1935,6 +1981,18 @@ impl SAACPProtocolHandler {
     ///
     /// Authorization Invariance: `cached_token_result` being Some() is a protocol
     /// violation (§20.3). Passing a non-None cached result raises an error.
+    ///
+    /// **Default-build behavior note** (longcat.md Step 7): this 4-argument
+    /// convenience entry point injects NO gateway, rate limiter, audit log,
+    /// AEGF governor, or CSCS detector and runs on the shared-default
+    /// [`SaacpContext`]. In any build without the `dangerously-skip-gateway`
+    /// feature, Gate 1.0 therefore fails CLOSED (`LateralMovementBlocked`) for
+    /// every token-bearing packet — there is no trust anchor to validate
+    /// against. Production traffic must be driven through a gateway-configured
+    /// daemon (`SAACPNetworkDaemon::with_gateway`) or through
+    /// [`Self::intercept_packet_full`]/[`Self::intercept_packet_full_with_ctx`]
+    /// with an explicit gateway; the dangerous feature flag exists solely for
+    /// local parity with the Python reference harness.
     pub fn intercept_packet(
         packet: &[u8],
         secret_key: &[u8],
@@ -2001,11 +2059,13 @@ impl SAACPProtocolHandler {
     ) -> Result<ParsedPacket, SAACPHardDrop> {
         // ── GAP-3 / GAP-10: Always enforce circuit breaker ────────────────────
         // Python's `intercept_packet` always calls AgentRateLimiter.is_locked()
-        // and record_error() as classmethods (global state). In Rust we enforce
-        // the same invariant by falling back to the global singleton when no
-        // rate_limiter is explicitly injected (the daemon's default call path).
-        let global_rl = AgentRateLimiter::global();
-        let effective_rl: &AgentRateLimiter = rate_limiter.unwrap_or(global_rl);
+        // and record_error() as classmethods (global state). The fallback chain
+        // here is param → this context's limiter (Gap B / longcat.md Step 2);
+        // the shared-default context's `rate_limiter` field aliases the exact
+        // instance the legacy `AgentRateLimiter::global()` accessor returns, so
+        // unconfigured callers observe byte-identical behavior.
+        let effective_rl: &AgentRateLimiter =
+            rate_limiter.unwrap_or_else(|| ctx.rate_limiter.as_ref());
 
         // opusplan.md 6.4 item 1: one wall-clock read shared by both pre-gate checks
         // below (`is_locked_at` + `requires_reauth_at`) — a few lines apart with no
@@ -2013,10 +2073,7 @@ impl SAACPProtocolHandler {
         // identical to each check taking its own while removing a redundant syscall
         // from every packet's hot path. Mirrors the `pipeline_now_secs` precedent
         // later in this pipeline (Gate 11.0/12.0's shared TTL read).
-        let pregate_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let pregate_now = crate::clock::now_secs_f64();
 
         // ── Pre-gate: AgentRateLimiter circuit-breaker lockout check ─────────
         // If the agent is locked out, reject before even decrypting (saves compute).
@@ -2191,15 +2248,14 @@ impl SAACPProtocolHandler {
         rate_limiter: Option<&AgentRateLimiter>,
         audit_log: Option<&ImmutableAuditLog>,
     ) -> Result<ParsedPacket, SAACPHardDrop> {
-        let global_rl = AgentRateLimiter::global();
-        let effective_rl: &AgentRateLimiter = rate_limiter.unwrap_or(global_rl);
+        // Gap B / longcat.md Step 2: param → context fallback — see the GAP-3
+        // comment in `intercept_packet_full_with_ctx`.
+        let effective_rl: &AgentRateLimiter =
+            rate_limiter.unwrap_or_else(|| ctx.rate_limiter.as_ref());
 
         // opusplan.md 6.4 item 1: see the identical comment in `intercept_packet_full`
         // above — one wall-clock read shared by both pre-gate checks below.
-        let pregate_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let pregate_now = crate::clock::now_secs_f64();
 
         if effective_rl.is_locked_at(current_agent_name, pregate_now) {
             return Err(SAACPHardDrop::new(
@@ -2575,7 +2631,9 @@ impl SAACPProtocolHandler {
             // On HEARTBEAT_PING, ping the DeadMansSwitch for this context.
             if parsed.status_code == SAACPBytecodes::HeartbeatPing as u8 {
                 let cid_bytes = hex::decode(&parsed.context_state_id).unwrap_or_default();
-                let dms = DeadMansSwitch::global();
+                // Gap B / longcat.md Step 2: this context's dead-man's switch
+                // (aliases the legacy process global under the shared default).
+                let dms = ctx.dead_mans_switch.as_ref();
                 // A heartbeat is how a session signals liveness, so it is also
                 // where the session first becomes tracked. `ping` deliberately
                 // never creates a phantom session (it only refreshes an existing
@@ -2596,7 +2654,9 @@ impl SAACPProtocolHandler {
                 }
             }
             // Validate context exists in FederatedMemory (version must match).
-            let cid_result = FederatedMemory::global()
+            // Gap B / longcat.md Step 2: per-context federated memory.
+            let cid_result = ctx
+                .federated_memory
                 .fetch_context_by_hex(&parsed.context_state_id, parsed.context_version);
             if cid_result.is_err() {
                 if parsed.status_code == SAACPBytecodes::HeartbeatPing as u8 {
@@ -2740,16 +2800,12 @@ impl SAACPProtocolHandler {
         // deployments where identity binding is off but a caller still wants ordering
         // bookkeeping. AUTHORIZED reflects that Gate 1.0 (this function) has just
         // validated the capability token.
-        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
-            &source_agent,
-            &parsed.session_uuid,
-            "IDENTITY_VERIFIED",
-        );
-        let _ = crate::identity_binding::GLOBAL_IDENTITY_GATE.advance(
-            &source_agent,
-            &parsed.session_uuid,
-            "AUTHORIZED",
-        );
+        let _ = ctx
+            .identity_gate
+            .advance(&source_agent, &parsed.session_uuid, "IDENTITY_VERIFIED");
+        let _ = ctx
+            .identity_gate
+            .advance(&source_agent, &parsed.session_uuid, "AUTHORIZED");
 
         parsed.source_agent = Arc::from(token_result.source_agent);
 
@@ -2856,7 +2912,7 @@ impl SAACPProtocolHandler {
             // receipt time (see `ievl::declaration_id`'s doc comment).
             if parsed.action_class >= crate::ievl::RECEIPT_REQUIRED_ACTION_CLASS {
                 if let Some(task_str) = Self::extract_task_str(&parsed.payload_dict) {
-                    crate::ievl::IevlEngine::global().register_declaration(
+                    ctx.ievl.register_declaration(
                         &parsed.session_uuid,
                         parsed.sequence_id,
                         &source_agent,
@@ -3023,26 +3079,28 @@ impl SAACPProtocolHandler {
         );
         let traceparent_hex: String = hex::encode(&parsed.traceparent);
 
-        if let Some(log) = audit_log {
-            log.append_event(
-                secret_key,
-                &source_agent,
-                current_agent_name,
-                &token_sig_hex,
-                &evaluated_intent,
-                &traceparent_hex,
-            );
-        } else {
-            // Use the global audit log when none injected.
-            ctx.audit.as_ref().append_event(
-                secret_key,
-                &source_agent,
-                current_agent_name,
-                &token_sig_hex,
-                &evaluated_intent,
-                &traceparent_hex,
-            );
-        }
+        // longcat.md Step 3: the checkpoint goes through the FALLIBLE append
+        // with the class-aware contract — an IRREVERSIBLE packet whose own
+        // audit entry cannot be enqueued is hard-dropped (fail-closed);
+        // reversible/read-only traffic keeps the legacy count-only flow (the
+        // drop is already recorded by the WAL layer: lifetime counter, sticky
+        // health floor, warn). `audit_log` is resolved to this context's chain
+        // near the top of this function, so the legacy
+        // `if let Some(log) ... else { ctx.audit }` fallback branches collapse
+        // into one binding here. No `report_gate_rejection` on the Err path:
+        // `enqueue_wal_line`'s drop handling already recorded the
+        // `gate_6_0_audit` rejection for THIS event (every dropped audit event
+        // is counted) — re-counting would double-charge one failure.
+        Self::gate_6_0_audit_checkpoint(
+            audit_log.unwrap_or_else(|| ctx.audit.as_ref()),
+            secret_key,
+            &source_agent,
+            current_agent_name,
+            &token_sig_hex,
+            &evaluated_intent,
+            &traceparent_hex,
+            parsed.action_class,
+        )?;
 
         // ── Gate 9.0: JSON Schema Validation + RGC Gate 2 ────────────────────
         // Mandatory for ALL tiers on non-binary, non-stream-continuation frames.
@@ -3104,19 +3162,18 @@ impl SAACPProtocolHandler {
         }
 
         // Phase 3 fix: a single wall-clock read shared by Gate 11.0's and Gate
-        // 12.0's TTL computation below, replacing two separate SystemTime::now()
-        // calls a few dozen lines apart with no state change between them — both
+        // 12.0's TTL computation below, replacing two separate clock reads a
+        // few dozen lines apart with no state change between them — both
         // gates only ever add a fixed 3600-second window to "now", so sharing one
         // timestamp is behaviorally identical while removing a redundant syscall
-        // from the hot path. Computed only when at least one of the two gates
-        // below will actually run (both share the exact same `is_schema_exempt`
-        // guard) — a schema-exempt packet still performs zero wall-clock reads
-        // here, exactly as before this change.
+        // from the hot path. Longcat.md Step 6: the read goes through
+        // `crate::clock::now_secs_f64()` (the injectable seam). Computed only
+        // when at least one of the two gates below will actually run (both
+        // share the exact same `is_schema_exempt` guard) — a schema-exempt
+        // packet still performs zero wall-clock reads here, exactly as before
+        // this change.
         let pipeline_now_secs = if !is_schema_exempt(parsed.status_code) {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
+            crate::clock::now_secs_f64()
         } else {
             0.0 // unused: both gates below are skipped for schema-exempt packets
         };
@@ -3142,8 +3199,10 @@ impl SAACPProtocolHandler {
         // `factf::DelegationChainValidator::validate_chain` — which validates the
         // actual signed parent-child delegation chain, not this per-packet DEG.
         if !is_schema_exempt(parsed.status_code) {
-            use crate::aegf::{AEGFMetadata, GovernanceDecision, GLOBAL_AEGF_GOVERNOR, RID_ROOT};
-            let gov = _aegf_governor.unwrap_or_else(|| &*GLOBAL_AEGF_GOVERNOR);
+            use crate::aegf::{AEGFMetadata, GovernanceDecision, RID_ROOT};
+            // Gap B / longcat.md Step 2: param → this context's governor (the
+            // shared default aliases the legacy `GLOBAL_AEGF_GOVERNOR`).
+            let gov = _aegf_governor.unwrap_or_else(|| ctx.aegf.as_ref());
 
             // Derive a deterministic per-packet RID from session + sequence so
             // each intercepted packet is a distinct node in the DEG.
@@ -3231,9 +3290,10 @@ impl SAACPProtocolHandler {
         // call site. Only check (1) provides real loop protection here.
         if !is_schema_exempt(parsed.status_code) {
             use crate::aegf::{AEGFMetadata, RID_ROOT};
-            use crate::cscs::GLOBAL_CSCS;
 
-            let cscs_det = _cscs.unwrap_or_else(|| &*GLOBAL_CSCS);
+            // Gap B / longcat.md Step 2: param → this context's loop detector
+            // (the shared default aliases the legacy `GLOBAL_CSCS`).
+            let cscs_det = _cscs.unwrap_or_else(|| ctx.cscs.as_ref());
 
             // RID unique per (session + sequence) → fingerprint unique per packet.
             // hc = truncated sequence_id represents progression within the session.
@@ -3357,10 +3417,7 @@ impl SAACPProtocolHandler {
             };
 
         // Gate 1.0 (capability expiry) — enforced on stream originating token
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::clock::now_secs_f64();
         if token_exp > 0.0 && now > token_exp {
             ctx.streams.abort_stream(&stream_id);
             return Err(SAACPHardDrop::new(
@@ -3370,13 +3427,17 @@ impl SAACPProtocolHandler {
         }
 
         // Gate 1.0 (capability revocation) — live revocation list check
-        // SECURITY FIX: When no gateway is injected, fall back to the global singleton
-        // rather than silently skipping revocation. The old code returned `false` (not
-        // revoked) unconditionally when gateway=None, allowing streams started with a
-        // valid token to continue indefinitely even after that token was revoked.
+        // SECURITY FIX: When no gateway is injected, fall back to this context's
+        // gateway rather than silently skipping revocation (Gap B / longcat.md
+        // Step 2). The shared default's `gateway` field aliases the exact
+        // `ZeroTrustGateway::global()` instance, so unconfigured callers behave
+        // byte-identically to the pre-Phase-4 global fallback. The old code
+        // returned `false` (not revoked) unconditionally when gateway=None,
+        // allowing streams started with a valid token to continue indefinitely
+        // even after that token was revoked.
         if !token_sig_hash.is_empty() {
-            let global_gw = crate::gateway::ZeroTrustGateway::global();
-            let effective_gw: &crate::gateway::ZeroTrustGateway = gateway.unwrap_or(global_gw);
+            let effective_gw: &crate::gateway::ZeroTrustGateway =
+                gateway.unwrap_or_else(|| ctx.gateway.as_ref());
             if effective_gw.is_token_revoked(&token_sig_hash) {
                 ctx.streams.abort_stream(&stream_id);
                 return Err(SAACPHardDrop::new(
@@ -3555,10 +3616,7 @@ impl SAACPProtocolHandler {
         )) = &session_info
         {
             // Gate 1.0 (capability expiry)
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
+            let now = crate::clock::now_secs_f64();
             if *token_exp > 0.0 && now > *token_exp {
                 ctx.streams.abort_stream(&stream_id);
                 return Err(SAACPHardDrop::new(
@@ -3567,13 +3625,15 @@ impl SAACPProtocolHandler {
                 ));
             }
             // Gate 1.0 (capability revocation)
-            // SECURITY FIX (STREAM-END-REVOKE): Mirror handle_stream_continuation — fall back
-            // to the global gateway when none is injected. The old code returned `false`
-            // (not revoked) unconditionally when gateway=None, allowing STREAM_END frames
-            // to complete even after the originating token had been revoked.
+            // SECURITY FIX (STREAM-END-REVOKE): Mirror handle_stream_continuation — fall
+            // back to this context's gateway when none is injected (Gap B / longcat.md
+            // Step 2; the shared default's `gateway` field aliases the legacy process
+            // global). The old code returned `false` (not revoked) unconditionally when
+            // gateway=None, allowing STREAM_END frames to complete even after the
+            // originating token had been revoked.
             if !token_sig_hash.is_empty() {
-                let global_gw = crate::gateway::ZeroTrustGateway::global();
-                let effective_gw: &crate::gateway::ZeroTrustGateway = gateway.unwrap_or(global_gw);
+                let effective_gw: &crate::gateway::ZeroTrustGateway =
+                    gateway.unwrap_or_else(|| ctx.gateway.as_ref());
                 if effective_gw.is_token_revoked(token_sig_hash) {
                     ctx.streams.abort_stream(&stream_id);
                     return Err(SAACPHardDrop::new(
@@ -4384,6 +4444,137 @@ mod tests {
 
         // READ_ONLY under the same degraded conditions still passes.
         assert!(SAACPProtocolHandler::gate_2_5_kinetic_firewall(0, 2, Some(&log)).is_ok());
+    }
+
+    /// longcat.md Step 3 (Gate 6.0 fail-closed on the WRITE itself): when the
+    /// WAL cannot persist this packet's own audit entry, an IRREVERSIBLE
+    /// packet must be hard-dropped with `AuditSubsystemDegraded` — a packet
+    /// whose action cannot be recorded must not execute. This is the
+    /// complement to Gate 2.5's pre-write health check: 2.5 cannot observe a
+    /// queue that fills (or a worker that dies) between its check and the
+    /// Gate 6.0 write.
+    ///
+    /// Deterministic harness: a WAL pointed at a nonexistent directory fails
+    /// its real open() — the worker exits, health goes Fatal, and every
+    /// subsequent `try_append_event` enqueue fails. Gate 2.5 is deliberately
+    /// not in this path; calling the Gate 6.0 helper directly pins the
+    /// class-aware write contract itself.
+    #[test]
+    fn test_gate_6_0_fail_closed_irreversible_when_audit_unwritable() {
+        let bad_dir = std::env::temp_dir().join(format!(
+            "saacp_no_such_dir_{}_{}_g6irr",
+            std::process::id(),
+            line!()
+        ));
+        let log_file = bad_dir.join("audit.log");
+        let log = ImmutableAuditLog::with_paths(
+            log_file.to_str().unwrap(),
+            &format!("{}.sentinel", log_file.to_str().unwrap()),
+        );
+        // Poll (bounded) for the WAL worker's open failure — same pattern as
+        // test_gate_2_5_rejects_irreversible_when_audit_degraded above.
+        let mut waited = std::time::Duration::ZERO;
+        while log.health() != crate::security::AuditHealth::Fatal
+            && waited < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += std::time::Duration::from_millis(5);
+        }
+        assert_eq!(log.health(), crate::security::AuditHealth::Fatal);
+
+        let err = SAACPProtocolHandler::gate_6_0_audit_checkpoint(
+            &log,
+            b"gate6-secret",
+            "agent-a",
+            "agent-b",
+            "sig",
+            "intent",
+            "trace",
+            0x02,
+        )
+        .expect_err(
+            "an IRREVERSIBLE action whose own audit entry cannot be enqueued must be \
+             hard-dropped (fail-closed), not silently executed",
+        );
+        assert_eq!(err.bytecode, SAACPBytecodes::AuditSubsystemDegraded);
+    }
+
+    /// The other half of the Step 3 contract: a REVERSIBLE packet against the
+    /// same unwritable audit WAL still succeeds (count-only flow) — the drop
+    /// itself is already surfaced via `dropped_audit_count` + the sticky
+    /// health floor, which keeps Gate 2.5 fail-closed for any LATER
+    /// irreversible traffic. Blocking reversible reads/writes on audit
+    /// pressure would be a self-inflicted availability cliff.
+    #[test]
+    fn test_gate_6_0_reversible_keeps_count_only_flow_when_audit_unwritable() {
+        let bad_dir = std::env::temp_dir().join(format!(
+            "saacp_no_such_dir_{}_{}_g6rev",
+            std::process::id(),
+            line!()
+        ));
+        let log_file = bad_dir.join("audit.log");
+        let log = ImmutableAuditLog::with_paths(
+            log_file.to_str().unwrap(),
+            &format!("{}.sentinel", log_file.to_str().unwrap()),
+        );
+        let mut waited = std::time::Duration::ZERO;
+        while log.health() != crate::security::AuditHealth::Fatal
+            && waited < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += std::time::Duration::from_millis(5);
+        }
+        assert_eq!(log.health(), crate::security::AuditHealth::Fatal);
+
+        let before = log.dropped_audit_count();
+        SAACPProtocolHandler::gate_6_0_audit_checkpoint(
+            &log,
+            b"gate6-secret",
+            "agent-a",
+            "agent-b",
+            "sig",
+            "intent",
+            "trace",
+            0x01,
+        )
+        .expect(
+            "a reversible packet keeps the count-only flow — its audit drop is \
+                 recorded by the WAL layer, not charged to the packet",
+        );
+        assert!(
+            log.dropped_audit_count() > before,
+            "the failed enqueue must still be counted (sticky floor drives Gate 2.5)"
+        );
+    }
+
+    /// Healthy-WAL control for the two tests above: with a writable WAL both
+    /// action classes succeed at the checkpoint itself.
+    #[test]
+    fn test_gate_6_0_irreversible_succeeds_when_audit_healthy() {
+        let log_file = std::env::temp_dir().join(format!(
+            "saacp_gate6_helper_{}_{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let count_file = format!("{}.sentinel", log_file.to_str().unwrap());
+        let _ = std::fs::remove_file(&log_file);
+        let _ = std::fs::remove_file(&count_file);
+        let log = ImmutableAuditLog::with_paths(log_file.to_str().unwrap(), &count_file);
+
+        SAACPProtocolHandler::gate_6_0_audit_checkpoint(
+            &log,
+            b"gate6-secret",
+            "agent-a",
+            "agent-b",
+            "sig",
+            "intent",
+            "trace",
+            0x02,
+        )
+        .expect("irreversible action on a healthy WAL must succeed at Gate 6.0");
+
+        let _ = std::fs::remove_file(&log_file);
+        let _ = std::fs::remove_file(&count_file);
     }
 
     #[test]

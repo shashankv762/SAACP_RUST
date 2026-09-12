@@ -135,7 +135,8 @@ async fn identity_bound_matching_token_accepted() {
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_identity_binding(server_seed, "daemon-main", &[("ca-accept-01", ca_vk)])
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
     tokio::spawn(async move {
         let _ = daemon.start().await;
@@ -184,7 +185,8 @@ async fn identity_bound_token_claiming_different_agent_rejected() {
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_identity_binding(server_seed, "daemon-main", &[("ca-mismatch-01", ca_vk)])
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
     tokio::spawn(async move {
         let _ = daemon.start().await;
@@ -240,7 +242,8 @@ async fn identity_bound_untrusted_ca_certificate_rejected() {
                 &[("ca-trusted-01", trusted_ca_vk)],
             )
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
     tokio::spawn(async move {
         let _ = daemon.start().await;
@@ -288,7 +291,8 @@ async fn identity_bound_forged_proof_of_possession_rejected() {
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_identity_binding(server_seed, "daemon-main", &[("ca-forged-01", ca_vk)])
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     let server_vk = daemon.server_verifying_key().expect("server auth enabled");
     tokio::spawn(async move {
         let _ = daemon.start().await;
@@ -328,7 +332,8 @@ async fn non_identity_bound_connection_unaffected() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_encrypted_transport(Arc::new(SessionEpochManager::new()));
+            .with_encrypted_transport(Arc::new(SessionEpochManager::new()))
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

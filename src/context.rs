@@ -43,9 +43,17 @@
 //! gate (Gap B completion). Handler fallbacks resolve
 //! `param → context → legacy global`, and the daemon injects its
 //! context-owned instances explicitly, so the legacy process globals are no
-//! longer reachable from the packet hot path. The cluster/gossip engines
-//! remain daemon-owned (topology state, not per-packet pipeline state) and
-//! are documented as such in their modules.
+//! longer reachable from the packet hot path; the daemon's per-connection
+//! security decisions (IP trust gating + hard-drop penalty, revocation-epoch
+//! pinning, identity-gate advancement incl. the handshake, shutdown WAL
+//! flush, audit-chain recovery) resolve through the same context as well.
+//!
+//! Two globals remain deliberately process-wide: the cluster/gossip engines
+//! (daemon-owned topology state, not per-packet pipeline state — documented
+//! in their modules) and `identity_binding::DEFAULT_IDENTITY_REGISTRY` (the
+//! session→agent map written by the daemon's ECDH handshake and cross-checked
+//! by Gate 1.0; scoping it per context would sever that handshake↔pipeline
+//! pairing, and it is documented in `daemon.rs`/`identity_binding.rs`).
 
 use std::sync::{Arc, LazyLock};
 
@@ -118,6 +126,14 @@ impl SaacpContext {
     /// multi-tenant deployments: construct one per tenant and thread it into
     /// that tenant's daemon(s). Nothing here is reachable from any other
     /// context or from the legacy process globals.
+    ///
+    /// **Audit-trail caveat:** the fresh audit log uses
+    /// [`ImmutableAuditLog::with_default_path`], so two hermetic contexts in
+    /// one process resolve to the SAME on-disk WAL file — their entries
+    /// interleave in one shared chain. Logical state (in-memory shards,
+    /// health, counters) is per-context, but cross-tenant PHYSICAL audit
+    /// separation requires constructing each tenant's log with
+    /// [`ImmutableAuditLog::with_paths`] and injecting it via [`Self::with_audit`].
     pub fn new() -> Self {
         Self {
             trust: Arc::new(TrustDecayEngine::new()),

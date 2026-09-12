@@ -1,0 +1,56 @@
+# SAACP Helm chart default values
+image:
+  repository: ghcr.io/shashankv762/saacp
+  tag: ""  # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+# Sidecar configuration
+sidecar:
+  replicaCount: 2
+  port: 7443
+  httpPort: 8787
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Command center
+commandCenter:
+  enabled: true
+  port: 9090
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Health endpoint
+health:
+  enabled: true
+  port: 9091
+
+# Secrets — reference existing k8s secrets by name
+secrets:
+  tokenSecret:
+    secretName: saacp-token-secret
+    key: token-secret
+  peerSecrets:
+    secretName: saacp-peer-secrets
+    key: peers.json
+  # Optional: Redis URL for shared state backend (M2)
+  redisUrl:
+    secretName: ""
+    key: redis-url
+
+# Audit node designation — ordinal-0 by default
+auditNode:
+  enabled: true
+
+# TOML config overrides (rendered into a ConfigMap)
+config: {}

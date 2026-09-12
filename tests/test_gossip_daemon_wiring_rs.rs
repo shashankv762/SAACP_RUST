@@ -113,7 +113,8 @@ async fn inbound_schema_11_packet_is_delivered_to_gossip_engine() {
     let daemon =
         SAACPNetworkDaemon::insecure_for_testing("127.0.0.1", port, Some(mesh_secret.to_vec()))
             .with_gateway(Arc::new(ZeroTrustGateway::new()))
-            .with_gossip_engine(engine);
+            .with_gossip_engine(engine)
+            .with_audit_chain_recovery(false);
     tokio::spawn(async move {
         let _ = daemon.start().await;
     });

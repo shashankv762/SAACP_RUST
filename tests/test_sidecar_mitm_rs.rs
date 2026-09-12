@@ -118,12 +118,12 @@ async fn send_probe(
     .await
 }
 
-/// Lock the current default handshake posture: `LegacyOnly` with no pinned peers and
-/// no server seed. Phase 1 flips the BINARY default (env-driven) but must keep the
-/// library constructor default byte-for-byte compatible with existing meshes — this
-/// test is the regression lock for that promise.
+/// Lock the current default handshake posture: `PreferPinned` (v0.2.2+ M4
+/// remediation) with no pinned peers and no server seed. The library
+/// constructor now defaults to authenticated handshakes with graceful
+/// fallback — this test is the regression lock for that posture.
 #[test]
-fn default_handshake_mode_is_legacy_only() {
+fn default_handshake_mode_is_prefer_pinned() {
     let saacp_addr = free_addr_blocking();
     let http_addr = free_addr_blocking();
 
@@ -131,9 +131,9 @@ fn default_handshake_mode_is_legacy_only() {
 
     assert_eq!(
         config.handshake_mode,
-        SidecarHandshakeMode::LegacyOnly,
-        "library default must stay LegacyOnly (compat contract) — a default change \
-         is a breaking change that must update this test deliberately"
+        SidecarHandshakeMode::PreferPinned,
+        "library default must be PreferPinned (M4 audit remediation) — \
+         a default change must update this test deliberately"
     );
     assert!(
         config.pinned_peers.is_empty(),
@@ -394,8 +394,8 @@ async fn healthz_reports_handshake_posture_and_telemetry() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("healthz json");
     assert_eq!(
-        body["handshake_mode"], "LEGACY_ONLY",
-        "spawned config used the library default; body: {body}"
+        body["handshake_mode"], "PREFER_PINNED",
+        "M4 remediation: SidecarConfig::new() defaults to PreferPinned; body: {body}"
     );
     assert!(body["handshake_pinned_ok"].is_u64(), "body: {body}");
     assert!(body["handshake_fallback_total"].is_u64(), "body: {body}");

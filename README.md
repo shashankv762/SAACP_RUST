@@ -772,7 +772,7 @@ pattern (secret files mounted read-only, `*_FILE` env references).
    repo `Dockerfile` (nonroot runtime, no shell, rustls-only TLS).
 
 The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
-**56 integration/adversarial test files** under `tests/`, and **5 fuzz targets**.
+**61 integration/adversarial test files** under `tests/` (the `tests/breakit.rs` harness alone carries **7 attack suites** from `tests/breakit/`), and **5 fuzz targets**.
 
 **Adversarial / red-team coverage** includes:
 
@@ -923,14 +923,14 @@ packet is dropped, never partially processed.
 
 ```
 saacp-rs/
-├── src/                     # 52 Rust modules — protocol core, gates, crypto, trust
+├── src/                     # 68 source modules — protocol core, gates, crypto, trust
 │   ├── bin/                 # saacp-sidecar, saacp-command-center binaries
 │   ├── hrt/                 # Hardware Root of Trust (mod.rs + aws_kms, gcp_kms, pkcs11, remote)
 │   └── transport/           # ws.rs, tls.rs
 ├── benches/benchmarks.rs    # Criterion benchmark harness (175 benchmarks)
-├── tests/                   # 56 integration/adversarial test files
-│   ├── breakit/             # red-team: timing, injection, downgrade, forensics, …
-│   └── adversarial/         # agent framework + attack library
+├── tests/                   # 61 integration/adversarial test files
+│   ├── breakit/             # 7 red-team suites: timing, injection, downgrade, forensics, …
+│   └── fixtures/            # pinned wire/chain fixtures (e.g. audit v1)
 ├── fuzz/                    # 5 cargo-fuzz targets
 ├── python/                  # saacp-client Python package + sidecar demos
 ├── dashboard-ui/            # Next.js 16 / React 19 Command Center frontend

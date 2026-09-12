@@ -248,6 +248,13 @@ pub struct Counters {
     /// NOT a counter — a timestamp gauge; `snapshot()`/`render_prometheus()`
     /// derive `revocation_lag_seconds = now − this` from it at scrape time.
     pub revocation_last_received_epoch: AtomicU64,
+    /// M3 (production audit R9): state-backend circuit-breaker position
+    /// gauge (0 = closed, 1 = half-open, 2 = open), reported by
+    /// `state_backend::CircuitBreakerBackend` on every state transition.
+    /// Last-writer-wins when several breakers exist in one process — the
+    /// gauge is a liveness signal ("some backend is failing fast"), not a
+    /// per-instance registry; transition details are on stderr.
+    pub state_backend_circuit_breaker_state: AtomicU64,
 }
 
 impl Counters {
@@ -332,6 +339,7 @@ impl Counters {
             alert_sink_failures_total: z!(),
             audit_chain_designated_node: z!(),
             revocation_last_received_epoch: z!(),
+            state_backend_circuit_breaker_state: z!(),
         }
     }
 }
@@ -1247,6 +1255,21 @@ impl TelemetryCollector {
             .store(u64::from(designated), Ordering::Relaxed);
     }
 
+    /// M3 (production audit R9): set the state-backend circuit-breaker
+    /// position gauge — 0 closed, 1 half-open, 2 open. Called by
+    /// `state_backend::CircuitBreakerBackend` on every transition. Gauge is
+    /// coarse by design: see the field doc on
+    /// `Counters::state_backend_circuit_breaker_state`.
+    pub fn set_state_backend_circuit_breaker_state(&self, state: u64) {
+        debug_assert!(
+            state <= 2,
+            "circuit-breaker state gauge value {state} out of range 0..=2"
+        );
+        self.counters
+            .state_backend_circuit_breaker_state
+            .store(state.min(2), Ordering::Relaxed);
+    }
+
     /// R9 (Phase 4): record that a valid DRI revocation was received at
     /// `epoch_secs` (wall-clock seconds). Keeps the MOST RECENT timestamp
     /// (`fetch_max`), so out-of-order receipts never regress the lag metric.
@@ -1471,6 +1494,10 @@ impl TelemetryCollector {
         snap!("gossip_send_failures_total", c.gossip_send_failures_total);
         snap!("alert_sink_failures_total", c.alert_sink_failures_total);
         snap!("audit_chain_designated_node", c.audit_chain_designated_node);
+        snap!(
+            "state_backend_circuit_breaker_state",
+            c.state_backend_circuit_breaker_state
+        );
         // R9: derived (not stored) — lag is computed at scrape time from the
         // last-received revocation timestamp gauge.
         m.insert(
@@ -1601,6 +1628,19 @@ impl TelemetryCollector {
         out.push_str(&format!(
             "saacp_audit_chain_designated_node {}\n",
             snap.get("audit_chain_designated_node")
+                .copied()
+                .unwrap_or(0)
+        ));
+
+        // ── State-backend circuit breaker (M3 / production audit R9) ────────
+        // Gauge: 0 closed, 1 half-open, 2 open.
+        out.push_str(
+            "# HELP saacp_state_backend_circuit_breaker_state State-backend circuit-breaker position (0=closed, 1=half-open, 2=open); last-writer-wins across wrapped backends.\n",
+        );
+        out.push_str("# TYPE saacp_state_backend_circuit_breaker_state gauge\n");
+        out.push_str(&format!(
+            "saacp_state_backend_circuit_breaker_state {}\n",
+            snap.get("state_backend_circuit_breaker_state")
                 .copied()
                 .unwrap_or(0)
         ));
@@ -2043,6 +2083,13 @@ impl SecurityAlertFeed {
         // external sink (RFC 5424 syslog over UDP — see `alert_sink.rs`).
         // Absent sink (env unset) = zero overhead, byte-identical behavior.
         if let Some(sink) = crate::alert_sink::syslog_sink() {
+            sink.emit(&alert);
+        }
+        // M5 remediation: best-effort forwarding to the process-wide webhook
+        // sink (JSON POST — see `alert_sink.rs`). Both sinks can be active
+        // simultaneously; absent sink = zero overhead.
+        #[cfg(feature = "webhook-alerts")]
+        if let Some(sink) = crate::alert_sink::webhook_sink() {
             sink.emit(&alert);
         }
     }

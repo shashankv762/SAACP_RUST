@@ -181,7 +181,7 @@ jobs:
           SUMMARY=$(cargo llvm-cov report --summary-only)
           echo "${SUMMARY}"
           PCT=$(echo "${SUMMARY}" | awk '/^TOTAL/ {print $NF}' | tr -d '%')
-          awk -v p="${PCT}" 'BEGIN { if (p+0 < 60) { print "FAIL: coverage " p "% < 60%"; exit 1 } else { print "PASS: coverage " p "% >= 60%" } }'
+          awk -v p="${PCT}" 'BEGIN { if (p+0 < 70) { print "FAIL: coverage " p "% < 70%"; exit 1 } else { print "PASS: coverage " p "% >= 70%" } }'
 
   # ── Fuzz targets (smoke pass, blocking) ──────────────────────────────────
   # Runs a short 10s/target pass on every push and PR. Unlike the previous
@@ -234,3 +234,23 @@ jobs:
           name: fuzz-crashes
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  # ── Dashboard UI (lint + build) ──────────────────────────────────────────
+  # M9 remediation (production audit G5): the dashboard-ui Next.js codebase
+  # was not part of CI — TypeScript errors and build regressions were only
+  # caught locally. This job runs `npm ci && npm run build` on every push/PR.
+  dashboard:
+    name: Dashboard UI (build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: dashboard-ui/package-lock.json
+      - run: npm ci
+      - run: npm run build

@@ -120,9 +120,13 @@ async fn audit_chain_recovery_adopt_refuse_and_off_paths() {
         "refusal must be actionable (got: {err})"
     );
 
-    // ---- Path 3: recovery OFF (the default) => unchanged behavior. The same
-    // corrupt file must not block startup when recovery was never requested.
-    let daemon_off = SAACPNetworkDaemon::new("127.0.0.1", 0, Some(SECRET.to_vec()));
+    // ---- Path 3: recovery explicitly OFF via the builder => the same corrupt
+    // file must not block startup. (v0.2.2+ note: `Some(secret)` now auto-enables
+    // recovery via M1, so "default" no longer means "off" — the builder override
+    // is the only in-code way to pin the off behavior this assertion originally
+    // guarded.)
+    let daemon_off = SAACPNetworkDaemon::new("127.0.0.1", 0, Some(SECRET.to_vec()))
+        .with_audit_chain_recovery(false);
     let token_off = CancellationToken::new();
     let handle_off = {
         let t = token_off.clone();
@@ -131,7 +135,7 @@ async fn audit_chain_recovery_adopt_refuse_and_off_paths() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !handle_off.is_finished(),
-        "recovery-off daemon must start even with a corrupt chain on disk (default unchanged)"
+        "recovery-off daemon must start even with a corrupt chain on disk (builder override)"
     );
     token_off.cancel();
     let result_off = handle_off.await.expect("start task must not panic");
