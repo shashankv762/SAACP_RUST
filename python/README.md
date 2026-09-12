@@ -41,8 +41,9 @@ SAACP_AGENT_ID=agent-a SAACP_TOKEN_SECRET=<shared secret> \
   ./target/release/saacp-sidecar
 ```
 
-| Env var | Meaning |
-|---|---|
+| Variable / Setting | Meaning |
+|--------------------|---------|
+| `SAACP_CONFIG` | Path to optional TOML configuration file (e.g. `/etc/saacp/saacp.toml`) with a `[sidecar]` section. Environment variables override TOML values |
 | `SAACP_AGENT_ID` | This sidecar's agent identity (required) |
 | `SAACP_TOKEN_SECRET` | Base64 32-byte shared mesh secret (required unless `SAACP_TOKEN_SECRET_FILE` is set). Held by **every** sidecar in the mesh, so any holder can forge any agent's messages — prefer `SAACP_PEER_SECRETS_FILE` |
 | `SAACP_TOKEN_SECRET_FILE` | Path to a file holding the base64 secret instead of the env var directly (keeps it out of `/proc/<pid>/environ`) |

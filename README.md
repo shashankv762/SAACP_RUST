@@ -1,6 +1,6 @@
 # SAACP — Secure Autonomous Agent Communication Protocol
 
-**Rust implementation** · Protocol `SAACP/0.2-beta1` · Crate `saacp` v0.2.0 · License MIT
+**Rust implementation** · Protocol `SAACP/0.2-beta1` · Crate `saacp` v0.2.1 · License MIT
 
 SAACP is a zero-trust, cryptographically-authenticated wire protocol and security
 gate pipeline for **autonomous AI agents talking to other autonomous AI agents**.
@@ -80,36 +80,36 @@ agent's business logic.
 ## Architecture at a Glance
 
 ```
-   ┌──────────────┐      plain HTTP/JSON        ┌──────────────────────┐
-   │  Your agent  │ ─────────────────────────▶  │   saacp-sidecar      │
-    │ (any language) │ ◀─────────────────────────  │  (optional edge)     │
-   └──────────────┘                             └──────────┬───────────┘
+   ┌────────────────┐      plain HTTP/JSON       ┌──────────────────────┐
+   │   Your agent   │ ─────────────────────────▶ │    saacp-sidecar     │
+   │ (any language) │ ◀───────────────────────── │   (optional edge)    │
+   └────────────────┘                            └──────────┬───────────┘
                                                             │  real SAACP wire
                                                             ▼
    ┌────────────────────────────────────────────────────────────────────────┐
-   │                     SAACPNetworkDaemon (src/daemon.rs)                 │
+   │                   SAACPNetworkDaemon (src/daemon.rs)                   │
    │   TCP / WebSocket / TLS transport  ·  per-IP circuit breakers          │
    └───────────────────────────────┬────────────────────────────────────────┘
-                                    ▼
+                                   ▼
    ┌────────────────────────────────────────────────────────────────────────┐
-   │            SAACPProtocolHandler::intercept_packet(_full/_encrypted)    │
+   │          SAACPProtocolHandler::intercept_packet(_full/_encrypted)      │
    │                                                                        │
-   │  Gate 0  Crypto integrity  (AES-256-GCM + replay window + Adler-32)    │
-   │  Gate 1.0 Capability token validation (Ed25519/HMAC, revocation, expiry)│
-   │  Gate 2.5 Kinetic firewall (action-class escalation guard)             │
-   │  Gate 1.5 Intent envelope (root-intent binding + drift + dangerous verb)│
-   │  Gate 0.5 Financial circuit breaker (token-budget cap)                 │
-   │  Gate 3.0 Lateral-movement guard (secondary token for mutations)       │
-   │  Gate 4.0 Prompt-injection scanner (Unicode-normalized, multi-encoding)│
-   │  Gate 5.0 Epistemic circuit breaker (confidence sanity, schema 3)      │
+   │  Gate 0    Crypto integrity (AES-256-GCM + replay window + Adler-32)   │
+   │  Gate 1.0  Capability token validation (Ed25519/HMAC, revocation, exp) │
+   │  Gate 2.5  Kinetic firewall (action-class escalation guard)            │
+   │  Gate 1.5  Intent envelope (root-intent binding + drift + danger verb) │
+   │  Gate 0.5  Financial circuit breaker (token-budget cap)                │
+   │  Gate 3.0  Lateral-movement guard (secondary token for mutations)      │
+   │  Gate 4.0  Prompt-injection scanner (Unicode-normalized, multi-encode) │
+   │  Gate 5.0  Epistemic circuit breaker (confidence sanity, schema 3)     │
    │  Gate 5.0b Scope-consistency reinforcement                             │
-   │  Gate 6.0 Immutable audit checkpoint (HMAC hash-chain, WAL)            │
-   │  Gate 9.0 JSON schema validation + RGC resource governance             │
-   │  Gate 11.0 AEGF hop-limit + causal-graph governance                    │
-   │  Gate 12.0 CSCS oscillation / loop detection                           │
+   │  Gate 6.0  Immutable audit checkpoint (HMAC hash-chain, WAL)           │
+   │  Gate 9.0  JSON schema validation + RGC resource governance            │
+   │  Gate 11.0 AEGF hop-limit + causal-graph governance                   │
+   │  Gate 12.0 CSCS oscillation / loop detection                          │
    └───────────────────────────────┬────────────────────────────────────────┘
-                                    ▼
-                          delivered to receiving agent
+                                   ▼
+                         delivered to receiving agent
 ```
 
 Cross-cutting engines run alongside the numbered gates: a per-agent **rate
@@ -202,6 +202,8 @@ transport-layer frame that carries all live traffic.
 | Key derivation / ratchet | **HKDF-SHA256** |
 | Capability & identity signatures | **Ed25519** (`ed25519-dalek`) |
 | Session key agreement (sidecar mesh) | **X25519 ECDH** |
+| Post-quantum digital signatures (PQC) | **ML-DSA-65** (FIPS 204, Dilithium) + Hybrid Ed25519/ML-DSA-65 |
+| Post-quantum key encapsulation (PQC) | **ML-KEM-768** (FIPS 203, Kyber) + Hybrid X25519/ML-KEM-768 |
 | Response authentication (M3) | **HMAC-SHA256** |
 | Corruption filter (non-cryptographic) | **Adler-32** |
 | Baseline suite string | `AES-256-GCM-HKDF-SHA256` / signature `ed25519` |
@@ -337,6 +339,9 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 | `klms.rs` | Key Lifecycle Management System (rotation, revocation, audit) |
 | `trust_decay.rs` | Continuous behavioral trust scoring + intent-drift tracking |
 | `aca.rs` | Agent Capability Attestation (operator-signed safety-level claims) |
+| `attestation.rs` | Hardware attestation token verification |
+| `clock.rs` | Deterministic clock abstraction (`Clock` trait + `SystemClock` impl) |
+| `pqc/` | Post-Quantum Cryptography: ML-DSA (FIPS 204) signatures, ML-KEM (FIPS 203) key encapsulation, hybrid suites |
 
 </details>
 
@@ -383,6 +388,10 @@ each frame's key to its exact `(session, epoch, psn)` triple.
 | `sidecar.rs` | Local HTTP proxy: plain JSON ⇄ SAACP-secured traffic |
 | `command_center.rs` / `command_center_demo.rs` | REST + SSE dashboard backend |
 | `context.rs` | `SaacpContext` — Phase 4 de-globalization container for trust, telemetry, alerts, rulepacks, streams, and audit state |
+| `alert_sink.rs` | External security alert delivery: RFC 5424 Syslog UDP + HTTP Webhook (`webhook-alerts`) |
+| `config.rs` | Scoped TOML configuration parser for `saacp-sidecar` and `saacp-command-center` (`SAACP_CONFIG`) |
+| `health.rs` | Health/readiness HTTP endpoints (`/healthz`, `/readyz`, `/metrics`, `/api/audit/ack`) |
+| `logging.rs` | Structured logging setup (`tracing` + `tracing-subscriber`) |
 
 </details>
 
@@ -536,16 +545,20 @@ for embedded targets.
 |---------|---------|------|
 | `transport-ws` | WebSocket tunneling transport (survives HTTP-only proxies/CDNs) | tokio-tungstenite, bytes, futures-util |
 | `transport-tls` | Raw TCP + in-protocol TLS termination | tokio-rustls, rustls-pemfile |
+| `transport-wss` | `wss://` — WebSocket over TLS (`SAACPWebSocketDaemon::with_tls`) | (combines `transport-ws` + `transport-tls`) |
 | `redis-backend` | Redis-shared `StateBackend` for horizontally-scaled fleets | redis |
+| `webhook-alerts` | HTTP webhook alert delivery (`alert_sink.rs::WebhookAlertSink`) | reqwest |
+| `health-endpoint` | HTTP health/readiness endpoints (`/healthz`, `/readyz`, `/metrics`, `/api/audit/ack`) | axum |
 | `sidecar` | `saacp-sidecar` HTTP proxy binary | axum, mpf |
 | `command-center` | `saacp-command-center` REST+SSE dashboard backend | axum, futures-util |
 | `mpf` | Metadata Privacy Filter (cover traffic, adaptive padding, timing jitter) | — |
+| `audit-plaintext` | **Debug only.** Opt-out for audit-log encryption at rest. **Never use in production.** | — |
 | `hrt-pkcs11` | **Hardware Root of Trust: PKCS#11.** Signing keys held in an on-premise HSM or token (Thales, Entrust, Utimaco, YubiHSM, SoftHSM2) — the private key never enters process memory. | cryptoki |
 | `hrt-aws-kms` | **Hardware Root of Trust: AWS KMS.** `ECC_NIST_EDWARDS25519` keys; every signature lands in CloudTrail. | aws-sdk-kms, aws-config |
 | `hrt-gcp-kms` | **Hardware Root of Trust: Google Cloud KMS.** `EC_SIGN_ED25519` key versions. | gcloud-sdk |
 | `hrt-tpm` / `hrt-sgx` | Hardware Root of Trust seams for TPM 2.0 / Intel SGX (compile placeholders — return `NotImplemented`) | — |
-| `transport-wss` | `wss://` — WebSocket over TLS (`SAACPWebSocketDaemon::with_tls`) | (combines `transport-ws` + `transport-tls`) |
 | `unsafe-structural-only` | **Debug only.** Exposes unauthenticated structural header parsing. **Must never be enabled in production.** | — |
+| `dangerously-skip-gateway` | **Test only.** Allows no-gateway fallback in Gate 1.0 to grant synthetic READ_ONLY access instead of hard-dropping. | — |
 
 **Hardware Root of Trust support matrix (honest status):**
 
@@ -756,7 +769,26 @@ peer_secrets_file = "/run/secrets/saacp_peer_secrets"
 The sample `compose.yaml` at the repo root wires both binaries with this
 pattern (secret files mounted read-only, `*_FILE` env references).
 
-### 7. Release runbook (v0.2.0)
+### 7. Kubernetes deployment via Helm chart (`deploy/helm/saacp`)
+
+A production-grade Helm chart is located in [`deploy/helm/saacp`](deploy/helm/saacp):
+
+- **StatefulSet architecture**: provides ordered ordinal identity, persistent storage mounts, and resource bounds.
+- **Service definitions**: exposes port `7443` (SAACP wire protocol), `8787` (sidecar HTTP API), `9090` (Command Center dashboard), and `9091` (health probes and Prometheus metrics).
+- **Probes**: native Kubernetes HTTP probes targeting `/healthz` (liveness) and `/readyz` (readiness with affinity and audit health verification).
+- **Secret management**: mounts Kubernetes secrets for `tokenSecret`, `peerSecrets` (`peers.json`), and optional `redisUrl` (`redis-backend`).
+- **Audit-node designation**: ordinal-0 pod automatically designates itself as the authoritative audit node (`auditNode.enabled = true`).
+- **ConfigMap integration**: renders structured TOML configuration overrides (`values.yaml` `config:` mapping).
+
+Deploy the Helm chart:
+```sh
+helm upgrade --install saacp ./deploy/helm/saacp \
+  --namespace saacp --create-namespace \
+  --set sidecar.replicaCount=2 \
+  --set secrets.tokenSecret.secretName=saacp-token-secret
+```
+
+### 8. Release runbook (v0.2.1)
 
 1. All gates green on the release commit: `cargo fmt --all -- --check`,
    `cargo clippy --all-targets --all-features -- -D warnings`,
@@ -764,12 +796,15 @@ pattern (secret files mounted read-only, `*_FILE` env references).
    target individually, the 5 fuzz targets smoke-run (60s each), the
    `python/` pytest suite, and the cross-language wire-compat vectors
    (`test_cross_lang_vectors_rs` + the pinned `audit_v1` fixture).
-2. `CHANGELOG.md`'s `[Unreleased]` section is folded into the version entry
-   with the M1/M8/M10 hardening IDs and audit cross-references.
+2. Release notes verified and version bump applied across manifests and binaries.
 3. `cargo bench --no-run` compiles clean; spot-run the WC4 and gate-path
    benches before publishing refreshed numbers to `benchmark_results.md`.
-4. Only then tag (`v0.2.0`) and build/push the distroless image from the
+4. Only then tag (`v0.2.1`) and build/push the distroless image from the
    repo `Dockerfile` (nonroot runtime, no shell, rustls-only TLS).
+
+---
+
+## Testing & Fuzzing
 
 The suite spans unit tests (inline `#[cfg(test)]` modules in every source file),
 **61 integration/adversarial test files** under `tests/` (the `tests/breakit.rs` harness alone carries **7 attack suites** from `tests/breakit/`), and **5 fuzz targets**.
@@ -926,14 +961,20 @@ saacp-rs/
 ├── src/                     # 68 source modules — protocol core, gates, crypto, trust
 │   ├── bin/                 # saacp-sidecar, saacp-command-center binaries
 │   ├── hrt/                 # Hardware Root of Trust (mod.rs + aws_kms, gcp_kms, pkcs11, remote)
+│   ├── pqc/                 # Post-Quantum Cryptography (mod.rs + kem.rs, signature.rs)
 │   └── transport/           # ws.rs, tls.rs
 ├── benches/benchmarks.rs    # Criterion benchmark harness (175 benchmarks)
+├── deploy/                  # Production deployment manifests
+│   └── helm/saacp/          # Kubernetes Helm chart (StatefulSet, Service, values.yaml)
 ├── tests/                   # 61 integration/adversarial test files
 │   ├── breakit/             # 7 red-team suites: timing, injection, downgrade, forensics, …
 │   └── fixtures/            # pinned wire/chain fixtures (e.g. audit v1)
 ├── fuzz/                    # 5 cargo-fuzz targets
 ├── python/                  # saacp-client Python package + sidecar demos
 ├── dashboard-ui/            # Next.js 16 / React 19 Command Center frontend
+├── .github/workflows/       # CI/CD workflows (matrix tests, deny, fuzz, dashboard-ui)
+├── compose.yaml             # Multi-service container orchestration with secret mounts
+├── Dockerfile               # Distroless non-root container build
 ├── Cargo.toml               # crate + feature definitions
 ├── README.md                # this file
 └── benchmark_results.md     # measured benchmark results (real numbers)
@@ -947,4 +988,4 @@ MIT. See [`LICENSE`](LICENSE).
 
 ---
 
-*Protocol version `SAACP/0.2-beta1` · crate version `0.2.0` · Ed25519 + AES-256-GCM + HKDF-SHA256.*
+*Protocol version `SAACP/0.2-beta1` · crate version `0.2.1` · Ed25519 + AES-256-GCM + HKDF-SHA256.*

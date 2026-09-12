@@ -30,15 +30,13 @@ stay empty rather than inventing data.
 
 1. Start the backend (from the repo root):
    ```sh
+   # Production mode (observes live gateway telemetry, demo daemon disabled by default):
    SAACP_DASHBOARD_TOKEN=<base64 32 bytes> cargo run --bin saacp-command-center --features command-center
+
+   # Or enable synthetic demo mode for exploration (populates all panels immediately):
+   SAACP_DEMO_MODE=1 SAACP_DASHBOARD_TOKEN=<base64 32 bytes> cargo run --bin saacp-command-center --features command-center
    ```
-   This also starts a bare demo `SAACPNetworkDaemon` on `127.0.0.1:7444` and a synthetic
-   activity generator (`command_center_demo.rs`) that drives live agents, trust-mesh edges,
-   gate rejections and Gate 0.5 financial blocks through the same global engines a real
-   gateway drives — so every panel is populated the moment you open the dashboard. Both are
-   demo-only and share one opt-out: `SAACP_DISABLE_DEMO_DAEMON=1` runs the dashboard alone
-   against a real gateway process's shared state, with zero synthetic data. See
-   `src/bin/saacp_command_center.rs`'s doc comment for all environment variables.
+   As of v0.2.1 (remediation M-G), the synthetic demo daemon is **disabled by default** so production dashboards are never populated with artificial telemetry. Setting `SAACP_DEMO_MODE=1` (or `demo_mode = true` under `[command_center]` in `SAACP_CONFIG`) starts a bare demo `SAACPNetworkDaemon` on `127.0.0.1:7444` and a synthetic activity generator (`command_center_demo.rs`) that drives live agents, trust-mesh edges, gate rejections, and Gate 0.5 financial blocks through the engines. In production, run without `SAACP_DEMO_MODE` to monitor genuine traffic. The backend also supports file-based configuration via `SAACP_CONFIG` (TOML with a `[command_center]` section). See `src/bin/saacp_command_center.rs`'s doc comment for all environment variables and options.
 
 2. Configure this frontend:
    ```sh
