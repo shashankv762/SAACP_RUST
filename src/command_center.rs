@@ -1,4 +1,4 @@
-//! command_center.rs — SAACP Command Center: live dashboard backend (REST + SSE).
+﻿//! command_center.rs — SAACP Command Center: live dashboard backend (REST + SSE).
 //!
 //! The pitch: a web dashboard for operators to see, in real time, what a fleet of SAACP
 //! gateways is actually doing — which agents are trusted, who has delegated capability to
@@ -788,7 +788,7 @@ async fn handle_rules_reload(body: String) -> Response {
 /// admin plane as `/api/alerts`.
 async fn handle_rules_status() -> Json<RulePackState> {
     let store = crate::rulepack::RulePackStore::global();
-    let builtin = crate::handler::builtin_injection_patterns().len();
+    let builtin = crate::injection_patterns::builtin_injection_patterns().len();
     match store.current() {
         Some(active) => Json(RulePackState {
             trust_anchor_provisioned: store.has_trust_anchor(),

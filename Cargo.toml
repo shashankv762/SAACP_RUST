@@ -1,20 +1,94 @@
+# ── Workspace definition ────────────────────────────────────────────────────────
+# G3/M7: Cargo workspace decomposition. The repo root is BOTH the workspace root
+# AND the `saacp` facade package (automatically included as a member when the
+# [workspace] and [package] tables coexist in the same Cargo.toml).
+[workspace]
+resolver = "2"
+members = [
+    ".",                         # saacp facade + saacp-core (this package)
+    "crates/saacp-primitives",   # Layer 0: zero-dependency leaf types
+    "crates/saacp-crypto",       # Layer 1: FIPS cryptographic boundary
+]
+
+# Shared package metadata — avoids duplication across workspace members.
+[workspace.package]
+edition = "2021"
+rust-version = "1.96.0"
+license = "MIT"
+
+# ── Shared dependency versions ──────────────────────────────────────────────────
+# All workspace members use { workspace = true } to pin the same version.
+[workspace.dependencies]
+# Cryptography
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-dsa = "0.1.1"
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
+sha3 = "0.10"
+rand_core = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Async runtime
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tokio-util = { version = "0.7", default-features = false }
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+parking_lot = "0.12"
+arc-swap = "1"
+aho-corasick = "1"
+flate2 = "1"
+unicode-normalization = "0.1"
+adler2 = "2"
+toml = "0.8"
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Optional transport / server deps (version-pinned here; marked optional per-crate)
+tokio-tungstenite = "0.24"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+redis = "0.27"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.7"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+cryptoki = "0.12"
+aws-sdk-kms = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+gcloud-sdk = { version = "0.30", default-features = false, features = ["google-cloud-kms-v1", "tls-roots"] }
+# Workspace members (for inter-crate deps)
+saacp-primitives = { path = "crates/saacp-primitives" }
+saacp-crypto = { path = "crates/saacp-crypto" }
+# Dev
+serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+rcgen = "0.13"
+
+# ── Facade package ──────────────────────────────────────────────────────────────
 [package]
 name = "saacp"
 version = "0.2.1"
-edition = "2021"
-# MSRV (audit G7: "declare the real MSRV" — resolves the previous TODO).
-# The de-facto floor is pinned by rust-toolchain.toml (1.96.0) and is what
-# every CI job and the Dockerfile (rust:1.96-slim-bookworm) now use, so the
-# floor is declared here to match instead of being left implicit. Downgrading
-# to the older 1.80 floor sketched in the original TODO would require
-# rewriting the 1.82+/1.87+-stable sites in acsvaf_authority.rs / daemon.rs /
-# handler.rs / security.rs (see git history for that analysis) — tracked as
-# roadmap work, not done silently here.
-rust-version = "1.96.0"
+edition.workspace = true
+rust-version.workspace = true
 description = "Secure Autonomous Agent Communication Protocol - Rust Implementation"
-license = "MIT"
+license.workspace = true
 
 [dependencies]
+# ── Workspace member crates ──────────────────────────────────────────────────
+# G3/M7: saacp-primitives extracted (Phase 1); saacp-crypto extracted (Phase 2).
+# crypto_bridge.rs wires saacp-core telemetry into the saacp-crypto boundary.
+saacp-primitives = { workspace = true }
+saacp-crypto = { workspace = true }
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hkdf = "0.12"

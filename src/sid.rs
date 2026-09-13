@@ -1,4 +1,4 @@
-//! sid.rs — Semantic Injection Defense, Layer 1 (Phase 6 / item 7 / Part 8.3).
+﻿//! sid.rs — Semantic Injection Defense, Layer 1 (Phase 6 / item 7 / Part 8.3).
 //!
 //! Gate 4.0 (`handler.rs`'s `PromptInjectionScanner`) is an Aho-Corasick automaton over a
 //! fixed list of known-bad literal substrings (after Unicode-confusable normalization and
@@ -205,8 +205,8 @@ const MAX_FLATTEN_DEPTH: usize = 20;
 /// [`SemanticInjectionDefense::score_payload_map`]. Depth-bounded the same way Gate 4.0
 /// bounds its own traversal — a payload deep enough to matter here already failed Gate
 /// 4.0's identical depth check and never reaches this call.
-fn flatten_strings(value: &crate::handler::JsonValue, depth: usize, out: &mut String) {
-    use crate::handler::JsonValue;
+fn flatten_strings(value: &crate::types::JsonValue, depth: usize, out: &mut String) {
+    use crate::types::JsonValue;
     if depth > MAX_FLATTEN_DEPTH {
         return;
     }
@@ -240,7 +240,7 @@ impl SemanticInjectionDefense {
     /// The natural entry point for gate wiring; [`Self::score`] itself stays a pure
     /// `&str -> f64` function for direct/unit-test use.
     pub fn score_payload_map(
-        map: &std::collections::HashMap<String, crate::handler::JsonValue>,
+        map: &std::collections::HashMap<String, crate::types::JsonValue>,
     ) -> f64 {
         let mut text = String::new();
         for (k, v) in map {
@@ -331,7 +331,7 @@ pub fn is_required() -> bool {
 /// content nor names which heuristic family fired, so an attacker cannot use
 /// repeated probes as a scoring oracle (Part 12 — no info leak).
 pub fn enforce_semantic_injection(
-    payload_dict: &std::collections::HashMap<String, crate::handler::JsonValue>,
+    payload_dict: &std::collections::HashMap<String, crate::types::JsonValue>,
 ) -> Result<(), crate::errors::SAACPHardDrop> {
     if !is_required() {
         return Ok(());
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn score_payload_map_flattens_nested_values() {
-        use crate::handler::JsonValue;
+        use crate::types::JsonValue;
         let mut map = std::collections::HashMap::new();
         map.insert(
             "task".to_string(),
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn score_payload_map_of_benign_dict_is_low() {
-        use crate::handler::JsonValue;
+        use crate::types::JsonValue;
         let mut map = std::collections::HashMap::new();
         map.insert(
             "task".to_string(),

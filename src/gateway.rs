@@ -792,7 +792,12 @@ impl ZeroTrustGateway {
     /// the Gate 1.0 path.
     pub fn global_arc() -> &'static std::sync::Arc<ZeroTrustGateway> {
         static GLOBAL_ZTG: LazyLock<std::sync::Arc<ZeroTrustGateway>> =
-            LazyLock::new(|| std::sync::Arc::new(ZeroTrustGateway::new()));
+            LazyLock::new(|| {
+                // G3/M7 Phase 4: wire saacp-core telemetry into the saacp-crypto FIPS boundary.
+                // Runs once per process. NOP-safe if called again (OnceLock inside).
+                crate::crypto_bridge::init_crypto_telemetry_bridge();
+                std::sync::Arc::new(ZeroTrustGateway::new())
+            });
         &GLOBAL_ZTG
     }
 

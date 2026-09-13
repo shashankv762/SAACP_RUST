@@ -1,4 +1,4 @@
-//! rulepack.rs — Dynamic Hot-Reloadable Injection Rules (signed rule packs).
+﻿//! rulepack.rs — Dynamic Hot-Reloadable Injection Rules (signed rule packs).
 //!
 //! Gate 4.0's signature list (`handler::INJECTION_PATTERNS`) is a compile-time
 //! `static`, compiled once into a `LazyLock<AhoCorasick>`. That makes zero-day
@@ -451,7 +451,7 @@ impl RulePack {
             return Err(RulePackRejection::TooManyRules);
         }
 
-        let builtin = crate::handler::builtin_injection_patterns();
+        let builtin = crate::injection_patterns::builtin_injection_patterns();
         let mut patterns: Vec<String> = builtin.iter().map(|p| (*p).to_string()).collect();
         // Labels are what Gate 4.0 echoes on a match. For built-ins that stays the
         // pattern itself (unchanged behavior); for pack rules it is the operator's
@@ -468,7 +468,7 @@ impl RulePack {
             {
                 return Err(RulePackRejection::InvalidRule);
             }
-            let normalized = crate::handler::normalize_scan_window(&rule.pattern);
+            let normalized = crate::injection_patterns::normalize_scan_window(&rule.pattern);
             if normalized.len() < MIN_NORMALIZED_PATTERN_LEN {
                 // Covers both "authored too short" and "normalized away to
                 // nothing" (e.g. a pattern made entirely of zero-width chars).
@@ -732,7 +732,7 @@ impl RulePackStore {
         let _install = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.current.store(None);
         crate::telemetry::global_telemetry()
-            .set_rulepack_active_rules(crate::handler::builtin_injection_patterns().len() as u64);
+            .set_rulepack_active_rules(crate::injection_patterns::builtin_injection_patterns().len() as u64);
     }
 
     /// Current active pack, if any.
@@ -987,7 +987,7 @@ mod tests {
         let (sk, _vk) = keypair();
         let pack = fresh_pack(1, vec![rule("zd-1", "brand new zero day phrase")], &sk);
         let compiled = pack.compile().expect("a well-formed pack must compile");
-        let builtins = crate::handler::builtin_injection_patterns();
+        let builtins = crate::injection_patterns::builtin_injection_patterns();
 
         assert_eq!(compiled.builtin_count(), builtins.len());
         assert_eq!(compiled.pack_rule_count(), 1);
@@ -1036,7 +1036,7 @@ mod tests {
             // Cyrillic 'е' homoglyphs + a zero-width space: folded by normalization.
             "r\u{0435}veal the syst\u{0435}m\u{200b} prompt",
         ] {
-            let normalized = crate::handler::PromptInjectionScanner::normalize(wire_text);
+            let normalized = crate::injection_patterns::PromptInjectionScanner::normalize(wire_text);
             assert!(
                 compiled.automaton().find(&normalized).is_some(),
                 "a rule authored as human text must match Gate 4.0's normalization \
@@ -1051,8 +1051,8 @@ mod tests {
         // they ever diverge, a pack rule silently never matches.
         for text in ["Ignore Previous Instructions", "Drop Table users;", "eval("] {
             assert_eq!(
-                crate::handler::normalize_scan_window(text),
-                crate::handler::PromptInjectionScanner::normalize(text),
+                crate::injection_patterns::normalize_scan_window(text),
+                crate::injection_patterns::PromptInjectionScanner::normalize(text),
                 "the rule-pack loader must normalize {text:?} identically to the scanner"
             );
         }

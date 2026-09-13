@@ -15,6 +15,7 @@ pub mod clock;
 pub mod cluster;
 pub mod config;
 pub mod context;
+pub mod crypto_bridge; // G3/M7: telemetry bridge saacp-core → saacp-crypto FIPS boundary
 pub mod crypto_governance;
 pub mod cryptosuite;
 pub mod cscs;
@@ -30,6 +31,8 @@ pub mod framing;
 pub mod gateway;
 pub mod gossip;
 pub mod handler;
+pub mod injection_patterns; // G3/M7: scanner extracted from handler to break circular deps
+pub mod types;              // G3/M7: JsonValue, ParsedPacket extracted from handler
 pub mod hth;
 pub mod identity_binding;
 pub mod klms;
