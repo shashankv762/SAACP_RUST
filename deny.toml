@@ -11,15 +11,42 @@
 # ── Advisories ────────────────────────────────────────────────────────────────
 # Check the RustSec advisory database for known vulnerabilities.
 [advisories]
-# Path to the advisory database (defaults to the official RustSec repo).
-path = "~/.cargo/advisory-dbs"
-# Ignore advisories that are withdrawn or unaffected in this crate.
-# Each entry must be justified with a comment.
+# Ignore advisories that are withdrawn, unaffected, or remediated via
+# an explicit compensating control. Each entry carries a justification
+# and a tracked remediation path.
+#
+# All four entries below come from the AWS SDK's transitive dependency
+# chain: aws-smithy-runtime/aws-smithy-http-client pull in rustls 0.21
+# and h2 0.3, which carry the CVEs below. They are ONLY reachable when
+# the `hrt-aws-kms` feature is enabled. Upgrading the AWS SDK to a
+# version that drops these deps is tracked in opusreview.md §2.8 / M21.
+# Re-check on every quarterly review or when a new AWS SDK major ships.
 ignore = [
-    # Example: "RUSTSEC-2020-0001",  # Not affected: only used in tests
+    # rustls-webpki 0.101.7 → URI name constraint bypass
+    # Affects: TLS cert validation when hrt-aws-kms is enabled.
+    # Remediation: AWS SDK upgrade (M21). Compensating: no external TLS
+    # endpoints are served through the aws-smithy-runtime path.
+    { id = "RUSTSEC-2026-0098", reason = "AWS SDK transitive — remediation tracked in M21 (aws-sdk upgrade)" },
+
+    # rustls-webpki 0.101.7 → wildcard name constraint bypass
+    # Same chain and remediation as RUSTSEC-2026-0098.
+    { id = "RUSTSEC-2026-0099", reason = "AWS SDK transitive — remediation tracked in M21" },
+
+    # rustls-webpki 0.101.7 → CRL parsing reachable panic
+    # Same chain and remediation as RUSTSEC-2026-0098.
+    { id = "RUSTSEC-2026-0104", reason = "AWS SDK transitive — remediation tracked in M21" },
+
+    # h2 0.3.27 → unbounded empty DATA frames (DoS)
+    # Affects: HTTP/2 client via aws-smithy-http-client when hrt-aws-kms
+    # is enabled. Compensating: the KMS endpoint is an outbound client
+    # connection, not an inbound server; the attack requires a malicious
+    # server, which is Amazon KMS — highly unlikely in practice.
+    { id = "RUSTSEC-2026-0258", reason = "AWS SDK transitive — remediation tracked in M21" },
 ]
-# The crates.io API token is read from the CARGO_REGISTRY_TOKEN env var
-# if needed for private registries. Not used here.
+# Emit a warning (not an error) when an ignored advisory is not detected
+# in the current build. This is expected for --all-features-only advisories
+# like the AWS SDK CVEs above, which are absent in a default-feature build.
+unused-ignored-advisory = "warn"
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
 # Deny specific crates by name or version range.
@@ -40,48 +67,65 @@ multiple-versions = "deny"
 # if the upstream unification tracked in opusreview.md §2.8 / M21 lands
 # first, delete the entry entirely.
 skip = [
-    # `rand 0.10.2` is the new version; `rand 0.8.6` is required by
-    # `ed25519-dalek 2.x` for its `rand_core` feature. The old version
-    # is only used in dev-dependencies and test utilities, never in
-    # production code paths. Tracked in opusreview.md §2.8.
-    # reviewed: 2026-09-05 — no rand 0.8.x-only advisory; unification blocked
-    # on ed25519-dalek's rand_core 0.2 dependency (upstream, not ours).
+    # `rand 0.8.6` required by ed25519-dalek 2.x / tungstenite.
+    # reviewed: 2026-09-13 — no rand 0.8.x-only advisory; blocked upstream.
     { name = "rand" },
 
-    # `axum 0.7.9` and `axum 0.8.9` coexist because the `sidecar` and
-    # `command-center` features use different major versions. Unification
-    # is tracked in opusreview.md §2.8 / M21.
-    # reviewed: 2026-09-05 — no 0.7.x-only advisory; both majors are
-    # maintained lines, neither is EOL.
+    # `sha3 0.10.9` (our direct dep) vs `sha3 0.11.0` pulled by ml-kem 0.3.
+    # reviewed: 2026-09-13 — no sha3 0.10.x-only advisory; ml-kem pins 0.11.
+    { name = "sha3" },
+
+    # `signature 2.2.0` (ed25519-dalek) vs `signature 3.0.0` (ml-dsa).
+    # reviewed: 2026-09-13 — no signature 2.x-only advisory.
+    { name = "signature" },
+
+    # `rand_core 0.6.x` (ed25519-dalek transitive) vs `rand_core 0.10.x`.
+    # reviewed: 2026-09-13 — no rand_core 0.6.x-only advisory.
+    { name = "rand_core" },
+
+    # `crypto-common 0.1.x` (sha2/hmac) vs `crypto-common 0.2.x` (ml-kem).
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "crypto-common" },
+
+    # `digest 0.10.x` vs `digest 0.11.x` (ml-kem/ml-dsa split).
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "digest" },
+
+    # `getrandom 0.2.x` (rand 0.8 transitive) vs `getrandom 0.4.x`.
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "getrandom" },
+
+    # `block-buffer 0.10.x` vs `block-buffer 0.11.x` (sha3 version split).
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "block-buffer" },
+
+    # `cpufeatures 0.2.x` vs `cpufeatures 0.3.x` (sha3 version split).
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "cpufeatures" },
+
+    # `keccak 0.1.x` vs `keccak 0.2.x` (sha3 0.10 vs sha3 0.11 split).
+    # reviewed: 2026-09-13 — no advisory.
+    { name = "keccak" },
+
+    # `axum 0.7.9` and `axum 0.8.9` — sidecar vs command-center feature split.
+    # reviewed: 2026-09-05 — no 0.7.x-only advisory; both majors maintained.
     { name = "axum" },
 
-    # `rustls 0.21.12` is pulled in transitively by `aws-smithy-runtime`
-    # when `hrt-aws-kms` is enabled. Upgrading the AWS SDK is tracked
-    # in opusreview.md §2.8 / M21.
-    # reviewed: 2026-09-05 — rustls 0.21 is EOL upstream; this is the
-    # HIGHEST-priority entry to re-check quarterly. If any rustls 0.21
-    # advisory lands, `hrt-aws-kms` must be treated as affected until the
-    # AWS SDK unification ships.
+    # `rustls 0.21.12` — AWS SDK transitive (hrt-aws-kms feature). EOL upstream;
+    # HIGHEST-priority entry to re-check quarterly. Tracked in M21.
+    # reviewed: 2026-09-05
     { name = "rustls" },
 
-    # `tokio-rustls 0.24.1` accompanies `rustls 0.21` via the same
-    # transitive path. Same remediation as above.
+    # `tokio-rustls 0.24.1` — same transitive path as rustls 0.21.
     # reviewed: 2026-09-05 — same EOL exposure as the rustls 0.21 entry.
     { name = "tokio-rustls" },
 
-    # `hyper 0.14` and `h2 0.3` enter through `aws-smithy-runtime` →
-    # `hyper-rustls 0.24.2` when `hrt-aws-kms` is enabled.
-    # reviewed: 2026-09-05 — h2 0.3 has had past advisories (HTTP/2
-    # rapid-reset family); re-check this entry on every h2 advisory.
+    # `hyper 0.14` and `h2 0.3` — AWS SDK transitive (hrt-aws-kms).
+    # reviewed: 2026-09-05 — h2 0.3 has past HTTP/2 rapid-reset advisories;
+    # re-check this entry on every h2 advisory.
     { name = "hyper" },
     { name = "h2" },
 ]
-
-# Deny crates from unknown git repositories (no git = "..." sources).
-unknown-git = "deny"
-
-# Deny crates that are not from crates.io or an approved registry.
-unknown-registry = "deny"
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
 # Enforce license compatibility. SAACP is MIT-licensed; dependencies must

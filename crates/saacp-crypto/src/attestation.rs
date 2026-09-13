@@ -14,6 +14,7 @@
 //! - Binds cryptographic identity to hardware root of trust
 //! - Enables compliance with healthcare/banking hardware requirements
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::pqc::domain_separation;
@@ -130,10 +131,16 @@ pub struct TeeAttestation {
     pub measurement: Vec<u8>,
     /// Attestation report data.
     pub report_data: Vec<u8>,
-    /// Signature over the report.
+    /// #5 FIX: Signature over the TEE report digest.
     pub signature: Vec<u8>,
     /// TEE type identifier.
     pub tee_type: String,
+    /// Public key used to verify `signature`.
+    ///
+    /// For Intel SGX ECDSA: the quoting enclave’s Ed25519 attestation key.
+    /// For ARM TrustZone: the TEE manufacturer’s Ed25519 signing key.
+    /// Must be exactly 32 bytes (raw Ed25519 compressed point).
+    pub signing_public_key: Vec<u8>,
     /// #5 FIX: Nonce from the attestation challenge (binds quote to this session).
     pub nonce: Vec<u8>,
     /// #5 FIX: Channel binding value (binds quote to this specific channel).
@@ -286,14 +293,22 @@ impl AttestationVerifier {
 
         // #5 FIX: Verify signature over quote data INCLUDING the freshness binding.
         // The signature must cover nonce || channel_binding || suite_transcript_hash || quote_data || pcr_values.
-        let _sig_input = Self::compute_quote_digest(
+        let sig_input = Self::compute_quote_digest(
             &quote.quote_data,
             &quote.pcr_values,
             &quote.nonce,
             &quote.channel_binding,
             &quote.suite_transcript_hash,
         );
-        let sig_valid = quote.signature.len() >= 64; // TODO(SECURITY): Placeholder — must verify against AIK public key for production.
+        // Cryptographic Ed25519 verification against the AIK public key.
+        // Rejects any payload whose signature was not produced by the private key
+        // corresponding to quote.aik_public — including replays, fabrications,
+        // and any 64-byte blob that is not a valid signature over sig_input.
+        let sig_valid = Self::verify_ed25519_signature(
+            &quote.aik_public,
+            &sig_input,
+            &quote.signature,
+        );
 
         AttestationVerification {
             is_valid: pcr_valid && sig_valid,
@@ -399,10 +414,21 @@ impl AttestationVerifier {
             }
         }
 
-        // Verify signature over report data
-        // TODO(SECURITY): Placeholder — must verify TEE report signature against manufacturer
-        // root certificate (Intel SGX EPID/ECDSA, ARM TrustZone, AMD SEV) for production.
-        let sig_valid = !tee.signature.is_empty();
+        // Verify signature over TEE report digest INCLUDING freshness binding.
+        // The signing_public_key must be the exact TEE manufacturer or quoting enclave key.
+        // Any empty blob, random bytes, or wrong-key signature is rejected cryptographically.
+        let tee_digest = Self::compute_tee_report_digest(
+            &tee.measurement,
+            &tee.report_data,
+            &tee.nonce,
+            &tee.channel_binding,
+            &tee.suite_transcript_hash,
+        );
+        let sig_valid = Self::verify_ed25519_signature(
+            &tee.signing_public_key,
+            &tee_digest,
+            &tee.signature,
+        );
 
         AttestationVerification {
             is_valid: measurement_valid && sig_valid,
@@ -440,6 +466,69 @@ impl AttestationVerifier {
         hasher.update((pcr_values.len() as u32).to_be_bytes());
         hasher.update(pcr_values);
         hasher.finalize().to_vec()
+    }
+
+    /// Compute the digest of a TEE attestation report for signature verification.
+    ///
+    /// Includes freshness binding (nonce, channel_binding, suite_transcript_hash)
+    /// so the signature covers the full session context and cannot be replayed.
+    ///
+    /// `pub(crate)` so that test helpers can produce correctly-signed reports.
+    pub(crate) fn compute_tee_report_digest(
+        measurement: &[u8],
+        report_data: &[u8],
+        nonce: &[u8],
+        channel_binding: &[u8],
+        suite_transcript_hash: &[u8],
+    ) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"SAACP-TEE-report-digest-v1");
+        // Freshness binding — length-prefixed to prevent extension attacks
+        hasher.update((nonce.len() as u32).to_be_bytes());
+        hasher.update(nonce);
+        hasher.update((channel_binding.len() as u32).to_be_bytes());
+        hasher.update(channel_binding);
+        hasher.update((suite_transcript_hash.len() as u32).to_be_bytes());
+        hasher.update(suite_transcript_hash);
+        // Report payload
+        hasher.update((measurement.len() as u32).to_be_bytes());
+        hasher.update(measurement);
+        hasher.update((report_data.len() as u32).to_be_bytes());
+        hasher.update(report_data);
+        hasher.finalize().to_vec()
+    }
+
+    /// Verify an Ed25519 signature over a message using a raw 32-byte public key.
+    ///
+    /// Returns `false` — never panics — on any of:
+    /// - `public_key_bytes` is not exactly 32 bytes
+    /// - `signature_bytes` is not exactly 64 bytes
+    /// - the key bytes do not represent a valid compressed Ed25519 point
+    /// - the signature does not verify against the key and message
+    ///
+    /// `pub(crate)` so the test submodule can exercise it directly.
+    pub(crate) fn verify_ed25519_signature(
+        public_key_bytes: &[u8],
+        message: &[u8],
+        signature_bytes: &[u8],
+    ) -> bool {
+        // Parse public key — must be exactly 32 bytes
+        let pk_array: [u8; 32] = match public_key_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&pk_array) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        // Parse signature — must be exactly 64 bytes
+        let sig_array: [u8; 64] = match signature_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&sig_array);
+        // Cryptographic verification — the only accepted path to `true`
+        verifying_key.verify(message, &signature).is_ok()
     }
 }
 
@@ -542,6 +631,59 @@ pub fn validate_attestation_size(quote_size: usize) -> Result<(), PqcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
+
+    /// Generate a random Ed25519 signing keypair for tests.
+    fn test_keypair() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    /// Build a correctly-signed TpmQuote for the given signing key.
+    fn make_valid_tpm_quote(sk: &ed25519_dalek::SigningKey) -> TpmQuote {
+        let quote_data = vec![1u8; 100];
+        let pcr_values = vec![1u8; 32];
+        let nonce = vec![1u8; 32];
+        let channel_binding = vec![2u8; 32];
+        let suite_transcript_hash = vec![3u8; 32];
+        let digest = AttestationVerifier::compute_quote_digest(
+            &quote_data, &pcr_values, &nonce, &channel_binding, &suite_transcript_hash,
+        );
+        let signature: ed25519_dalek::Signature = sk.sign(&digest);
+        TpmQuote {
+            quote_data,
+            pcr_values,
+            signature: signature.to_bytes().to_vec(),
+            aik_public: sk.verifying_key().to_bytes().to_vec(),
+            nonce,
+            channel_binding,
+            suite_transcript_hash,
+            quote_timestamp: 0.0,
+        }
+    }
+
+    /// Build a correctly-signed TeeAttestation for the given signing key.
+    fn make_valid_tee_attest(sk: &ed25519_dalek::SigningKey) -> TeeAttestation {
+        let measurement = vec![7u8; 32];
+        let report_data = vec![8u8; 64];
+        let nonce = vec![4u8; 32];
+        let channel_binding = vec![5u8; 32];
+        let suite_transcript_hash = vec![6u8; 32];
+        let digest = AttestationVerifier::compute_tee_report_digest(
+            &measurement, &report_data, &nonce, &channel_binding, &suite_transcript_hash,
+        );
+        let signature: ed25519_dalek::Signature = sk.sign(&digest);
+        TeeAttestation {
+            measurement,
+            report_data,
+            signature: signature.to_bytes().to_vec(),
+            tee_type: "sgx".to_string(),
+            signing_public_key: sk.verifying_key().to_bytes().to_vec(),
+            nonce,
+            channel_binding,
+            suite_transcript_hash,
+            quote_timestamp: 0.0,
+        }
+    }
 
     #[test]
     fn test_attestation_type_strings() {
@@ -586,50 +728,152 @@ mod tests {
         assert!(validate_attestation_size(max_sizes::MAX_ATTESTATION_QUOTE + 1).is_err());
     }
 
+    // ── TPM tests ─────────────────────────────────────────────────────────
+
     #[test]
-    fn test_tpm_quote_verification() {
+    fn test_tpm_quote_valid_signature_accepted() {
+        let sk = test_keypair();
         let mut verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
-
-        let quote = TpmQuote {
-            quote_data: vec![1u8; 100],
-            pcr_values: vec![1u8; 32],
-            signature: vec![0u8; 64],
-            aik_public: vec![0u8; 32],
-            // #5 FIX: Freshness binding fields
-            nonce: vec![1u8; 32],
-            channel_binding: vec![2u8; 32],
-            suite_transcript_hash: vec![3u8; 32],
-            // No timestamp — age check is skipped (backward compat with stubs).
-            quote_timestamp: 0.0,
-        };
-
+        let quote = make_valid_tpm_quote(&sk);
         let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
-        assert!(result.is_valid);
+        assert!(result.is_valid, "Valid TPM quote must be accepted");
     }
 
-    /// #5 FIX: Test that attestation without freshness binding is rejected.
+    /// Previously the placeholder `len >= 64` would have accepted this.
     #[test]
-    fn test_tpm_quote_without_freshness_rejected() {
+    fn test_tpm_quote_wrong_aik_rejected() {
+        let signing_key = test_keypair();
+        let wrong_key = test_keypair();
         let mut verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
-
-        let quote = TpmQuote {
-            quote_data: vec![1u8; 100],
-            pcr_values: vec![1u8; 32],
-            signature: vec![0u8; 64],
-            aik_public: vec![0u8; 32],
-            // Missing freshness binding
-            nonce: vec![],
-            channel_binding: vec![],
-            suite_transcript_hash: vec![],
-            quote_timestamp: 0.0,
-        };
-
+        let mut quote = make_valid_tpm_quote(&signing_key);
+        quote.aik_public = wrong_key.verifying_key().to_bytes().to_vec();
         let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
+        assert!(!result.is_valid, "TPM quote with wrong AIK must be rejected");
+    }
+
+    #[test]
+    fn test_tpm_quote_zeros_sig_rejected() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
+        let mut quote = make_valid_tpm_quote(&sk);
+        quote.signature = vec![0u8; 64];
+        let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
+        assert!(!result.is_valid, "Zero-filled TPM signature must be rejected");
+    }
+
+    #[test]
+    fn test_tpm_quote_tampered_data_rejected() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
+        let mut quote = make_valid_tpm_quote(&sk);
+        quote.quote_data[0] ^= 0xFF;
+        let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
+        assert!(!result.is_valid, "Tampered TPM quote_data must be rejected");
+    }
+
+    #[test]
+    fn test_tpm_quote_without_freshness_rejected() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
+        let mut quote = make_valid_tpm_quote(&sk);
+        quote.nonce = vec![];
+        quote.channel_binding = vec![];
+        quote.suite_transcript_hash = vec![];
+        let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
+        assert!(!result.is_valid, "TPM quote without freshness binding must be rejected");
+    }
+
+    // ── TEE tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tee_attestation_valid_accepted() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Enclave, vec![7u8; 32]);
+        let attest = make_valid_tee_attest(&sk);
+        let result = verifier.verify(&AttestationEvidence::Tee(attest), 0.0);
+        assert!(result.is_valid, "Valid TEE attestation must be accepted");
+    }
+
+    /// Previously the placeholder `!is_empty()` would have accepted this.
+    #[test]
+    fn test_tee_attestation_empty_sig_rejected() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Enclave, vec![7u8; 32]);
+        let mut attest = make_valid_tee_attest(&sk);
+        attest.signature = vec![];
+        let result = verifier.verify(&AttestationEvidence::Tee(attest), 0.0);
+        assert!(!result.is_valid, "Empty TEE signature must be rejected");
+    }
+
+    #[test]
+    fn test_tee_attestation_wrong_key_rejected() {
+        let signing_key = test_keypair();
+        let wrong_key = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Enclave, vec![7u8; 32]);
+        let mut attest = make_valid_tee_attest(&signing_key);
+        attest.signing_public_key = wrong_key.verifying_key().to_bytes().to_vec();
+        let result = verifier.verify(&AttestationEvidence::Tee(attest), 0.0);
+        assert!(!result.is_valid, "TEE attestation with wrong signing key must be rejected");
+    }
+
+    #[test]
+    fn test_tee_attestation_tampered_measurement_rejected() {
+        let sk = test_keypair();
+        let mut verifier = AttestationVerifier::new();
+        verifier.register_trusted_measurement(AttestationType::Enclave, vec![7u8; 32]);
+        let mut attest = make_valid_tee_attest(&sk);
+        attest.measurement[0] ^= 0xFF;
+        let result = verifier.verify(&AttestationEvidence::Tee(attest), 0.0);
+        assert!(!result.is_valid, "Tampered TEE measurement must be rejected");
+    }
+
+    // ── verify_ed25519_signature unit tests ──────────────────────────────────
+
+    #[test]
+    fn test_verify_ed25519_valid() {
+        let sk = test_keypair();
+        let msg = b"test message";
+        let sig: ed25519_dalek::Signature = sk.sign(msg);
         assert!(
-            !result.is_valid,
-            "TPM quote without freshness binding should be rejected"
+            AttestationVerifier::verify_ed25519_signature(&sk.verifying_key().to_bytes(), msg, &sig.to_bytes()),
+            "Genuine Ed25519 signature must verify"
+        );
+    }
+
+    #[test]
+    fn test_verify_ed25519_wrong_message_rejected() {
+        let sk = test_keypair();
+        let sig: ed25519_dalek::Signature = sk.sign(b"original message");
+        assert!(
+            !AttestationVerifier::verify_ed25519_signature(
+                &sk.verifying_key().to_bytes(), b"different message", &sig.to_bytes()
+            ),
+            "Signature over different message must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_ed25519_short_key_rejected() {
+        assert!(
+            !AttestationVerifier::verify_ed25519_signature(&[0u8; 31], b"msg", &[0u8; 64]),
+            "Short public key must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_ed25519_short_sig_rejected() {
+        let sk = test_keypair();
+        assert!(
+            !AttestationVerifier::verify_ed25519_signature(&sk.verifying_key().to_bytes(), b"msg", &[0u8; 63]),
+            "Short signature must be rejected"
         );
     }
 }

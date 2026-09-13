@@ -1,0 +1,20 @@
+﻿# cargo audit workspace-level configuration.
+# Matches the [advisories] ignore policy in deny.toml.
+# All CVEs originate from AWS SDK transitive deps (aws-smithy-runtime pulls
+# rustls 0.21 + h2 0.3 when hrt-aws-kms is enabled). Re-check quarterly.
+
+[advisories]
+ignore = [
+    # rustls-webpki 0.101.7 - URI name constraint bypass
+    "RUSTSEC-2026-0098",
+    # rustls-webpki 0.101.7 - wildcard name constraint bypass
+    "RUSTSEC-2026-0099",
+    # rustls-webpki 0.101.7 - CRL parsing reachable panic
+    "RUSTSEC-2026-0104",
+    # h2 0.3.27 - unbounded empty DATA frames DoS
+    # Compensating control: outbound-only KMS client, not a server.
+    "RUSTSEC-2026-0258",
+    # rustls-pemfile 2.2.0 - unmaintained warning (not a CVE)
+    # rustls-pemfile is a transitive dep of rustls 0.21 (AWS SDK).
+    "RUSTSEC-2025-0134",
+]
