@@ -1,4 +1,4 @@
-//! daemon.rs — SAACPNetworkDaemon
+﻿//! daemon.rs — SAACPNetworkDaemon
 //!
 //! Full feature-parity with Python SAACP daemon.py (329 lines).
 //! Async TCP server using Tokio. One task spawned per accepted connection.
@@ -19,7 +19,8 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
-use crate::handler::{JsonValue, ParsedPacket, SAACPProtocolHandler};
+use crate::types::{JsonValue, ParsedPacket};
+use crate::handler::SAACPProtocolHandler;
 use crate::measc::SessionEpochManager;
 use crate::pecf::{generate_correlation_id, internal_to_external_raw, SREL};
 use crate::response_auth::{compute_response_mac, RESPONSE_MAC_LEN};

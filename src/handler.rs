@@ -1,4 +1,4 @@
-//! handler.rs - SAACP Protocol Handler + Gates
+﻿//! handler.rs - SAACP Protocol Handler + Gates
 //!
 //! Zero-Trust Micro-Gateway Interceptor.
 //! Validates tokens, enforces action class, scans for injection,
@@ -50,6 +50,7 @@ fn percent_decode(s: &str) -> String {
 fn wire_session_id_hex(packet: &[u8]) -> String {
     packet.get(16..32).map(hex::encode).unwrap_or_default()
 }
+
 
 use crate::aegf::AEGFGovernor;
 use crate::context::SaacpContext;

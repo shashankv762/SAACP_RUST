@@ -1,4 +1,4 @@
-//! sidecar.rs — local HTTP proxy translating plain JSON into SAACP-secured traffic.
+﻿//! sidecar.rs — local HTTP proxy translating plain JSON into SAACP-secured traffic.
 //!
 //! The pitch: a Python (or any other language's) agent should get SAACP's crypto/gate-
 //! pipeline guarantees without knowing SAACP exists. Rather than a native binding (PyO3),
@@ -81,7 +81,7 @@ use crate::daemon::{
 };
 use crate::faitf_audit::FAITFAuditLog;
 use crate::gateway::{AgentRateLimiter, ZeroTrustGateway};
-use crate::handler::{JsonValue, ParsedPacket};
+use crate::types::{JsonValue, ParsedPacket};
 use crate::measc::{
     MEASCFrame, SessionEpochManager, MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
     MEASC_DEFAULT_EPOCH_TIME_SECONDS,

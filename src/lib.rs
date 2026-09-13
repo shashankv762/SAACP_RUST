@@ -30,6 +30,8 @@ pub mod framing;
 pub mod gateway;
 pub mod gossip;
 pub mod handler;
+pub mod injection_patterns; // G3/M7: scanner extracted from handler to break circular deps
+pub mod types;              // G3/M7: JsonValue, ParsedPacket extracted from handler
 pub mod hth;
 pub mod identity_binding;
 pub mod klms;

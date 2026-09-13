@@ -1,4 +1,4 @@
-//! ievl.rs — Intent-Execution Verification Loop (Phase 6 / Part 8.1)
+﻿//! ievl.rs — Intent-Execution Verification Loop (Phase 6 / Part 8.1)
 //!
 //! *New in Rust* — no Python-reference analog.
 //!
@@ -52,7 +52,7 @@
 //!   only reachable if a deployment lowers `RECEIPT_REQUIRED_ACTION_CLASS`
 //!   below the protocol's ceiling, since at the documented default
 //!   (IRREVERSIBLE only) a declaration already sits at the maximum class; or
-//!   (2) `actual_action`'s text names a [`crate::handler::DANGEROUS_ACTION_TERMS`]
+//!   (2) `actual_action`'s text names a [`crate::types::DANGEROUS_ACTION_TERMS`]
 //!   verb absent from the declaration — the same denylist Gate 1.5c already
 //!   applies prospectively, reused here retrospectively so escalation stays
 //!   detectable even when every tracked declaration is already at the
@@ -114,7 +114,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
-use crate::handler::{JsonValue, ParsedPacket, SAACPProtocolHandler};
+use crate::types::{JsonValue, ParsedPacket};
+use crate::handler::SAACPProtocolHandler;
 use crate::telemetry::report_gate_rejection;
 use crate::trust_decay::{trust_key_for, PenaltyKind, RewardKind, TrustDecayEngine};
 
@@ -366,7 +367,7 @@ impl IevlEngine {
         // something more dangerous than it promised.
         let declared_terms = SAACPProtocolHandler::intent_terms(&decl.declared_action);
         let actual_terms = SAACPProtocolHandler::intent_terms(actual_action);
-        for term in crate::handler::DANGEROUS_ACTION_TERMS {
+        for term in crate::types::DANGEROUS_ACTION_TERMS {
             if actual_terms.contains_key(*term) && !declared_terms.contains_key(*term) {
                 return VerificationVerdict::ClassEscalation;
             }

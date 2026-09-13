@@ -1,4 +1,4 @@
-//! type_state.rs — compile-time gate ordering enforcement (Phase 6 / item 2 / Part 1.3,
+﻿//! type_state.rs — compile-time gate ordering enforcement (Phase 6 / item 2 / Part 1.3,
 //! Part 8.7).
 //!
 //! `handler.rs`'s `_intercept_packet_inner`/`run_gates_1_through_12` is a single, ~600-line,
@@ -41,7 +41,8 @@
 use std::marker::PhantomData;
 
 use crate::errors::SAACPHardDrop;
-use crate::handler::{JsonValue, ParsedPacket, SAACPProtocolHandler};
+use crate::types::{JsonValue, ParsedPacket};
+use crate::handler::SAACPProtocolHandler;
 use crate::security::ImmutableAuditLog;
 
 /// A `ParsedPacket` that has passed Gate 0 (cryptographic integrity) and nothing else yet.
@@ -114,7 +115,7 @@ impl PipelineToken<Gate0Verified> {
                     // authenticated peer with a deeply-nested payload would
                     // blow the stack during this dict construction.
                     for (k, val) in map.into_iter() {
-                        let jv = crate::handler::serde_value_to_json_value_bounded(val, 1);
+                        let jv = crate::types::serde_value_to_json_value_bounded(val, 1);
                         // Fix 2 (longcat.md Gap D): depth-limited conversion. The
                         // scaffold previously recursed without bound; an
                         // authenticated peer with a deeply-nested payload would
@@ -124,13 +125,13 @@ impl PipelineToken<Gate0Verified> {
                         // deepest node, not at the top, so we must walk the
                         // resulting tree via `json_value_depth_exceeded` rather
                         // than pattern-matching only the top-level variant.
-                        if crate::handler::json_value_depth_exceeded(&jv) {
+                        if crate::types::json_value_depth_exceeded(&jv) {
                             return Err(SAACPHardDrop::new(
                                 crate::errors::SAACPBytecodes::PayloadTooLarge,
                                 format!(
                                     "Payload JSON exceeds max nesting depth ({}). \
                                      Rejecting at Gate 0 scaffold.",
-                                    crate::handler::PromptInjectionScanner::MAX_DEPTH
+                                    crate::injection_patterns::PromptInjectionScanner::MAX_DEPTH
                                 ),
                             ));
                         }
