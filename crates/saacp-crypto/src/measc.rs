@@ -1,0 +1,2577 @@
+﻿//! MEASC — Mandatory Encryption & Authenticated Sequence Control
+//!
+//! Full feature-parity with Python SAACP measc.py (1476 lines).
+//! Security ordering in parse_frame() MUST NOT be reordered.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use saacp_primitives::errors::{SAACPBytecodes, SAACPHardDrop};
+use crate::schemas::PreCompiledSchemas;
+
+// ─── Protocol constants ───────────────────────────────────────────────────────
+
+pub const MEASC_REPLAY_WINDOW_SIZE: usize = 4096;
+pub const MEASC_MAX_PSN_ADVANCE: u64 = 2048;
+pub const MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD: u64 = 512;
+pub const MEASC_REPLAY_RATE_LIMIT_WINDOW_SEC: f64 = 1.0;
+pub const MEASC_REPLAY_MAX_LARGE_ADVANCES: u32 = 3;
+pub const MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE: u32 = 5;
+pub const MEASC_DEFAULT_EPOCH_TIME_SECONDS: u64 = 600;
+pub const MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD: u64 = 1_048_576;
+pub const MEASC_EPOCH_GRACE_PERIOD_SECONDS: u64 = 60;
+pub const MEASC_PSN_MAX: u64 = i64::MAX as u64;
+/// S1 fix: hard cap on distinct sessions tracked by one `SessionEpochManager`.
+/// Pre-fix, the manager grew without bound — every packet whose 16-byte header
+/// `session_id` was unknown auto-created a ~1KB session entry BEFORE any AEAD
+/// verification (`daemon.rs` encrypted-transport path), so a single
+/// unauthenticated connection could grow memory at ~8x bandwidth amplification
+/// forever. The cap fails CLOSED: new legitimate sessions are rejected while
+/// an attacker's junk fills the table, but memory stays bounded at
+/// `cap * ~1KB`. Pair with `reap_idle_sessions` (never-authenticated junk is
+/// reaped within `MEASC_UNAUTH_SESSION_IDLE_SECS`) so slot-exhaustion is also
+/// short-lived. Override per deployment with
+/// [`SessionEpochManager::with_session_cap`].
+pub const MEASC_MAX_TRACKED_SESSIONS: usize = 4096;
+/// S1 fix: idle TTL for a session that has NEVER completed a successful AEAD
+/// decryption (i.e. one of the attacker's auto-created junk entries).
+pub const MEASC_UNAUTH_SESSION_IDLE_SECS: f64 = 60.0;
+/// S1 fix: idle TTL for a fully authenticated session before the reaper may
+/// retire it. Generous by design — an authenticated session going quiet for
+/// half an hour is far more likely a long-lived agent connection than junk.
+pub const MEASC_AUTH_SESSION_IDLE_SECS: f64 = 1800.0;
+pub const MEASC_AUTH_TAG_SIZE: usize = 16;
+pub const MEASC_HEADER_SIZE: usize = 128;
+pub const MEASC_MAGIC: &[u8; 4] = b"SACP";
+pub const MEASC_CONTEXT_REF_ID_OFFSET: usize = 44;
+pub const MEASC_CONTEXT_REF_ID_SIZE: usize = 32;
+
+// INVARIANT (spec §4.1): MEASC_MAX_PSN_ADVANCE MUST be < MEASC_REPLAY_WINDOW_SIZE.
+// A larger advance would allow an attacker to skip beyond the entire bitmap,
+// clearing all replay-protection records in a single packet.
+const _: () = assert!(
+    MEASC_MAX_PSN_ADVANCE < MEASC_REPLAY_WINDOW_SIZE as u64,
+    "INVARIANT VIOLATED: MEASC_MAX_PSN_ADVANCE must be strictly less than MEASC_REPLAY_WINDOW_SIZE"
+);
+
+// INVARIANT: MEASC header sizes must match the wire layout.
+const _: () = assert!(MEASC_HEADER_SIZE == 128, "MEASC_HEADER_SIZE must be 128");
+const _: () = assert!(MEASC_AUTH_TAG_SIZE == 16, "MEASC_AUTH_TAG_SIZE must be 16");
+const _: () = assert!(
+    MEASC_CONTEXT_REF_ID_OFFSET == 44,
+    "context_ref_id must be at offset 44"
+);
+const _: () = assert!(
+    MEASC_CONTEXT_REF_ID_SIZE == 32,
+    "context_ref_id field must be 32 bytes"
+);
+
+// HKDF info prefixes — MUST match Python measc.py exactly.
+const HKDF_EPOCH_KEY_INFO_PREFIX: &[u8] = b"SAACP-MEASC-epoch-key-v1";
+const HKDF_IV_INFO_PREFIX: &[u8] = b"SAACP-MEASC-iv-v1";
+
+// ─── AnomalyPolicy ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnomalyPolicy {
+    Allow,
+    #[default]
+    Audit,
+    RateLimit,
+    Quarantine,
+}
+
+// ─── ReplayWindowPolicy ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ReplayWindowPolicy {
+    pub window_size: usize,
+    pub max_advance: u64,
+    pub anomaly_jump_threshold: u64,
+    pub anomaly_policy: AnomalyPolicy,
+    pub max_anomalies_before_quarantine: u32,
+    pub rate_limit_window_seconds: f64,
+    pub max_large_advances_per_window: u32,
+}
+
+impl Default for ReplayWindowPolicy {
+    fn default() -> Self {
+        let mut p = Self {
+            window_size: MEASC_REPLAY_WINDOW_SIZE,
+            max_advance: MEASC_MAX_PSN_ADVANCE,
+            anomaly_jump_threshold: MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD,
+            anomaly_policy: AnomalyPolicy::Audit,
+            max_anomalies_before_quarantine: MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE,
+            rate_limit_window_seconds: MEASC_REPLAY_RATE_LIMIT_WINDOW_SEC,
+            max_large_advances_per_window: MEASC_REPLAY_MAX_LARGE_ADVANCES,
+        };
+        p.clamp();
+        p
+    }
+}
+
+impl ReplayWindowPolicy {
+    pub fn clamp(&mut self) {
+        if self.window_size < 1 {
+            self.window_size = 1;
+        }
+        if self.max_advance >= self.window_size as u64 {
+            self.max_advance = (self.window_size as u64).saturating_sub(1);
+        }
+        if self.anomaly_jump_threshold == 0 {
+            self.anomaly_jump_threshold = 1;
+        }
+        if self.anomaly_jump_threshold >= self.max_advance {
+            self.anomaly_jump_threshold = (self.max_advance / 2).max(1);
+        }
+    }
+}
+
+// ─── ReplayWindowStats ───────────────────────────────────────────────────────
+// Matches the dict returned by Python ReplayWindow.statistics()
+
+#[derive(Debug, Clone)]
+pub struct ReplayWindowStats {
+    pub highest: i64,
+    pub window_size: usize,
+    pub max_advance: u64,
+    pub initialized: bool,
+    pub grace_period_locked: bool,
+    pub anomaly_count: u32,
+    pub quarantined: bool,
+    pub anomaly_policy: AnomalyPolicy,
+    pub anomaly_jump_threshold: u64,
+    pub rate_window_advances: u32,
+}
+
+// ─── EpochSnapshot ───────────────────────────────────────────────────────────
+// Safe, Send-able snapshot of epoch state — returned by get_epoch() / get_current_epoch().
+
+#[derive(Debug, Clone)]
+pub struct EpochSnapshot {
+    pub session_id: [u8; 16],
+    pub epoch_id: u32,
+    pub is_destroyed: bool,
+    pub is_in_grace_period: bool,
+    pub should_rotate: bool,
+}
+
+// ─── ReplayWindow ────────────────────────────────────────────────────────────
+
+pub struct ReplayWindow {
+    policy: ReplayWindowPolicy,
+    bitmap: Vec<u8>,
+    highest_psn: i64,
+    initialized: bool,
+    grace_period_locked: bool,
+    anomaly_count: u32,
+    quarantined: bool,
+    rate_window_start: Instant,
+    rate_window_advances: u32,
+}
+
+impl ReplayWindow {
+    pub fn new(policy: ReplayWindowPolicy) -> Self {
+        let bitmap_bytes = policy.window_size.div_ceil(8);
+        Self {
+            bitmap: vec![0u8; bitmap_bytes],
+            highest_psn: -1,
+            initialized: false,
+            grace_period_locked: false,
+            anomaly_count: 0,
+            quarantined: false,
+            rate_window_start: Instant::now(),
+            rate_window_advances: 0,
+            policy,
+        }
+    }
+
+    pub fn with_default_policy() -> Self {
+        Self::new(ReplayWindowPolicy::default())
+    }
+
+    pub fn highest(&self) -> i64 {
+        self.highest_psn
+    }
+    pub fn anomaly_count(&self) -> u32 {
+        self.anomaly_count
+    }
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+    pub fn is_grace_period_locked(&self) -> bool {
+        self.grace_period_locked
+    }
+    pub fn anomaly_policy(&self) -> AnomalyPolicy {
+        self.policy.anomaly_policy
+    }
+    /// Return a rich snapshot of replay-window state for monitoring/telemetry.
+    /// Matches Python `ReplayWindow.statistics()` return dict exactly.
+    pub fn statistics(&self) -> ReplayWindowStats {
+        ReplayWindowStats {
+            highest: self.highest_psn,
+            window_size: self.policy.window_size,
+            max_advance: self.policy.max_advance,
+            initialized: self.initialized,
+            grace_period_locked: self.grace_period_locked,
+            anomaly_count: self.anomaly_count,
+            quarantined: self.quarantined,
+            anomaly_policy: self.policy.anomaly_policy,
+            anomaly_jump_threshold: self.policy.anomaly_jump_threshold,
+            rate_window_advances: self.rate_window_advances,
+        }
+    }
+
+    /// Legacy tuple accessor for internal tests that compare (highest, anomaly_count,
+    /// quarantined, grace_period_locked). Python parity: use statistics() for rich access.
+    #[allow(dead_code)]
+    pub fn statistics_tuple(&self) -> (i64, u32, bool, bool) {
+        (
+            self.highest_psn,
+            self.anomaly_count,
+            self.quarantined,
+            self.grace_period_locked,
+        )
+    }
+
+    pub fn lock_for_grace_period(&mut self) {
+        self.grace_period_locked = true;
+    }
+
+    /// Atomic check-and-accept: verify PSN is not a duplicate/out-of-window AND
+    /// immediately mark it as seen in one operation while the Mutex is held.
+    ///
+    /// SECURITY FIX (C-1 REPLAY-TOCTOU): Previously, `check()` and `accept()` were
+    /// separate method calls separated by AES-GCM decryption. Under concurrent load,
+    /// two threads for the same session+PSN could both pass `check()` before either
+    /// called `accept()`, allowing a replay to succeed. Now the bitmap is marked
+    /// atomically inside the same method, closing the window.
+    ///
+    /// Returns `(ok: bool, reason: &'static str)`. On `ok == true` the PSN is
+    /// already recorded; the caller MUST NOT call `accept()` separately.
+    pub fn check_and_accept(&mut self, psn: u64) -> (bool, &'static str) {
+        // Run the check logic
+        let (ok, reason) = self.check(psn);
+        if ok {
+            // Immediately mark as seen — same lock hold, no TOCTOU gap.
+            let _ = self.accept(psn);
+        }
+        (ok, reason)
+    }
+
+    /// F1 fix (PRE-AUTH-POISONING): read-only admission pre-check.
+    ///
+    /// Performs ONLY the gate checks that read attacker-relevant state —
+    /// duplicate bitmap, window bounds, max advance — and records NOTHING:
+    /// no bitmap bit is set, `highest_psn` is not advanced, and anomaly
+    /// accounting is skipped. `parse_frame` calls this BEFORE AES-GCM
+    /// authentication so an unauthenticated injector can be cheaply rejected
+    /// without being able to consume a PSN, move the window, burn the
+    /// RateLimit budget, or inflate anomaly counts toward quarantine.
+    /// The authoritative, state-mutating decision happens in
+    /// [`check_and_accept`], re-run AFTER authentication succeeds.
+    pub fn peek(&self, psn: u64) -> (bool, &'static str) {
+        if psn == 0 {
+            return (false, "negative_psn");
+        }
+        // F7 fix: `accept` stores psn in an i64 `highest_psn`; a psn above
+        // MEASC_PSN_MAX would wrap it negative and corrupt the window state.
+        // Reject here (pre-auth, cheap) so the authoritative path never sees it.
+        if psn > MEASC_PSN_MAX {
+            return (false, "psn_above_max");
+        }
+        if self.quarantined {
+            return (false, "quarantined");
+        }
+
+        let highest = self.highest_psn;
+
+        if highest >= 0 {
+            // highest is i64 and checked >= 0; cast to u64 is safe.
+            #[allow(clippy::cast_sign_loss)]
+            let h = highest as u64;
+            if psn > h.saturating_add(self.policy.max_advance) {
+                return (false, "advance_too_large");
+            }
+            if psn <= h.saturating_sub(self.policy.window_size as u64) {
+                return (false, "out_of_window");
+            }
+            if psn <= h {
+                // psn % window_size <= window_size <= 4096 — always fits in usize.
+                #[allow(clippy::cast_possible_truncation)]
+                let bit_idx = (psn as usize) % self.policy.window_size;
+                let byte_idx = bit_idx / 8;
+                let bit_off = bit_idx % 8;
+                if self.bitmap[byte_idx] & (1 << bit_off) != 0 {
+                    return (false, "duplicate");
+                }
+            }
+        }
+        (true, "ok")
+    }
+
+    pub fn check(&mut self, psn: u64) -> (bool, &'static str) {
+        // F1 fix: the state-independent gate logic lives in the read-only
+        // `peek` so the pre-authentication and post-authentication paths
+        // evaluate identical rules and can never drift apart.
+        let (ok, reason) = self.peek(psn);
+        if !ok {
+            return (ok, reason);
+        }
+
+        let highest = self.highest_psn;
+
+        // highest checked >= 0 above; cast to u64 is safe.
+        #[allow(clippy::cast_sign_loss)]
+        let highest_u64 = if highest >= 0 { highest as u64 } else { 0u64 };
+        let is_anomalous =
+            highest >= 0 && psn > highest_u64.saturating_add(self.policy.anomaly_jump_threshold);
+
+        if is_anomalous {
+            match self.policy.anomaly_policy {
+                AnomalyPolicy::Allow => {}
+                AnomalyPolicy::Audit => {
+                    self.anomaly_count += 1;
+                    return (true, "ok_anomaly_recorded");
+                }
+                AnomalyPolicy::RateLimit => {
+                    let elapsed = self.rate_window_start.elapsed().as_secs_f64();
+                    if elapsed > self.policy.rate_limit_window_seconds {
+                        self.rate_window_advances = 0;
+                        self.rate_window_start = Instant::now();
+                    }
+                    self.rate_window_advances += 1;
+                    if self.rate_window_advances > self.policy.max_large_advances_per_window {
+                        return (false, "rate_limit_exceeded");
+                    }
+                    self.anomaly_count += 1;
+                    return (true, "ok_anomaly_recorded");
+                }
+                AnomalyPolicy::Quarantine => {
+                    self.anomaly_count += 1;
+                    if self.anomaly_count >= self.policy.max_anomalies_before_quarantine {
+                        self.quarantined = true;
+                        return (false, "quarantined");
+                    }
+                    return (true, "ok_anomaly_recorded");
+                }
+            }
+        }
+
+        (true, "ok")
+    }
+
+    pub fn accept(&mut self, psn: u64) -> Result<(), SAACPHardDrop> {
+        if psn == 0 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PsnOutOfWindow,
+                "PSN must be > 0",
+            ));
+        }
+        // F7 fix: enforce the MEASC_PSN_MAX bound the i64 cast below previously
+        // only assumed. A malicious key-holder sending psn > i64::MAX used to
+        // wrap `highest_psn` negative and silently corrupt the replay window.
+        if psn > MEASC_PSN_MAX {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PsnOutOfWindow,
+                "PSN exceeds MEASC_PSN_MAX",
+            ));
+        }
+
+        // highest_psn is i64; checked < 0 then cast to u64 is safe.
+        #[allow(clippy::cast_sign_loss)]
+        let h = if self.highest_psn < 0 {
+            0u64
+        } else {
+            self.highest_psn as u64
+        };
+
+        if psn > h || !self.initialized {
+            let old_h = h;
+            let new_h = psn;
+            let new_start = new_h.saturating_sub(self.policy.window_size as u64);
+            let old_start = old_h.saturating_sub(self.policy.window_size as u64);
+
+            if new_start > old_start || !self.initialized {
+                let clear_start = if self.initialized { old_start + 1 } else { 0 };
+                let clear_end = new_start;
+                let clear_count = if clear_end >= clear_start {
+                    (clear_end - clear_start + 1).min(self.policy.window_size as u64)
+                } else {
+                    0
+                };
+
+                if clear_count >= self.policy.window_size as u64 {
+                    self.bitmap.iter_mut().for_each(|b| *b = 0);
+                } else {
+                    for i in 0..clear_count {
+                        let seq = clear_start + i;
+                        // seq % window_size <= window_size <= 4096 — fits in usize.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let bit_idx = (seq as usize) % self.policy.window_size;
+                        let byte_idx = bit_idx / 8;
+                        let bit_off = bit_idx % 8;
+                        self.bitmap[byte_idx] &= !(1 << bit_off);
+                    }
+                }
+            }
+
+            // F7 guarantees psn <= MEASC_PSN_MAX = i64::MAX as u64, so this
+            // cast fits — the bound is now enforced, not merely assumed.
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                self.highest_psn = psn as i64;
+            }
+            self.initialized = true;
+        }
+
+        // psn % window_size <= window_size <= 4096 — fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
+        let bit_idx = (psn as usize) % self.policy.window_size;
+        let byte_idx = bit_idx / 8;
+        let bit_off = bit_idx % 8;
+        self.bitmap[byte_idx] |= 1 << bit_off;
+        Ok(())
+    }
+
+    pub fn reset(&mut self) -> Result<(), SAACPHardDrop> {
+        if self.grace_period_locked {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                "Cannot reset a grace-period-locked replay window",
+            ));
+        }
+        self.bitmap.iter_mut().for_each(|b| *b = 0);
+        self.highest_psn = -1;
+        self.initialized = false;
+        self.anomaly_count = 0;
+        self.quarantined = false;
+        Ok(())
+    }
+}
+
+// ─── PacketSequencer ─────────────────────────────────────────────────────────
+
+pub struct PacketSequencer {
+    next_psn: AtomicU64,
+}
+
+impl PacketSequencer {
+    pub fn new(start: u64) -> Self {
+        Self {
+            next_psn: AtomicU64::new(start),
+        }
+    }
+
+    /// L-2 fix: was `fetch_add` then a compensating `fetch_sub` on overflow — safe with
+    /// respect to *uniqueness* (each caller still gets a distinct reserved PSN, since
+    /// `fetch_add` is a single atomic RMW), but not with respect to *visibility*: between
+    /// the `fetch_add` and the rollback, the counter briefly held a value strictly
+    /// greater than `MEASC_PSN_MAX`, observable by a concurrent `current()` call as an
+    /// invariant violation even if only for a moment. `fetch_update` performs the bounds
+    /// check and the increment as a single atomic compare-exchange loop, so the stored
+    /// value never exceeds `MEASC_PSN_MAX`, not even transiently.
+    pub fn next_psn(&self) -> Result<u64, SAACPHardDrop> {
+        self.next_psn
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |psn| {
+                if psn >= MEASC_PSN_MAX {
+                    None
+                } else {
+                    Some(psn + 1)
+                }
+            })
+            .map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::SequenceOverflow,
+                    "PSN would exceed MEASC_PSN_MAX",
+                )
+            })
+    }
+
+    pub fn next(&self) -> Result<u64, SAACPHardDrop> {
+        self.next_psn()
+    }
+
+    pub fn current(&self) -> u64 {
+        self.next_psn.load(Ordering::SeqCst)
+    }
+}
+
+// ─── KeyEvolutionEngine ──────────────────────────────────────────────────────
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct KeyEvolutionEngine {
+    session_secret: [u8; 32],
+}
+
+impl KeyEvolutionEngine {
+    pub fn new(session_secret: [u8; 32]) -> Self {
+        Self { session_secret }
+    }
+
+    /// HKDF info prefix for the S4 root ratchet — domain-separated from the
+    /// epoch-key and IV prefixes so a ratcheted root can never be mistaken
+    /// for (or collide with) any other derived value.
+    const ROOT_RATCHET_INFO_PREFIX: &'static [u8] = b"SAACP-MEASC-root-ratchet-v1";
+
+    /// S4: one forward-secrecy ratchet step of the session root secret.
+    ///
+    /// `new_root = HKDF-SHA256(salt = session_id, IKM = old_root XOR
+    /// current_traffic_key, info = ROOT_RATCHET_INFO_PREFIX ||
+    /// new_epoch_id_BE4)`.
+    ///
+    /// Mixing the CURRENT epoch's traffic key into the ratchet is what makes
+    /// this a real ratchet rather than a deterministic chain: after the old
+    /// epoch's grace period expires its traffic key is destroyed (zeroized),
+    /// so a compromise of ONLY the long-term root (the classic PSK/config
+    /// leak) can no longer compute later roots — deriving root_{n+1} requires
+    /// material that no longer exists anywhere. A pure `HKDF(root_n)` chain
+    /// would give the attacker with root_0 every future root forever and add
+    /// no secrecy at all.
+    ///
+    /// Cross-side synchronization: both peers hold identical epoch traffic
+    /// keys at all times (the invariant of this key schedule), so both
+    /// compute the identical `new_root` at the same rotation boundary without
+    /// any wire negotiation. The ratchet is opt-in per
+    /// [`SessionEpochManager::with_root_ratchet`] because it changes derived
+    /// key values versus the v1 (Python-parity) schedule.
+    pub fn ratchet_root(
+        old_root: &[u8; 32],
+        current_traffic_key: &[u8; 32],
+        session_id: &[u8; 16],
+        new_epoch_id: u32,
+    ) -> [u8; 32] {
+        let mut ikm = [0u8; 32];
+        for i in 0..32 {
+            ikm[i] = old_root[i] ^ current_traffic_key[i];
+        }
+        let mut info = Vec::with_capacity(Self::ROOT_RATCHET_INFO_PREFIX.len() + 4);
+        info.extend_from_slice(Self::ROOT_RATCHET_INFO_PREFIX);
+        info.extend_from_slice(&new_epoch_id.to_be_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(session_id), &ikm);
+        let mut okm = [0u8; 32];
+        hk.expand(&info, &mut okm)
+            .expect("HKDF expand failed for root ratchet");
+        okm
+    }
+
+    pub fn derive_epoch_key(
+        &self,
+        session_id: &[u8; 16],
+        epoch_id: u32,
+        prev_key: Option<&[u8; 32]>,
+    ) -> [u8; 32] {
+        if let Some(pk) = prev_key {
+            // Chained epoch key derivation — matches Python normative reference (measc.py:226–228).
+            //   IKM  = session_secret XOR prev_key   (XOR-mixed, not prev_key alone)
+            //   salt = session_id
+            //   info = b"SAACP-MEASC-epoch-key-v1" || epoch_id_BE4
+            //
+            // Using prev_key directly as IKM (the old approach) breaks forward secrecy:
+            // an attacker who recovers epoch N's traffic key can derive all future epoch
+            // keys without ever knowing session_secret.  The XOR mix forces session_secret
+            // to be part of every chained derivation.
+            let mut ikm = [0u8; 32];
+            for i in 0..32 {
+                ikm[i] = self.session_secret[i] ^ pk[i];
+            }
+
+            let mut info = Vec::with_capacity(HKDF_EPOCH_KEY_INFO_PREFIX.len() + 4);
+            info.extend_from_slice(HKDF_EPOCH_KEY_INFO_PREFIX);
+            info.extend_from_slice(&epoch_id.to_be_bytes());
+
+            let hk = Hkdf::<Sha256>::new(Some(session_id), &ikm);
+            let mut okm = [0u8; 32];
+            hk.expand(&info, &mut okm)
+                .expect("HKDF expand failed for epoch evolution");
+            okm
+        } else {
+            // Initial epoch key derivation: IKM = session_secret.
+            let mut info = Vec::with_capacity(HKDF_EPOCH_KEY_INFO_PREFIX.len() + 4);
+            info.extend_from_slice(HKDF_EPOCH_KEY_INFO_PREFIX);
+            info.extend_from_slice(&epoch_id.to_be_bytes());
+
+            let hk = Hkdf::<Sha256>::new(Some(session_id), &self.session_secret);
+            let mut okm = [0u8; 32];
+            hk.expand(&info, &mut okm).expect("HKDF expand failed");
+            okm
+        }
+    }
+}
+
+// ─── IV Derivation ───────────────────────────────────────────────────────────
+
+fn derive_iv(traffic_key: &[u8; 32], epoch_id: u32, psn: u64) -> [u8; 12] {
+    let mut info = Vec::with_capacity(HKDF_IV_INFO_PREFIX.len() + 12);
+    info.extend_from_slice(HKDF_IV_INFO_PREFIX);
+    info.extend_from_slice(&epoch_id.to_be_bytes());
+    info.extend_from_slice(&psn.to_be_bytes());
+
+    let hk = Hkdf::<Sha256>::from_prk(traffic_key).expect("PRK length valid");
+    let mut iv = [0u8; 12];
+    hk.expand(&info, &mut iv).expect("IV HKDF expand failed");
+    iv
+}
+
+// ─── SessionEpoch ────────────────────────────────────────────────────────────
+
+pub struct SessionEpoch {
+    pub session_id: [u8; 16],
+    pub epoch_id: u32,
+    traffic_key: [u8; 32],
+    pub created_at: Instant,
+    pub packet_threshold: u64,
+    pub time_threshold: Duration,
+    pub replay_window: ReplayWindow,
+    pub sequencer: PacketSequencer,
+    destroyed: bool,
+    in_grace_period: bool,
+}
+
+impl SessionEpoch {
+    pub fn new(
+        session_id: [u8; 16],
+        epoch_id: u32,
+        traffic_key: [u8; 32],
+        packet_threshold: u64,
+        time_threshold_secs: f64,
+    ) -> Self {
+        Self {
+            session_id,
+            epoch_id,
+            traffic_key,
+            created_at: Instant::now(),
+            packet_threshold,
+            time_threshold: Duration::from_secs_f64(time_threshold_secs),
+            replay_window: ReplayWindow::with_default_policy(),
+            sequencer: PacketSequencer::new(1),
+            destroyed: false,
+            in_grace_period: false,
+        }
+    }
+
+    pub fn traffic_key(&self) -> Result<&[u8; 32], SAACPHardDrop> {
+        if self.destroyed {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::EpochExpired,
+                "Attempted to access destroyed epoch key material",
+            ));
+        }
+        Ok(&self.traffic_key)
+    }
+
+    pub fn is_destroyed(&self) -> bool {
+        self.destroyed
+    }
+    pub fn is_in_grace_period(&self) -> bool {
+        self.in_grace_period
+    }
+
+    pub fn should_rotate(&self) -> bool {
+        if self.destroyed {
+            return false;
+        }
+        self.sequencer.current() >= self.packet_threshold
+            || self.created_at.elapsed() >= self.time_threshold
+    }
+
+    pub fn enter_grace_period(&mut self) {
+        self.in_grace_period = true;
+        self.replay_window.lock_for_grace_period();
+    }
+
+    pub fn destroy(&mut self) {
+        if !self.destroyed {
+            self.traffic_key.zeroize();
+            self.destroyed = true;
+        }
+    }
+}
+
+/// SECURITY FIX (FINDING-2b): `destroy()` was previously the only path that
+/// zeroized `traffic_key`; a panic unwinding through a scope holding a live
+/// `SessionEpoch` (e.g. before `rotate_epoch()`/`destroy_session()` call
+/// `destroy()`) skipped zeroization entirely. Drop guarantees it always runs.
+impl Drop for SessionEpoch {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+// ─── SessionEpochManager ─────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SessionMeta {
+    secret: [u8; 32],
+    current_epoch: u32,
+    packet_threshold: u64,
+    time_threshold_secs: f64,
+    suite_transcript_hash_hex: String,
+    /// S1 fix: liveness bookkeeping for the idle reaper. Skipped from
+    /// `Zeroize` — `Instant` has no key material.
+    #[zeroize(skip)]
+    last_active: Instant,
+    /// S1 fix: true once this session completed at least one successful AEAD
+    /// decryption (`parse_frame`). Never-authenticated sessions are reaped
+    /// after the much shorter `MEASC_UNAUTH_SESSION_IDLE_SECS`.
+    #[zeroize(skip)]
+    authenticated: bool,
+}
+
+/// L-11 fix: lock ordering. This type holds three independent locks (`sessions`,
+/// `meta`, `grace`). Every method in `impl SessionEpochManager` (verified by reading
+/// each one directly) acquires at most ONE of these three at a time — each acquisition
+/// is scoped to a single statement or a tightly-bounded block, and the guard is always
+/// dropped before the next lock (of any of the three) is taken. No method ever holds
+/// two of these locks simultaneously, so there is no fixed cross-lock ordering to
+/// document or violate: two threads racing any combination of these methods can never
+/// deadlock against each other on this type, regardless of which lock each happens to
+/// reach for first. Any future addition to this `impl` block that needs to hold two of
+/// these locks at once must establish and follow a fixed acquisition order
+/// (`sessions` → `meta` → `grace`, matching their declaration order below) to preserve
+/// this invariant.
+pub struct SessionEpochManager {
+    pub sessions: Mutex<HashMap<[u8; 16], HashMap<u32, SessionEpoch>>>,
+    meta: Mutex<HashMap<[u8; 16], SessionMeta>>,
+    grace: Mutex<HashMap<[u8; 16], HashMap<u32, Instant>>>,
+    /// S1 fix: see [`MEASC_MAX_TRACKED_SESSIONS`].
+    session_cap: usize,
+    /// S1 fix: idle TTLs used by [`Self::reap_idle_sessions`] — injectable so
+    /// tests (and unusual deployments) can shorten them; defaults are the
+    /// [`MEASC_UNAUTH_SESSION_IDLE_SECS`]/[`MEASC_AUTH_SESSION_IDLE_SECS`] consts.
+    unauth_idle_secs: f64,
+    auth_idle_secs: f64,
+    /// S4: opt-in forward-secrecy root ratchet — see
+    /// [`KeyEvolutionEngine::ratchet_root`]. Default `false` preserves the
+    /// exact v1 (Python-parity) key schedule; both peers of a session MUST
+    /// set the same value (it is a deployment-level setting, like the
+    /// negotiated suite list).
+    root_ratchet: bool,
+}
+
+impl Default for SessionEpochManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionEpochManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            meta: Mutex::new(HashMap::new()),
+            grace: Mutex::new(HashMap::new()),
+            session_cap: MEASC_MAX_TRACKED_SESSIONS,
+            unauth_idle_secs: MEASC_UNAUTH_SESSION_IDLE_SECS,
+            auth_idle_secs: MEASC_AUTH_SESSION_IDLE_SECS,
+            // R-4 fix: forward-secrecy root ratchet is now on by default. A PSK
+            // compromise no longer exposes past/future traffic. Use
+            // `without_root_ratchet()` to opt out (changes derived key values
+            // vs the v1 Python-parity schedule).
+            root_ratchet: true,
+        }
+    }
+
+    /// R-4 fix: explicitly disable the forward-secrecy root ratchet.
+    /// Opt-out only — most deployments should keep the ratchet enabled.
+    pub fn without_root_ratchet(mut self) -> Self {
+        self.root_ratchet = false;
+        self
+    }
+
+    /// S4: enable the forward-secrecy root ratchet for every session this
+    /// manager creates — see [`KeyEvolutionEngine::ratchet_root`]. Changes
+    /// derived epoch-key values versus v1, so every peer of these sessions
+    /// must enable it too. The stored root is ratcheted (and the previous
+    /// value overwritten) at every epoch rotation.
+    pub fn with_root_ratchet(mut self) -> Self {
+        self.root_ratchet = true;
+        self
+    }
+
+    /// S1 fix: override the session-table cap (see
+    /// [`MEASC_MAX_TRACKED_SESSIONS`]). Values below 1 are clamped to 1.
+    pub fn with_session_cap(mut self, cap: usize) -> Self {
+        self.session_cap = cap.max(1);
+        self
+    }
+
+    /// S1 fix: override the idle-reaper TTLs (seconds). A
+    /// never-AEAD-authenticated session is reaped after `unauth_idle_secs`;
+    /// an authenticated one only after `auth_idle_secs`. Both clamped to a
+    /// 1ms floor so a zero value cannot reap sessions the instant they are
+    /// created.
+    pub fn with_idle_ttls(mut self, unauth_idle_secs: f64, auth_idle_secs: f64) -> Self {
+        self.unauth_idle_secs = unauth_idle_secs.max(0.001);
+        self.auth_idle_secs = auth_idle_secs.max(0.001);
+        self
+    }
+
+    pub fn create_session(
+        &self,
+        session_id: [u8; 16],
+        session_secret: [u8; 32],
+        packet_threshold: u64,
+        time_threshold_secs: f64,
+        suite_transcript_hash: Option<[u8; 32]>,
+    ) -> Result<u32, SAACPHardDrop> {
+        let (bound_secret, suite_hex) = if let Some(tx_hash) = suite_transcript_hash {
+            let hk = Hkdf::<Sha256>::new(Some(&tx_hash), &session_secret);
+            let mut bound = [0u8; 32];
+            hk.expand(b"SAACP-suite-binding", &mut bound)
+                .expect("HKDF expand");
+            (bound, hex::encode(tx_hash))
+        } else {
+            (session_secret, String::new())
+        };
+
+        let engine = KeyEvolutionEngine::new(bound_secret);
+        let initial_key = engine.derive_epoch_key(&session_id, 0, None);
+        let epoch = SessionEpoch::new(
+            session_id,
+            0,
+            initial_key,
+            packet_threshold,
+            time_threshold_secs,
+        );
+
+        {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking —
+            // `SessionEpochManager` is exercised from the daemon's packet pipeline,
+            // so one poisoning panic must not cascade into every other in-flight
+            // packet losing epoch management entirely. A poisoned lock does not
+            // imply data corruption — the data is still valid and recoverable.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if sessions.contains_key(&session_id) {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::SchemaMismatch,
+                    format!("Session {} already exists", hex::encode(session_id)),
+                ));
+            }
+            // S1 fix: fail-closed session-table cap — see MEASC_MAX_TRACKED_SESSIONS.
+            if sessions.len() >= self.session_cap {
+                return Err(SAACPHardDrop::new(
+                    SAACPBytecodes::CircuitBreakerOpen,
+                    format!(
+                        "Session table at capacity ({}) — refusing new session. \
+                         Reap idle sessions (reap_idle_sessions) or raise the cap \
+                         (with_session_cap).",
+                        self.session_cap
+                    ),
+                ));
+            }
+            let mut ep_map = HashMap::new();
+            ep_map.insert(0u32, epoch);
+            sessions.insert(session_id, ep_map);
+        }
+
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            session_id,
+            SessionMeta {
+                secret: bound_secret,
+                current_epoch: 0,
+                packet_threshold,
+                time_threshold_secs,
+                suite_transcript_hash_hex: suite_hex,
+                last_active: Instant::now(),
+                authenticated: false,
+            },
+        );
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id, HashMap::new());
+        Ok(0)
+    }
+
+    pub fn with_epoch<F, R>(&self, session_id: &[u8; 16], epoch_id: u32, f: F) -> Option<R>
+    where
+        F: FnOnce(&SessionEpoch) -> R,
+    {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)?
+            .get(&epoch_id)
+            .map(f)
+    }
+
+    pub fn with_epoch_mut<F, R>(&self, session_id: &[u8; 16], epoch_id: u32, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut SessionEpoch) -> R,
+    {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        self.sessions
+            .lock()
+            .unwrap()
+            .get_mut(session_id)?
+            .get_mut(&epoch_id)
+            .map(f)
+    }
+
+    pub fn get_current_epoch_id(&self, session_id: &[u8; 16]) -> Option<u32> {
+        // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+        self.meta
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|m| m.current_epoch)
+    }
+
+    // R-1: read-only observability enumeration — not a security gate; safe to
+    // recover from a poisoned lock rather than panic.
+    pub fn list_epoch_ids(&self, session_id: &[u8; 16]) -> Vec<u32> {
+        match self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+        {
+            Some(m) => {
+                let mut v: Vec<u32> = m.keys().copied().collect();
+                v.sort();
+                v
+            }
+            None => vec![],
+        }
+    }
+
+    pub fn rotate_epoch(&self, session_id: &[u8; 16]) -> Result<u32, SAACPHardDrop> {
+        let (current_id, secret, packet_threshold, time_threshold_secs) = {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let m = meta.get(session_id).ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    format!(
+                        "Cannot rotate: session {} not found",
+                        hex::encode(session_id)
+                    ),
+                )
+            })?;
+            (
+                m.current_epoch,
+                m.secret,
+                m.packet_threshold,
+                m.time_threshold_secs,
+            )
+        };
+
+        let prev_key = {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let ep_map = sessions.get(session_id).ok_or_else(|| {
+                SAACPHardDrop::new(SAACPBytecodes::EpochExpired, "Session not found")
+            })?;
+            let epoch = ep_map.get(&current_id).ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    format!("Current epoch {} not found", current_id),
+                )
+            })?;
+            *epoch.traffic_key()?
+        };
+
+        let new_epoch_id = current_id.checked_add(1).ok_or_else(|| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::SequenceOverflow,
+                "Epoch ID exhausted — u32 overflow",
+            )
+        })?;
+        // S4: advance the root through one ratchet step BEFORE deriving the
+        // new epoch key, so the new key is bound to the ratcheted root. The
+        // local `secret` copy (old root) is zeroized right after use; the
+        // stored copy is overwritten below once the rotation commits.
+        let mut secret = secret;
+        let (engine, ratcheted_root) = if self.root_ratchet {
+            let ratcheted =
+                KeyEvolutionEngine::ratchet_root(&secret, &prev_key, session_id, new_epoch_id);
+            use zeroize::Zeroize;
+            secret.zeroize();
+            (KeyEvolutionEngine::new(ratcheted), Some(ratcheted))
+        } else {
+            (KeyEvolutionEngine::new(secret), None)
+        };
+        let new_key = engine.derive_epoch_key(session_id, new_epoch_id, Some(&prev_key));
+        let new_epoch = SessionEpoch::new(
+            *session_id,
+            new_epoch_id,
+            new_key,
+            packet_threshold,
+            time_threshold_secs,
+        );
+
+        {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let ep_map = sessions.get_mut(session_id).ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    "Session disappeared during rotation",
+                )
+            })?;
+            ep_map.insert(new_epoch_id, new_epoch);
+        }
+
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        if let Some(m) = self
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(session_id)
+        {
+            m.current_epoch = new_epoch_id;
+            // S4: commit the ratcheted root over the old one. Assigning a
+            // fixed-size array overwrites every byte of the previous value —
+            // no copy of the old root survives in this process.
+            if let Some(new_root) = ratcheted_root {
+                m.secret = new_root;
+            }
+        }
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(*session_id)
+            .or_default()
+            .insert(current_id, Instant::now());
+
+        {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ep_map) = sessions.get_mut(session_id) {
+                if let Some(old) = ep_map.get_mut(&current_id) {
+                    old.enter_grace_period();
+                    old.destroy();
+                }
+            }
+        }
+
+        Ok(new_epoch_id)
+    }
+
+    pub fn check_and_rotate(&self, session_id: &[u8; 16]) -> Option<u32> {
+        let current_id = self.get_current_epoch_id(session_id)?;
+        let should = self.with_epoch(session_id, current_id, |e| e.should_rotate())?;
+        if should {
+            self.rotate_epoch(session_id).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn destroy_session(&self, session_id: &[u8; 16]) {
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        let epochs = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        self.grace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        if let Some(mut ep_map) = epochs {
+            for e in ep_map.values_mut() {
+                e.destroy();
+            }
+        }
+    }
+
+    /// S1 fix: mark a session as having completed a successful AEAD decryption
+    /// and refresh its liveness clock. Called by `parse_frame` at Step 6.5 —
+    /// only a genuine traffic-key holder can reach it, so the reaper can trust
+    /// `authenticated == false` as "possibly attacker junk".
+    pub fn note_authenticated(&self, session_id: &[u8; 16]) {
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        if let Some(m) = self
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(session_id)
+        {
+            m.last_active = Instant::now();
+            m.authenticated = true;
+        }
+    }
+
+    /// S1 fix: reap idle sessions. A session that NEVER authenticated is
+    /// removed after `unauth_idle_secs` (default 60s — these are, with near
+    /// certainty, entries an unauthenticated peer's random header session_ids
+    /// auto-created); an authenticated session is removed only after
+    /// `auth_idle_secs` (default 30min of total silence). Lock discipline
+    /// follows the L-11 single-lock-at-a-time rule: collect the doom list
+    /// under the `meta` lock, then destroy each id via `destroy_session`
+    /// (which takes each lock in turn). Returns the number of sessions reaped.
+    pub fn reap_idle_sessions(&self) -> usize {
+        let unauth_idle = Duration::from_secs_f64(self.unauth_idle_secs);
+        let auth_idle = Duration::from_secs_f64(self.auth_idle_secs);
+        let now = Instant::now();
+        let doomed: Vec<[u8; 16]> = {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+            meta.iter()
+                .filter(|(_, m)| {
+                    let idle_for = now.duration_since(m.last_active);
+                    if m.authenticated {
+                        idle_for >= auth_idle
+                    } else {
+                        idle_for >= unauth_idle
+                    }
+                })
+                .map(|(sid, _)| *sid)
+                .collect()
+        };
+        let n = doomed.len();
+        for sid in &doomed {
+            self.destroy_session(sid);
+        }
+        n
+    }
+
+    pub fn expire_old_epochs(&self, grace_seconds: Option<f64>) -> usize {
+        let grace = Duration::from_secs_f64(
+            grace_seconds.unwrap_or(MEASC_EPOCH_GRACE_PERIOD_SECONDS as f64),
+        );
+        let to_remove: Vec<([u8; 16], u32)> = {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let g = self.grace.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .flat_map(|(sid, eid_map)| {
+                    eid_map
+                        .iter()
+                        .filter(|(_, &t)| t.elapsed() >= grace)
+                        .map(|(&eid, _)| (*sid, eid))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut collected = 0;
+        for (sid, eid) in to_remove {
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            let ep = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&sid)
+                .and_then(|m| m.remove(&eid));
+            // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+            self.grace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&sid)
+                .map(|m| m.remove(&eid));
+            if let Some(mut e) = ep {
+                e.destroy();
+                collected += 1;
+            }
+        }
+        collected
+    }
+
+    // R-1: pure observability counter — safe to recover from a poisoned lock
+    // rather than panic.
+    pub fn session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    // ── Python parity: get_epoch() and get_current_epoch() ──────────────────
+
+    /// Return a clone of the SessionEpoch state for the given (session_id, epoch_id).
+    /// Python parity: `SessionEpochManager.get_epoch(session_id, epoch_id)`.
+    pub fn get_epoch(&self, session_id: &[u8; 16], epoch_id: u32) -> Option<EpochSnapshot> {
+        // M-38 fix: recover via `into_inner()` on poison rather than panicking.
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let ep = sessions.get(session_id)?.get(&epoch_id)?;
+        Some(EpochSnapshot {
+            session_id: *session_id,
+            epoch_id,
+            is_destroyed: ep.is_destroyed(),
+            is_in_grace_period: ep.is_in_grace_period(),
+            should_rotate: ep.should_rotate(),
+        })
+    }
+
+    /// Return a clone of the current-epoch state for a session.
+    /// Python parity: `SessionEpochManager.get_current_epoch(session_id)`.
+    pub fn get_current_epoch(&self, session_id: &[u8; 16]) -> Option<EpochSnapshot> {
+        let current_id = self.get_current_epoch_id(session_id)?;
+        self.get_epoch(session_id, current_id)
+    }
+
+    /// Negotiate a cipher suite and create a session in one call.
+    /// Python parity: `SessionEpochManager.create_session_with_negotiation()`.
+    ///
+    /// 1. Calls `SuiteNegotiator::negotiate()` to select an approved suite and
+    ///    produce a `NegotiationTranscript`.
+    /// 2. Derives a 32-byte transcript hash from the transcript's `transcript_hash_hex`.
+    /// 3. Passes the transcript hash to `create_session()` for key binding.
+    /// 4. Returns `(epoch_id, NegotiationTranscript)` so callers can transmit
+    ///    `transcript_hash_hex` to the remote peer for verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_negotiation(
+        &self,
+        session_id: [u8; 16],
+        session_secret: [u8; 32],
+        local_suites: &[&str],
+        remote_suites: &[&str],
+        protocol_version: Option<&str>,
+        packet_threshold: u64,
+        time_threshold_secs: f64,
+    ) -> Result<(u32, crate::crypto_governance::NegotiationTranscript), SAACPHardDrop> {
+        use crate::crypto_governance::{CryptoTransparencyLedger, SuiteNegotiator};
+        // Use a temporary per-call ledger so this convenience method does not
+        // require a global ledger reference (callers can pass their own ledger to
+        // SuiteNegotiator::negotiate directly if they need persistent audit).
+        let tmp_ledger = CryptoTransparencyLedger::new();
+        // Step 1: negotiate a common approved suite
+        let transcript = SuiteNegotiator::negotiate(
+            local_suites,
+            remote_suites,
+            &session_id,
+            protocol_version,
+            None, // use production policy default
+            &tmp_ledger,
+            None, // use default security tier (PqcPreferred)
+        )
+        .map_err(|e| {
+            SAACPHardDrop::new(
+                SAACPBytecodes::SchemaMismatch,
+                format!("Suite negotiation failed: {e}"),
+            )
+        })?;
+        // Step 2: copy transcript.transcript_hash (32-byte SHA-256) into fixed array
+        let mut suite_tx_hash = [0u8; 32];
+        let src = &transcript.transcript_hash;
+        let len = src.len().min(32);
+        suite_tx_hash[..len].copy_from_slice(&src[..len]);
+        // Step 3: create session with transcript binding
+        let epoch_id = self.create_session(
+            session_id,
+            session_secret,
+            packet_threshold,
+            time_threshold_secs,
+            Some(suite_tx_hash),
+        )?;
+        Ok((epoch_id, transcript))
+    }
+}
+
+// ─── ParsedMEASCFrame ─────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct ParsedMEASCFrame {
+    pub schema_id: u16,
+    pub status_code: u8,
+    pub flags: u8,
+    pub action_class: u8,
+    pub payload_length: u32,
+    pub session_id: [u8; 16],
+    pub epoch_id: u32,
+    pub psn: u64,
+    pub context_ref_id: [u8; 32],
+    pub context_version: u32,
+    pub traceparent: [u8; 24],
+    pub payload: Vec<u8>,
+}
+
+// ─── MEASCFrame ───────────────────────────────────────────────────────────────
+
+pub struct MEASCFrame;
+
+impl MEASCFrame {
+    pub const HEADER_SIZE: usize = MEASC_HEADER_SIZE;
+    pub const AUTH_TAG_SIZE: usize = MEASC_AUTH_TAG_SIZE;
+    pub const MIN_FRAME_SIZE: usize = MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_frame(
+        epoch: &mut SessionEpoch,
+        schema_id: u16,
+        status_code: u8,
+        flags: u8,
+        action_class: u8,
+        payload: &[u8],
+        context_ref_id: &[u8; 32],
+        traceparent: &[u8; 24],
+        context_version: u32,
+    ) -> Result<(Vec<u8>, u64), SAACPHardDrop> {
+        let psn = epoch.sequencer.next_psn()?;
+        let traffic_key = *epoch.traffic_key()?;
+        let iv = derive_iv(&traffic_key, epoch.epoch_id, psn);
+
+        // GAP-9 / M-2 fix: EASI-encrypt the Context Ref ID before placing it in
+        // the authenticated header. The outer AES-256-GCM tag covers the encrypted
+        // form, providing both integrity and confidentiality for this field.
+        let easi_ctx_ref_id =
+            crate::easi::EasiEncryptor::encrypt(context_ref_id, &traffic_key, epoch.epoch_id, psn);
+
+        let mut header = vec![0u8; MEASC_HEADER_SIZE];
+        header[0..4].copy_from_slice(MEASC_MAGIC);
+        header[4..6].copy_from_slice(&schema_id.to_be_bytes());
+        header[6] = status_code;
+        header[7] = flags;
+        header[8] = action_class;
+        // payload.len() <= 10 MB (checked before build_frame is called) — fits in u32.
+        header[12..16].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        header[16..32].copy_from_slice(&epoch.session_id);
+        header[32..36].copy_from_slice(&epoch.epoch_id.to_be_bytes());
+        header[36..44].copy_from_slice(&psn.to_be_bytes());
+        header[44..76].copy_from_slice(&easi_ctx_ref_id);
+        header[76..80].copy_from_slice(&context_version.to_be_bytes());
+        header[80..104].copy_from_slice(traceparent);
+
+        let key = Key::<Aes256Gcm>::from_slice(&traffic_key);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&iv);
+
+        let ct_with_tag = cipher
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: payload,
+                    aad: &header,
+                },
+            )
+            .map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "AES-GCM encryption failed",
+                )
+            })?;
+
+        // Wire format: header || tag (last 16B) || ciphertext (matches Python layout)
+        let ct_len = ct_with_tag.len() - MEASC_AUTH_TAG_SIZE;
+        let mut frame = Vec::with_capacity(MEASC_HEADER_SIZE + ct_with_tag.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&ct_with_tag[ct_len..]); // tag
+        frame.extend_from_slice(&ct_with_tag[..ct_len]); // ciphertext
+
+        Ok((frame, psn))
+    }
+
+    /// Security pipeline — DO NOT REORDER.
+    ///
+    /// - **Step 1** — Minimum frame length
+    /// - **Step 2** — Header decode + magic check
+    /// - **Step 3** — `payload_length` bounds (MTU + buffer)
+    /// - **Step 4** — Epoch existence + not destroyed
+    /// - **Step 5** — Replay-window PEEK (read-only — F1 fix: no state
+    ///   mutation pre-auth)
+    /// - **Step 6** — AES-256-GCM authentication + decryption
+    /// - **Step 6.5** — Replay-window CHECK-AND-ACCEPT (F1 fix: authoritative,
+    ///   atomic, post-authentication — only key-holders move replay state)
+    /// - **Step 7** — EASI context_ref_id recovery
+    /// - **Step 8** — Optional schema validation
+    /// - **Step 9** — Rotation check
+    pub fn parse_frame(
+        buffer: &[u8],
+        epoch_manager: &SessionEpochManager,
+        skip_schema_validation: bool,
+    ) -> Result<ParsedMEASCFrame, SAACPHardDrop> {
+        // Step 1
+        if buffer.len() < Self::MIN_FRAME_SIZE {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                "Buffer too short for MEASC frame",
+            ));
+        }
+
+        // Step 2
+        let header = &buffer[..MEASC_HEADER_SIZE];
+        if &header[0..4] != MEASC_MAGIC {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                format!("Invalid MEASC magic: {:?}", &header[0..4]),
+            ));
+        }
+        let schema_id = u16::from_be_bytes(header[4..6].try_into().unwrap());
+        let status_code = header[6];
+        let flags = header[7];
+        let action_class = header[8];
+        let payload_length = u32::from_be_bytes(header[12..16].try_into().unwrap());
+        let session_id: [u8; 16] = header[16..32].try_into().unwrap();
+        let epoch_id = u32::from_be_bytes(header[32..36].try_into().unwrap());
+        let psn = u64::from_be_bytes(header[36..44].try_into().unwrap());
+        let context_ref_id: [u8; 32] = header[44..76].try_into().unwrap();
+        let context_version = u32::from_be_bytes(header[76..80].try_into().unwrap());
+        let traceparent: [u8; 24] = header[80..104].try_into().unwrap();
+
+        // Step 3
+        if payload_length > 10_000_000 {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::PayloadTooLarge,
+                format!("MEASC payload {} > 10MB MTU", payload_length),
+            ));
+        }
+        let expected_total = MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE + payload_length as usize;
+        if buffer.len() < expected_total {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::MalformedHeader,
+                "Buffer too short for declared payload length",
+            ));
+        }
+
+        // Step 4
+        let epoch_ok = epoch_manager.with_epoch(&session_id, epoch_id, |e| !e.is_destroyed());
+        if epoch_ok != Some(true) {
+            return Err(SAACPHardDrop::new(
+                SAACPBytecodes::EpochExpired,
+                format!(
+                    "Epoch (session={}, epoch_id={}) unknown or destroyed",
+                    hex::encode(&session_id[..4]),
+                    epoch_id
+                ),
+            ));
+        }
+
+        // Step 5 — SECURITY FIX (F1 PRE-AUTH-POISONING + C-1 REPLAY-TOCTOU):
+        // READ-ONLY pre-authentication gate. `peek()` validates the PSN against
+        // the replay window WITHOUT recording it — no bitmap bit is set and
+        // `highest_psn` is not advanced until Step 6.5, after the AES-GCM tag
+        // verifies. The pre-fix code ran `check_and_accept` here, mutating
+        // window state pre-authentication, which let an active injector with NO
+        // key (a) pre-mark the predictable next PSNs so the legitimate sender's
+        // frames were rejected as "duplicate", and (b) advance `highest_psn` by
+        // up to `max_advance` per junk packet — unbounded under the default
+        // Audit anomaly policy — pushing the window past the sender's counter
+        // and locking the session out. Deferring all state mutation to after
+        // authentication removes both shapes; only a holder of the traffic key
+        // can now move replay state. The C-1 TOCTOU property is preserved
+        // because Step 6.5's `check_and_accept` is still a single atomic
+        // check-and-mark under one Mutex hold.
+        // TOCTOU fix (retained): the step-4 existence check and this use are not
+        // covered by a single lock hold, so a concurrently-destroyed/rotated
+        // epoch between them is rejected gracefully instead of panicking.
+        let (rw_ok, rw_reason) = epoch_manager
+            .with_epoch(&session_id, epoch_id, |e| e.replay_window.peek(psn))
+            .ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    format!(
+                        "Epoch (session={}, epoch_id={}) was destroyed between existence \
+                     check and replay-window pre-check.",
+                        hex::encode(&session_id[..4]),
+                        epoch_id
+                    ),
+                )
+            })?;
+
+        if !rw_ok {
+            return Err(psn_rejection(psn, epoch_id, rw_reason));
+        }
+
+        // Step 6
+        let auth_tag = &buffer[MEASC_HEADER_SIZE..MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE];
+        let ciphertext = &buffer[MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE..expected_total];
+
+        // TOCTOU fix: same rationale as the replay-window access above.
+        let traffic_key = epoch_manager
+            .with_epoch(&session_id, epoch_id, |e| e.traffic_key().copied())
+            .ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    format!(
+                        "Epoch (session={}, epoch_id={}) was destroyed between existence \
+                         check and traffic-key use.",
+                        hex::encode(&session_id[..4]),
+                        epoch_id
+                    ),
+                )
+            })??;
+
+        let iv = derive_iv(&traffic_key, epoch_id, psn);
+        let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + MEASC_AUTH_TAG_SIZE);
+        ct_with_tag.extend_from_slice(ciphertext);
+        ct_with_tag.extend_from_slice(auth_tag);
+
+        let key = Key::<Aes256Gcm>::from_slice(&traffic_key);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&iv);
+
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: &ct_with_tag,
+                    aad: header,
+                },
+            )
+            .map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::InvalidSignature,
+                    "MEASC AES-GCM auth failed — tampering or replay",
+                )
+            })?;
+
+        // Step 6.5 — SECURITY FIX (F1): authenticated, atomic PSN acceptance.
+        // Runs ONLY after the AES-GCM tag verified, so exclusively holders of
+        // the traffic key can mutate replay state. `check_and_accept` is the
+        // single atomic check-and-mark from the C-1 fix: two threads racing the
+        // same AUTHENTICATED frame still converge — exactly one accepts and the
+        // other is rejected as "duplicate". A rejection here means the frame's
+        // PSN lost a race against another authenticated frame processed
+        // concurrently (true replay, or the window advanced past it between the
+        // Step 5 peek and now) — fail closed either way.
+        let (rw_ok, rw_reason) = epoch_manager
+            .with_epoch_mut(&session_id, epoch_id, |e| {
+                e.replay_window.check_and_accept(psn)
+            })
+            .ok_or_else(|| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::EpochExpired,
+                    format!(
+                        "Epoch (session={}, epoch_id={}) was destroyed between authentication \
+                     and replay-window acceptance.",
+                        hex::encode(&session_id[..4]),
+                        epoch_id
+                    ),
+                )
+            })?;
+
+        if !rw_ok {
+            return Err(psn_rejection(psn, epoch_id, rw_reason));
+        }
+
+        // S1 fix: this session has now PROVEN possession of the traffic key
+        // (AEAD verified) — mark it authenticated and refresh its liveness
+        // clock so the idle reaper treats it as a live session, not junk.
+        epoch_manager.note_authenticated(&session_id);
+
+        // GAP-9 / M-2 fix: EASI-decrypt the Context Ref ID.
+        // The header was authenticated (Step 6 AES-GCM) with the encrypted form.
+        // Now recover the plaintext context_ref_id using the same traffic_key,
+        // epoch_id, and psn that were used during build_frame encryption.
+        let context_ref_id =
+            crate::easi::EasiEncryptor::decrypt(&context_ref_id, &traffic_key, epoch_id, psn);
+
+        // Step 8
+        if !skip_schema_validation {
+            let json_val: serde_json::Value = serde_json::from_slice(&plaintext).map_err(|_| {
+                SAACPHardDrop::new(
+                    SAACPBytecodes::SchemaMismatch,
+                    "MEASC payload is not valid JSON for schema validation",
+                )
+            })?;
+            PreCompiledSchemas::validate_payload(schema_id, &json_val)?;
+        }
+
+        // Step 9
+        let should = epoch_manager
+            .with_epoch(&session_id, epoch_id, |e| e.should_rotate())
+            .unwrap_or(false);
+        if should {
+            let _ = epoch_manager.check_and_rotate(&session_id);
+        }
+
+        Ok(ParsedMEASCFrame {
+            schema_id,
+            status_code,
+            flags,
+            action_class,
+            payload_length,
+            session_id,
+            epoch_id,
+            psn,
+            context_ref_id,
+            context_version,
+            traceparent,
+            payload: plaintext,
+        })
+    }
+}
+
+/// Map a `ReplayWindow` rejection reason to its wire bytecode + message.
+///
+/// Shared by `parse_frame`'s Step 5 (pre-authentication peek) and Step 6.5
+/// (post-authentication acceptance) so both gates report identical errors for
+/// identical reasons — a frame rejected by the cheap pre-auth peek and the same
+/// frame losing the post-auth race are indistinguishable to the peer, which
+/// keeps the error channel from leaking which defense fired.
+fn psn_rejection(psn: u64, epoch_id: u32, reason: &str) -> SAACPHardDrop {
+    let (bc, msg) = match reason {
+        "duplicate" => (
+            SAACPBytecodes::PsnReplayDetected,
+            format!("PSN {} already accepted in epoch {}", psn, epoch_id),
+        ),
+        "advance_too_large" => (
+            SAACPBytecodes::PsnOutOfWindow,
+            format!("PSN {} advance exceeds max {}", psn, MEASC_MAX_PSN_ADVANCE),
+        ),
+        "rate_limit_exceeded" => (
+            SAACPBytecodes::PsnOutOfWindow,
+            format!("PSN {} rate limit exceeded in epoch {}", psn, epoch_id),
+        ),
+        "quarantined" => (
+            SAACPBytecodes::PsnReplayDetected,
+            format!(
+                "PSN {} rejected — epoch {} window quarantined",
+                psn, epoch_id
+            ),
+        ),
+        _ => (
+            SAACPBytecodes::PsnOutOfWindow,
+            format!("PSN {} out of window ({})", psn, reason),
+        ),
+    };
+    SAACPHardDrop::new(bc, msg)
+}
+
+// ─── PSKCompromiseRecovery ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PSKCompromiseReport {
+    pub sessions_destroyed: usize,
+    pub session_ids_hex: Vec<String>,
+    pub revocation_epoch: u64,
+    pub recovery_complete: bool,
+    /// Whether Step 1 (gateway `revoke_all_tokens()`) confirmed success. `true` if no
+    /// gateway callback was registered (caller handles revocation out of band) or the
+    /// registered callback returned `Ok(())`. `false` if it returned `Err` or panicked —
+    /// in that case `recovery_complete` is also `false` and no further steps ran.
+    pub gateway_revocation_ok: bool,
+    /// Step 6 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub capability_revocation_ok: Option<bool>,
+    /// Step 7 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub key_rotation_ok: Option<bool>,
+    /// Step 8 outcome: `None` if no callback registered, `Some(true/false)` otherwise.
+    pub audit_ok: Option<bool>,
+}
+
+pub struct PSKCompromiseRecovery {
+    manager: Arc<SessionEpochManager>,
+    /// Step 1/2 gateway callback: called to execute `revoke_all_tokens()`.
+    /// Must return `Ok(())` only if revocation actually succeeded — an `Err` or a panic
+    /// aborts the entire recovery (H-5 fix: previously panics were silently swallowed).
+    gateway_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    /// Step 6 callback: revoke all SignedCapabilityTokens via ACSVAF/FACTF.
+    /// Caller should close/revoke all active capability tokens.
+    capability_revoke_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    /// Step 7 callback: rotate all Ed25519 keys via `KeyLifecycleManager`.
+    /// Caller should call `KeyLifecycleManager::rotate_key()` for every key.
+    key_rotation_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    /// Step 8 callback: audit `SecureDiagnosticLedger` (PECF) for anomalies.
+    /// Caller should scan SDL for anomalous session records and log/alert.
+    audit_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+}
+
+impl PSKCompromiseRecovery {
+    /// Create with only the mandatory gateway callback (steps 1–5 only).
+    pub fn new(
+        manager: Arc<SessionEpochManager>,
+        gateway_callback: Option<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    ) -> Self {
+        Self {
+            manager,
+            gateway_callback,
+            capability_revoke_callback: None,
+            key_rotation_callback: None,
+            audit_callback: None,
+        }
+    }
+
+    /// Builder: register Step 6 callback (ACSVAF/FACTF token revocation).
+    ///
+    /// # Python parity
+    /// Matches README §5.6 Step 6: "Revoke all SignedCapabilityTokens via ACSVAF/FACTF".
+    pub fn with_capability_revoke(
+        mut self,
+        cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.capability_revoke_callback = Some(cb);
+        self
+    }
+
+    /// Builder: register Step 7 callback (Ed25519 key rotation via KLMS).
+    ///
+    /// # Python parity
+    /// Matches README §5.6 Step 7: "Rotate all Ed25519 signing keys via KeyLifecycleManager".
+    pub fn with_key_rotation(
+        mut self,
+        cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.key_rotation_callback = Some(cb);
+        self
+    }
+
+    /// Builder: register Step 8 callback (SDL audit via PECF).
+    ///
+    /// # Python parity
+    /// Matches README §5.6 Step 8: "Audit SecureDiagnosticLedger for anomalous sessions".
+    pub fn with_audit(mut self, cb: Box<dyn Fn() -> Result<(), String> + Send + Sync>) -> Self {
+        self.audit_callback = Some(cb);
+        self
+    }
+
+    /// Execute the **full 8-step PSK Compromise Recovery** procedure.
+    ///
+    /// Step ordering (MUST NOT be reordered per SAACP/M-6):
+    ///   Step 1: Invoke gateway_callback → `ZeroTrustGateway::revoke_all_tokens()`
+    ///   Step 2: Destroy ALL active MEASC sessions via `SessionEpochManager`
+    ///   Step 3–5: Rotate PSK / re-register issuer keys / re-issue tokens
+    ///             (caller's responsibility after this call returns)
+    ///   Step 6: Invoke capability_revoke_callback → revoke all ACSVAF/FACTF tokens
+    ///   Step 7: Invoke key_rotation_callback → rotate all Ed25519 keys via KLMS
+    ///   Step 8: Invoke audit_callback → scan SDL for anomalous sessions
+    ///
+    /// # Python parity
+    /// Fully implements the 8-step procedure documented in README §5.6 and measc.py.
+    pub fn execute(&self, gateway_revocation_epoch: Option<u64>) -> PSKCompromiseReport {
+        // ── Step 1: Gateway revoke_all_tokens ──────────────────────────────
+        // MANDATORY security boundary. A panic or an explicit `Err` here means
+        // tokens were NOT revoked — abort the entire recovery rather than
+        // silently reporting success (H-5 fix: previously the panic result was
+        // discarded via `let _ = ...` and recovery always proceeded/succeeded).
+        let gateway_revocation_ok = match &self.gateway_callback {
+            None => true,
+            Some(cb) => matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
+                Ok(Ok(()))
+            ),
+        };
+
+        if !gateway_revocation_ok {
+            return PSKCompromiseReport {
+                sessions_destroyed: 0,
+                session_ids_hex: Vec::new(),
+                revocation_epoch: gateway_revocation_epoch.unwrap_or(0),
+                recovery_complete: false,
+                gateway_revocation_ok: false,
+                capability_revocation_ok: None,
+                key_rotation_ok: None,
+                audit_ok: None,
+            };
+        }
+
+        // ── Step 2: Destroy ALL active MEASC sessions ──────────────────────
+        let session_ids: Vec<[u8; 16]> = {
+            // R-1: intentionally left as unwrap() — poisoned lock here means corrupted security invariant, fail-closed by panicking rather than serving stale/partial state
+            self.manager
+                .sessions
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect()
+        };
+        let mut destroyed = 0usize;
+        let mut destroyed_hex = Vec::new();
+        for sid in &session_ids {
+            self.manager.destroy_session(sid);
+            destroyed += 1;
+            destroyed_hex.push(hex::encode(sid));
+        }
+
+        // ── Steps 6-8: best-effort extended remediation ────────────────────
+        // Outcomes are tracked (not silently discarded) so partial failures
+        // remain observable even though they don't gate `recovery_complete`.
+        let capability_revocation_ok = self.capability_revoke_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
+                Ok(Ok(()))
+            )
+        });
+
+        let key_rotation_ok = self.key_rotation_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
+                Ok(Ok(()))
+            )
+        });
+
+        let audit_ok = self.audit_callback.as_ref().map(|cb| {
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb)),
+                Ok(Ok(()))
+            )
+        });
+
+        PSKCompromiseReport {
+            sessions_destroyed: destroyed,
+            session_ids_hex: destroyed_hex,
+            revocation_epoch: gateway_revocation_epoch.unwrap_or(0),
+            recovery_complete: true,
+            gateway_revocation_ok: true,
+            capability_revocation_ok,
+            key_rotation_ok,
+            audit_ok,
+        }
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replay_window_policy_defaults() {
+        let p = ReplayWindowPolicy::default();
+        assert_eq!(p.window_size, MEASC_REPLAY_WINDOW_SIZE);
+        assert!(p.max_advance < p.window_size as u64);
+    }
+
+    #[test]
+    fn test_replay_window_policy_clamping() {
+        let mut p = ReplayWindowPolicy {
+            window_size: 10,
+            max_advance: MEASC_MAX_PSN_ADVANCE,
+            anomaly_jump_threshold: MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD,
+            anomaly_policy: AnomalyPolicy::Audit,
+            max_anomalies_before_quarantine: 5,
+            rate_limit_window_seconds: 1.0,
+            max_large_advances_per_window: 3,
+        };
+        p.clamp();
+        assert!(p.max_advance < 10);
+        assert!(p.anomaly_jump_threshold < p.max_advance);
+    }
+
+    /// F7 regression: a psn above `MEASC_PSN_MAX` (i64::MAX) must be rejected
+    /// by both the read-only pre-auth `peek` and the authoritative `accept` —
+    /// pre-fix, `accept`'s `psn as i64` cast wrapped `highest_psn` negative
+    /// and silently corrupted the window state (key-holder-only, but state
+    /// corruption nonetheless).
+    #[test]
+    fn test_replay_window_rejects_psn_above_max() {
+        let mut w = ReplayWindow::with_default_policy();
+        assert!(w.accept(1).is_ok());
+        let over_max = MEASC_PSN_MAX + 1;
+        let (ok, reason) = w.peek(over_max);
+        assert!(!ok, "peek must reject psn > MEASC_PSN_MAX");
+        assert_eq!(reason, "psn_above_max");
+        assert!(
+            w.accept(over_max).is_err(),
+            "accept must reject psn > MEASC_PSN_MAX without corrupting highest_psn"
+        );
+        // Window state must be intact after the rejection.
+        let (ok, _) = w.peek(2);
+        assert!(ok, "window still usable after over-max rejection");
+        assert!(w.accept(2).is_ok());
+    }
+
+    #[test]
+    fn test_replay_window_basic() {
+        let mut w = ReplayWindow::with_default_policy();
+        let (ok, _) = w.check(1);
+        assert!(ok);
+        w.accept(1).unwrap();
+        let (ok2, r) = w.check(1);
+        assert!(!ok2);
+        assert_eq!(r, "duplicate");
+    }
+
+    #[test]
+    fn test_replay_window_advance_too_large() {
+        let mut w = ReplayWindow::with_default_policy();
+        w.accept(1).unwrap();
+        let (ok, r) = w.check(1 + MEASC_MAX_PSN_ADVANCE + 1);
+        assert!(!ok);
+        assert_eq!(r, "advance_too_large");
+    }
+
+    #[test]
+    fn test_replay_window_grace_period_lock() {
+        let mut w = ReplayWindow::with_default_policy();
+        w.lock_for_grace_period();
+        assert!(w.is_grace_period_locked());
+        assert!(w.reset().is_err());
+    }
+
+    #[test]
+    fn test_replay_window_statistics() {
+        let mut w = ReplayWindow::with_default_policy();
+        w.accept(5).unwrap();
+        // Test new struct API (matches Python statistics() dict)
+        let stats = w.statistics();
+        assert_eq!(stats.highest, 5);
+        assert_eq!(stats.anomaly_count, 0);
+        assert!(!stats.quarantined);
+        assert!(!stats.grace_period_locked);
+        assert!(stats.initialized);
+        assert_eq!(stats.window_size, MEASC_REPLAY_WINDOW_SIZE);
+        assert_eq!(stats.max_advance, MEASC_MAX_PSN_ADVANCE);
+        assert_eq!(
+            stats.anomaly_jump_threshold,
+            MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD
+        );
+        // Legacy tuple (for backward compat)
+        let (h, anomaly, quarantined, grace) = w.statistics_tuple();
+        assert_eq!(h, 5);
+        assert_eq!(anomaly, 0);
+        assert!(!quarantined);
+        assert!(!grace);
+    }
+
+    #[test]
+    fn test_session_epoch_destroy_guard() {
+        let mut e = SessionEpoch::new(
+            [0u8; 16],
+            0,
+            [1u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        );
+        assert!(e.traffic_key().is_ok());
+        e.destroy();
+        assert!(e.is_destroyed());
+        assert!(e.traffic_key().is_err());
+    }
+
+    #[test]
+    fn test_session_epoch_manager_multi_session() {
+        let mgr = SessionEpochManager::new();
+        let sid1 = [1u8; 16];
+        let sid2 = [2u8; 16];
+        mgr.create_session(
+            sid1,
+            [42u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+        mgr.create_session(
+            sid2,
+            [42u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mgr.session_count(), 2);
+        mgr.destroy_session(&sid1);
+        assert_eq!(mgr.session_count(), 1);
+        assert_eq!(mgr.get_current_epoch_id(&sid2), Some(0));
+    }
+
+    #[test]
+    fn test_session_epoch_manager_duplicate_rejected() {
+        let mgr = SessionEpochManager::new();
+        let sid = [9u8; 16];
+        mgr.create_session(
+            sid,
+            [0u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+        assert!(mgr
+            .create_session(
+                sid,
+                [0u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_hkdf_info_prefixes_match_python() {
+        assert_eq!(HKDF_EPOCH_KEY_INFO_PREFIX, b"SAACP-MEASC-epoch-key-v1");
+        assert_eq!(HKDF_IV_INFO_PREFIX, b"SAACP-MEASC-iv-v1");
+    }
+
+    #[test]
+    fn test_key_evolution_engine_deterministic() {
+        let engine = KeyEvolutionEngine::new([1u8; 32]);
+        let sid = [2u8; 16];
+        let k1 = engine.derive_epoch_key(&sid, 0, None);
+        let k2 = engine.derive_epoch_key(&sid, 0, None);
+        assert_eq!(k1, k2);
+        let k3 = engine.derive_epoch_key(&sid, 1, Some(&k1));
+        assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn test_measc_frame_round_trip() {
+        let mgr = SessionEpochManager::new();
+        let sid = [5u8; 16];
+        mgr.create_session(
+            sid,
+            [7u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+
+        let (frame, psn) = {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            let ep = sessions.get_mut(&sid).unwrap().get_mut(&0u32).unwrap();
+            MEASCFrame::build_frame(ep, 1, 0, 0, 0, b"hello SAACP", &[0u8; 32], &[0u8; 24], 1)
+                .unwrap()
+        };
+
+        assert_eq!(psn, 1);
+        let parsed = MEASCFrame::parse_frame(&frame, &mgr, true).unwrap();
+        assert_eq!(parsed.payload, b"hello SAACP");
+        assert_eq!(parsed.psn, 1);
+        assert_eq!(parsed.session_id, sid);
+    }
+
+    // ── F1 (PRE-AUTH-POISONING) regression tests ────────────────────────────
+    //
+    // The pre-fix parse_frame marked the PSN as seen BEFORE AES-GCM
+    // authentication. These tests prove both attack shapes are closed: junk
+    // frames (invalid tag, no key) can neither advance the window nor pre-mark
+    // the PSNs the legitimate sender will use next.
+
+    /// Hand-craft a syntactically valid MEASC frame with an arbitrary PSN whose
+    /// 16-byte auth tag is garbage — exactly what an injector without the
+    /// traffic key can produce. Passes Steps 1–4 and the Step 5 peek, then MUST
+    /// die at Step 6 (AEAD) without touching replay state.
+    fn junk_frame(session_id: &[u8; 16], epoch_id: u32, psn: u64) -> Vec<u8> {
+        let mut f = Vec::with_capacity(MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE);
+        f.extend_from_slice(MEASC_MAGIC); // 0..4
+        f.extend_from_slice(&1u16.to_be_bytes()); // schema_id
+        f.push(0x10); // status_code
+        f.push(0); // flags
+        f.push(0); // action_class
+        f.extend_from_slice(&[0u8; 3]); // padding1
+        f.extend_from_slice(&0u32.to_be_bytes()); // payload_length = 0
+        f.extend_from_slice(session_id); // 16..32
+        f.extend_from_slice(&epoch_id.to_be_bytes()); // 32..36
+        f.extend_from_slice(&psn.to_be_bytes()); // 36..44
+        f.extend_from_slice(&[0u8; 32]); // ctx_ref_id
+        f.extend_from_slice(&0u32.to_be_bytes()); // ctx_version
+        f.extend_from_slice(&[0u8; 24]); // traceparent
+        f.extend_from_slice(&[0u8; 24]); // reserved + padding2 → 128
+        f.extend_from_slice(&[0x42u8; 16]); // bogus auth tag
+        debug_assert_eq!(f.len(), MEASC_HEADER_SIZE + MEASC_AUTH_TAG_SIZE);
+        f
+    }
+
+    #[test]
+    fn test_peek_does_not_mutate_window_state() {
+        let mut w = ReplayWindow::with_default_policy();
+        w.accept(1).unwrap();
+
+        // peek reports the same verdicts as check...
+        let (ok, reason) = w.peek(1);
+        assert!(!ok);
+        assert_eq!(reason, "duplicate");
+        let (ok2, _) = w.peek(2);
+        assert!(ok2);
+
+        // ...but records NOTHING: repeated peeks are stable, and the
+        // statistics the authenticated path depends on are unchanged.
+        let stats = w.statistics();
+        assert_eq!(stats.highest, 1);
+        assert_eq!(stats.anomaly_count, 0);
+
+        // A fresh PSN that was only ever peeked is still acceptable afterwards.
+        assert!(w.check_and_accept(2).0);
+    }
+
+    #[test]
+    fn test_junk_frames_cannot_advance_replay_window() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0x21u8; 16];
+        mgr.create_session(
+            sid,
+            [9u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+
+        // Legitimate authenticated traffic at PSN 1.
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            let ep = sessions.get_mut(&sid).unwrap().get_mut(&0u32).unwrap();
+            let (frame, _) =
+                MEASCFrame::build_frame(ep, 1, 0x10, 0, 0, b"legit", &[0u8; 32], &[0u8; 24], 1)
+                    .unwrap();
+            drop(sessions);
+            MEASCFrame::parse_frame(&frame, &mgr, true).unwrap();
+        }
+
+        // Flood of unauthenticated junk across every PSN the peek would still
+        // admit (2..=1+max_advance — the maximum reachable range without ever
+        // authenticating). Pre-fix, the first junk frame advanced highest_psn
+        // and each subsequent one could then claim a still-higher PSN, walking
+        // the window arbitrarily far past the legitimate sender.
+        let top = 1u64 + MEASC_MAX_PSN_ADVANCE;
+        let mut psn = 2u64;
+        while psn <= top {
+            let junk = junk_frame(&sid, 0, psn);
+            let err = MEASCFrame::parse_frame(&junk, &mgr, true).unwrap_err();
+            assert_eq!(
+                err.bytecode,
+                SAACPBytecodes::InvalidSignature,
+                "junk frame (psn {psn}) must fail AEAD authentication"
+            );
+            psn += 64;
+        }
+        // And the single largest admissible hop, for the boundary case.
+        let junk = junk_frame(&sid, 0, top);
+        assert_eq!(
+            MEASCFrame::parse_frame(&junk, &mgr, true)
+                .unwrap_err()
+                .bytecode,
+            SAACPBytecodes::InvalidSignature
+        );
+
+        // The window must not have moved: the next legitimate PSN (2) still
+        // parses cleanly even after junk frames claimed every admissible PSN
+        // from 2 through 1+max_advance.
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            let ep = sessions.get_mut(&sid).unwrap().get_mut(&0u32).unwrap();
+            let (frame, psn) =
+                MEASCFrame::build_frame(ep, 1, 0x10, 0, 0, b"legit-2", &[0u8; 32], &[0u8; 24], 1)
+                    .unwrap();
+            drop(sessions);
+            assert_eq!(psn, 2, "sender's sequencer is unaffected by the flood");
+            let parsed = MEASCFrame::parse_frame(&frame, &mgr, true)
+                .expect("legitimate PSN 2 must still be accepted post-flood");
+            assert_eq!(parsed.payload, b"legit-2");
+        }
+    }
+
+    #[test]
+    fn test_junk_frames_cannot_poison_future_psns() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0x22u8; 16];
+        mgr.create_session(
+            sid,
+            [11u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+
+        // Legitimate PSN 1.
+        {
+            let mut sessions = mgr.sessions.lock().unwrap();
+            let ep = sessions.get_mut(&sid).unwrap().get_mut(&0u32).unwrap();
+            let (frame, _) =
+                MEASCFrame::build_frame(ep, 1, 0x10, 0, 0, b"one", &[0u8; 32], &[0u8; 24], 1)
+                    .unwrap();
+            drop(sessions);
+            MEASCFrame::parse_frame(&frame, &mgr, true).unwrap();
+        }
+
+        // The attacker cannot know PSNs in advance in general — but PSNs are
+        // sequential, so the WORST case is it guessing the exact next PSNs the
+        // sender will use (2 and 3) and pre-marking them with junk.
+        for poison_psn in [2u64, 3u64] {
+            let junk = junk_frame(&sid, 0, poison_psn);
+            let err = MEASCFrame::parse_frame(&junk, &mgr, true).unwrap_err();
+            assert_eq!(err.bytecode, SAACPBytecodes::InvalidSignature);
+        }
+
+        // The sender's actual PSN 2 and 3 frames must still be accepted —
+        // pre-fix they were rejected as "duplicate".
+        for (n, msg) in [(2u64, &b"two"[..]), (3, b"three")] {
+            let (frame, psn) = {
+                let mut sessions = mgr.sessions.lock().unwrap();
+                let ep = sessions.get_mut(&sid).unwrap().get_mut(&0u32).unwrap();
+                MEASCFrame::build_frame(ep, 1, 0x10, 0, 0, msg, &[0u8; 32], &[0u8; 24], 1).unwrap()
+            };
+            assert_eq!(psn, n);
+            let parsed = MEASCFrame::parse_frame(&frame, &mgr, true)
+                .unwrap_or_else(|e| panic!("legitimate PSN {n} poisoned by junk: {e:?}"));
+            assert_eq!(parsed.payload, msg);
+        }
+    }
+
+    #[test]
+    fn test_psk_compromise_recovery() {
+        let mgr = Arc::new(SessionEpochManager::new());
+        for i in 0u8..3 {
+            mgr.create_session(
+                [i; 16],
+                [i; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .unwrap();
+        }
+        let recovery = PSKCompromiseRecovery::new(Arc::clone(&mgr), None);
+        let report = recovery.execute(Some(42));
+        assert_eq!(report.sessions_destroyed, 3);
+        assert!(report.recovery_complete);
+        assert_eq!(report.revocation_epoch, 42);
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn test_psk_compromise_recovery_steps_6_7_8() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let mgr = Arc::new(SessionEpochManager::new());
+        mgr.create_session(
+            [0u8; 16],
+            [1u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+
+        // Track which callbacks fired
+        let step6_fired = StdArc::new(AtomicBool::new(false));
+        let step7_fired = StdArc::new(AtomicBool::new(false));
+        let step8_fired = StdArc::new(AtomicBool::new(false));
+
+        let s6 = StdArc::clone(&step6_fired);
+        let s7 = StdArc::clone(&step7_fired);
+        let s8 = StdArc::clone(&step8_fired);
+
+        let recovery = PSKCompromiseRecovery::new(Arc::clone(&mgr), None)
+            .with_capability_revoke(Box::new(move || {
+                s6.store(true, Ordering::SeqCst);
+                Ok(())
+            }))
+            .with_key_rotation(Box::new(move || {
+                s7.store(true, Ordering::SeqCst);
+                Ok(())
+            }))
+            .with_audit(Box::new(move || {
+                s8.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+
+        let report = recovery.execute(Some(99));
+        assert_eq!(report.sessions_destroyed, 1);
+        assert!(report.recovery_complete);
+        assert_eq!(mgr.session_count(), 0);
+
+        // All three extended steps must have fired
+        assert!(
+            step6_fired.load(Ordering::SeqCst),
+            "Step 6 (capability revoke) must fire"
+        );
+        assert!(
+            step7_fired.load(Ordering::SeqCst),
+            "Step 7 (key rotation) must fire"
+        );
+        assert!(
+            step8_fired.load(Ordering::SeqCst),
+            "Step 8 (SDL audit) must fire"
+        );
+    }
+
+    #[test]
+    fn test_get_epoch_snapshot() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0xEEu8; 16];
+        mgr.create_session(
+            sid,
+            [0xABu8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        )
+        .unwrap();
+        // get_epoch returns a snapshot
+        let snap = mgr.get_epoch(&sid, 0).expect("epoch 0 must exist");
+        assert_eq!(snap.epoch_id, 0);
+        assert!(!snap.is_destroyed);
+        assert!(!snap.is_in_grace_period);
+        // get_current_epoch matches
+        let cur = mgr
+            .get_current_epoch(&sid)
+            .expect("current epoch must exist");
+        assert_eq!(cur.epoch_id, snap.epoch_id);
+        // Missing session returns None
+        assert!(mgr.get_epoch(&[0xFFu8; 16], 0).is_none());
+    }
+
+    #[test]
+    fn test_create_session_with_negotiation() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0x11u8; 16];
+        let secret = [0x22u8; 32];
+        // Must include the mandatory baseline "ed25519" and the encryption suite.
+        // Python SuiteNegotiator checks that mandatory_baseline is in BOTH peer lists.
+        let local = &["ed25519", "AES-256-GCM-HKDF-SHA256"];
+        let remote = &["ed25519", "AES-256-GCM-HKDF-SHA256"];
+        let result = mgr.create_session_with_negotiation(
+            sid,
+            secret,
+            local,
+            remote,
+            None,
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+        );
+        assert!(
+            result.is_ok(),
+            "negotiation must succeed for common suite: {:?}",
+            result.err()
+        );
+        let (epoch_id, transcript) = result.unwrap();
+        assert_eq!(epoch_id, 0);
+        assert!(!transcript.transcript_hash_hex().is_empty());
+        // Session was created
+        assert_eq!(mgr.session_count(), 1);
+        assert!(mgr.get_current_epoch(&sid).is_some());
+    }
+
+    #[test]
+    fn test_create_session_with_negotiation_no_common_suite() {
+        let mgr = SessionEpochManager::new();
+        let sid = [0x33u8; 16];
+        // Remote peer is missing the mandatory baseline "ed25519" — this is the
+        // DOWNGRADE_ATTEMPT rejection path in SuiteNegotiator::negotiate().
+        let local = &["ed25519", "AES-256-GCM-HKDF-SHA256"];
+        let remote = &["ChaCha20-Poly1305-HKDF-SHA256"]; // no ed25519 baseline
+        let result =
+            mgr.create_session_with_negotiation(sid, [0u8; 32], local, remote, None, 0, 0.0);
+        assert!(result.is_err(), "missing baseline must produce an error");
+    }
+
+    /// S1 regression: the session table must fail CLOSED at its cap — an
+    /// unauthenticated flood of distinct session_ids (one per packet header)
+    /// cannot grow memory past `cap` entries. Pre-fix the table grew without
+    /// bound (~1KB per junk entry, ~8x bandwidth amplification).
+    #[test]
+    fn s1_session_table_cap_fails_closed_under_flood() {
+        let mgr = SessionEpochManager::new().with_session_cap(8);
+        for i in 0..8u8 {
+            let r = mgr.create_session(
+                [i; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+            assert!(r.is_ok(), "session {i} within cap must be created");
+        }
+        // The flood: 10_000 further distinct ids must ALL be rejected and the
+        // table must stay exactly at the cap.
+        for i in 0..10_000u32 {
+            let sid = [
+                (i >> 24) as u8,
+                (i >> 16) as u8,
+                (i >> 8) as u8,
+                i as u8,
+                0xAA,
+                0xBB,
+                0xCC,
+                0xDD,
+                0xEE,
+                0xFF,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+            ];
+            let r = mgr.create_session(
+                sid,
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+            assert!(r.is_err(), "beyond-cap session {i} must be rejected");
+        }
+        assert_eq!(
+            mgr.session_count(),
+            8,
+            "memory must stay bounded at the cap"
+        );
+    }
+
+    /// S1 regression: after reaping, capacity returns — the cap is not a
+    /// permanent DoS vector against legitimate new sessions once the junk
+    /// idles out.
+    #[test]
+    fn s1_reaper_frees_capacity_for_new_sessions() {
+        // unauth TTL 40ms so the test runs fast; auth TTL generous.
+        let mgr = SessionEpochManager::new()
+            .with_session_cap(2)
+            .with_idle_ttls(0.04, 60.0);
+        for i in 0..2u8 {
+            let _ = mgr.create_session(
+                [i; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            );
+        }
+        assert!(
+            mgr.create_session(
+                [9u8; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .is_err(),
+            "cap must be enforced while full"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            mgr.reap_idle_sessions(),
+            2,
+            "both never-authed sessions reaped"
+        );
+        assert_eq!(mgr.session_count(), 0);
+        assert!(
+            mgr.create_session(
+                [9u8; 16],
+                [7u8; 32],
+                MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+                MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+                None,
+            )
+            .is_ok(),
+            "capacity must return after reaping"
+        );
+    }
+
+    /// S1 regression: an AUTHENTICATED session survives the short unauth TTL —
+    /// only `note_authenticated` (reachable solely via successful AEAD
+    /// decryption in `parse_frame`) promotes a session to the long TTL.
+    #[test]
+    fn s1_authenticated_sessions_survive_unauth_ttl() {
+        let mgr = SessionEpochManager::new()
+            .with_session_cap(16)
+            .with_idle_ttls(0.04, 60.0);
+        let _ = mgr.create_session(
+            [1u8; 16],
+            [7u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        );
+        let _ = mgr.create_session(
+            [2u8; 16],
+            [7u8; 32],
+            MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD,
+            MEASC_DEFAULT_EPOCH_TIME_SECONDS as f64,
+            None,
+        );
+        // Session 1 proves key possession (AEAD verified in production).
+        mgr.note_authenticated(&[1u8; 16]);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(mgr.reap_idle_sessions(), 1, "only the unauth session dies");
+        assert_eq!(mgr.session_count(), 1, "authenticated session survives");
+        assert!(mgr.get_current_epoch_id(&[1u8; 16]).is_some());
+        assert!(mgr.get_current_epoch_id(&[2u8; 16]).is_none());
+    }
+
+    /// S4 regression: ratchet ON — a PSK-only compromise (root_0 leaked from
+    /// config, no traffic keys held) cannot derive epoch-1's key: the
+    /// v1-schedule derivation from root_0 mismatches the ratcheted schedule,
+    /// and the stored root itself has advanced past root_0.
+    #[test]
+    fn s4_ratchet_old_root_cannot_derive_later_epochs() {
+        let mgr = SessionEpochManager::new().with_root_ratchet();
+        let sid = [0xA5u8; 16];
+        let root0 = [0x77u8; 32];
+        mgr.create_session(sid, root0, 2, 60.0, None)
+            .expect("create");
+        let key0 = mgr
+            .with_epoch(&sid, 0, |e| *e.traffic_key().expect("key"))
+            .expect("epoch 0");
+        mgr.rotate_epoch(&sid).expect("rotate to 1");
+        let key1 = mgr
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .expect("epoch 1");
+
+        // Attacker holding root0 (+ captured epoch-0 key) tries the v1
+        // schedule: wrong under the ratchet.
+        let attacker_guess = KeyEvolutionEngine::new(root0).derive_epoch_key(&sid, 1, Some(&key0));
+        assert_ne!(
+            attacker_guess, key1,
+            "ratcheted key must not equal a v1-schedule derivation from the old root"
+        );
+
+        // The stored root HAS advanced — root0 is gone from process memory.
+        let stored_root = mgr.meta.lock().unwrap().get(&sid).unwrap().secret;
+        assert_ne!(stored_root, root0, "stored root must be ratcheted");
+    }
+
+    /// S4: both peers (independent managers, same PSK, ratchet ON) derive the
+    /// identical epoch key at every rotation without any wire negotiation —
+    /// the cross-side sync invariant the schedule must preserve.
+    #[test]
+    fn s4_ratchet_peers_stay_in_sync() {
+        let a = SessionEpochManager::new().with_root_ratchet();
+        let b = SessionEpochManager::new().with_root_ratchet();
+        let sid = [0xB7u8; 16];
+        let root0 = [0x31u8; 32];
+        a.create_session(sid, root0, 2, 60.0, None).unwrap();
+        b.create_session(sid, root0, 2, 60.0, None).unwrap();
+        a.rotate_epoch(&sid).unwrap();
+        b.rotate_epoch(&sid).unwrap();
+        let ka = a
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let kb = b
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        assert_eq!(
+            ka, kb,
+            "peers must derive the identical ratcheted epoch-1 key"
+        );
+        a.rotate_epoch(&sid).unwrap();
+        b.rotate_epoch(&sid).unwrap();
+        let k2a = a
+            .with_epoch(&sid, 2, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let k2b = b
+            .with_epoch(&sid, 2, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        assert_eq!(k2a, k2b, "peers must stay in sync on the chained ratchet");
+        assert_ne!(k2a, ka, "epoch keys must advance");
+    }
+
+    /// S4: opt-out (`without_root_ratchet`) must produce the exact v1 (Python-parity)
+    /// schedule value; the cross-language vectors depend on this.
+    #[test]
+    fn s4_default_off_matches_v1_schedule() {
+        let mgr = SessionEpochManager::new().without_root_ratchet();
+        let sid = [0xC3u8; 16];
+        let root0 = [0x59u8; 32];
+        mgr.create_session(sid, root0, 2, 60.0, None).unwrap();
+        let key0 = mgr
+            .with_epoch(&sid, 0, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        mgr.rotate_epoch(&sid).unwrap();
+        let key1 = mgr
+            .with_epoch(&sid, 1, |e| *e.traffic_key().expect("key"))
+            .unwrap();
+        let v1 = KeyEvolutionEngine::new(root0).derive_epoch_key(&sid, 1, Some(&key0));
+        assert_eq!(
+            key1, v1,
+            "ratchet-off rotation must be byte-identical to the v1 schedule"
+        );
+    }
+}
