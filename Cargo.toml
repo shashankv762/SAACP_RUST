@@ -85,8 +85,10 @@ license.workspace = true
 
 [dependencies]
 # ── Workspace member crates ──────────────────────────────────────────────────
-# G3/M7: saacp-primitives extracted; saacp-crypto to follow in Phase 2.
+# G3/M7: saacp-primitives extracted (Phase 1); saacp-crypto extracted (Phase 2).
+# crypto_bridge.rs wires saacp-core telemetry into the saacp-crypto boundary.
 saacp-primitives = { workspace = true }
+saacp-crypto = { workspace = true }
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hkdf = "0.12"

@@ -15,6 +15,7 @@ pub mod clock;
 pub mod cluster;
 pub mod config;
 pub mod context;
+pub mod crypto_bridge; // G3/M7: telemetry bridge saacp-core → saacp-crypto FIPS boundary
 pub mod crypto_governance;
 pub mod cryptosuite;
 pub mod cscs;
