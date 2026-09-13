@@ -33,7 +33,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: Rustfmt
@@ -45,7 +45,7 @@ jobs:
           toolchain: "1.96.0"
           components: rustfmt
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: cargo fmt --workspace --all -- --check
 
   # ── Security audit ───────────────────────────────────────────────────────
   audit:
@@ -77,11 +77,11 @@ jobs:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --all-features
+        run: cargo build --workspace --all-features
       - name: Run library tests
-        run: cargo test --lib --all-features
+        run: cargo test --workspace --lib --all-features
       - name: Run integration tests
-        run: cargo test --tests --all-features
+        run: cargo test --workspace --tests --all-features
 
   # ── Feature-gated tests ──────────────────────────────────────────────────
   test-features:
@@ -118,7 +118,7 @@ jobs:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
-        run: cargo bench -- --test --warmup-iters 3 --measurement-time 10 2>&1 | tail -20
+        run: cargo bench --workspace -- --test --warmup-iters 3 --measurement-time 10 2>&1 | tail -20
 
   # ── Supply chain (cargo deny) ─────────────────────────────────────────────
   # Runs advisories / bans / licenses / sources checks. Configured in
@@ -166,7 +166,7 @@ jobs:
         # coverage report (and we can see the regression in the diff).
         # The threshold is enforced at the end via `llvm-cov report`.
         run: |
-          cargo llvm-cov --locked --no-fail-fast --lib --doc \
+          cargo llvm-cov --workspace --locked --no-fail-fast --lib --doc \
             --codecov --output-path codecov_lib.json
       - name: Enforce line-coverage threshold
         # `cargo llvm-cov report --summary-only` ends with a `TOTAL`
@@ -234,6 +234,25 @@ jobs:
           name: fuzz-crashes
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  # ── Security placeholder tracking ───────────────────────────────────────
+  # Ensures TODO(SECURITY) markers are present (i.e., not accidentally removed).
+  # These mark production-blocking attestation stubs in attestation.rs.
+  # If count drops to zero, someone deleted a marker without replacing the stub.
+  security-placeholders:
+    name: Security placeholder audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count TODO(SECURITY) markers
+        run: |
+          COUNT=$(grep -rn 'TODO(SECURITY)' --include='*.rs' | wc -l)
+          echo "Found $COUNT TODO(SECURITY) markers"
+          if [ "$COUNT" -lt 2 ]; then
+            echo "ERROR: Expected at least 2 TODO(SECURITY) markers (TPM + TEE attestation stubs)."
+            echo "       Do not remove these without replacing the placeholder with real verification."
+            exit 1
+          fi
 
   # ── Dashboard UI (lint + build) ──────────────────────────────────────────
   # M9 remediation (production audit G5): the dashboard-ui Next.js codebase
