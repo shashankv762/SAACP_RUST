@@ -19,9 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /usr/src/saacp
 
-# Cache dependencies: copy only Cargo files first
+# G3/M7: Cargo workspace — must copy workspace member manifests alongside root.
+# The build layer cache is: workspace Cargo.toml + member manifests → cargo fetch
+# → src + crates/*/src → cargo build. Separating manifest copy from source copy
+# lets Docker re-use the dep-download layer when only src/ changes.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/saacp-primitives/Cargo.toml crates/saacp-primitives/Cargo.toml
+COPY crates/saacp-crypto/Cargo.toml crates/saacp-crypto/Cargo.toml
 COPY src/ src/
+COPY crates/ crates/
 
 # Build release binaries with production features
 # M-C remediation (production audit G3/R3): `health-endpoint` is compiled in

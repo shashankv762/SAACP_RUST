@@ -1,50 +1,82 @@
+# Rust & cargo build artifacts
 /target
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+*.profraw
+*.profdata
+
+# Logs and sentinels
 *.log
 *.sentinel
 !tests/fixtures/*.sentinel
 
-# Transient exit-code capture files from gate verification runs, and scratch UI notes.
+# Transient exit-code capture files from gate verification runs, and scratch notes
 *_exit.txt
-commandUI .md
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Dev-only benchmark artifacts (regenerable, not source)
 benches_output.txt
-*.bak
+/bench_raw_output.txt
+/bench_parsed.txt
 
-# Python bytecode cache (python/saacp_client package)
+# Python bytecode, caches, and packaging (python/saacp_client package)
 __pycache__/
 *.pyc
 *.egg-info/
-opusplan.md
-opusplan2.md
-_TEMP_impl_plan.md
-imp_plan*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+.venv/
+venv/
+env/
 
-# Append-only manifest written by scripts/prune_test_results.py — a log of
-# pruned/trimmed test-result files, not a build artifact, but regenerated
-# indefinitely so it doesn't belong in version control.
-/.test-manifest.jsonl
+# Node.js and Next.js artifacts (dashboard-ui)
+node_modules/
+.next/
+/out/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# Local agent/dev tooling and machine-specific config — not part of the project.
-# .cargo/config.toml pins a machine-specific RAM-disk target dir (R:/...), and
-# .claude/.agents hold local assistant settings; none belong in the public repo.
+# Environment and secrets
+.env
+.env*.local
+*.env
+
+# Local agent, IDE, and machine-specific tooling
 /.claude/
 /.agents/
 /.cargo/
+/.kilo/
+/.cursor/
+/.vscode/
+/.idea/
+/.gemini/
+/.zcode/
+/.rbxsync-trash/
 /scripts/
 /.tmp-target-build/
 
-# Local working/analysis docs and tooling state (same class as opusplan/imp_plan
-# above): the kimiplan assessment is responded to normatively in
-# KIMIPLAN_RESPONSE.md, which quotes what it needs.
+# Local working/analysis docs and LLM scratchpads
+opusplan*.md
+opus46.md
+opusreview.md
+opus*.md
+llmplan.md
+longcat.md
+commandUI .md
+_TEMP_impl_plan.md
+imp_plan*
 /kimiplan
-/.zcode/
-/.rbxsync-trash/
-
-# Benchmark run artifacts (regenerable from `cargo bench`) — the curated,
-# human-readable results live in benchmark_results.md instead.
-/bench_raw_output.txt
-/bench_parsed.txt
+/.test-manifest.jsonl

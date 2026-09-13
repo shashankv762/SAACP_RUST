@@ -2973,6 +2973,8 @@ dependencies = [
  "redis",
  "reqwest 0.12.28",
  "rustls-pemfile",
+ "saacp-crypto",
+ "saacp-primitives",
  "serde",
  "serde_json",
  "serial_test",
@@ -2990,6 +2992,52 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "saacp-crypto"
+version = "0.2.2"
+dependencies = [
+ "adler2",
+ "aes-gcm",
+ "arc-swap",
+ "aws-config",
+ "aws-sdk-kms",
+ "base64",
+ "cryptoki",
+ "ed25519-dalek",
+ "flate2",
+ "gcloud-sdk",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "ml-dsa",
+ "ml-kem",
+ "parking_lot",
+ "rand 0.8.6",
+ "rand_core 0.10.1",
+ "saacp-primitives",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "subtle",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "saacp-primitives"
+version = "0.2.2"
+dependencies = [
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
