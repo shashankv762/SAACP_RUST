@@ -32,6 +32,32 @@ use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
+// ---------------------------------------------------------------------------
+// AuditEventSink — pluggable output for every WAL-written audit event
+// ---------------------------------------------------------------------------
+
+/// Pluggable output sink for `ImmutableAuditLog` events.
+///
+/// Implementors receive the canonical JSON representation of every audit event
+/// immediately after the WAL write is enqueued (shard lock already released).
+/// Implementations MUST be fast and non-blocking — they run inline on the
+/// gate pipeline thread. Deferred I/O (HTTP export, disk writes) must be
+/// buffered internally and flushed on a background thread.
+///
+/// Built-in implementations:
+/// - [`crate::otlp::StdoutJsonSink`] — newline-delimited JSON to stdout.
+/// - [`crate::otlp::OtlpLogSink`] — OTLP/HTTP JSON to any OTEL collector
+///   (requires `otlp-export` feature).
+pub trait AuditEventSink: Send + Sync {
+    /// Called for every successfully WAL-written audit event.
+    /// `event_json` is the canonical `{"record":{...},"chain_hash":"..."}` line.
+    fn on_event(&self, event_json: &str);
+
+    /// Flush any buffered events. Called on daemon shutdown or periodically
+    /// by a background thread. Must not panic.
+    fn flush(&self);
+}
+
 /// Constant-time comparison of two byte slices.
 /// Returns true iff a.len() == b.len() AND all bytes are equal,
 /// without short-circuiting on the first differing byte.
@@ -71,8 +97,16 @@ pub(crate) fn constant_time_eq_hex(a: &str, b: &str) -> bool {
     }
 }
 
+/// Monotonic time for elapsed-time comparisons: nonce age, replay windows.
+/// Never decreases — NTP jumps cannot reset or extend replay windows.
 fn now_secs() -> f64 {
     crate::clock::now_secs_f64()
+}
+
+/// Wall-clock time for WAL audit log entries.
+/// Must be real Unix timestamps so SIEM / Splunk consumers can correlate events.
+fn wal_timestamp() -> f64 {
+    crate::clock::wall_clock_now()
 }
 
 // ===========================================================================
@@ -283,11 +317,10 @@ impl NonceTracker {
     /// (pre-fix, a flood of unauthenticated frames with random nonces filled
     /// `max_entries` and tripped the capacity circuit-breaker for everyone).
     pub fn contains(&self, nonce: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .seen_nonces
-            .contains_key(&nonce)
+        match self.inner.lock() {
+            Ok(g) => g.seen_nonces.contains_key(&nonce),
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="nonce_tracker","SECURITY GATE STATE CORRUPTION: NonceTracker poison recovered."); p.into_inner().seen_nonces.contains_key(&nonce) }
+        }
     }
 
     /// Session-scoped variant of [`contains`] — same key composition as
@@ -328,7 +361,10 @@ impl NonceTracker {
     /// losing replay protection entirely.
     fn track_key(&self, key: u64) -> Result<(), SAACPHardDrop> {
         let current_time = now_secs();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="nonce_tracker","SECURITY GATE STATE CORRUPTION: NonceTracker poison recovered."); p.into_inner() }
+        };
 
         // Atomic check-and-insert (fixes TOCTOU race condition)
         if inner.seen_nonces.contains_key(&key) {
@@ -369,14 +405,18 @@ impl NonceTracker {
 
     /// Return the number of tracked nonces.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.seen_nonces.len()
+        match self.inner.lock() {
+            Ok(g) => g.seen_nonces.len(),
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().seen_nonces.len() }
+        }
     }
 
     /// Clear all tracked nonces.
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.seen_nonces.clear();
+        match self.inner.lock() {
+            Ok(mut g) => g.seen_nonces.clear(),
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().seen_nonces.clear() }
+        }
     }
 }
 
@@ -923,6 +963,10 @@ pub struct ImmutableAuditLog {
     /// all (that's driven entirely by `CanonicalAuditRecord`, untouched).
     #[allow(clippy::type_complexity)]
     subscribers: Mutex<Vec<Arc<dyn Fn(&AuditRecord) + Send + Sync>>>,
+    /// Pluggable output sinks notified on every successfully WAL-written event.
+    /// Called after the shard lock is released, with the canonical JSON string.
+    /// See [`AuditEventSink`].
+    sinks: Mutex<Vec<Arc<dyn AuditEventSink>>>,
 }
 
 thread_local! {
@@ -1141,6 +1185,7 @@ impl ImmutableAuditLog {
             wal_write_failures,
             queue_len,
             subscribers: Mutex::new(Vec::new()),
+            sinks: Mutex::new(Vec::new()),
         };
         // longcat.md Step 5 / Risk 5: one-shot repair of orphaned uncompressed
         // `.bak` rotations (crash between rename and compression). See
@@ -1155,16 +1200,35 @@ impl ImmutableAuditLog {
     /// hash-chain lock is released). Keep callbacks fast and non-blocking —
     /// they run inline on the packet-processing path that triggered the
     /// append. Mirrors `TrustDecayEngine::subscribe`'s established pattern.
+
+    /// Register an [`AuditEventSink`] to receive every WAL-written event as
+    /// canonical JSON. Multiple sinks can be registered; all are called in
+    /// registration order. Thread-safe — may be called at any time.
+    pub fn register_sink(&self, sink: Arc<dyn AuditEventSink>) {
+        match self.sinks.lock() {
+            Ok(mut s) => s.push(sink),
+            Err(p) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "audit_log_sinks",
+                    "SECURITY GATE STATE CORRUPTION: audit sinks mutex poison recovered."
+                );
+                p.into_inner().push(sink);
+            }
+        }
+    }
+
+    /// Flush all registered sinks. Call on daemon shutdown.
     /// M-38 fix: every `self.inner.lock()`/`self.subscribers.lock()` in this
     /// impl block recovers via `into_inner()` on poison rather than panicking
     /// — `ImmutableAuditLog::global()` is a process-wide singleton, so one
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing the ability to append/verify the audit chain.
     pub fn subscribe(&self, cb: Arc<dyn Fn(&AuditRecord) + Send + Sync>) {
-        self.subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(cb);
+        match self.subscribers.lock() {
+            Ok(mut s) => s.push(cb),
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_subscribers","SECURITY GATE STATE CORRUPTION: audit subscribers mutex poison recovered."); p.into_inner().push(cb) }
+        }
     }
 
     /// Create a new audit log with default file path (reads from env vars). C-4: also
@@ -1286,7 +1350,10 @@ impl ImmutableAuditLog {
                 ),
             };
             {
-                let mut shard = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
+                let mut shard = match self.shards[i].lock() {
+                    Ok(g) => g,
+                    Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_shard","SECURITY GATE STATE CORRUPTION: audit shard poison recovered during chain init."); p.into_inner() }
+                };
                 shard.last_hash = hash.clone();
                 shard.shard_seq = shard_seq;
                 shard.entries.clear();
@@ -1323,7 +1390,10 @@ impl ImmutableAuditLog {
         for i in 0..AUDIT_SHARDS {
             let genesis = shard_genesis_hash(i as u16);
             {
-                let mut shard = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
+                let mut shard = match self.shards[i].lock() {
+                    Ok(g) => g,
+                    Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_shard","SECURITY GATE STATE CORRUPTION: audit shard poison recovered during reset."); p.into_inner() }
+                };
                 shard.last_hash = genesis.clone();
                 shard.shard_seq = 0;
                 shard.entries.clear();
@@ -1428,7 +1498,7 @@ impl ImmutableAuditLog {
         // ordering hint; cross-shard *ordering* is deliberately relaxed (no
         // consumer depends on it — see the module docs and `verify_chain`).
         let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
-        let timestamp = now_secs();
+        let timestamp = wal_timestamp();
 
         // O-6: non-blocking probe first — on contention, record the observation
         // then fall through to the normal blocking lock() below.
@@ -1438,7 +1508,7 @@ impl ImmutableAuditLog {
                 crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
                 self.shards[shard_idx]
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(|_| { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_shard","SECURITY GATE STATE CORRUPTION: audit shard poison recovered."); self.shards[shard_idx].lock().map(|g| g).unwrap_or_else(|e| e.into_inner()) })
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
@@ -1508,15 +1578,21 @@ impl ImmutableAuditLog {
         // is released so building an anchor never needs to take all 16 locks.
         self.shard_heads[shard_idx].store(Arc::new(ShardHead { hash: chain_hash }));
 
-        self.enqueue_wal_line(entry_json);
+        self.enqueue_wal_line(entry_json.clone());
         self.recompute_health();
 
-        for cb in self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
+        // Notify AuditEventSink implementors with the canonical JSON line.
+        // Lock released, same ordering rule as subscriber callbacks.
+        if let Ok(sinks) = self.sinks.lock() {
+            for sink in sinks.iter() {
+                sink.on_event(&entry_json);
+            }
+        }
+
+        for cb in match self.subscribers.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_subscribers","SECURITY GATE STATE CORRUPTION: audit subscribers poison recovered."); p.into_inner() }
+        }.iter() {
             cb(&record_for_subscribers);
         }
     }
@@ -1546,7 +1622,7 @@ impl ImmutableAuditLog {
         let shard_idx = AUDIT_SHARD_SLOT.with(|s| *s);
         let anchor_epoch = self.anchor_epoch.load(Ordering::Relaxed);
         let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
-        let timestamp = now_secs();
+        let timestamp = wal_timestamp();
 
         // O-6: non-blocking probe first — on contention, record the observation
         // then fall through to the normal blocking lock() below.
@@ -1556,7 +1632,7 @@ impl ImmutableAuditLog {
                 crate::telemetry::global_telemetry().record_mutex_contention("wal_append");
                 self.shards[shard_idx]
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(|_| { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_shard","SECURITY GATE STATE CORRUPTION: audit shard poison recovered."); self.shards[shard_idx].lock().map(|g| g).unwrap_or_else(|e| e.into_inner()) })
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
@@ -1616,12 +1692,10 @@ impl ImmutableAuditLog {
         // the packet path can apply backpressure.
         if self.enqueue_wal_line(entry_json) {
             self.recompute_health();
-            for cb in self
-                .subscribers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-            {
+            for cb in match self.subscribers.lock() {
+                Ok(g) => g,
+                Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="audit_subscribers","SECURITY GATE STATE CORRUPTION: audit subscribers poison recovered."); p.into_inner() }
+            }.iter() {
                 cb(&record_for_subscribers);
             }
             Ok(())
@@ -2636,7 +2710,7 @@ impl WalWriter {
             w.get_ref().sync_data()?;
         }
         self.writer = None;
-        let rotated = format!("{}.{}.bak", self.path, now_secs() as u64);
+        let rotated = format!("{}.{}.bak", self.path, wal_timestamp() as u64);
         // C-4: only kick off background compression/archival if the rename actually
         // succeeded — a failed rename means `rotated` doesn't exist, and spawning a
         // thread to compress a nonexistent file would just be a spurious error log.
@@ -2785,7 +2859,7 @@ fn build_anchor_line(
         root: root.clone(),
         prev_root: prev_root.to_string(),
         event_count,
-        timestamp: now_secs(),
+        timestamp: wal_timestamp(),
     };
     let json = serde_json::to_string(&serde_json::json!({ ANCHOR_LINE_KEY: anchor })).ok()?;
     Some(AnchorLine { json, root })

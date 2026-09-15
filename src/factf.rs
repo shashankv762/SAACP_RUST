@@ -8,7 +8,7 @@
 //! - `PostCompromiseRecovery` — structured key-compromise handling
 
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -22,10 +22,7 @@ use crate::acsvaf::{
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 
 fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 fn new_uuid_hex() -> String {

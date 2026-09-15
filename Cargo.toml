@@ -8,6 +8,7 @@ members = [
     ".",                         # saacp facade + saacp-core (this package)
     "crates/saacp-primitives",   # Layer 0: zero-dependency leaf types
     "crates/saacp-crypto",       # Layer 1: FIPS cryptographic boundary
+    "crates/saacp-wire",         # Layer 2: no_std wire format types (Phase 1.4)
 ]
 
 # Shared package metadata — avoids duplication across workspace members.
@@ -69,10 +70,14 @@ gcloud-sdk = { version = "0.30", default-features = false, features = ["google-c
 # Workspace members (for inter-crate deps)
 saacp-primitives = { path = "crates/saacp-primitives" }
 saacp-crypto = { path = "crates/saacp-crypto" }
+saacp-wire = { path = "crates/saacp-wire" }
 # Dev
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rcgen = "0.13"
+# SO_REUSEPORT multi-listener (Phase 3) — already a transitive dep via tokio;
+# declared directly so daemon.rs can call socket2's bind API on Linux.
+socket2 = { version = "0.5", features = ["all"] }
 
 # ── Facade package ──────────────────────────────────────────────────────────────
 [package]
@@ -154,7 +159,7 @@ tokio-tungstenite = { version = "0.24", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 redis = { version = "0.27", optional = true }
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "blocking"] }
 axum = { version = "0.7", optional = true }
 # TLS-wrapped raw-TCP transport (src/transport/tls.rs) — TLS-terminates an accepted
 # TcpStream, then hands the resulting rustls TlsStream directly to the existing generic
@@ -165,6 +170,12 @@ axum = { version = "0.7", optional = true }
 # real, non-dev, optional dependency adds no version conflict.
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+# QUIC transport (Phase 1.1) — feature-gated via `transport-quic`.
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+# SO_REUSEPORT multi-listener (Phase 3) — Linux-only at runtime but compiled on all
+# platforms; the `bind_reuseport` helper in daemon.rs gates the actual call behind
+# `#[cfg(target_os = "linux")]` so other platforms use plain TcpListener::bind.
+socket2 = { workspace = true }
 
 # ── Post-Quantum Cryptography (NIST FIPS standards) ──────────────────────────
 # ML-DSA (FIPS 204, Dilithium) — lattice-based digital signatures for quantum-safe non-repudiation.
@@ -223,6 +234,12 @@ transport-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 # which upgrades each accepted TCP connection to TLS before the WebSocket
 # handshake. Requires both underlying transports.
 transport-wss = ["transport-ws", "transport-tls"]
+# QUIC transport (src/transport/quic.rs, Phase 1.1) — SAACPQuicDaemon over the
+# quinn 0.11 QUIC stack. Enables native connection migration (eliminates sticky
+# sessions for the MEASC replay window), 0-RTT resumption for agents roaming
+# between Wi-Fi and 5G, and QUIC-native DDoS protection via stateless retry
+# tokens. Off by default; enable explicitly for deployments that need it.
+transport-quic = ["dep:quinn"]
 # Redis-backed StateBackend (src/state_backend.rs) — lets a horizontally
 # scaled fleet of SAACP gateways share rate-limiter/session/stream state
 # across nodes instead of each node holding an isolated in-memory view. Off
@@ -231,6 +248,13 @@ redis-backend = ["dep:redis"]
 # M5: HTTP webhook alert sink (alert_sink.rs::WebhookAlertSink). Off by default
 # so deployments that don't need webhook alerts never pull in reqwest.
 webhook-alerts = ["dep:reqwest"]
+# OTLP log/trace export over HTTP+JSON (src/otlp.rs) — sends AuditEvents to
+# any OpenTelemetry-compatible collector (Grafana Cloud, Jaeger, Tempo, etc.)
+# via the OTLP/HTTP JSON endpoint. Reuses the already-optional `reqwest` dep;
+# adds ZERO new Cargo dependencies. Off by default so deployments that use a
+# sidecar collector agent (e.g. otel-collector DaemonSet) and prefer stdout-
+# JSON logs never pay for the HTTP client path.
+otlp-export = ["dep:reqwest"]
 # Metadata Privacy Filter (src/mpf.rs) — cover traffic, adaptive padding, and
 # timing-jitter recommendations for traffic-analysis resistance. This is not,
 # and never has been, wired into the mandatory gate pipeline (it's opt-in
@@ -274,6 +298,25 @@ command-center = ["dep:axum", "dep:futures-util"]
 # structural path was migrated to build genuinely-encrypted frames via
 # `encode_encrypted` instead. See CRIT-1 in opusplan.md.
 unsafe-structural-only = []
+# ── Convenience feature aliases ───────────────────────────────────────────────
+# `minimal`: smallest possible build — library only, no optional transports,
+# no observability sinks, no HRT backends. Suitable for Wasm / edge targets.
+minimal = []
+# `full`: all production-recommended features enabled in one flag. Excludes
+# unsafe-* flags and audit-plaintext (those must always be explicit).
+full = [
+    "transport-ws",
+    "transport-tls",
+    "transport-wss",
+    "transport-quic",
+    "redis-backend",
+    "webhook-alerts",
+    "otlp-export",
+    "health-endpoint",
+    "sidecar",
+    "command-center",
+    "mpf",
+]
 # UNSAFE: allows the no-gateway fallback path in `handler.rs` Gate 1.0 to grant
 # READ_ONLY access instead of rejecting unverified tokens. Off by default —
 # every production deployment MUST inject a real `ZeroTrustGateway` via

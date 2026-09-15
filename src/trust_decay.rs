@@ -77,6 +77,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::security_mutex::SecurityMutex;
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -442,9 +444,9 @@ pub const TRUST_MAX_OBSERVERS: usize = 64;
 /// Process-wide (or per-instance, for tests) continuous behavioral trust
 /// tracker. See module docs for the full model.
 pub struct TrustDecayEngine {
-    shards: Vec<Mutex<HashMap<String, TrustEntry>>>,
+    shards: Vec<SecurityMutex<HashMap<String, TrustEntry>>>,
     #[allow(clippy::type_complexity)]
-    observers: Mutex<HashMap<u64, Arc<dyn Fn(TrustSignal) + Send + Sync>>>,
+    observers: SecurityMutex<HashMap<u64, Arc<dyn Fn(TrustSignal) + Send + Sync>>>,
     next_observer_id: AtomicU64,
 }
 
@@ -458,23 +460,29 @@ impl TrustDecayEngine {
     pub fn new() -> Self {
         Self {
             shards: (0..TRUST_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .enumerate()
+                .map(|(i, _)| {
+                    // Each shard gets a unique name for tracing diagnostics.
+                    // SAFETY: The name string is leaked once per shard (16 total)
+                    // so it can be &'static. Total leak: 16 * ~25 bytes = trivial.
+                    let name: &'static str = Box::leak(
+                        format!("trust_decay_shard[{i}]").into_boxed_str()
+                    );
+                    SecurityMutex::new(HashMap::new(), name)
+                })
                 .collect(),
-            observers: Mutex::new(HashMap::new()),
+            observers: SecurityMutex::new(HashMap::new(), "trust_decay_observers"),
             next_observer_id: AtomicU64::new(0),
         }
     }
 
     /// Lock and return the shard responsible for `key`.
     ///
-    /// M-38 fix: every lock in this impl block recovers via `into_inner()` on
-    /// poison rather than panicking — `TrustDecayEngine::global()` is a
-    /// process-wide singleton, so one poisoning panic must not cascade into
-    /// every other agent's trust-score checks.
+    /// M-38 fix: implemented inside [`SecurityMutex::lock()`] — poison is
+    /// recovered via `into_inner()`, the counter is incremented, and a
+    /// tracing error is emitted, all without propagating the panic.
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, TrustEntry>> {
-        self.shards[trust_shard_index(key)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.shards[trust_shard_index(key)].lock()
     }
 
     /// Process-wide singleton, matching `AgentRateLimiter::global()` /
@@ -506,7 +514,7 @@ impl TrustDecayEngine {
         &self,
         cb: Arc<dyn Fn(TrustSignal) + Send + Sync>,
     ) -> Option<TrustObserverHandle> {
-        let mut observers = self.observers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut observers = self.observers.lock();
         if observers.len() >= TRUST_MAX_OBSERVERS {
             return None;
         }
@@ -520,7 +528,6 @@ impl TrustDecayEngine {
     pub fn unsubscribe(&self, handle: TrustObserverHandle) -> bool {
         self.observers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .remove(&handle.0)
             .is_some()
     }
@@ -548,7 +555,6 @@ impl TrustDecayEngine {
         let observers: Vec<_> = self
             .observers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect();
@@ -818,7 +824,7 @@ impl TrustDecayEngine {
             }
             None => {
                 for shard in &self.shards {
-                    shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    shard.lock().clear();
                 }
             }
         }
@@ -829,7 +835,7 @@ impl TrustDecayEngine {
     pub fn tracked_count(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| s.lock().len())
             .sum()
     }
 
@@ -857,7 +863,7 @@ impl TrustDecayEngine {
         let now = now_secs();
         let mut removed = 0usize;
         for shard in &self.shards {
-            let mut entries = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entries = shard.lock();
             let before = entries.len();
             entries.retain(|_, e| {
                 e.locked_at.is_some() || (now - e.last_update) < TRUST_ENTRY_STALENESS_SECONDS
@@ -890,7 +896,7 @@ impl TrustDecayEngine {
         // briefly contend, same as before sharding).
         let mut out: Vec<AgentTrustSnapshot> = Vec::new();
         for shard in &self.shards {
-            let mut entries = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entries = shard.lock();
             out.extend(entries.iter_mut().map(|(id, e)| {
                 e.recover_to(now);
                 let requires_reauth = match e.locked_at {
@@ -1003,7 +1009,10 @@ impl IntentDriftTracker {
     /// is a process-wide singleton, so one poisoning panic must not cascade
     /// into every other session's intent-drift tracking.
     pub fn accumulate(&self, session_uuid: &str, divergence: f64) -> f64 {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="intent_drift_sessions","SECURITY GATE STATE CORRUPTION: IntentDriftTracker sessions poison recovered."); p.into_inner() }
+        };
         let now = now_secs();
 
         if sessions.len() >= DRIFT_MAX_TRACKED_SESSIONS && !sessions.contains_key(session_uuid) {
@@ -1036,7 +1045,10 @@ impl IntentDriftTracker {
 
     /// Clear tracking for a session (e.g. on clean completion) or all sessions.
     pub fn reset(&self, session_uuid: Option<&str>) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="intent_drift_sessions","SECURITY GATE STATE CORRUPTION: IntentDriftTracker sessions poison recovered."); p.into_inner() }
+        };
         match session_uuid {
             Some(id) => {
                 sessions.remove(id);
@@ -1046,10 +1058,10 @@ impl IntentDriftTracker {
     }
 
     pub fn tracked_count(&self) -> usize {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        match self.sessions.lock() {
+            Ok(g) => g.len(),
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().len() }
+        }
     }
 }
 

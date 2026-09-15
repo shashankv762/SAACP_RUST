@@ -20,8 +20,14 @@
 //!   - `transport-tls`  → [`tls`] — TLS-terminated raw TCP (`tokio-rustls`).
 //!     Raw TCP+TLS only, not WebSocket-over-TLS (`wss://`) — see [`tls`]'s
 //!     module doc for why.
+//!   - `transport-quic` → [`quic`] — QUIC/UDP transport (Phase 1.1). Provides
+//!     native connection migration (eliminates sticky-session requirement),
+//!     0-RTT agent reconnects, and QUIC stateless retry tokens for DDoS
+//!     protection. Built on the `quinn` crate over `tokio`.
 
 #[cfg(feature = "transport-tls")]
 pub mod tls;
 #[cfg(feature = "transport-ws")]
 pub mod ws;
+#[cfg(feature = "transport-quic")]
+pub mod quic;

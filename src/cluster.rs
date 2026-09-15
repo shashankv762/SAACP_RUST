@@ -71,7 +71,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -82,11 +82,22 @@ use sha2::{Digest, Sha256};
 use crate::faitf::{AgentIdentity, TrustStore};
 use crate::state_backend::StateBackend;
 
-fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+/// Monotonic elapsed-time source for failure-detector comparisons.
+///
+/// `last_seen`, `state_changed_at`, and `tick()` timeout comparisons
+/// use this so that an NTP backward step cannot promote a healthy member
+/// to Suspect or Dead (the step would make elapsed time appear larger).
+fn now_monotonic() -> f64 {
+    crate::clock::now_secs_f64()
+}
+
+/// Wall-clock source for wire fields verified by peers.
+///
+/// `sent_at` in [`ClusterMessage`] is compared against the *receiving*
+/// node's wall clock with a `CLUSTER_MAX_CLOCK_SKEW` tolerance, so it
+/// must track real Unix time — not the process's monotonic offset.
+fn cluster_wall_clock_now() -> f64 {
+    crate::clock::wall_clock_now()
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +657,7 @@ impl ClusterEngine {
         addr: impl Into<String>,
     ) -> Self {
         let node_id = identity.agent_id.clone();
-        let now = now_f64();
+        let now = now_monotonic();
         let addr = addr.into();
 
         let mut members = HashMap::new();
@@ -796,7 +807,7 @@ impl ClusterEngine {
         if node_id == self.node_id {
             return;
         }
-        let now = now_f64();
+        let now = now_monotonic();
         let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
         if members.contains_key(node_id) || members.len() >= CLUSTER_MAX_MEMBERS {
             return;
@@ -843,7 +854,7 @@ impl ClusterEngine {
             sender_id: self.node_id.clone(),
             sender_incarnation: self.incarnation.load(Ordering::Relaxed),
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
-            sent_at: now_f64(),
+            sent_at: cluster_wall_clock_now(),
             leader_epoch: self.leader_epoch.load(Ordering::Relaxed),
             leader_id,
             cluster_size: self.config.expected_cluster_size,
@@ -874,7 +885,7 @@ impl ClusterEngine {
     /// instead of waiting out the dead-timeout. Call before shutting the daemon down.
     pub fn leave(&self) {
         {
-            let now = now_f64();
+            let now = now_monotonic();
             let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(me) = members.get_mut(&self.node_id) {
                 me.state = NodeState::Left;
@@ -945,7 +956,7 @@ impl ClusterEngine {
             return Err(ClusterRejection::WrongCluster);
         }
 
-        let now = now_f64();
+        let now = now_monotonic();
         let age = now - msg.sent_at;
         if age > self.config.message_max_age.as_secs_f64() || age < -CLUSTER_MAX_CLOCK_SKEW {
             return Err(ClusterRejection::Stale);
@@ -1139,7 +1150,7 @@ impl ClusterEngine {
 
     /// Bump our incarnation above the suspicion and immediately re-announce liveness.
     fn refute_suspicion(&self) {
-        let now = now_f64();
+        let now = now_monotonic();
         let new_incarnation = self.incarnation.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
@@ -1163,7 +1174,7 @@ impl ClusterEngine {
     /// recompute leadership. Safe to call from [`crate::maintenance::MaintenanceCoordinator`]
     /// or a dedicated thread; see [`Self::start`] for the cadence caveat.
     pub fn tick(&self) -> TickOutcome {
-        let now = now_f64();
+        let now = now_monotonic();
         let suspect_after = self.config.suspect_timeout.as_secs_f64();
         let dead_after = self.config.dead_timeout.as_secs_f64();
 
@@ -1264,7 +1275,7 @@ impl ClusterEngine {
             new_leader: candidate.clone(),
             epoch,
             self_is_leader: candidate.as_deref() == Some(self.node_id.as_str()),
-            at: now_f64(),
+            at: now_monotonic(),
         };
 
         let hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
@@ -1313,7 +1324,7 @@ impl ClusterEngine {
     /// `dead_timeout`, and drop their replay high-water entries. Returns how many were
     /// removed. Registered by [`crate::maintenance::MaintenanceCoordinator::with_cluster`].
     pub fn sweep_expired(&self) -> usize {
-        let now = now_f64();
+        let now = now_monotonic();
         let cutoff = self.config.dead_timeout.as_secs_f64();
         let removed: Vec<String> = {
             let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
@@ -1590,7 +1601,7 @@ mod tests {
         let (node_b, _tb) = make_node(&b, &["node-a"], &[&a, &b], 2);
 
         let mut msg = node_b.build_message(ClusterMessageKind::Heartbeat);
-        msg.sent_at = now_f64() - DEFAULT_MESSAGE_MAX_AGE.as_secs_f64() - 60.0;
+        msg.sent_at = cluster_wall_clock_now() - DEFAULT_MESSAGE_MAX_AGE.as_secs_f64() - 60.0;
         msg.signature = sign_data(&b.signing_key, &msg.body_bytes()); // validly re-signed
 
         assert_eq!(
@@ -1764,7 +1775,7 @@ mod tests {
             let m = members
                 .get_mut(&victim)
                 .expect("victim must be a known member");
-            m.last_seen = now_f64() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
+            m.last_seen = now_monotonic() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
             m.state = NodeState::Suspect;
         }
         node_a.tick();
@@ -1820,7 +1831,7 @@ mod tests {
             let mut members = node_a.members.lock().unwrap();
             for id in ["node-b", "node-c"] {
                 let m = members.get_mut(id).unwrap();
-                m.last_seen = now_f64() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
+                m.last_seen = now_monotonic() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
             }
         }
         node_a.tick();
@@ -1892,7 +1903,7 @@ mod tests {
     #[test]
     fn higher_incarnation_alive_overrides_a_dead_record() {
         let mut members = HashMap::new();
-        let now = now_f64();
+        let now = now_monotonic();
         members.insert(
             "n1".to_string(),
             MemberRecord {
@@ -1998,7 +2009,7 @@ mod tests {
             let mut members = node_a.members.lock().unwrap();
             let m = members.get_mut("node-b").unwrap();
             m.state = NodeState::Dead;
-            m.state_changed_at = now_f64() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
+            m.state_changed_at = now_monotonic() - DEFAULT_DEAD_TIMEOUT.as_secs_f64() - 60.0;
         }
 
         assert_eq!(node_a.sweep_expired(), 1);

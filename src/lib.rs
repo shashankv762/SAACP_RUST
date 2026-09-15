@@ -46,10 +46,12 @@ pub mod rgc;
 pub mod rulepack;
 pub mod schemas;
 pub mod security;
+pub mod security_mutex;
 pub mod session_affinity;
 pub mod shard;
 pub mod streaming;
 pub mod temporal;
+pub mod roots_watcher;
 // Metadata Privacy (cover traffic / adaptive padding / timing jitter): traffic-
 // analysis resistance. Never wired into the default gate pipeline (verified —
 // it was already dead code before this feature gate existed), and matters far
@@ -71,6 +73,8 @@ pub mod mace;
 pub mod maintenance;
 #[cfg(feature = "mpf")]
 pub mod mpf;
+#[cfg(feature = "otlp-export")]
+pub mod otlp;
 pub mod sid;
 #[cfg(feature = "sidecar")]
 pub mod sidecar;
@@ -103,8 +107,9 @@ pub use attestation::{
     create_attestation_binding, generate_attestation_challenge, validate_attestation_size,
     verify_challenge_response, AttestationEvidence, AttestationType as HardwareAttestationType,
     AttestationVerification, AttestationVerifier, HsmAttestation, TeeAttestation, TpmQuote,
-    MAX_ATTESTATION_QUOTE_SIZE,
+    TrustedRootBundle, MAX_ATTESTATION_QUOTE_SIZE,
 };
+pub use roots_watcher::start_roots_watcher;
 pub use cluster::{
     ClusterConfig, ClusterEngine, ClusterMessage, ClusterMessageKind, ClusterRejection,
     ClusterTransport, LeadershipChange, MemberRecord, MemberUpdate, NodeState,
@@ -219,10 +224,18 @@ pub use measc::{
     ReplayWindowStats, SessionEpoch, SessionEpochManager, MEASC_AUTH_SESSION_IDLE_SECS,
     MEASC_AUTH_TAG_SIZE, MEASC_CONTEXT_REF_ID_OFFSET, MEASC_CONTEXT_REF_ID_SIZE,
     MEASC_DEFAULT_EPOCH_PACKET_THRESHOLD, MEASC_DEFAULT_EPOCH_TIME_SECONDS,
-    MEASC_EPOCH_GRACE_PERIOD_SECONDS, MEASC_HEADER_SIZE, MEASC_MAGIC, MEASC_MAX_PSN_ADVANCE,
-    MEASC_MAX_TRACKED_SESSIONS, MEASC_PSN_MAX, MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD,
-    MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE, MEASC_REPLAY_MAX_LARGE_ADVANCES,
-    MEASC_REPLAY_RATE_LIMIT_WINDOW_SEC, MEASC_REPLAY_WINDOW_SIZE, MEASC_UNAUTH_SESSION_IDLE_SECS,
+    MEASC_EPOCH_FLOOR_KEY, MEASC_EPOCH_GRACE_PERIOD_SECONDS,
+    MEASC_FORMAT_VERSION_V1, MEASC_FORMAT_VERSION_V2,
+    MEASC_HEADER_SIZE, MEASC_LEGACY_ACCEPT_WINDOW_SECONDS,
+    MEASC_MAGIC, MEASC_MAX_PSN_ADVANCE, MEASC_MAX_TRACKED_SESSIONS,
+    MEASC_PSN_MAX, MEASC_REPLAY_ANOMALY_JUMP_THRESHOLD, MEASC_REPLAY_MAX_ANOMALIES_QUARANTINE,
+    MEASC_REPLAY_MAX_LARGE_ADVANCES, MEASC_REPLAY_RATE_LIMIT_WINDOW_SEC,
+    MEASC_REPLAY_WINDOW_SIZE, MEASC_UNAUTH_SESSION_IDLE_SECS,
+    // v2 packet chaining
+    MEASC_V2_CHAIN_GENESIS, MEASC_V2_EPOCH_BEACON_OFFSET, MEASC_V2_EPOCH_BEACON_SIZE,
+    MEASC_V2_HEADER_SIZE, MEASC_V2_PREV_HASH_OFFSET, MEASC_V2_PREV_HASH_SIZE,
+    PacketChainStats, PacketChainVerifier,
+    build_v2_extension, compute_prev_packet_hash, parse_v2_extension,
 };
 pub use memory::{
     CheckpointedSession, FederatedMemory, SecureContextStore, StallReport, CHECKPOINT_MAX_ENTRIES,

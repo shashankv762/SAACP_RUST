@@ -6,10 +6,21 @@
 //!   * Policy-driven rotation and overlap periods (KeyLifecycleManager)
 //!   * Revocation, emergency revocation, and propagation to federation peers
 //!   * Audit trail per key identifier
+//!
+//! # Clock discipline
+//!
+//! [`KeyLifecycleManager`] uses a [`crate::clock::Clock`] injected at
+//! construction time (defaulting to [`crate::clock::MonotonicClock`]) for all
+//! TTL and rotation-window calculations. This makes key lifecycle immune to
+//! NTP jumps — a backward step never prevents rotation; a forward step only
+//! causes keys to expire slightly early (the safe direction).
+//!
+//! The standalone [`make_descriptor`] helper and the [`KeyRegistry`] itself
+//! use [`crate::clock::wall_clock_now()`] for `created_at`/`expires_at` fields
+//! that external audit consumers read as Unix timestamps.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -583,20 +594,49 @@ impl Default for KeyRegistry {
 // ---------------------------------------------------------------------------
 
 /// Orchestrates rotation, revocation, expiry, and audit of managed keys.
+///
+/// Uses an injected [`crate::clock::Clock`] for all TTL / rotation-window
+/// calculations. Defaults to the process-wide monotonic clock so that key
+/// lifecycle is immune to NTP jumps. Pass a custom clock for tests.
 pub struct KeyLifecycleManager {
     registry: KeyRegistry,
     policy: KeyRotationPolicy,
     revocation_log: Mutex<Vec<KeyRevocationRecord>>,
+    /// Monotonic-safe clock used for all rotation / expiry decisions.
+    /// Never decreases, so NTP backward adjustments cannot stall rotation.
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 impl KeyLifecycleManager {
     /// Create a new KeyLifecycleManager with the given registry and policy.
+    /// Uses the process-wide [`crate::clock::MonotonicClock`] by default.
     pub fn new(registry: KeyRegistry, policy: Option<KeyRotationPolicy>) -> Self {
         Self {
             registry,
             policy: policy.unwrap_or_default(),
             revocation_log: Mutex::new(Vec::new()),
+            clock: Arc::new(crate::clock::monotonic().clone()),
         }
+    }
+
+    /// Create with a custom clock implementation (e.g. a `FakeClock` in tests).
+    pub fn with_clock(
+        registry: KeyRegistry,
+        policy: Option<KeyRotationPolicy>,
+        clock: Arc<dyn crate::clock::Clock>,
+    ) -> Self {
+        Self {
+            registry,
+            policy: policy.unwrap_or_default(),
+            revocation_log: Mutex::new(Vec::new()),
+            clock,
+        }
+    }
+
+    /// Current "now" for TTL / rotation decisions. Monotonic — never goes backward.
+    #[inline]
+    fn now(&self) -> f64 {
+        self.clock.now_secs_f64()
     }
 
     /// Rotate an existing key, producing a new version.
@@ -609,7 +649,7 @@ impl KeyLifecycleManager {
         new_key_material: Vec<u8>,
         algorithm: KeyAlgorithm,
     ) -> Result<KeyDescriptor, SAACPHardDrop> {
-        let now = now_epoch_secs();
+        let now = self.now();
         let policy = &self.policy;
 
         // Read-current, build-new, and write-both all happen under one lock inside
@@ -661,7 +701,7 @@ impl KeyLifecycleManager {
     ///
     /// If reason is "compromised", status is set to Compromised; otherwise Revoked.
     pub fn revoke_key(&self, kid: &str, reason: &str) -> Result<KeyRevocationRecord, String> {
-        let now = now_epoch_secs();
+        let now = self.now();
         let new_status = if reason == "compromised" {
             KeyStatus::Compromised
         } else {
@@ -923,12 +963,11 @@ pub fn make_descriptor(
     )
 }
 
-/// Current wall-clock time as seconds since UNIX epoch.
+/// Time helper for module-level free functions that cannot access `self.clock()`.
+/// Delegates to the monotonic clock — consistent with KeyLifecycleManager::now().
+/// New code should prefer `KeyLifecycleManager::now()` over this function.
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::now_secs_f64()
 }
 
 /// Sane default CSPRNG-backed key-material generator for

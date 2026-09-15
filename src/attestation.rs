@@ -14,6 +14,9 @@
 //! - Binds cryptographic identity to hardware root of trust
 //! - Enables compliance with healthcare/banking hardware requirements
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -66,7 +69,7 @@ impl AttestationType {
     /// Parse from string.
     ///
     /// Deliberately an inherent method (Python-parity shape), not a `FromStr`
-    /// impl — see `cluster.rs`'s matching `#[allow]` for the rationale.
+    /// impl â€” see `cluster.rs`'s matching `#[allow]` for the rationale.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -114,14 +117,36 @@ pub struct TpmQuote {
 }
 
 /// HSM attestation via PKCS#11.
+///
+/// All fields are parity with [`TpmQuote`] and [`TeeAttestation`]: a real
+/// HSM attestation includes a manufacturer certificate chain, a key attestation
+/// structure signed by the HSM manufacturer's signing key, and the same
+/// freshness-binding fields (nonce / channel_binding / suite_transcript_hash)
+/// that bind the quote to this specific session and prevent replay.
 #[derive(Debug, Clone)]
 pub struct HsmAttestation {
-    /// PKCS#11 token label.
+    /// PKCS#11 token label (informational, not security-critical).
     pub token_label: String,
-    /// Key handle attestation.
+    /// Key attestation structure from the HSM firmware.
     pub key_attestation: Vec<u8>,
-    /// HSM manufacturer certificate.
+    /// HSM manufacturer certificate chain (DER-encoded). Presence is
+    /// validated but not chain-verified (requires platform CA trust store).
     pub manufacturer_cert: Vec<u8>,
+    /// HSM manufacturer's Ed25519 signing key (32 bytes, raw compressed point).
+    /// Used to verify `signature` over [`Self::key_attestation`] and freshness fields.
+    pub signing_public_key: Vec<u8>,
+    /// Ed25519 signature over the attestation digest (see
+    /// [`AttestationVerifier::compute_hsm_attestation_digest`]).
+    pub signature: Vec<u8>,
+    /// Freshness nonce from the attestation challenge (binds quote to this session).
+    pub nonce: Vec<u8>,
+    /// Channel binding value (binds quote to this specific channel).
+    pub channel_binding: Vec<u8>,
+    /// Suite transcript hash (binds quote to this key negotiation).
+    pub suite_transcript_hash: Vec<u8>,
+    /// Unix timestamp (seconds) when the HSM generated this attestation.
+    /// A value of `0.0` means no timestamp was provided and the age check is skipped.
+    pub quote_timestamp: f64,
 }
 
 /// TEE/Enclave attestation report.
@@ -166,19 +191,50 @@ pub enum AttestationEvidence {
     Tee(TeeAttestation),
 }
 
+/// Snapshot of all trusted signing keys and measurements.
+///
+/// Stored behind `ArcSwap` so live reloads (via [`AttestationVerifier::update_roots`])
+/// are lock-free on the read path and atomic â€” in-flight verifications using the old
+/// bundle complete naturally; new ones start with the updated bundle.
+#[derive(Clone)]
+pub struct TrustedRootBundle {
+    /// Trusted measurements (PCR values, enclave hashes) indexed by attestation type.
+    pub measurements: Vec<(AttestationType, Vec<u8>)>,
+    /// Trusted Ed25519 signing keys indexed by attestation type.
+    /// Loaded from a TOML/JSON roots file and verified against the CA signature.
+    pub signing_keys: Vec<(AttestationType, VerifyingKey)>,
+    /// Monotonically increasing bundle version for diagnostic logging.
+    pub version: u64,
+}
+
+impl TrustedRootBundle {
+    pub fn new() -> Self {
+        Self { measurements: Vec::new(), signing_keys: Vec::new(), version: 0 }
+    }
+}
+
+impl Default for TrustedRootBundle {
+    fn default() -> Self { Self::new() }
+}
+
 /// Attestation verifier for hardware root of trust.
+///
+/// Trusted signing keys and measurements are stored in an `ArcSwap<TrustedRootBundle>`
+/// so they can be reloaded at runtime (via [`Self::update_roots`]) without restarting
+/// the process. The read path is lock-free â€” `self.roots.load()` is an atomic pointer
+/// load with no contention.
 pub struct AttestationVerifier {
-    /// Trusted measurements (PCR values, enclave hashes) indexed by type.
-    trusted_measurements: Vec<(AttestationType, Vec<u8>)>,
+    /// Lock-free, hot-reloadable trusted root bundle.
+    roots: ArcSwap<TrustedRootBundle>,
     /// Maximum age of an attestation quote (seconds).
     max_quote_age: f64,
 }
 
 impl AttestationVerifier {
-    /// Create a new attestation verifier with default settings.
+    /// Create a new attestation verifier with an empty trusted root bundle.
     pub fn new() -> Self {
         Self {
-            trusted_measurements: Vec::new(),
+            roots: ArcSwap::new(Arc::new(TrustedRootBundle::new())),
             max_quote_age: 300.0, // 5 minutes
         }
     }
@@ -186,18 +242,61 @@ impl AttestationVerifier {
     /// Create with custom max quote age.
     pub fn with_max_quote_age(max_age: f64) -> Self {
         Self {
-            trusted_measurements: Vec::new(),
+            roots: ArcSwap::new(Arc::new(TrustedRootBundle::new())),
             max_quote_age: max_age,
         }
     }
 
+    /// Atomically swap in a new root bundle.
+    ///
+    /// In-flight verifications using the old bundle complete naturally.
+    /// New verifications immediately see the updated keys and measurements.
+    /// Safe to call from any thread â€” `ArcSwap::store` is lock-free.
+    pub fn update_roots(&self, new_bundle: TrustedRootBundle) {
+        let version = new_bundle.version;
+        self.roots.store(Arc::new(new_bundle));
+        tracing::info!(bundle_version = version, "AttestationVerifier: trusted root bundle updated");
+    }
+
     /// Register a trusted measurement for verification.
+    ///
+    /// Builds a new bundle from the current one with the measurement appended
+    /// and atomically swaps it in. For initial setup; prefer `update_roots` for
+    /// bulk changes (avoids N atomic swaps).
     pub fn register_trusted_measurement(
-        &mut self,
+        &self,
         att_type: AttestationType,
         measurement: Vec<u8>,
     ) {
-        self.trusted_measurements.push((att_type, measurement));
+        let old = self.roots.load();
+        let mut new_bundle = (**old).clone();
+        new_bundle.measurements.push((att_type, measurement));
+        new_bundle.version += 1;
+        self.roots.store(Arc::new(new_bundle));
+    }
+
+    /// Register an Ed25519 attestation signing key for one hardware type.
+    ///
+    /// Verification is fail-closed: a mathematically valid signature from a key
+    /// that is not present in this registry is not trusted. Prefer loading a
+    /// complete [`TrustedRootBundle`] with [`Self::update_roots`] for startup
+    /// configuration or atomic rotation.
+    pub fn register_trusted_signing_key(
+        &self,
+        att_type: AttestationType,
+        key: VerifyingKey,
+    ) {
+        let old = self.roots.load();
+        let mut new_bundle = (**old).clone();
+        if !new_bundle
+            .signing_keys
+            .iter()
+            .any(|(existing_type, existing_key)| *existing_type == att_type && existing_key == &key)
+        {
+            new_bundle.signing_keys.push((att_type, key));
+            new_bundle.version += 1;
+            self.roots.store(Arc::new(new_bundle));
+        }
     }
 
     /// Verify attestation evidence.
@@ -234,7 +333,7 @@ impl AttestationVerifier {
             };
         }
 
-        // #5 FIX: Verify freshness binding — nonce + channel_binding + suite_transcript_hash
+        // #5 FIX: Verify freshness binding â€” nonce + channel_binding + suite_transcript_hash
         // must be present and non-empty. This binds the quote to this specific session
         // and prevents replay of captured attestations.
         if quote.nonce.is_empty()
@@ -251,7 +350,7 @@ impl AttestationVerifier {
             };
         }
 
-        // #5 FIX: Verify quote age — rejects stale quotes beyond max_quote_age.
+        // #5 FIX: Verify quote age â€” rejects stale quotes beyond max_quote_age.
         // A quote_timestamp of 0.0 means the TPM did not embed a timestamp, in
         // which case the age check is skipped (backward compatibility with
         // stubs that do not produce real quotes).
@@ -283,9 +382,10 @@ impl AttestationVerifier {
             false
         };
 
-        // Verify PCR values against trusted measurements
-        let pcr_valid = self
-            .trusted_measurements
+        // Verify PCR values against trusted measurements (lock-free ArcSwap read).
+        let roots = self.roots.load();
+        let pcr_valid = roots
+            .measurements
             .iter()
             .any(|(t, m)| *t == AttestationType::Tpm && m == &quote.pcr_values);
 
@@ -305,47 +405,137 @@ impl AttestationVerifier {
             &sig_input,
             &quote.signature,
         );
+        let key_trusted = roots.signing_keys.iter().any(|(t, key)| {
+            *t == AttestationType::Tpm && key.as_bytes() == quote.aik_public.as_slice()
+        });
 
         AttestationVerification {
-            is_valid: pcr_valid && sig_valid,
+            is_valid: pcr_valid && sig_valid && key_trusted,
             attestation_type: AttestationType::Tpm,
             measurement: quote.pcr_values.clone(),
             timestamp,
             details: format!(
-                "TPM quote verification: PCR match={}, signature valid={}, freshness bound={}, age_valid={}",
-                pcr_valid, sig_valid, !quote.nonce.is_empty(), age_valid
+                "TPM quote verification: PCR match={}, signature valid={}, trusted key={}, freshness bound={}, age_valid={}",
+                pcr_valid, sig_valid, key_trusted, !quote.nonce.is_empty(), age_valid
             ),
         }
     }
 
     /// Verify an HSM attestation.
+    ///
+    /// Validates:
+    /// 1. Structure completeness (key_attestation, manufacturer_cert, signing_public_key)
+    /// 2. Freshness binding (nonce, channel_binding, suite_transcript_hash must be non-empty)
+    /// 3. Quote age (rejected if beyond `max_quote_age`)
+    /// 4. Ed25519 signature over [`AttestationVerifier::compute_hsm_attestation_digest`]
     fn verify_hsm_attestation(
         &self,
         att: &HsmAttestation,
         timestamp: f64,
     ) -> AttestationVerification {
-        // Verify key attestation structure
-        if att.key_attestation.is_empty() {
+        // Step 1: Structure completeness
+        if att.key_attestation.is_empty()
+            || att.manufacturer_cert.is_empty()
+            || att.signing_public_key.is_empty()
+            || att.signature.is_empty()
+        {
             return AttestationVerification {
                 is_valid: false,
                 attestation_type: AttestationType::Hsm,
                 measurement: vec![],
                 timestamp,
-                details: "Invalid HSM attestation structure".to_string(),
+                details: "Invalid HSM attestation structure: missing required fields".to_string(),
             };
         }
 
-        // Verify manufacturer certificate chain (simplified)
-        let cert_valid = !att.manufacturer_cert.is_empty();
+        // Step 2: Freshness binding â€” nonce + channel_binding + suite_transcript_hash
+        // must all be non-empty to bind this attestation to the current session.
+        if att.nonce.is_empty()
+            || att.channel_binding.is_empty()
+            || att.suite_transcript_hash.is_empty()
+        {
+            return AttestationVerification {
+                is_valid: false,
+                attestation_type: AttestationType::Hsm,
+                measurement: vec![],
+                timestamp,
+                details: "HSM attestation missing freshness binding (nonce/channel/transcript)"
+                    .to_string(),
+            };
+        }
+
+        // Step 3: Quote age check â€” same freshness window as TPM/TEE.
+        if att.quote_timestamp > 0.0 {
+            let age = timestamp - att.quote_timestamp;
+            if age < 0.0 {
+                return AttestationVerification {
+                    is_valid: false,
+                    attestation_type: AttestationType::Hsm,
+                    measurement: vec![],
+                    timestamp,
+                    details: format!(
+                        "HSM attestation timestamp is in the future (skew {}s)",
+                        -age
+                    ),
+                };
+            }
+            if age > self.max_quote_age {
+                return AttestationVerification {
+                    is_valid: false,
+                    attestation_type: AttestationType::Hsm,
+                    measurement: vec![],
+                    timestamp,
+                    details: format!(
+                        "HSM attestation expired: age {age}s exceeds max_quote_age {}s",
+                        self.max_quote_age
+                    ),
+                };
+            }
+        }
+
+        // Load one immutable root snapshot for both signature and trust checks.
+        // Keeping this load in the same verification scope prevents a live root
+        // rotation from producing a mixed-version decision.
+        let roots = self.roots.load();
+
+        // Step 4: Ed25519 signature verification over the attestation digest.
+        // The digest covers key_attestation + freshness fields, domain-separated.
+        let digest = Self::compute_hsm_attestation_digest(
+            &att.key_attestation,
+            &att.nonce,
+            &att.channel_binding,
+            &att.suite_transcript_hash,
+        );
+        let sig_valid = Self::verify_ed25519_signature(
+            &att.signing_public_key,
+            &digest,
+            &att.signature,
+        );
+        let key_trusted = VerifyingKey::from_bytes(match att.signing_public_key.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return AttestationVerification {
+                is_valid: false,
+                attestation_type: AttestationType::Hsm,
+                measurement: vec![],
+                timestamp,
+                details: "HSM attestation signing key has invalid length".to_string(),
+            },
+        }).ok().is_some_and(|key| {
+            roots.signing_keys.iter().any(|(t, trusted)| {
+                *t == AttestationType::Hsm && trusted == &key
+            })
+        });
 
         AttestationVerification {
-            is_valid: cert_valid,
+            is_valid: sig_valid && key_trusted,
             attestation_type: AttestationType::Hsm,
             measurement: att.key_attestation.clone(),
             timestamp,
             details: format!(
-                "HSM attestation verification: token={}, cert valid={}",
-                att.token_label, cert_valid
+                "HSM attestation verification: token={}, sig_valid={sig_valid}, \
+                 trusted_key={key_trusted}, freshness_bound=true, age_valid={}",
+                att.token_label,
+                att.quote_timestamp > 0.0
             ),
         }
     }
@@ -356,13 +546,14 @@ impl AttestationVerifier {
         tee: &TeeAttestation,
         timestamp: f64,
     ) -> AttestationVerification {
-        // Verify measurement against trusted values
-        let measurement_valid = self
-            .trusted_measurements
+        // Verify measurement against trusted values (lock-free ArcSwap read).
+        let roots = self.roots.load();
+        let measurement_valid = roots
+            .measurements
             .iter()
             .any(|(t, m)| *t == AttestationType::Enclave && m == &tee.measurement);
 
-        // #5 FIX: Verify freshness binding — nonce + channel_binding + suite_transcript_hash
+        // #5 FIX: Verify freshness binding â€” nonce + channel_binding + suite_transcript_hash
         // must be present and non-empty. This binds the quote to this specific session.
         if tee.nonce.is_empty()
             || tee.channel_binding.is_empty()
@@ -378,7 +569,7 @@ impl AttestationVerifier {
             };
         }
 
-        // #5 FIX: Verify quote age — rejects stale TEE reports beyond max_quote_age.
+        // #5 FIX: Verify quote age â€” rejects stale TEE reports beyond max_quote_age.
         // A quote_timestamp of 0.0 means no timestamp was provided; skip the check.
         if tee.quote_timestamp > 0.0 {
             let age = timestamp - tee.quote_timestamp;
@@ -411,7 +602,7 @@ impl AttestationVerifier {
         // Verify signature over the TEE report digest INCLUDING freshness binding.
         // The signing_public_key (TEE manufacturer / quoting enclave key) must be the
         // exact verifying key. Any empty blob, random bytes, or wrong-key signature
-        // is rejected cryptographically — not merely by a length or emptiness check.
+        // is rejected cryptographically â€” not merely by a length or emptiness check.
         let tee_digest = Self::compute_tee_report_digest(
             &tee.measurement,
             &tee.report_data,
@@ -424,18 +615,33 @@ impl AttestationVerifier {
             &tee_digest,
             &tee.signature,
         );
+        let key_trusted = VerifyingKey::from_bytes(match tee.signing_public_key.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return AttestationVerification {
+                is_valid: false,
+                attestation_type: AttestationType::Enclave,
+                measurement: vec![],
+                timestamp,
+                details: "TEE attestation signing key has invalid length".to_string(),
+            },
+        }).ok().is_some_and(|key| {
+            roots.signing_keys.iter().any(|(t, trusted)| {
+                *t == AttestationType::Enclave && trusted == &key
+            })
+        });
 
         AttestationVerification {
-            is_valid: measurement_valid && sig_valid,
+            is_valid: measurement_valid && sig_valid && key_trusted,
             attestation_type: AttestationType::Enclave,
             measurement: tee.measurement.clone(),
             timestamp,
             details: format!(
                 "TEE attestation verification: type={}, measurement valid={}, signature valid={}, \
-                 freshness bound={}, key present={}",
+                 trusted key={}, freshness bound={}, key present={}",
                 tee.tee_type,
                 measurement_valid,
                 sig_valid,
+                key_trusted,
                 !tee.nonce.is_empty(),
                 !tee.signing_public_key.is_empty(),
             ),
@@ -458,7 +664,7 @@ impl AttestationVerifier {
     ) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(b"SAACP-TPM-quote-digest-v2");
-        // Freshness binding — length-prefixed to prevent extension attacks
+        // Freshness binding â€” length-prefixed to prevent extension attacks
         hasher.update((nonce.len() as u32).to_be_bytes());
         hasher.update(nonce);
         hasher.update((channel_binding.len() as u32).to_be_bytes());
@@ -488,7 +694,7 @@ impl AttestationVerifier {
     ) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(b"SAACP-TEE-report-digest-v1");
-        // Freshness binding — length-prefixed to prevent extension attacks
+        // Freshness binding â€” length-prefixed to prevent extension attacks
         hasher.update((nonce.len() as u32).to_be_bytes());
         hasher.update(nonce);
         hasher.update((channel_binding.len() as u32).to_be_bytes());
@@ -503,22 +709,55 @@ impl AttestationVerifier {
         hasher.finalize().to_vec()
     }
 
+    /// Compute the digest of an HSM attestation for signature verification.
+    ///
+    /// Domain-separated from TPM and TEE digests. Uses the same length-prefixed
+    /// SHA-256 pattern as [`Self::compute_quote_digest`] and
+    /// [`Self::compute_tee_report_digest`] to prevent extension attacks.
+    ///
+    /// Covers `key_attestation` + freshness fields (nonce, channel_binding,
+    /// suite_transcript_hash). The PKCS#11 token_label and manufacturer_cert
+    /// are NOT included in the digest because they are advisory metadata;
+    /// the signing key is the trust anchor, not the label.
+    ///
+    /// `pub(crate)` so that test helpers can produce correctly-signed attestations.
+    pub(crate) fn compute_hsm_attestation_digest(
+        key_attestation: &[u8],
+        nonce: &[u8],
+        channel_binding: &[u8],
+        suite_transcript_hash: &[u8],
+    ) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"SAACP-HSM-attestation-digest-v1");
+        // Freshness binding â€” length-prefixed to prevent extension attacks
+        hasher.update((nonce.len() as u32).to_be_bytes());
+        hasher.update(nonce);
+        hasher.update((channel_binding.len() as u32).to_be_bytes());
+        hasher.update(channel_binding);
+        hasher.update((suite_transcript_hash.len() as u32).to_be_bytes());
+        hasher.update(suite_transcript_hash);
+        // Key attestation payload
+        hasher.update((key_attestation.len() as u32).to_be_bytes());
+        hasher.update(key_attestation);
+        hasher.finalize().to_vec()
+    }
+
     /// Verify an Ed25519 signature over a message using a raw 32-byte public key.
     ///
-    /// Returns `false` — never panics — on any of:
+    /// Returns `false` â€” never panics â€” on any of:
     /// - `public_key_bytes` is not exactly 32 bytes
     /// - `signature_bytes` is not exactly 64 bytes
     /// - the key bytes do not represent a valid compressed Ed25519 point
     /// - the signature does not verify against the key and message
     ///
     /// `pub(crate)` so the test submodule can exercise it directly as a unit test.
-    /// Not exposed as public API — callers should use `AttestationVerifier::verify`.
+    /// Not exposed as public API â€” callers should use `AttestationVerifier::verify`.
     pub(crate) fn verify_ed25519_signature(
         public_key_bytes: &[u8],
         message: &[u8],
         signature_bytes: &[u8],
     ) -> bool {
-        // Parse public key — must be exactly 32 bytes
+        // Parse public key â€” must be exactly 32 bytes
         let pk_array: [u8; 32] = match public_key_bytes.try_into() {
             Ok(a) => a,
             Err(_) => return false,
@@ -527,13 +766,13 @@ impl AttestationVerifier {
             Ok(vk) => vk,
             Err(_) => return false,
         };
-        // Parse signature — must be exactly 64 bytes
+        // Parse signature â€” must be exactly 64 bytes
         let sig_array: [u8; 64] = match signature_bytes.try_into() {
             Ok(a) => a,
             Err(_) => return false,
         };
         let signature = Signature::from_bytes(&sig_array);
-        // Cryptographic verification — the only accepted path to `true`
+        // Cryptographic verification â€” the only accepted path to `true`
         verifying_key.verify(message, &signature).is_ok()
     }
 }
@@ -639,7 +878,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
 
-    // ── Helpers ─────────────────────────────────────────────────────────────────
+    // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Generate a random Ed25519 signing keypair for tests.
     fn test_keypair() -> ed25519_dalek::SigningKey {
@@ -705,7 +944,7 @@ mod tests {
         }
     }
 
-    // ── Unchanged basic tests ────────────────────────────────────────────────────
+    // â”€â”€ Unchanged basic tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_attestation_type_strings() {
@@ -759,27 +998,28 @@ mod tests {
         assert!(validate_attestation_size(max_sizes::MAX_ATTESTATION_QUOTE + 1).is_err());
     }
 
-    // ── TPM: valid path ──────────────────────────────────────────────────────────
+    // â”€â”€ TPM: valid path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// A correctly-signed quote with a matching AIK public key must be accepted.
     #[test]
     fn test_tpm_quote_verification() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
+        verifier.register_trusted_signing_key(AttestationType::Tpm, sk.verifying_key());
 
         let quote = make_valid_tpm_quote(&sk);
         let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
         assert!(result.is_valid, "Valid TPM quote with correct signature must be accepted");
     }
 
-    // ── TPM: freshness binding ───────────────────────────────────────────────────
+    // â”€â”€ TPM: freshness binding â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// A quote missing nonce/channel/transcript must be rejected before signature check.
     #[test]
     fn test_tpm_quote_without_freshness_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
 
         let mut quote = make_valid_tpm_quote(&sk);
@@ -794,14 +1034,14 @@ mod tests {
         );
     }
 
-    // ── TPM: adversarial signature tests ────────────────────────────────────────
+    // â”€â”€ TPM: adversarial signature tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// A random 64-byte blob submitted as a TPM signature must be rejected
     /// (previously the placeholder `len >= 64` would have accepted this).
     #[test]
     fn test_tpm_forged_signature_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
 
         let mut quote = make_valid_tpm_quote(&sk);
@@ -821,11 +1061,11 @@ mod tests {
         let sk_signer = test_keypair();
         let sk_other = test_keypair();
 
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
 
         let mut quote = make_valid_tpm_quote(&sk_signer);
-        // Replace AIK with the *other* key's public bytes — signature no longer matches
+        // Replace AIK with the *other* key's public bytes â€” signature no longer matches
         quote.aik_public = sk_other.verifying_key().to_bytes().to_vec();
 
         let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
@@ -839,11 +1079,11 @@ mod tests {
     #[test]
     fn test_tpm_malformed_aik_key_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
 
         let mut quote = make_valid_tpm_quote(&sk);
-        // 31 bytes — not a valid Ed25519 compressed point
+        // 31 bytes â€” not a valid Ed25519 compressed point
         quote.aik_public = vec![0u8; 31];
 
         let result = verifier.verify(&AttestationEvidence::Tpm(quote), 0.0);
@@ -857,7 +1097,7 @@ mod tests {
     #[test]
     fn test_tpm_empty_aik_key_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Tpm, vec![1u8; 32]);
 
         let mut quote = make_valid_tpm_quote(&sk);
@@ -870,28 +1110,29 @@ mod tests {
         );
     }
 
-    // ── TEE: valid path ──────────────────────────────────────────────────────────
+    // â”€â”€ TEE: valid path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// A correctly-signed TEE report with a matching signing public key must be accepted.
     #[test]
     fn test_tee_valid_signature_accepted() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Enclave, vec![0xDDu8; 32]);
+        verifier.register_trusted_signing_key(AttestationType::Enclave, sk.verifying_key());
 
         let tee = make_valid_tee_attest(&sk);
         let result = verifier.verify(&AttestationEvidence::Tee(tee), 0.0);
         assert!(result.is_valid, "Valid TEE attestation with correct signature must be accepted");
     }
 
-    // ── TEE: adversarial signature tests ────────────────────────────────────────
+    // â”€â”€ TEE: adversarial signature tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// A non-empty but random blob submitted as a TEE signature must be rejected
     /// (previously the placeholder `!is_empty()` would have accepted this).
     #[test]
     fn test_tee_forged_signature_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Enclave, vec![0xDDu8; 32]);
 
         let mut tee = make_valid_tee_attest(&sk);
@@ -911,7 +1152,7 @@ mod tests {
         let sk_signer = test_keypair();
         let sk_other = test_keypair();
 
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Enclave, vec![0xDDu8; 32]);
 
         let mut tee = make_valid_tee_attest(&sk_signer);
@@ -929,7 +1170,7 @@ mod tests {
     #[test]
     fn test_tee_without_freshness_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Enclave, vec![0xDDu8; 32]);
 
         let mut tee = make_valid_tee_attest(&sk);
@@ -948,7 +1189,7 @@ mod tests {
     #[test]
     fn test_tee_empty_signing_key_rejected() {
         let sk = test_keypair();
-        let mut verifier = AttestationVerifier::new();
+        let verifier = AttestationVerifier::new();
         verifier.register_trusted_measurement(AttestationType::Enclave, vec![0xDDu8; 32]);
 
         let mut tee = make_valid_tee_attest(&sk);
@@ -961,7 +1202,7 @@ mod tests {
         );
     }
 
-    // ── verify_ed25519_signature unit tests ─────────────────────────────────────
+    // â”€â”€ verify_ed25519_signature unit tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// The low-level helper correctly verifies a genuine signature.
     #[test]
@@ -996,4 +1237,3 @@ mod tests {
         );
     }
 }
-

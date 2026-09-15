@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,11 +39,12 @@ pub const MAX_STREAMS_PER_AGENT: usize = 10;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Phase 5.1: Thin alias to the canonical wall-clock source in `crate::clock`.
+/// All callers that need wall-clock time (TTL, frame timestamps) go through
+/// `wall_clock_now()` — a single change in `clock.rs` updates the whole module.
+#[inline]
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 // ── StreamSession ──────────────────────────────────────────────────────────
@@ -273,9 +274,17 @@ impl StreamRegistry {
     /// process-wide singleton, so one poisoning panic must not cascade into
     /// every other agent's streaming sessions.
     fn shard(&self, stream_id: &str) -> std::sync::MutexGuard<'_, HashMap<String, StreamSession>> {
-        self.streams[stream_shard_index(stream_id)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.streams[stream_shard_index(stream_id)].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "stream_registry_shard",
+                    "SECURITY GATE STATE CORRUPTION: StreamRegistry shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     fn stream_key(stream_id: &str) -> String {
@@ -338,7 +347,10 @@ impl StreamRegistry {
     fn register_local(&self, session: StreamSession) -> Result<(), SAACPHardDrop> {
         // Per-agent limit.
         {
-            let agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let agent_counts = match self.agent_counts.lock() {
+                Ok(g) => g,
+                Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+            };
             let agent_count = agent_counts.get(&session.agent_id).copied().unwrap_or(0);
             if agent_count >= MAX_STREAMS_PER_AGENT {
                 return Err(SAACPHardDrop::new(
@@ -359,12 +371,15 @@ impl StreamRegistry {
         let total: usize = self
             .streams
             .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| match s.lock() { Ok(g) => g.len(), Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().len() } })
             .sum();
         if total >= MAX_ACTIVE_STREAMS {
             let mut oldest: Option<(usize, String, f64)> = None;
             for (idx, shard) in self.streams.iter().enumerate() {
-                let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+                let guard = match shard.lock() {
+                    Ok(g) => g,
+                    Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_registry_shard","SECURITY GATE STATE CORRUPTION: StreamRegistry shard poison recovered."); p.into_inner() }
+                };
                 if let Some((id, sess)) = guard
                     .iter()
                     .min_by(|a, b| a.1.started_at.partial_cmp(&b.1.started_at).unwrap())
@@ -375,13 +390,19 @@ impl StreamRegistry {
                 }
             }
             if let Some((idx, id, _)) = oldest {
-                let evicted = self.streams[idx]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
+                let evicted = match self.streams[idx].lock() {
+                    Ok(mut g) => g.remove(&id),
+                    Err(p) => {
+                        crate::security_mutex::inc_poison_recovery_count();
+                        tracing::error!(mutex_name="stream_registry_shard","SECURITY GATE STATE CORRUPTION: StreamRegistry shard poison recovered.");
+                        p.into_inner().remove(&id)
+                    }
+                };
                 if let Some(evicted) = evicted {
-                    let mut agent_counts =
-                        self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut agent_counts = match self.agent_counts.lock() {
+                        Ok(g) => g,
+                        Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+                    };
                     let cnt = agent_counts.entry(evicted.agent_id.clone()).or_insert(1);
                     *cnt = cnt.saturating_sub(1);
                     if *cnt == 0 {
@@ -394,7 +415,10 @@ impl StreamRegistry {
         let agent_id = session.agent_id.clone();
         self.shard(&session.stream_id)
             .insert(session.stream_id.clone(), session);
-        let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut agent_counts = match self.agent_counts.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+        };
         *agent_counts.entry(agent_id).or_insert(0) += 1;
         Ok(())
     }
@@ -561,7 +585,10 @@ impl StreamRegistry {
             }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+                let mut agent_counts = match self.agent_counts.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+        };
 
                 if let Some(session) = streams.remove(stream_id) {
                     let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
@@ -603,7 +630,10 @@ impl StreamRegistry {
         let now = now_epoch_secs();
         let mut removed = 0usize;
         for shard in &self.streams {
-            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = match shard.lock() {
+                Ok(g) => g,
+                Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_registry_shard","SECURITY GATE STATE CORRUPTION: StreamRegistry shard poison recovered."); p.into_inner() }
+            };
             let stale_ids: Vec<String> = guard
                 .iter()
                 .filter(|(_, s)| {
@@ -615,7 +645,10 @@ impl StreamRegistry {
             if stale_ids.is_empty() {
                 continue;
             }
-            let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut agent_counts = match self.agent_counts.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+        };
             for id in stale_ids {
                 if let Some(session) = guard.remove(&id) {
                     let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);
@@ -640,7 +673,7 @@ impl StreamRegistry {
             None => self
                 .streams
                 .iter()
-                .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+                .map(|s| match s.lock() { Ok(g) => g.len(), Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().len() } })
                 .sum(),
         }
     }
@@ -652,13 +685,10 @@ impl StreamRegistry {
                 .iter()
                 .filter(|s| s.agent_id == agent_id)
                 .count(),
-            None => self
-                .agent_counts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(agent_id)
-                .copied()
-                .unwrap_or(0),
+            None => match self.agent_counts.lock() {
+                Ok(g) => g.get(agent_id).copied().unwrap_or(0),
+                Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name = "stream_agent_counts", "SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner().get(agent_id).copied().unwrap_or(0) }
+            },
         }
     }
 
@@ -707,7 +737,10 @@ impl StreamRegistry {
             }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+                let mut agent_counts = match self.agent_counts.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+        };
                 if let Some(session) = streams.remove(stream_id) {
                     let cnt = agent_counts.entry(session.agent_id).or_insert(0);
                     *cnt = cnt.saturating_sub(1);
@@ -827,7 +860,10 @@ impl StreamRegistry {
             }
             None => {
                 let mut streams = self.shard(stream_id);
-                let mut agent_counts = self.agent_counts.lock().unwrap_or_else(|e| e.into_inner());
+                let mut agent_counts = match self.agent_counts.lock() {
+            Ok(g) => g,
+            Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="stream_agent_counts","SECURITY GATE STATE CORRUPTION: agent_counts poison recovered."); p.into_inner() }
+        };
                 if let Some(mut session) = streams.remove(stream_id) {
                     session.closed = true;
                     let cnt = agent_counts.entry(session.agent_id.clone()).or_insert(0);

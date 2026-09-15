@@ -1,4 +1,4 @@
-﻿//! command_center.rs — SAACP Command Center: live dashboard backend (REST + SSE).
+//! command_center.rs — SAACP Command Center: live dashboard backend (REST + SSE).
 //!
 //! The pitch: a web dashboard for operators to see, in real time, what a fleet of SAACP
 //! gateways is actually doing — which agents are trusted, who has delegated capability to
@@ -64,7 +64,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -82,10 +82,7 @@ use crate::trust_decay::{AgentTrustSnapshot, TrustDecayEngine, TrustEvent, Trust
 use crate::MAX_PAYLOAD_SIZE;
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 /// M-1 fix: use the crate's single canonical constant-time comparison

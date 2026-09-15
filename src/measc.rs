@@ -16,6 +16,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::errors::{SAACPBytecodes, SAACPHardDrop};
 use crate::schemas::PreCompiledSchemas;
+use sha3::{Digest as Sha3Digest, Sha3_256};
 
 // ─── Protocol constants ───────────────────────────────────────────────────────
 
@@ -49,7 +50,64 @@ pub const MEASC_UNAUTH_SESSION_IDLE_SECS: f64 = 60.0;
 /// half an hour is far more likely a long-lived agent connection than junk.
 pub const MEASC_AUTH_SESSION_IDLE_SECS: f64 = 1800.0;
 pub const MEASC_AUTH_TAG_SIZE: usize = 16;
+
+// ─── MEASC Wire Format Versions ──────────────────────────────────────────────
+//
+// v1 (128-byte header): original Python-parity wire format. The session_id occupies
+//   bytes 16..32 of the header, context_ref_id at bytes 44..76. Bytes 76..128 are
+//   reserved (zero) in v1.
+//
+// v2 (160-byte header): adds cryptographic packet chaining for stateless cross-node
+//   replay protection. Layout:
+//   - Bytes 0..128  : identical v1 header fields (backward-compatible).
+//   - Byte 5        : format-version discriminator (was reserved/0x00 in v1, now 0x02).
+//   - Bytes 128..152: `prev_packet_hash` — SHA-3-256(previous authenticated header
+//                     [0..128])[0..24]. Truncated to 24 bytes (192-bit security, matching
+//                     AES-256-GCM's 128-bit tag; 192 bits >> collision resistance needed).
+//   - Bytes 152..160: `epoch_beacon` — u64 big-endian cluster-wide revocation epoch
+//                     counter. Receivers reject packets whose `epoch_beacon` is below the
+//                     cluster's global minimum epoch floor (`StateBackend::get(
+//                     MEASC_EPOCH_FLOOR_KEY)`), preventing stale-epoch replay across nodes.
+//
+// Both versions set magic bytes `b"SACP"` at offset 0. The version discriminator at
+// byte 5 (a reserved byte in both SAACPFrame and MEASCFrame that was always 0x00 in v1)
+// is the first thing a receiver checks after magic to determine header length.
+
+/// v1 MEASC header size — 128 bytes. The original Python-parity wire format.
+/// Retained for backward compatibility; v2 is the default for new sessions.
 pub const MEASC_HEADER_SIZE: usize = 128;
+
+/// v2 MEASC header size — 160 bytes. Adds `prev_packet_hash` (24 bytes) and
+/// `epoch_beacon` (8 bytes) for stateless cross-node replay protection.
+/// New deployments SHOULD use v2; v1 is accepted during a configurable migration
+/// window (`MEASC_LEGACY_ACCEPT_WINDOW_SECONDS`).
+pub const MEASC_V2_HEADER_SIZE: usize = 160;
+
+/// Format-version discriminator value at header byte 5 for v2 packets.
+/// v1 packets have 0x00 at this byte (the original reserved value).
+pub const MEASC_FORMAT_VERSION_V1: u8 = 0x00;
+pub const MEASC_FORMAT_VERSION_V2: u8 = 0x02;
+
+/// Byte offset of the `prev_packet_hash` field within a v2 header.
+pub const MEASC_V2_PREV_HASH_OFFSET: usize = 128;
+/// Byte length of the `prev_packet_hash` field — truncated SHA-3-256, 24 bytes.
+pub const MEASC_V2_PREV_HASH_SIZE: usize = 24;
+
+/// Byte offset of the `epoch_beacon` field within a v2 header.
+pub const MEASC_V2_EPOCH_BEACON_OFFSET: usize = 152;
+/// Byte length of the `epoch_beacon` field — u64 big-endian.
+pub const MEASC_V2_EPOCH_BEACON_SIZE: usize = 8;
+
+/// How long v1 (128-byte) headers are accepted during a migration window.
+/// After this window expires, a v2-only node rejects v1 packets.
+/// Default: 7 days (604 800 seconds). Override via `SAACP_MEASC_LEGACY_WINDOW_SECS` env var.
+pub const MEASC_LEGACY_ACCEPT_WINDOW_SECONDS: u64 = 604_800;
+
+/// The `StateBackend` key used to store the cluster-wide minimum revocation epoch floor.
+/// v2 receivers call `StateBackend::get(MEASC_EPOCH_FLOOR_KEY)` (at most once per second,
+/// cached locally) and reject packets whose `epoch_beacon` is below this value.
+pub const MEASC_EPOCH_FLOOR_KEY: &str = "saacp:measc:epoch_floor";
+
 pub const MEASC_MAGIC: &[u8; 4] = b"SACP";
 pub const MEASC_CONTEXT_REF_ID_OFFSET: usize = 44;
 pub const MEASC_CONTEXT_REF_ID_SIZE: usize = 32;
@@ -63,7 +121,13 @@ const _: () = assert!(
 );
 
 // INVARIANT: MEASC header sizes must match the wire layout.
-const _: () = assert!(MEASC_HEADER_SIZE == 128, "MEASC_HEADER_SIZE must be 128");
+const _: () = assert!(MEASC_HEADER_SIZE == 128, "MEASC_HEADER_SIZE v1 must be 128 bytes");
+const _: () = assert!(MEASC_V2_HEADER_SIZE == 160, "MEASC_V2_HEADER_SIZE must be 160 bytes");
+const _: () = assert!(
+    MEASC_V2_PREV_HASH_OFFSET + MEASC_V2_PREV_HASH_SIZE + MEASC_V2_EPOCH_BEACON_SIZE
+        == MEASC_V2_HEADER_SIZE,
+    "v2 header layout invariant: 128 + 24 + 8 == 160"
+);
 const _: () = assert!(MEASC_AUTH_TAG_SIZE == 16, "MEASC_AUTH_TAG_SIZE must be 16");
 const _: () = assert!(
     MEASC_CONTEXT_REF_ID_OFFSET == 44,
@@ -77,6 +141,219 @@ const _: () = assert!(
 // HKDF info prefixes — MUST match Python measc.py exactly.
 const HKDF_EPOCH_KEY_INFO_PREFIX: &[u8] = b"SAACP-MEASC-epoch-key-v1";
 const HKDF_IV_INFO_PREFIX: &[u8] = b"SAACP-MEASC-iv-v1";
+
+// ─── MEASC v2: Packet Chain Functions ─────────────────────────────────────────
+
+/// Compute the 24-byte truncated SHA-3-256 hash of a 128-byte v1-format
+/// authenticated header, for use as `prev_packet_hash` in the v2 extension.
+///
+/// # Security note
+/// SHA-3-256 over a 128-byte (1024-bit) domain produces a 256-bit output.
+/// We truncate to 24 bytes (192 bits), providing 96-bit pre-image resistance
+/// and 96-bit collision resistance — well above the 128-bit security level
+/// of AES-256-GCM's auth tag (the binding mechanism this extends). The
+/// truncation follows NIST SP 800-185 §4.3 guidance for fixed-output functions.
+///
+/// # Parameters
+/// * `authenticated_header` — the full 128-byte MEASCFrame header that was
+///   successfully AEAD-verified by the receiver's `parse_frame`. Callers MUST
+///   NOT pass unauthenticated bytes here.
+pub fn compute_prev_packet_hash(authenticated_header: &[u8; 128]) -> [u8; 24] {
+    let digest = Sha3_256::digest(authenticated_header);
+    let mut out = [0u8; MEASC_V2_PREV_HASH_SIZE];
+    out.copy_from_slice(&digest[..MEASC_V2_PREV_HASH_SIZE]);
+    out
+}
+
+/// Build the 32-byte v2 extension block (appended at offset 128 of a v2 packet):
+///   bytes  0..24  : `prev_packet_hash` (24-byte truncated SHA-3-256).
+///   bytes 24..32  : `epoch_beacon`     (u64 big-endian).
+pub fn build_v2_extension(
+    prev_packet_hash: &[u8; MEASC_V2_PREV_HASH_SIZE],
+    epoch_beacon: u64,
+) -> [u8; 32] {
+    let mut ext = [0u8; 32];
+    ext[..MEASC_V2_PREV_HASH_SIZE].copy_from_slice(prev_packet_hash);
+    ext[MEASC_V2_PREV_HASH_SIZE..].copy_from_slice(&epoch_beacon.to_be_bytes());
+    ext
+}
+
+/// Parse the 32-byte v2 extension block from a v2 header buffer.
+///
+/// Returns `(prev_packet_hash, epoch_beacon)` or a `SAACPHardDrop` if the buffer
+/// is shorter than `MEASC_V2_HEADER_SIZE`.
+pub fn parse_v2_extension(
+    header: &[u8],
+) -> Result<([u8; MEASC_V2_PREV_HASH_SIZE], u64), SAACPHardDrop> {
+    if header.len() < MEASC_V2_HEADER_SIZE {
+        return Err(SAACPHardDrop::new(
+            SAACPBytecodes::MalformedHeader,
+            format!(
+                "MEASC v2 header too short: need {} bytes, got {}",
+                MEASC_V2_HEADER_SIZE,
+                header.len()
+            ),
+        ));
+    }
+    let mut prev_hash = [0u8; MEASC_V2_PREV_HASH_SIZE];
+    prev_hash.copy_from_slice(
+        &header[MEASC_V2_PREV_HASH_OFFSET..MEASC_V2_PREV_HASH_OFFSET + MEASC_V2_PREV_HASH_SIZE],
+    );
+    let beacon = u64::from_be_bytes([
+        header[MEASC_V2_EPOCH_BEACON_OFFSET],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 1],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 2],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 3],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 4],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 5],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 6],
+        header[MEASC_V2_EPOCH_BEACON_OFFSET + 7],
+    ]);
+    Ok((prev_hash, beacon))
+}
+
+// ─── PacketChainVerifier ──────────────────────────────────────────────────────
+
+/// Per-session state for MEASC v2 cryptographic packet chaining.
+///
+/// Maintains only the 24-byte SHA-3-256 hash of the last successfully
+/// authenticated header — a tiny fraction of the 4096-bit replay window's
+/// 512-byte footprint. The chain verifier SUPPLEMENTS (never replaces) the
+/// per-node `ReplayWindow`: the replay window catches duplicates within a
+/// single node's session; the chain verifier catches cross-session splicing
+/// and roaming attacks where a session migrates to a new node that has not
+/// seen prior packets.
+///
+/// # First-packet bootstrap
+/// The first packet in a session sets `prev_packet_hash` to
+/// `MEASC_V2_CHAIN_GENESIS` (all zeros). Receivers accept any genesis
+/// hash on the first packet and store the hash of that packet's header
+/// for subsequent verification.
+///
+/// # Thread safety
+/// `PacketChainVerifier` is NOT `Sync`. It is per-session state held inside
+/// the `SessionEpoch`'s existing `Mutex<SessionEpoch>` — exactly like
+/// `ReplayWindow`. Callers must not share a `PacketChainVerifier` across
+/// threads without external synchronization.
+#[derive(Debug)]
+pub struct PacketChainVerifier {
+    /// Hash of the last successfully authenticated v2 header.
+    /// `None` until the first packet is accepted (genesis state).
+    last_accepted_hash: Option<[u8; MEASC_V2_PREV_HASH_SIZE]>,
+    /// Total packets verified through this chain verifier.
+    packets_verified: u64,
+    /// Total chain breaks detected (a chain break is logged but does not
+    /// immediately quarantine — callers decide enforcement policy).
+    chain_breaks_detected: u64,
+}
+
+/// The genesis `prev_packet_hash` value for the first packet in a v2 session.
+/// Receivers accept any packet claiming this value as its predecessor,
+/// since there is no prior packet to verify against.
+pub const MEASC_V2_CHAIN_GENESIS: [u8; MEASC_V2_PREV_HASH_SIZE] = [0u8; MEASC_V2_PREV_HASH_SIZE];
+
+impl PacketChainVerifier {
+    /// Create a new verifier in genesis state (no packets accepted yet).
+    pub fn new() -> Self {
+        Self {
+            last_accepted_hash: None,
+            packets_verified: 0,
+            chain_breaks_detected: 0,
+        }
+    }
+
+    /// Verify the `prev_packet_hash` field from a v2 packet against this
+    /// session's known last hash.
+    ///
+    /// # Returns
+    /// - `Ok(true)` — hash matches; the packet is consistent with the chain.
+    /// - `Ok(false)` — hash does NOT match; this is a chain break. The caller
+    ///   decides enforcement (log, penalize, quarantine, reject). After a chain
+    ///   break, the verifier does NOT update its state — the session stays at
+    ///   the last known good hash until a valid continuation arrives or the
+    ///   caller resets.
+    /// - `Err(...)` — the packet is a genesis-claim (all-zero `prev_hash`)
+    ///   but this session has already seen packets. This is a hard protocol
+    ///   violation (session ID re-use or replay attack) and always returns an
+    ///   error regardless of caller policy.
+    pub fn verify(
+        &self,
+        prev_hash_claimed: &[u8; MEASC_V2_PREV_HASH_SIZE],
+    ) -> Result<bool, SAACPHardDrop> {
+        let is_genesis_claim = *prev_hash_claimed == MEASC_V2_CHAIN_GENESIS;
+
+        match &self.last_accepted_hash {
+            None => {
+                // First packet: accept genesis claim or any non-genesis claim
+                // (the sender may have started the chain from an arbitrary
+                // seed; the important thing is that WE store its hash next).
+                Ok(true)
+            }
+            Some(known_hash) => {
+                if is_genesis_claim {
+                    // A packet claiming genesis after the session has already
+                    // progressed is a hard error — either a session-ID collision
+                    // or an attempt to rewind the chain to an all-zero anchor.
+                    return Err(SAACPHardDrop::new(
+                        SAACPBytecodes::PsnOutOfWindow,
+                        "MEASC v2 chain break: genesis claim after session established",
+                    ));
+                }
+                Ok(prev_hash_claimed == known_hash.as_slice())
+            }
+        }
+    }
+
+    /// Record that a packet with `authenticated_header` has been accepted.
+    /// MUST be called AFTER both `verify` succeeds AND `ReplayWindow::check_and_accept`
+    /// succeeds, and ONLY when both succeed.
+    ///
+    /// `authenticated_header` MUST be the full 128-byte v1-format header
+    /// that was AEAD-verified. Callers MUST NOT pass unauthenticated bytes.
+    pub fn accept(&mut self, authenticated_header: &[u8; 128]) {
+        self.last_accepted_hash = Some(compute_prev_packet_hash(authenticated_header));
+        self.packets_verified += 1;
+    }
+
+    /// Record a detected chain break for telemetry. Does NOT update the
+    /// last-accepted hash — the session stays at the last known good state.
+    pub fn record_chain_break(&mut self) {
+        self.chain_breaks_detected += 1;
+    }
+
+    /// Reset the verifier to genesis state. Used on epoch rotation when
+    /// both peers synchronously advance to a new epoch.
+    pub fn reset(&mut self) {
+        self.last_accepted_hash = None;
+        // Do not reset counters — they are cumulative telemetry.
+    }
+
+    /// Statistics snapshot for telemetry/monitoring.
+    pub fn stats(&self) -> PacketChainStats {
+        PacketChainStats {
+            initialized: self.last_accepted_hash.is_some(),
+            packets_verified: self.packets_verified,
+            chain_breaks_detected: self.chain_breaks_detected,
+        }
+    }
+}
+
+impl Default for PacketChainVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Statistics snapshot for a `PacketChainVerifier`.
+#[derive(Debug, Clone)]
+pub struct PacketChainStats {
+    /// Whether the genesis packet has been accepted (chain is initialized).
+    pub initialized: bool,
+    /// Total packets accepted through this verifier.
+    pub packets_verified: u64,
+    /// Total chain breaks detected (non-matching `prev_packet_hash` claims).
+    pub chain_breaks_detected: u64,
+}
 
 // ─── AnomalyPolicy ──────────────────────────────────────────────────────────
 

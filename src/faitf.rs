@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -43,10 +43,7 @@ pub const CREDENTIAL_SIG_MARKER: &str = "ed25519";
 pub const PSK_SIG_MARKER: &str = "hmac-sha256";
 
 fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 fn pub_key_fingerprint(key: &VerifyingKey) -> String {

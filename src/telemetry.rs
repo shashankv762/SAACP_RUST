@@ -22,10 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,7 +1773,21 @@ impl TelemetryCollector {
             self.mutex_contention_count("deg_state")
         ));
 
-        // ── WAL queue depth / health gauges (O-3) ────────────────────────────
+        // ── Security mutex poison recoveries (M-38 observability) ────────────
+        // Should always be 0 in normal operation. A non-zero value means a
+        // thread panicked inside a security-critical shard lock. Operators
+        // MUST alert on this counter being > 0. See security_mutex.rs.
+        out.push_str("# HELP saacp_security_mutex_poison_recoveries_total \
+            Times a security-critical shard mutex was poisoned by a panicking thread \
+            and recovered via M-38 into_inner(). Should be 0 in normal operation — \
+            a non-zero value is a security incident indicator.\n");
+        out.push_str("# TYPE saacp_security_mutex_poison_recoveries_total counter\n");
+        out.push_str(&format!(
+            "saacp_security_mutex_poison_recoveries_total {}\n",
+            crate::security_mutex::poison_recovery_count()
+        ));
+
+
         // Read directly from the process-wide `ImmutableAuditLog::global()`
         // singleton at render time — same pattern as `saacp_trust_agents_tracked`
         // above (no opt-in wiring needed: `daemon.rs` already unconditionally

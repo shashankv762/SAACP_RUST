@@ -33,7 +33,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::cluster::ClusterEngine;
 use crate::faitf::IdentityProver;
@@ -51,10 +51,7 @@ use crate::trust_decay::TrustDecayEngine;
 pub const MAINTENANCE_DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 type Sweeper = Box<dyn Fn() + Send + Sync>;

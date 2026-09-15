@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -56,10 +56,7 @@ const POOL_TUNE_MISS_RATE_SHRINK: f64 = 0.1;
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 /// An `Instant` in the past, used by tests to simulate an old timestamp without

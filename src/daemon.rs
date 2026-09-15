@@ -1,4 +1,4 @@
-﻿//! daemon.rs — SAACPNetworkDaemon
+//! daemon.rs — SAACPNetworkDaemon
 //!
 //! Full feature-parity with Python SAACP daemon.py (329 lines).
 //! Async TCP server using Tokio. One task spawned per accepted connection.
@@ -12,6 +12,60 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+
+// ─── SO_REUSEPORT multi-listener helper ─────────────────────────────────────
+//
+// On Linux, `SO_REUSEPORT` allows multiple sockets to bind to the same
+// address:port.  The kernel distributes incoming connections across all
+// accepting sockets, eliminating the single-`accept()` bottleneck that
+// appears when many Tokio tasks compete on one listener under high
+// connection rates.  Each `SAACPNetworkDaemon::run()` call (e.g. one per
+// CPU core in a `thread-per-core` deployment) can call `bind_reuseport`
+// independently and get its own kernel-balanced accept queue.
+//
+// On platforms that don't support `SO_REUSEPORT` (Windows, macOS prior
+// to 10.9) we fall back to plain `TcpListener::bind` — identical to the
+// previous behaviour, zero regression.
+//
+// The `socket2` crate is already a transitive dependency (tokio pulls it
+// in on all platforms), so this adds no new packages to the dependency
+// tree.
+
+/// Bind a `TcpListener` to `addr`.
+///
+/// On Linux, sets `SO_REUSEPORT` before binding so that multiple concurrent
+/// listeners on the same address share the kernel's accept queue without
+/// contention.  On all other platforms, falls back to `TcpListener::bind`.
+async fn bind_reuseport(addr: &str) -> std::io::Result<TcpListener> {
+    // Parse eagerly on all platforms: catches malformed addresses before any
+    // platform-specific code runs, giving a consistent error message everywhere.
+    let _sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid bind address '{addr}': {e}"))
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sock_addr: std::net::SocketAddr = _sock_addr;
+        let domain = if sock_addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        // Allow multiple sockets to bind the same port — kernel load-balances.
+        socket.set_reuse_port(true)?;
+        // Standard non-blocking + reuse-addr for graceful restart.
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&sock_addr.into())?;
+        // Backlog 1024: matches the default tokio TcpListener backlog.
+        socket.listen(1024)?;
+        // Convert the socket2::Socket into a tokio TcpListener.
+        TcpListener::from_std(std::net::TcpListener::from(socket))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Non-Linux: plain bind — same behaviour as before Phase 3.
+        TcpListener::bind(addr).await
+    }
+}
 
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -150,7 +204,7 @@ pub struct CircuitBreakerEntry {
 }
 
 impl CircuitBreakerEntry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             error_count: 0,
             lockout_until: None,
@@ -159,7 +213,8 @@ impl CircuitBreakerEntry {
         }
     }
 
-    fn is_locked(&self) -> bool {
+    /// Whether this entry is currently enforcing a lockout.
+    pub(crate) fn is_locked(&self) -> bool {
         self.lockout_until.is_some_and(|t| Instant::now() < t)
     }
 
@@ -174,7 +229,7 @@ impl CircuitBreakerEntry {
         }
     }
 
-    fn record_error(&mut self) {
+    pub(crate) fn record_error(&mut self) {
         let now = Instant::now();
 
         // L-20 fix: genuine passive recovery — this entry has gone a full recovery
@@ -1171,7 +1226,11 @@ impl SAACPNetworkDaemon {
             }
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).await?;
+        // Phase 3 — SO_REUSEPORT: on Linux, `bind_reuseport` sets SO_REUSEPORT
+        // before binding so multiple daemon instances (one per CPU core) can each
+        // accept connections on the same port without a shared bottleneck lock.
+        // On all other platforms this is identical to `TcpListener::bind(&addr)`.
+        let listener = bind_reuseport(&addr).await?;
 
         // Plan item 2b: optionally spawn the standalone health/metrics
         // HTTP server. The server is bound to a *separate* TcpListener

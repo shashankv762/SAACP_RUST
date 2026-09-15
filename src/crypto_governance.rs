@@ -4,7 +4,7 @@
 //! NegotiationTranscript, and SuiteNegotiator.
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -13,10 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::security::constant_time_eq_hex;
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

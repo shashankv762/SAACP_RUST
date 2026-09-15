@@ -1,4 +1,4 @@
-﻿//! ievl.rs — Intent-Execution Verification Loop (Phase 6 / Part 8.1)
+//! ievl.rs — Intent-Execution Verification Loop (Phase 6 / Part 8.1)
 //!
 //! *New in Rust* — no Python-reference analog.
 //!
@@ -239,9 +239,17 @@ impl IevlEngine {
     }
 
     fn shard(&self, key: &str) -> std::sync::MutexGuard<'_, HashMap<String, IntentDeclaration>> {
-        self.shards[ievl_shard_index(key)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.shards[ievl_shard_index(key)].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "ievl_shard",
+                    "SECURITY GATE STATE CORRUPTION: IevlEngine shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Registration hook — called from `handler.rs`'s Gate 1.5 block, only for
@@ -397,7 +405,10 @@ impl IevlEngine {
         let mut expired: Vec<IntentDeclaration> = Vec::new();
 
         for shard_lock in &self.shards {
-            let mut shard = shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut shard = match shard_lock.lock() {
+                Ok(g) => g,
+                Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="ievl_shard","SECURITY GATE STATE CORRUPTION: IevlEngine shard poison recovered."); p.into_inner() }
+            };
             let expired_keys: Vec<String> = shard
                 .iter()
                 .filter(|(_, d)| now - d.declared_at > RECEIPT_TTL_SECONDS)
@@ -424,7 +435,7 @@ impl IevlEngine {
     pub fn tracked_count(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| match s.lock() { Ok(g) => g.len(), Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().len() } })
             .sum()
     }
 

@@ -22,17 +22,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use rand::seq::SliceRandom;
 
 use crate::faitf::{DistributedRevocationInfrastructure, SignedRevocationRecord, TrustStore};
 
 fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 /// Maximum number of peers a single revocation is forwarded to per hop (Part 8.6).

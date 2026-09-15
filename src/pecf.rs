@@ -11,7 +11,7 @@
 //! 7. ExternalResponse   — the wire-visible structure returned to the remote peer.
 
 use std::collections::VecDeque;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -706,10 +706,7 @@ pub(crate) fn generate_correlation_id() -> String {
 
 /// Current wall-clock time as seconds since UNIX epoch.
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 /// Convert any internal exception into an opaque ExternalResponse.

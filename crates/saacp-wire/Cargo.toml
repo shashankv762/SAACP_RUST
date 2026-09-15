@@ -1,0 +1,18 @@
+﻿[package]
+name = "saacp-wire"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96.0"
+license = "MIT"
+description = "SAACP wire format types: no_std-compatible MEASC/SAACPFrame parsing and building without AEAD or async runtime"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+adler2 = "2"
+sha3 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+hex = "0.4"

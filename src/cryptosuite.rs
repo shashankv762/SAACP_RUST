@@ -12,10 +12,7 @@ use crate::crypto_governance::{
 };
 
 fn now_epoch_secs() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

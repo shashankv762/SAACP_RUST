@@ -103,9 +103,17 @@ impl OscillationFingerprinter {
         &self,
         session_id: &str,
     ) -> std::sync::MutexGuard<'_, HashMap<String, SessionHistory>> {
-        self.history[cscs_shard_index(session_id)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.history[cscs_shard_index(session_id)].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "cscs_shard",
+                    "SECURITY GATE STATE CORRUPTION: CSCSLoopDetector shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Hashes stable causal identity (oaid+cid+action_class) to detect oscillation.
@@ -176,7 +184,7 @@ impl OscillationFingerprinter {
     pub fn tracked_sessions(&self) -> usize {
         self.history
             .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| match s.lock() { Ok(g) => g.len(), Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().len() } })
             .sum()
     }
 }

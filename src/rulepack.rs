@@ -1,4 +1,4 @@
-﻿//! rulepack.rs — Dynamic Hot-Reloadable Injection Rules (signed rule packs).
+//! rulepack.rs — Dynamic Hot-Reloadable Injection Rules (signed rule packs).
 //!
 //! Gate 4.0's signature list (`handler::INJECTION_PATTERNS`) is a compile-time
 //! `static`, compiled once into a `LazyLock<AhoCorasick>`. That makes zero-day
@@ -59,7 +59,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use aho_corasick::AhoCorasick;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -105,10 +105,7 @@ pub const MAX_CLOCK_SKEW: f64 = 5.0;
 pub const RULEPACK_FORMAT: &str = "saacp-rulepack-v1";
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    crate::clock::wall_clock_now()
 }
 
 /// Convert an `f64` to a JSON number, coercing NaN/Infinity to 0. Mirrors

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
@@ -116,10 +116,7 @@ fn revoked_token_shard_index(sig_hash: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 fn now_epoch_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::clock::wall_clock_now()
 }
 
 /// Maps an `AgentRateLimiter` map key (an `agent_id`) to its shard index.
@@ -140,16 +137,26 @@ fn new_ratelimit_shards<V>() -> Vec<Mutex<HashMap<String, V>>> {
 
 /// Lock and return the shard responsible for `key`.
 ///
-/// M-38 fix: recovers via `into_inner()` on poison rather than panicking —
-/// `AgentRateLimiter::global()` is a process-wide singleton, so one poisoning
-/// panic must not cascade into every other agent's rate-limit checks.
+/// M-38 / SecurityMutex pattern: recovers via `into_inner()` on poison,
+/// increments the global security-mutex poison counter, and emits a
+/// tracing error — identical behavior to [`crate::security_mutex::SecurityMutex::lock()`].
+/// The struct field stays `Vec<Mutex<...>>` to avoid cascading type changes;
+/// the M-38 observable recovery is applied here at the one lock site.
 fn ratelimit_shard<'a, V>(
     shards: &'a [Mutex<HashMap<String, V>>],
     key: &str,
 ) -> std::sync::MutexGuard<'a, HashMap<String, V>> {
-    shards[ratelimit_shard_index(key)]
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    match shards[ratelimit_shard_index(key)].lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            crate::security_mutex::inc_poison_recovery_count();
+            tracing::error!(
+                mutex_name = "gateway_ratelimit_shard",
+                "SECURITY GATE STATE CORRUPTION: gateway rate-limit shard poison recovered."
+            );
+            poisoned.into_inner()
+        }
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -809,9 +816,17 @@ impl ZeroTrustGateway {
         cache_key: &str,
     ) -> std::sync::MutexGuard<'_, HashMap<String, CacheEntry>> {
         let idx = crate::shard::fnv1a_shard(cache_key, TOKEN_CACHE_SHARDS);
-        self.token_cache[idx]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.token_cache[idx].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "gateway_token_cache_shard",
+                    "SECURITY GATE STATE CORRUPTION: gateway token-cache shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Drop every cached verdict.
@@ -1004,9 +1019,17 @@ impl ZeroTrustGateway {
     /// poisoning panic must not cascade into every other in-flight packet
     /// losing revocation enforcement entirely.
     fn revoked_shard(&self, sig_hash: &str) -> std::sync::MutexGuard<'_, HashMap<String, f64>> {
-        self.revoked_tokens[revoked_token_shard_index(sig_hash)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.revoked_tokens[revoked_token_shard_index(sig_hash)].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "gateway_revoked_token_shard",
+                    "SECURITY GATE STATE CORRUPTION: gateway revoked-token shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Revoke a token by adding its signature hash to the revocation set.

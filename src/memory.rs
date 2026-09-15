@@ -77,6 +77,24 @@ impl CheckpointedSession {
         }
     }
 
+    /// M-38 fix: lock helper that recovers from poison via `into_inner()`,
+    /// increments the global poison counter, and emits a structured tracing
+    /// error instead of panicking. CheckpointedSession is accessed from the
+    /// gate pipeline; a poisoning panic must not cascade to all other agents.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, CheckpointInner> {
+        match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "checkpointed_session",
+                    "SECURITY GATE STATE CORRUPTION: CheckpointedSession poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Saves the exact pipeline stage linked to the 32-byte Context-State-ID.
     pub fn save_checkpoint(
         &self,
@@ -84,7 +102,7 @@ impl CheckpointedSession {
         execution_stage: &str,
         intermediate_data: serde_json::Value,
     ) {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         inner.checkpoints.insert(
             context_state_id.to_vec(),
             CheckpointEntry {
@@ -107,7 +125,7 @@ impl CheckpointedSession {
         &self,
         context_state_id: &[u8],
     ) -> Option<(String, serde_json::Value)> {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         if let Some(cp) = inner.checkpoints.get(context_state_id) {
             if (now_secs() - cp.timestamp) > CHECKPOINT_TTL_SECONDS {
                 inner.checkpoints.remove(context_state_id);
@@ -129,7 +147,7 @@ impl CheckpointedSession {
         let now = now_secs();
         let mut to_delete = Vec::new();
 
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         for (cid, cp) in inner.checkpoints.iter() {
             let age = now - cp.timestamp;
             if age >= STALL_ABORT_SECONDS {
@@ -149,7 +167,7 @@ impl CheckpointedSession {
 
     /// Return number of active checkpoints.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.lock_inner();
         inner.checkpoints.len()
     }
 
@@ -169,7 +187,7 @@ impl CheckpointedSession {
     /// number of checkpoints removed.
     pub fn sweep_expired(&self) -> usize {
         let now = now_secs();
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         let before = inner.checkpoints.len();
         inner
             .checkpoints
@@ -446,9 +464,17 @@ impl FederatedMemory {
     /// poisoning panic must not cascade into every other caller sharing this
     /// shard losing access to its memory records.
     fn shard(&self, id: &[u8]) -> std::sync::MutexGuard<'_, FederatedInner> {
-        self.shards[shard_index(id)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        match self.shards[shard_index(id)].lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "federated_memory_shard",
+                    "SECURITY GATE STATE CORRUPTION: FederatedMemory shard poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// opusplan.md 6.5: rejects (returns `Err`, stores nothing) any `data` payload
@@ -640,7 +666,10 @@ impl FederatedMemory {
                 let now = now_secs();
                 let mut evicted = 0usize;
                 for shard in &self.shards {
-                    let mut inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut inner = match shard.lock() {
+                        Ok(g) => g,
+                        Err(p) => { crate::security_mutex::inc_poison_recovery_count(); tracing::error!(mutex_name="federated_memory_shard","SECURITY GATE STATE CORRUPTION: FederatedMemory shard poison recovered."); p.into_inner() }
+                    };
                     let before = inner.store.len();
                     inner.store.retain(|_, v| v.expires_at > now);
                     evicted += before - inner.store.len();
@@ -749,7 +778,7 @@ impl FederatedMemory {
             None => self
                 .shards
                 .iter()
-                .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).store.len())
+                .map(|s| match s.lock() { Ok(g) => g.store.len(), Err(p) => { crate::security_mutex::inc_poison_recovery_count(); p.into_inner().store.len() } })
                 .sum(),
         }
     }
@@ -891,6 +920,24 @@ impl SecureContextStore {
         }
     }
 
+    /// M-38 fix: lock helper that recovers from poison via `into_inner()`,
+    /// increments the global poison counter, and emits a structured tracing
+    /// error instead of panicking. SecureContextStore is accessed from the
+    /// gate pipeline; a poisoning panic must not cascade to all other agents.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, ScrInner> {
+        match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                crate::security_mutex::inc_poison_recovery_count();
+                tracing::error!(
+                    mutex_name = "secure_context_store",
+                    "SECURITY GATE STATE CORRUPTION: SecureContextStore poison recovered."
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Encrypt and store content. Returns SCR hex string (64 chars).
     pub fn store(
         &self,
@@ -925,7 +972,7 @@ impl SecureContextStore {
             .map_err(|e| format!("AES-GCM encrypt error: {e}"))?;
 
         let scr_hex = hex::encode(&scr);
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         Self::evict_if_needed(&mut inner);
         inner.store.insert(
             scr_hex.clone(),
@@ -977,7 +1024,7 @@ impl SecureContextStore {
         })?;
 
         let buffer = {
-            let mut inner = self.inner.lock().expect("lock poisoned");
+            let mut inner = self.lock_inner();
             let record = inner.store.get(scr_hex).ok_or_else(|| {
                 SAACPHardDrop::new(
                     SAACPBytecodes::ScrNotFound,
@@ -1033,7 +1080,7 @@ impl SecureContextStore {
 
     /// Revoke an SCR. Only the owner may revoke.
     pub fn revoke(&self, scr_hex: &str, revoker_id: &str) -> Result<bool, SAACPHardDrop> {
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         let record = match inner.store.get_mut(scr_hex) {
             Some(r) => r,
             None => return Ok(false),
@@ -1051,7 +1098,7 @@ impl SecureContextStore {
     /// Remove expired and revoked entries. Returns eviction count.
     pub fn evict_expired(&self) -> usize {
         let now = now_secs();
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.lock_inner();
         let before = inner.store.len();
         inner.store.retain(|_, v| v.expiry > now && !v.revoked);
         before - inner.store.len()
@@ -1059,7 +1106,7 @@ impl SecureContextStore {
 
     /// Return number of stored entries.
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().expect("lock poisoned");
+        let inner = self.lock_inner();
         inner.store.len()
     }
 
